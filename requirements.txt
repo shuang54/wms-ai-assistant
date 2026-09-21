@@ -1,6 +1,6 @@
-# WMS AI Assistant - Phase 1 Dependencies
-# Only the dependencies actually required by Phase 1.
-# LangChain / LangGraph / pgvector / vector DBs are NOT introduced in Phase 1.
+# WMS AI Assistant - Phase 3.1 Dependencies
+# Only the dependencies actually required by current phase.
+# LangChain / LangGraph / pgvector (vector DB) / vector DBs are NOT introduced yet.
 
 # Web framework
 fastapi>=0.115.0,<1.0
@@ -16,6 +16,16 @@ python-dotenv>=1.0.0,<2.0
 
 # HTTP client (for future WMS/ERP API calls and tests)
 httpx>=0.27.0,<2.0
+
+# ===== Database (Phase 3.1) =====
+# SQLAlchemy 2.x ORM (DeclarativeBase + Mapped[] style)
+SQLAlchemy>=2.0.0,<3.0
+
+# PostgreSQL driver (psycopg 3)
+psycopg[binary]>=3.1.0,<4.0
+
+# pgvector Python integration (paired with pgvector PostgreSQL extension)
+pgvector>=0.3.0,<1.0
 
 # Testing
 pytest>=8.0.0,<9.0

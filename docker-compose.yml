@@ -1,0 +1,42 @@
+# WMS AI Assistant - Local Development Database (Phase 3.1)
+#
+# Provides PostgreSQL 16 with the pgvector extension for RAG (Phase 3.2+).
+#
+# Usage:
+#   docker compose up -d            # start in background
+#   docker compose down             # stop
+#   docker compose down -v          # stop and wipe data volume
+#
+# After start, init the pgvector extension once:
+#   python -m backend.app.db.init_db
+#
+# Then update your local .env:
+#   DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/wms_ai
+#
+# Note:
+#   - Default password is "postgres" for local development only.
+#   - Do NOT use these credentials in any non-local environment.
+#   - Override POSTGRES_PASSWORD via shell env or .env at deploy time.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: wms-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-wms_ai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-wms_ai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+    name: wms-ai-postgres-data

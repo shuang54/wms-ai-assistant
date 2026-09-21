@@ -1,13 +1,17 @@
-"""应用配置（Phase 2）。
+"""应用配置（Phase 3.1）。
 
 所有配置从环境变量加载，支持 .env 文件。
-严禁在代码中硬编码任何凭据（API Key / Password / Token 等）。
+严禁在代码中硬编码任何凭据（API Key / Database Password / Token 等）。
 
 字段：
 - 应用层：APP_NAME / APP_ENV / APP_HOST / APP_PORT
 - LLM 层：LLM_PROVIDER / LLM_MODEL / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT_*
+- Database 层（Phase 3.1）：DATABASE_URL / DATABASE_ECHO / DATABASE_POOL_SIZE / DATABASE_MAX_OVERFLOW
 
-LLM_TIMEOUT_* 控制 httpx 请求的连接 / 读 / 写 / 连接池超时（秒）。
+DATABASE_URL 为空时，DB 相关功能自动禁用：
+- get_engine() 返回 None
+- /api/health 返回 database="disabled"
+- /api/chat 不受影响
 """
 from __future__ import annotations
 
@@ -50,6 +54,18 @@ def _get_float(key: str, default: float) -> float:
         return default
 
 
+def _get_bool(key: str, default: bool = False) -> bool:
+    """读取布尔型环境变量。接受 1/true/yes/on（不区分大小写）。"""
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ============================================================
+# LLM 配置（Phase 2）
+# ============================================================
+
 @dataclass(frozen=True)
 class LLMSettings:
     """LLM Provider 配置（Phase 2+ 真正使用）。
@@ -76,6 +92,34 @@ class LLMSettings:
     )
 
 
+# ============================================================
+# Database 配置（Phase 3.1）
+# ============================================================
+
+@dataclass(frozen=True)
+class DatabaseSettings:
+    """PostgreSQL + pgvector 数据库配置（Phase 3.1）。
+
+    字段：
+        url:        SQLAlchemy URL，格式 postgresql+psycopg://user:pass@host:port/db
+                    为空时所有 DB 功能禁用（health 返回 database="disabled"）。
+        echo:       是否打印 SQL（开发用，生产应关闭）。
+        pool_size:  SQLAlchemy 连接池基础大小。
+        max_overflow: 超出 pool_size 后的最大溢出连接数。
+    """
+
+    url: str = field(default_factory=lambda: _get_str("DATABASE_URL"))
+    echo: bool = field(default_factory=lambda: _get_bool("DATABASE_ECHO", False))
+    pool_size: int = field(default_factory=lambda: _get_int("DATABASE_POOL_SIZE", 5))
+    max_overflow: int = field(
+        default_factory=lambda: _get_int("DATABASE_MAX_OVERFLOW", 10)
+    )
+
+
+# ============================================================
+# 顶层 Settings
+# ============================================================
+
 @dataclass(frozen=True)
 class Settings:
     """全局应用配置。"""
@@ -85,8 +129,9 @@ class Settings:
     app_host: str = field(default_factory=lambda: _get_str("APP_HOST", "0.0.0.0"))
     app_port: int = field(default_factory=lambda: _get_int("APP_PORT", 8000))
     llm: LLMSettings = field(default_factory=LLMSettings)
+    database: DatabaseSettings = field(default_factory=DatabaseSettings)
 
 
 settings = Settings()
 
-__all__ = ["Settings", "LLMSettings", "settings"]
+__all__ = ["Settings", "LLMSettings", "DatabaseSettings", "settings"]
