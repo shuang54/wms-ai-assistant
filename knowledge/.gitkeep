@@ -1,0 +1,2 @@
+# 占位文件，保证 knowledge/ 目录被纳入版本控制
+# Phase 3 引入 RAG 时，本目录用于存放企业知识库原文（PDF/DOCX/TXT/MD）。
