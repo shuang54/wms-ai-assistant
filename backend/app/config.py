@@ -1,13 +1,13 @@
-"""应用配置（Phase 1）。
+"""应用配置（Phase 2）。
 
 所有配置从环境变量加载，支持 .env 文件。
 严禁在代码中硬编码任何凭据（API Key / Password / Token 等）。
 
 字段：
 - 应用层：APP_NAME / APP_ENV / APP_HOST / APP_PORT
-- LLM 层：LLM_PROVIDER / LLM_MODEL / LLM_API_KEY / LLM_BASE_URL
+- LLM 层：LLM_PROVIDER / LLM_MODEL / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT_*
 
-LLM 字段在 Phase 1 仅用于验证配置链路，Phase 2 才会真正使用。
+LLM_TIMEOUT_* 控制 httpx 请求的连接 / 读 / 写 / 连接池超时（秒）。
 """
 from __future__ import annotations
 
@@ -39,14 +39,41 @@ def _get_int(key: str, default: int) -> int:
         return default
 
 
+def _get_float(key: str, default: float) -> float:
+    """读取浮点环境变量，失败回退到默认值。"""
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class LLMSettings:
-    """LLM Provider 配置（Phase 2+ 真正使用）。"""
+    """LLM Provider 配置（Phase 2+ 真正使用）。
+
+    所有字段从环境变量读取。LLM_API_KEY 为空时，LLM Client 将自动回退
+    到 MockLLMClient（见 backend/app/llm/client.py 的 create_llm_client）。
+    """
 
     provider: str = field(default_factory=lambda: _get_str("LLM_PROVIDER"))
     model: str = field(default_factory=lambda: _get_str("LLM_MODEL"))
     api_key: str = field(default_factory=lambda: _get_str("LLM_API_KEY"))
     base_url: str = field(default_factory=lambda: _get_str("LLM_BASE_URL"))
+    timeout_connect: float = field(
+        default_factory=lambda: _get_float("LLM_TIMEOUT_CONNECT", 10.0)
+    )
+    timeout_read: float = field(
+        default_factory=lambda: _get_float("LLM_TIMEOUT_READ", 60.0)
+    )
+    timeout_write: float = field(
+        default_factory=lambda: _get_float("LLM_TIMEOUT_WRITE", 10.0)
+    )
+    timeout_pool: float = field(
+        default_factory=lambda: _get_float("LLM_TIMEOUT_POOL", 10.0)
+    )
 
 
 @dataclass(frozen=True)
