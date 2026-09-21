@@ -122,7 +122,7 @@ class DatabaseSettings:
 
 @dataclass(frozen=True)
 class EmbeddingSettings:
-    """Embedding 模型配置（Phase 3.2 引入）。
+    """Embedding 模型配置（Phase 3.2 引入，Phase 3.5.1 扩展为完整配置）。
 
     本阶段**仅**提供 `dimension` 字段占位，用于：
         - `KnowledgeChunk.embedding` 列类型（pgvector `vector(N)`）
@@ -138,7 +138,14 @@ class EmbeddingSettings:
     默认值 1536 = OpenAI `text-embedding-3-small` / `text-embedding-ada-002`。
     """
 
+    provider: str = field(default_factory=lambda: _get_str("EMBEDDING_PROVIDER"))
+    model: str = field(default_factory=lambda: _get_str("EMBEDDING_MODEL"))
+    base_url: str = field(default_factory=lambda: _get_str("EMBEDDING_BASE_URL"))
+    api_key: str = field(
+        default_factory=lambda: _get_str("EMBEDDING_API_KEY") or _get_str("LLM_API_KEY")
+    )
     dimension: int = field(default_factory=lambda: _get_int("EMBEDDING_DIMENSION", 1536))
+    timeout: float = field(default_factory=lambda: _get_float("EMBEDDING_TIMEOUT", 60.0))
 
 
 # ============================================================
