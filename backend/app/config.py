@@ -117,6 +117,31 @@ class DatabaseSettings:
 
 
 # ============================================================
+# Embedding 配置（Phase 3.2）
+# ============================================================
+
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    """Embedding 模型配置（Phase 3.2 引入）。
+
+    本阶段**仅**提供 `dimension` 字段占位，用于：
+        - `KnowledgeChunk.embedding` 列类型（pgvector `vector(N)`）
+        - 未来切换 Embedding Provider 时只需修改环境变量
+
+    **重要**：
+        - 当前阶段**不创建 vector 索引**（索引要求 dimension 已稳定）。
+        - 后续确定 Embedding 模型后，若 dimension 改变：
+          1. 更新 `EMBEDDING_DIMENSION` 环境变量
+          2. 执行 ALTER TABLE knowledge_chunk ALTER COLUMN embedding TYPE vector(<new_dim>);
+          3. 再考虑加索引（ivfflat / hnsw）
+
+    默认值 1536 = OpenAI `text-embedding-3-small` / `text-embedding-ada-002`。
+    """
+
+    dimension: int = field(default_factory=lambda: _get_int("EMBEDDING_DIMENSION", 1536))
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -130,8 +155,15 @@ class Settings:
     app_port: int = field(default_factory=lambda: _get_int("APP_PORT", 8000))
     llm: LLMSettings = field(default_factory=LLMSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
+    embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
 
 
 settings = Settings()
 
-__all__ = ["Settings", "LLMSettings", "DatabaseSettings", "settings"]
+__all__ = [
+    "Settings",
+    "LLMSettings",
+    "DatabaseSettings",
+    "EmbeddingSettings",
+    "settings",
+]
