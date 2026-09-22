@@ -135,7 +135,7 @@ class EmbeddingSettings:
           2. 执行 ALTER TABLE knowledge_chunk ALTER COLUMN embedding TYPE vector(<new_dim>);
           3. 再考虑加索引（ivfflat / hnsw）
 
-    默认值 1536 = OpenAI `text-embedding-3-small` / `text-embedding-ada-002`。
+    默认值 1024 = SiliconFlow `BAAI/bge-m3`（Phase 3.5.1.5 真实 API 验证）。
     """
 
     provider: str = field(default_factory=lambda: _get_str("EMBEDDING_PROVIDER"))
@@ -144,7 +144,7 @@ class EmbeddingSettings:
     api_key: str = field(
         default_factory=lambda: _get_str("EMBEDDING_API_KEY") or _get_str("LLM_API_KEY")
     )
-    dimension: int = field(default_factory=lambda: _get_int("EMBEDDING_DIMENSION", 1536))
+    dimension: int = field(default_factory=lambda: _get_int("EMBEDDING_DIMENSION", 1024))
     timeout: float = field(default_factory=lambda: _get_float("EMBEDDING_TIMEOUT", 60.0))
 
 

@@ -18,6 +18,7 @@ import logging
 import httpx
 import pytest
 
+import backend.app.embedding.client as embedding_client
 from backend.app.config import EmbeddingSettings
 from backend.app.embedding import (
     EmbeddingAPIError,
@@ -85,7 +86,7 @@ class TestExceptionHierarchy:
 class TestConfiguration:
     def test_valid_configuration_constructs(self) -> None:
         client = OpenAICompatibleEmbeddingClient(
-            api_key="k", base_url="https://x", model="m", dimension=1536,
+            api_key="k", base_url="https://x", model="m", dimension=1024,
         )
         assert isinstance(client, EmbeddingClient)
 
@@ -360,6 +361,33 @@ class TestDimensionValidation:
         with pytest.raises(EmbeddingDimensionError):
             await client.embed("x")
 
+    async def test_dimension_1024_success(self) -> None:
+        """Phase 3.5.1.7：BAAI/bge-m3 实际维度 1024 → 校验通过。"""
+        client = _make_client(
+            lambda request: _ok_response([0.1] * 1024), dimension=1024,
+        )
+        vector = await client.embed("采购入库需要先确认采购订单。")
+        assert len(vector) == 1024
+        assert all(isinstance(x, float) for x in vector)
+
+    async def test_dimension_1536_rejected(self) -> None:
+        """Phase 3.5.1.7：旧 1536 维向量在新配置（1024）下必须被拒绝。"""
+        client = _make_client(
+            lambda request: _ok_response([0.1] * 1536), dimension=1024,
+        )
+        with pytest.raises(EmbeddingDimensionError) as ei:
+            await client.embed("x")
+        msg = str(ei.value)
+        assert "1536" in msg and "1024" in msg
+
+    async def test_custom_dimension_512_still_supported(self) -> None:
+        """维度校验仍是配置驱动：自定义 512 依旧可用（并非全局硬编码 1024）。"""
+        client = _make_client(
+            lambda request: _ok_response([0.1] * 512), dimension=512,
+        )
+        vector = await client.embed("x")
+        assert len(vector) == 512
+
 
 # ============================================================
 # 安全：API Key 不泄漏
@@ -437,17 +465,40 @@ class TestFactory:
         s = EmbeddingSettings()
         assert s.api_key == "emb-key"
 
-    def test_default_dimension_is_1536(self) -> None:
-        assert EmbeddingSettings().dimension == 1536
+    def test_default_dimension_is_1024(self) -> None:
+        assert EmbeddingSettings().dimension == 1024
 
     def test_default_timeout_is_60(self) -> None:
         assert EmbeddingSettings().timeout == 60.0
 
-    def test_default_client_singleton_and_reset(self) -> None:
+    def test_default_client_singleton_and_reset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 强制不完整配置（Settings 为 frozen dataclass，不可直接 setattr 字段，
+        # 故替换 client 模块内引用的 settings 对象），验证 get_default_embedding_client()
+        # 显式抛错，不静默回退；随后补全配置，验证单例缓存与 reset 语义。
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            embedding_client,
+            "settings",
+            SimpleNamespace(embedding=EmbeddingSettings(api_key="", base_url="", model="")),
+        )
         reset_default_embedding_client()
         try:
             with pytest.raises(EmbeddingConfigurationError):
-                # 默认配置无 model / key → 应显式失败（无 Mock 回退）
                 get_default_embedding_client()
+
+            monkeypatch.setattr(
+                embedding_client,
+                "settings",
+                SimpleNamespace(
+                    embedding=EmbeddingSettings(
+                        api_key="k", base_url="https://x", model="m", dimension=4,
+                    ),
+                ),
+            )
+            c1 = get_default_embedding_client()
+            assert get_default_embedding_client() is c1
+            reset_default_embedding_client()
+            assert get_default_embedding_client() is not c1
         finally:
             reset_default_embedding_client()

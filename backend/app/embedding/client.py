@@ -27,8 +27,8 @@
 
 维度契约：
 
-    - `EMBEDDING_DIMENSION`（默认 1536）必须与 Phase 3.2 的
-      `knowledge_chunk.embedding vector(1536)` 一致；
+    - `EMBEDDING_DIMENSION`（默认 1024 = SiliconFlow `BAAI/bge-m3`）必须与
+      `knowledge_chunk.embedding vector(1024)` 一致（Phase 3.5.1.7 已迁移）；
     - Client 校验 `len(vector) == dimension`，不一致抛
       `EmbeddingDimensionError`——**不补 0、不截断、不改数据库**。
 
@@ -104,7 +104,7 @@ class OpenAICompatibleEmbeddingClient(EmbeddingClient):
     可对接以下任一服务（都遵循相同的 /embeddings 协议）：
 
         - OpenAI:        https://api.openai.com/v1        (text-embedding-3-small: 1536)
-        - 硅基流动:       https://api.siliconflow.cn/v1     (BAAI/bge-* 系列)
+        - 硅基流动:       https://api.siliconflow.cn/v1     (BAAI/bge-m3: 1024)
         - Qwen:          https://dashscope.aliyuncs.com/compatible-mode/v1
         - Ollama:        http://localhost:11434/v1
         - 其它自部署
