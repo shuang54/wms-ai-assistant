@@ -1,7 +1,8 @@
 # WMS AI Assistant — API 设计
 
-> 当前文档对应 MVP Phase 3.5.6 实现（Chat + RAG）。
+> 当前文档对应 MVP Phase 3.5.8 实现（Chat + RAG + Retrieval Evaluation + 真实知识库加载）。
 > Phase 3.5.7 起增加 RAG 检索质量评估（见 § 5）。
+> Phase 3.5.8 起增加真实知识库加载 CLI（见 § 6）。
 > 后续阶段按 `docs/requirements.md` 演进。
 
 ---
@@ -11,7 +12,7 @@
 | 项目     | 内容                                              |
 | -------- | ------------------------------------------------- |
 | 项目名称 | WMS AI Assistant                                  |
-| 当前阶段 | MVP — Phase 3.5.7（Chat + RAG + Retrieval Evaluation） |
+| 当前阶段 | MVP — Phase 3.5.8（Chat + RAG + Retrieval Evaluation + 真实知识库加载） |
 | Base URL | `/api`                                            |
 | 数据格式 | JSON                                              |
 | 鉴权     | 当前无；Phase 6+ 引入 JWT/RBAC                    |
@@ -321,9 +322,70 @@ pytest tests/test_rag_evaluation_service.py -q
 RUN_REAL_RAG_EVAL=1 pytest tests/test_rag_evaluation_real.py -q -s
 ```
 
+### 5.7 Baseline 快照（Phase 3.5.8）
+
+导入第一份真实 WMS 知识文档 `docs/knowledge/wms-basic-operations.md`
+（10 个 Chunk / BGE-M3 1024 维）后实测：
+
+```
+top_k         : 5
+total_cases   : 12
+matched_cases : 10
+failed_cases  : 0
+hit_rate      : 83.33%
+```
+
+未命中 case（真实反映 KB 覆盖范围，未人工修改 query / keywords）：
+
+- `case_003` "单据归档在哪里处理？" → KB 当前未覆盖「单据归档」
+- `case_011` "采购单如何创建？" → KB 覆盖「采购入库」但未涵盖「采购单」
+
+> 不修改 `evaluation_cases.json` / Vector Search / Top-K 以「提升分数」。
+
 ---
 
-## 6. 设计原则
+## 6. 真实知识库加载（Phase 3.5.8）
+
+### 6.1 CLI 导入入口
+
+复用现有 `KnowledgeIngestionService`，**不**直接操作 ORM / Parser /
+Chunker / EmbeddingClient：
+
+```bash
+python -m backend.app.cli.ingest_knowledge docs/knowledge/wms-basic-operations.md
+```
+
+可选 `--json` 输出单行 JSON。
+
+### 6.2 行为契约
+
+| 行为                        | 实现                                                                  |
+| --------------------------- | --------------------------------------------------------------------- |
+| Markdown 解析               | `MarkdownParser`（Phase 3.3）                                         |
+| 标题感知切分                | `MarkdownAwareChunker`（Phase 3.4）                                  |
+| Embedding                   | `EmbeddingClient`（BGE-M3 1024 维）                                  |
+| 维度校验                    | 双保险（Client 内部 + Service 写库前）                                |
+| 重复检测                    | `KnowledgeDocument.content_hash`（UNIQUE INDEX）                       |
+| 重复导入                    | `IngestionResult.status == "already_exists"`，不再调 Embedding / DB   |
+| 异常                       | `DocumentNotFoundError` / `UnsupportedDocumentTypeError` / `DocumentParseError` / `EmptyDocumentError` / `KnowledgeIngestionDatabaseError` |
+
+### 6.3 不在本阶段实现
+
+- ❌ `POST /api/knowledge/ingest` HTTP 接口（Phase 3.6+）
+- ❌ 目录递归批量导入 / 任务队列 / 异步 worker
+- ❌ 文档更新 / 删除 / 版本化
+- ❌ 文件存储位置（OSS / S3）
+
+### 6.4 CLI 退出码
+
+| 退出码 | 含义                                                       |
+| ------ | ---------------------------------------------------------- |
+| 0      | 成功（含 `ready` / `already_exists`）                       |
+| 1      | 失败（参数错误 / 文件不存在 / Service 异常）                |
+
+---
+
+## 7. 设计原则
 
 - **RESTful**：资源导向，HTTP 语义清晰。
 - **OpenAPI 自动生成**：所有接口必须能被 FastAPI 自动文档化。

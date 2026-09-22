@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-**Phase 3.5.7：RAG Retrieval Evaluation**
+**Phase 3.5.8：First Real WMS Knowledge Base**
 
 - ✅ Python + FastAPI 工程结构（Phase 1）
 - ✅ Health Check API（Phase 1）
@@ -25,6 +25,7 @@
 - ✅ **RAG API（POST /api/rag/answer）**（Phase 3.5.5）
 - ✅ **Chat + RAG（/api/chat 经知识库回答，含来源元数据）**（Phase 3.5.6）
 - ✅ **RAG 检索质量评估（Baseline：Top-K Keyword Hit Rate）**（Phase 3.5.7）
+- ✅ **第一份真实 WMS 知识库加载（CLI：ingest_knowledge）**（Phase 3.5.8）
 
 明确**未实现**（后续阶段按 `docs/requirements.md` 逐步推进）：
 
@@ -34,6 +35,16 @@
 - ❌ 多轮会话上下文 / Intent 分类 / 闲聊兜底（Phase 2.5+）
 - ❌ Streaming（Phase 6+）
 - ❌ Reranker / Hybrid Search / Query Rewrite（评估 → 优化阶段）
+
+### 第一份真实知识文档（Phase 3.5.8）
+
+```bash
+# 导入第一份真实 WMS 知识文档（推荐 CLI 入口）
+python -m backend.app.cli.ingest_knowledge docs/knowledge/wms-basic-operations.md
+```
+
+> 复用现有 `KnowledgeIngestionService`：MarkdownParser → MarkdownAwareChunker →
+> BGE-M3 1024 维 → PostgreSQL + pgvector；重复导入自动跳过（content_hash 唯一约束）。
 
 ---
 
