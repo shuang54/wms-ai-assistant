@@ -107,6 +107,38 @@ class RetrievalEvaluationSummary:
 
 
 # ============================================================
+# Top-K 离线评估 DTO（Phase 3.5.11）
+# ============================================================
+
+@dataclass(frozen=True)
+class TopKEvaluationEntry:
+    """单个 Top-K 档位的离线评估统计。
+
+    similarity 统计口径：该 Top-K 档位下、全部 case 的 Top-K 结果
+    （即每个 case 召回前 K 条）的 similarity 聚合；
+    所有 case 都无结果时 min / max 为 None，average 为 0.0。
+    """
+
+    top_k: int
+    case_count: int
+    hit_count: int
+    hit_rate: float
+    error_count: int
+    average_similarity: float
+    min_similarity: float | None
+    max_similarity: float | None
+    results: tuple[RetrievalEvaluationResult, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class TopKEvaluationSummary:
+    """多档 Top-K 离线评估汇总（按传入 top_ks 顺序）。"""
+
+    top_ks: tuple[int, ...]
+    entries: tuple[TopKEvaluationEntry, ...] = field(default_factory=tuple)
+
+
+# ============================================================
 # 匹配逻辑（轻量、可解释；不做 NLP / LLM 判断）
 # ============================================================
 
@@ -276,6 +308,135 @@ class RagEvaluationService:
             results=tuple(results),
         )
 
+    # ============================================================
+    # Top-K 离线评估（Phase 3.5.11 新增；不改变上面 evaluate 的行为）
+    # ============================================================
+
+    DEFAULT_TOP_KS: tuple[int, ...] = (1, 3, 5, 10)
+
+    async def evaluate_top_k(
+        self,
+        cases: list[RetrievalEvaluationCase],
+        *,
+        top_ks: tuple[int, ...] | list[int] = DEFAULT_TOP_KS,
+    ) -> TopKEvaluationSummary:
+        """对同一批 cases 在多个 Top-K 档位下做离线检索评估。
+
+        实现（复用 + 前缀截断，避免重复 Embedding 调用）：
+
+            1. 每个 case 只调用一次 search(query, top_k=max(top_ks))
+            2. 由于 search 结果按 similarity 降序（distance 升序）排列，
+               Top-K'（K' < max）的结果恒为该列表的前 K' 条前缀
+               —— 直接截断，不重复发起 Embedding / SQL。
+            3. 对每个档位分别跑既有 `_match_case`（匹配逻辑与 evaluate 完全一致）
+            4. 汇总每档位的 hit_count / hit_rate / similarity 统计
+
+        不调用 LLM（本服务不持有 LLMClient）。
+
+        Args:
+            cases:  评估 case 列表。
+            top_ks: 档位（会去重保序）。所有档位都必须落在
+                    VectorSearchService 的合法 top_k 范围内，
+                    否则底层抛 VectorSearchParameterError（原样透传）。
+
+        Returns:
+            TopKEvaluationSummary（cases 为空时 entries 的每档统计均为零值）。
+        """
+        ks = tuple(dict.fromkeys(int(k) for k in top_ks))
+        if not cases:
+            return TopKEvaluationSummary(
+                top_ks=ks,
+                entries=tuple(
+                    TopKEvaluationEntry(
+                        top_k=k,
+                        case_count=0,
+                        hit_count=0,
+                        hit_rate=0.0,
+                        error_count=0,
+                        average_similarity=0.0,
+                        min_similarity=None,
+                        max_similarity=None,
+                    )
+                    for k in ks
+                ),
+            )
+        if not ks:
+            return TopKEvaluationSummary(top_ks=(), entries=())
+
+        max_k = max(ks)
+        per_k_results: dict[int, list[RetrievalEvaluationResult]] = {k: [] for k in ks}
+        hit_counts: dict[int, int] = {k: 0 for k in ks}
+        error_counts: dict[int, int] = {k: 0 for k in ks}
+        sims_by_k: dict[int, list[float]] = {k: [] for k in ks}
+
+        for case in cases:
+            try:
+                rows = await self._vector_search_service.search(
+                    case.query, top_k=max_k
+                )
+            except Exception as exc:  # noqa: BLE001 — 与 evaluate() 相同的容错策略
+                logger.warning(
+                    "top-k evaluation case failed: case_id=%s error=%s",
+                    case.case_id,
+                    exc,
+                    extra={"case_id": case.case_id, "error_type": type(exc).__name__},
+                )
+                for k in ks:
+                    per_k_results[k].append(
+                        RetrievalEvaluationResult(
+                            case_id=case.case_id,
+                            query=case.query,
+                            top_k=k,
+                            matched=False,
+                            results_count=0,
+                            error=str(exc),
+                        )
+                    )
+                    error_counts[k] += 1
+                continue
+
+            for k in ks:
+                prefix = rows[:k]
+                matched, idx, mkw, mkw_miss, doc = _match_case(
+                    case=case, results=prefix
+                )
+                if matched:
+                    hit_counts[k] += 1
+                per_k_results[k].append(
+                    RetrievalEvaluationResult(
+                        case_id=case.case_id,
+                        query=case.query,
+                        top_k=k,
+                        matched=matched,
+                        results_count=len(prefix),
+                        matched_result_indexes=idx,
+                        matched_keywords=mkw,
+                        missing_keywords=mkw_miss,
+                        document_id_match=(
+                            case.expected_document_id is None or doc
+                        ),
+                    )
+                )
+                sims_by_k[k].extend(r.similarity for r in prefix)
+
+        entries = []
+        for k in ks:
+            sims = sims_by_k[k]
+            entry = TopKEvaluationEntry(
+                top_k=k,
+                case_count=len(cases),
+                hit_count=hit_counts[k],
+                hit_rate=hit_counts[k] / len(cases),
+                error_count=error_counts[k],
+                average_similarity=(sum(sims) / len(sims)) if sims else 0.0,
+                min_similarity=min(sims) if sims else None,
+                max_similarity=max(sims) if sims else None,
+                results=tuple(per_k_results[k]),
+            )
+            entries.append(entry)
+
+        return TopKEvaluationSummary(top_ks=ks, entries=tuple(entries))
+
 
 # ============================================================
 # 便捷：从 JSON 文件加载 Evaluation Cases
@@ -373,6 +534,8 @@ __all__ = [
     "RetrievalEvaluationCase",
     "RetrievalEvaluationResult",
     "RetrievalEvaluationSummary",
+    "TopKEvaluationEntry",
+    "TopKEvaluationSummary",
     "RagEvaluationService",
     "load_cases_from_json",
 ]
