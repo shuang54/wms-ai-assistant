@@ -54,9 +54,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -71,6 +72,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "IngestionResult",
+    "KnowledgeDocumentInfo",
+    "KnowledgeDocumentNotFoundError",
     "KnowledgeIngestionError",
     "EmptyDocumentError",
     "KnowledgeIngestionDatabaseError",
@@ -97,6 +100,10 @@ class EmptyDocumentError(KnowledgeIngestionError):
 
 class KnowledgeIngestionDatabaseError(KnowledgeIngestionError):
     """数据库写入失败（事务已回滚，无半成品残留）。"""
+
+
+class KnowledgeDocumentNotFoundError(KnowledgeIngestionError):
+    """按 document_id 未找到对应知识文档（update / delete / get 调用时使用）。"""
 
 
 # ============================================================
@@ -127,6 +134,43 @@ class IngestionResult:
 def _sha256_hex(content: str) -> str:
     """计算文本的 SHA-256 hex 摘要。"""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class KnowledgeDocumentInfo:
+    """知识文档只读摘要 DTO（frozen dataclass，Phase 3.5.10）。
+
+    字段：
+        id, title, file_name, file_type, source, status,
+        created_at, updated_at, chunk_count
+
+    明确**不**暴露：embedding 向量、数据库连接、API Key、完整 chunk content。
+    """
+
+    id: int
+    title: str
+    file_name: str | None
+    file_type: str | None
+    source: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    chunk_count: int
+
+
+def _to_document_info(doc: KnowledgeDocument) -> "KnowledgeDocumentInfo":
+    """ORM 行 → 只读 DTO（不暴露 ORM 对象）。"""
+    return KnowledgeDocumentInfo(
+        id=doc.id,
+        title=doc.title,
+        file_name=doc.file_name,
+        file_type=doc.file_type,
+        source=doc.source,
+        status=doc.status,
+        created_at=doc.created_at,
+        updated_at=doc.updated_at,
+        chunk_count=len(doc.chunks or []),
+    )
 
 
 # ============================================================
@@ -335,3 +379,230 @@ class KnowledgeIngestionService:
             embedded_chunk_count=len(vectors),
             content_hash=content_hash,
         )
+
+    # ============================================================
+    # Lifecycle: update / delete / get / list（Phase 3.5.10）
+    # ============================================================
+
+    async def update_document(
+        self,
+        document_id: int,
+        file_path: str | Path,
+    ) -> "IngestionResult":
+        """原地更新指定 document_id 的内容（保留主键）。
+
+        阶段式安全策略（任务书 §七/§八/§十一）：
+
+            Phase A — 只读加载文档 + 解析新文件 + content_hash 对比
+                       （同 → status="unchanged"，零 Embedding 调用）
+            Phase B — 重新 Chunk + 重新 Embedding（全部完成前不触碰 DB）
+                       （Embedding 失败 → 异常抛出，旧 doc/chunks 不动）
+            Phase C — 单事务：删除旧 chunks → 写入新 chunks → 更新
+                       document.content_hash/status（任一步失败 → ROLLBACK）
+
+        Args:
+            document_id: 已存在的 KnowledgeDocument 主键。
+            file_path:   新版本的文件路径（.md / .txt）。
+
+        Returns:
+            IngestionResult：status 为 "ready"/"already_exists"（同 hash 走 unchanged）
+            或 "updated"。
+
+        Raises:
+            KnowledgeDocumentNotFoundError: document_id 不存在。
+            DocumentNotFoundError / UnsupportedDocumentTypeError /
+            DocumentParseError: Parser 阶段失败。
+            EmptyDocumentError: 新内容为空。
+            EmbeddingConfigurationError / EmbeddingAPIError /
+            EmbeddingResponseError / EmbeddingDimensionError: Embedding 阶段失败。
+            KnowledgeIngestionDatabaseError: 写库失败（已回滚）。
+        """
+        started = time.perf_counter()
+        path = Path(file_path)
+        file_name = path.name
+
+        # ---- 1. Parser（异常在此抛出，未触碰 DB） ----
+        from backend.app.rag.parsers.factory import get_parser
+
+        parser = get_parser(path)
+        new_text = parser.parse(path)
+
+        if not new_text.strip():
+            raise EmptyDocumentError(
+                f"文档内容为空或纯空白，已拒绝更新: {file_name}"
+            )
+
+        new_hash = _sha256_hex(new_text)
+        factory = self._get_session_factory()
+
+        # ---- Phase A: 加载旧文档 + 对比 content_hash ----
+        old_chunk_count = 0
+        old_hash: str | None = None
+        with factory() as session:
+            existing = session.get(KnowledgeDocument, document_id)
+            if existing is None:
+                raise KnowledgeDocumentNotFoundError(
+                    f"知识文档不存在: document_id={document_id}"
+                )
+            old_hash = existing.content_hash
+            old_chunk_count = len(existing.chunks)
+
+        if old_hash == new_hash:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "Knowledge document update skipped (unchanged content)",
+                extra={
+                    "document_id": document_id,
+                    "file_name": file_name,
+                    "content_hash": new_hash,
+                    "status": "unchanged",
+                    "elapsed_ms": elapsed_ms,
+                },
+            )
+            return IngestionResult(
+                document_id=document_id,
+                file_name=file_name,
+                status="unchanged",
+                chunk_count=old_chunk_count,
+                embedded_chunk_count=0,
+                content_hash=new_hash,
+            )
+
+        # ---- Phase B: 重新 Chunk + 重新 Embedding（不触碰 DB） ----
+        chunks = self._chunker.chunk(new_text)
+        if not chunks:
+            raise EmptyDocumentError(
+                f"文档切分结果为空，已拒绝更新: {file_name}"
+            )
+
+        embedding_client = self._get_embedding_client()
+        dimension = settings.embedding.dimension
+        vectors: list[list[float]] = []
+        for chunk in chunks:
+            vector = await embedding_client.embed(chunk.content)
+            if len(vector) != dimension:
+                raise EmbeddingDimensionError(
+                    f"Embedding 向量维度不匹配：得到 {len(vector)} 维，"
+                    f"EMBEDDING_DIMENSION 配置为 {dimension} 维；"
+                    "已阻止数据库写入（不截断、不补零）。"
+                )
+            vectors.append(vector)
+
+        # ---- Phase C: 单事务 — 删旧 chunks + 写新 chunks + 更新 document ----
+        try:
+            with factory() as session, session.begin():
+                doc = session.get(KnowledgeDocument, document_id)
+                if doc is None:
+                    raise KnowledgeDocumentNotFoundError(
+                        f"知识文档在更新过程中消失: document_id={document_id}"
+                    )
+
+                # 删除旧 chunks（DB CASCADE 会自动处理；此处显式 SQL 更可控）
+                session.execute(
+                    delete(KnowledgeChunk).where(
+                        KnowledgeChunk.document_id == document_id
+                    )
+                )
+
+                # 写入新 chunks
+                for chunk, vector in zip(chunks, vectors):
+                    session.add(
+                        KnowledgeChunk(
+                            document_id=document_id,
+                            chunk_index=chunk.chunk_index,
+                            content=chunk.content,
+                            content_hash=_sha256_hex(chunk.content),
+                            token_count=None,
+                            embedding=vector,
+                            meta_data=dict(chunk.metadata),
+                        )
+                    )
+
+                # 更新 document
+                doc.content_hash = new_hash
+                doc.status = "ready"
+        except SQLAlchemyError as exc:
+            raise KnowledgeIngestionDatabaseError(
+                f"知识文档更新失败（事务已回滚）: {file_name}: {exc}"
+            ) from exc
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "Knowledge document updated",
+            extra={
+                "document_id": document_id,
+                "file_name": file_name,
+                "old_chunk_count": old_chunk_count,
+                "new_chunk_count": len(chunks),
+                "embedded_chunk_count": len(vectors),
+                "status": "updated",
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+        return IngestionResult(
+            document_id=document_id,
+            file_name=file_name,
+            status="updated",
+            chunk_count=len(chunks),
+            embedded_chunk_count=len(vectors),
+            content_hash=new_hash,
+        )
+
+    # ---------- delete / get / list ----------
+
+    def delete_document(self, document_id: int) -> int:
+        """删除指定 document 及其所有 chunks（依赖 FK CASCADE）。
+
+        Returns:
+            删除前该文档的 chunk 数。
+
+        Raises:
+            KnowledgeDocumentNotFoundError: document_id 不存在。
+            KnowledgeIngestionDatabaseError: DB 写失败（事务回滚）。
+        """
+        factory = self._get_session_factory()
+        chunk_count = 0
+        try:
+            with factory() as session, session.begin():
+                doc = session.get(KnowledgeDocument, document_id)
+                if doc is None:
+                    raise KnowledgeDocumentNotFoundError(
+                        f"知识文档不存在: document_id={document_id}"
+                    )
+                chunk_count = len(doc.chunks or [])
+                # ORM cascade + DB ondelete CASCADE 双重保障
+                session.delete(doc)
+        except SQLAlchemyError as exc:
+            raise KnowledgeIngestionDatabaseError(
+                f"知识文档删除失败（事务已回滚）: document_id={document_id}: {exc}"
+            ) from exc
+
+        logger.info(
+            "Knowledge document deleted",
+            extra={
+                "document_id": document_id,
+                "chunk_count": chunk_count,
+                "status": "deleted",
+            },
+        )
+        return chunk_count
+
+    def get_document(self, document_id: int) -> "KnowledgeDocumentInfo":
+        """按 document_id 查询文档摘要。"""
+        factory = self._get_session_factory()
+        with factory() as session:
+            doc = session.get(KnowledgeDocument, document_id)
+            if doc is None:
+                raise KnowledgeDocumentNotFoundError(
+                    f"知识文档不存在: document_id={document_id}"
+                )
+            return _to_document_info(doc)
+
+    def list_documents(self) -> tuple["KnowledgeDocumentInfo", ...]:
+        """列出所有知识文档摘要（按 id 升序）。"""
+        factory = self._get_session_factory()
+        with factory() as session:
+            rows = session.scalars(
+                select(KnowledgeDocument).order_by(KnowledgeDocument.id)
+            ).all()
+            return tuple(_to_document_info(r) for r in rows)
