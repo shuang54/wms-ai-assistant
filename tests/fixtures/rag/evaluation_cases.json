@@ -1,0 +1,110 @@
+{
+  "_schema_doc": "RAG Retrieval Evaluation Cases (Phase 3.5.7). 不假设具体 document_id —— 优先按 expected_keywords 评估，便于实验回放而不依赖某次运行的基线。",
+  "_schema_version": "1.0",
+  "_fields": {
+    "id": "string, required, unique case id",
+    "query": "string, required, user natural language query",
+    "expected_keywords": "array of substring, 全部命中才算该 case 成功（case-insensitive）",
+    "expected_document_id": "int|null, optional, 任一 Top-K 结果属于该文档将匹配",
+    "expected_source": "string|null, optional, metadata.source 包含该字符串即匹配",
+    "expected_title": "string|null, optional, metadata.title 包含该字符串即匹配"
+  },
+  "cases": [
+    {
+      "id": "case_001",
+      "query": "采购入库的操作步骤是什么？",
+      "expected_keywords": ["采购入库"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_002",
+      "query": "退货入库的流程是怎样的？",
+      "expected_keywords": ["退货入库"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_003",
+      "query": "单据归档在哪里处理？",
+      "expected_keywords": ["单据归档"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_004",
+      "query": "发货时需要注意哪些事项？",
+      "expected_keywords": ["发货"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_005",
+      "query": "调拨出库怎么操作？",
+      "expected_keywords": ["调拨"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_006",
+      "query": "盘点任务的执行步骤有哪些？",
+      "expected_keywords": ["盘点"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_007",
+      "query": "上架时如何选择货位？",
+      "expected_keywords": ["上架"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_008",
+      "query": "工单如何创建与下达？",
+      "expected_keywords": ["工单"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_009",
+      "query": "仓库的基本信息怎么维护？",
+      "expected_keywords": ["仓库"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_010",
+      "query": "条码的生成和打印规范是什么？",
+      "expected_keywords": ["条码"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_011",
+      "query": "采购单如何创建？",
+      "expected_keywords": ["采购入库", "采购单"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    },
+    {
+      "id": "case_012",
+      "query": "WMS 出库的完整流程说明",
+      "expected_keywords": ["出库"],
+      "expected_document_id": null,
+      "expected_source": null,
+      "expected_title": null
+    }
+  ]
+}

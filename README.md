@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-**Phase 3.5.6：Chat + RAG**
+**Phase 3.5.7：RAG Retrieval Evaluation**
 
 - ✅ Python + FastAPI 工程结构（Phase 1）
 - ✅ Health Check API（Phase 1）
@@ -24,6 +24,7 @@
 - ✅ **最小 RAG（RagService：检索 → Context → LLM）**（Phase 3.5.4）
 - ✅ **RAG API（POST /api/rag/answer）**（Phase 3.5.5）
 - ✅ **Chat + RAG（/api/chat 经知识库回答，含来源元数据）**（Phase 3.5.6）
+- ✅ **RAG 检索质量评估（Baseline：Top-K Keyword Hit Rate）**（Phase 3.5.7）
 
 明确**未实现**（后续阶段按 `docs/requirements.md` 逐步推进）：
 
@@ -32,6 +33,7 @@
 - ❌ 复杂权限 / 写操作 / 私有化部署（Phase 6+）
 - ❌ 多轮会话上下文 / Intent 分类 / 闲聊兜底（Phase 2.5+）
 - ❌ Streaming（Phase 6+）
+- ❌ Reranker / Hybrid Search / Query Rewrite（评估 → 优化阶段）
 
 ---
 

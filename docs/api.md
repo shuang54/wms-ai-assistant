@@ -1,6 +1,8 @@
 # WMS AI Assistant — API 设计
 
-> 当前文档对应 MVP Phase 3.5.6 实现（Chat + RAG）。后续阶段按 `docs/requirements.md` 演进。
+> 当前文档对应 MVP Phase 3.5.6 实现（Chat + RAG）。
+> Phase 3.5.7 起增加 RAG 检索质量评估（见 § 5）。
+> 后续阶段按 `docs/requirements.md` 演进。
 
 ---
 
@@ -9,7 +11,7 @@
 | 项目     | 内容                                              |
 | -------- | ------------------------------------------------- |
 | 项目名称 | WMS AI Assistant                                  |
-| 当前阶段 | MVP — Phase 3.5.6（Chat + RAG）                   |
+| 当前阶段 | MVP — Phase 3.5.7（Chat + RAG + Retrieval Evaluation） |
 | Base URL | `/api`                                            |
 | 数据格式 | JSON                                              |
 | 鉴权     | 当前无；Phase 6+ 引入 JWT/RBAC                    |
@@ -216,7 +218,112 @@ RagError                                services/rag_service.py（RAG 自身错�
 
 ---
 
-## 5. 设计原则
+## 5. RAG 检索质量评估（Phase 3.5.7）
+
+> 本节为 **测试评估层** 描述，不对外暴露 HTTP 接口。
+
+### 5.1 目的
+
+建立可重复运行的 RAG 检索质量 Baseline，作为后续优化（Reranker / Hybrid
+Search / Query Rewrite）的对比参照。
+
+### 5.2 范围
+
+```text
+test query
+  ↓
+RagEvaluationService
+  ↓
+VectorSearchService.search(query, top_k)
+  ↓
+Top-K Results
+  ↓
+Keyword / document_id 匹配
+  ↓
+RetrievalEvaluationSummary
+```
+
+**不含**
+
+- 不重新实现 embedding / pgvector / 距离计算（复用 `VectorSearchService`）
+- 不调用 LLM（评估的是检索链路，与生成链路解耦）
+
+### 5.3 评估数据集：`tests/fixtures/rag/evaluation_cases.json`
+
+```jsonc
+{
+  "_schema_version": "1.0",
+  "cases": [
+    {
+      "id": "case_001",
+      "query": "采购入库的操作步骤是什么？",
+      "expected_keywords": ["采购入库"],
+      "expected_document_id": null,   // 可选；不假设 DB 当前 ID
+      "expected_source": null,        // 可选；metadata.source 包含
+      "expected_title": null           // 可选；metadata.title 包含
+    },
+    ...
+  ]
+}
+```
+
+不假设具体 document_id，避免依赖 DB 当前状态。
+
+### 5.4 评估 Service：`backend/app/services/rag_evaluation_service.py`
+
+```python
+service = RagEvaluationService(vector_search_service=vector_search_service)
+
+summary = await service.evaluate(cases, top_k=5)
+# → RetrievalEvaluationSummary(
+#     total_cases, matched_cases, failed_cases,
+#     hit_rate = matched_cases / total_cases,
+#     top_k, results=(RetrievalEvaluationResult, ...))
+```
+
+匹配规则：
+
+| 字段                   | 命中条件                                                       |
+| ---------------------- | -------------------------------------------------------------- |
+| `expected_keywords`   | 全部关键字（任一 Top-K 命中）才匹配；支持中文/`metadata.source` |
+| `expected_document_id` | 任一 Top-K result 的 `document_id == expected_document_id`     |
+
+异常策略：
+
+- 单 case 异常 → 该 `RetrievalEvaluationResult.error` 填入，
+  `matched=False`，计入 `failed_cases`；**不阻断**其余 case。
+
+DTO（frozen dataclass）：
+
+| 类型                          | 字段                                                            |
+| ----------------------------- | --------------------------------------------------------------- |
+| `RetrievalEvaluationCase`     | case_id, query, expected_keywords, expected_document_id, ...    |
+| `RetrievalEvaluationResult`   | case_id, query, top_k, matched, results_count, error, ...       |
+| `RetrievalEvaluationSummary`  | total_cases, matched_cases, failed_cases, hit_rate, top_k, ... |
+
+### 5.5 Baseline 指标
+
+第一版只计算：
+
+```
+hit_rate = matched_cases / total_cases
+```
+
+后续如需 MRR / NDCG / Recall@K，独立 Phase。
+
+### 5.6 运行测试
+
+```bash
+# 单元（默认）
+pytest tests/test_rag_evaluation_service.py -q
+
+# 真实链路（默认 SKIP；不消耗 LLM 额度，只消耗 Embedding）
+RUN_REAL_RAG_EVAL=1 pytest tests/test_rag_evaluation_real.py -q -s
+```
+
+---
+
+## 6. 设计原则
 
 - **RESTful**：资源导向，HTTP 语义清晰。
 - **OpenAPI 自动生成**：所有接口必须能被 FastAPI 自动文档化。
