@@ -415,6 +415,11 @@ PDF / DOCX / TXT / MD
  PostgreSQL + pgvector
 ```
 
+当前实现（Phase 3.5.2）：`backend/app/services/knowledge_ingestion_service.py`
+提供 `ingest_one(file_path)` 单文件导入（Parser → Chunker → EmbeddingClient →
+单事务写库）；按 `content_hash` 检测重复文档（重复时不调用 Embedding API）。
+批量导入 / 后台任务与向量检索（Retrieval）为后续 Phase。
+
 每个 Chunk 至少保存：
 
 ```text
