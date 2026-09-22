@@ -149,6 +149,28 @@ class EmbeddingSettings:
 
 
 # ============================================================
+# RAG 配置（Phase 3.5.4）
+# ============================================================
+
+@dataclass(frozen=True)
+class RagSettings:
+    """RAG Service 配置（Phase 3.5.4 引入）。
+
+    字段：
+        max_context_chars: Context Builder 输出的最大字符数；
+                          超限后 Context Builder 会从后往前丢弃片段，
+                          最后一个被保留的片段允许尾部截断 content。
+                          默认 12000（约 2-3k token，对应中长上下文）。
+        default_top_k:    RagService 默认 top_k，与 VectorSearchService 一致 = 5。
+    """
+
+    max_context_chars: int = field(
+        default_factory=lambda: _get_int("RAG_MAX_CONTEXT_CHARS", 12000)
+    )
+    default_top_k: int = field(default_factory=lambda: _get_int("RAG_TOP_K", 5))
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -163,6 +185,7 @@ class Settings:
     llm: LLMSettings = field(default_factory=LLMSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
+    rag: RagSettings = field(default_factory=RagSettings)
 
 
 settings = Settings()
@@ -172,5 +195,6 @@ __all__ = [
     "LLMSettings",
     "DatabaseSettings",
     "EmbeddingSettings",
+    "RagSettings",
     "settings",
 ]
