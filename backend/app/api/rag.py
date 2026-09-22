@@ -16,38 +16,24 @@
 
     - 入参校验（Pydantic：query 非空、top_k ∈ [1, 50]）
     - RagResponse → RagAnswerResponse 字段映射
-    - 已知异常 → HTTP 状态码
+    - 已知异常 → HTTP 状态码（映射规则与 /api/chat 共享，
+      见 _rag_error_mapping.rag_pipeline_error_to_http）
 
 不做：Embedding / pgvector / Prompt 拼接 / LLM 调用 / 数据库查询。
 
-与 /api/chat 的关系：本阶段相互独立；Chat + RAG 合并留待后续 Phase。
+与 /api/chat 的关系：Phase 3.5.6 起 /api/chat 也经由 RagService；
+本接口保留独立的 RAG 问答入口（可显式指定 top_k）。
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter
 from pydantic import BaseModel, Field, field_validator
 
-from backend.app.embedding.exceptions import (
-    EmbeddingAPIError,
-    EmbeddingConfigurationError,
-    EmbeddingError,
-    EmbeddingResponseError,
-)
-from backend.app.llm.client import (
-    LLMConfigError,
-    LLMError,
-    LLMRequestError,
-    LLMResponseError,
-)
-from backend.app.services.rag_service import RagError, RagResponse, RagService
-from backend.app.services.vector_search_service import (
-    VectorSearchError,
-    VectorSearchInputError,
-    VectorSearchParameterError,
-    VectorSearchService,
-)
+from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http
+from backend.app.services.rag_service import RagResponse, RagService
+from backend.app.services.vector_search_service import VectorSearchService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -166,104 +152,9 @@ async def rag_answer(request: RagAnswerRequest) -> RagAnswerResponse:
     """
     try:
         result = await _rag_service.answer(request.query, top_k=request.top_k)
-    except VectorSearchInputError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        )
-    except VectorSearchParameterError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        )
-    except EmbeddingConfigurationError as exc:
-        logger.warning(
-            "Embedding config error: %s",
-            exc,
-            extra={"error_type": "EmbeddingConfigurationError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Embedding 配置错误: {exc}",
-        )
-    except EmbeddingAPIError as exc:
-        logger.warning(
-            "Embedding API error: %s",
-            exc,
-            extra={"error_type": "EmbeddingAPIError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Embedding 请求失败: {exc}",
-        )
-    except EmbeddingResponseError as exc:
-        logger.warning(
-            "Embedding response error: %s",
-            exc,
-            extra={"error_type": "EmbeddingResponseError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Embedding 响应解析失败: {exc}",
-        )
-    except EmbeddingError as exc:
-        logger.exception("Embedding unknown error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Embedding 调用异常: {exc}",
-        )
-    except VectorSearchError as exc:
-        logger.warning(
-            "Vector search error: %s",
-            exc,
-            extra={"error_type": "VectorSearchError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"向量检索失败: {exc}",
-        )
-    except LLMConfigError as exc:
-        logger.warning(
-            "LLM config error: %s",
-            exc,
-            extra={"error_type": "LLMConfigError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"LLM 配置错误: {exc}",
-        )
-    except LLMRequestError as exc:
-        logger.warning(
-            "LLM request error: %s",
-            exc,
-            extra={"error_type": "LLMRequestError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM 请求失败: {exc}",
-        )
-    except LLMResponseError as exc:
-        logger.warning(
-            "LLM response error: %s",
-            exc,
-            extra={"error_type": "LLMResponseError"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM 响应解析失败: {exc}",
-        )
-    except RagError as exc:
-        logger.exception("RAG service error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"RAG 服务内部错误: {exc}",
-        )
-    except LLMError as exc:
-        logger.exception("LLM unknown error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM 调用异常: {exc}",
-        )
+    except Exception as exc:
+        # 已知异常 → 统一映射（与 /api/chat 共享）；未知异常原样抛出
+        raise rag_pipeline_error_to_http(exc)
 
     return _to_answer_response(result)
 

@@ -79,3 +79,49 @@ async def test_real_llm_smoke_chat() -> None:
 
     assert isinstance(answer, str), f"LLM 返回类型异常：{type(answer).__name__}"
     assert answer.strip(), "LLM 返回内容为空字符串"
+
+
+@pytest.mark.asyncio
+async def test_real_rag_chat_smoke() -> None:
+    """对 POST /api/chat 执行一次真实 RAG 全链路冒烟（Phase 3.5.6）。
+
+    目标：验证
+        - Chat API → ChatService → RagService 真实链路打通
+        - HTTP 200 + answer 非空 + sources / used_chunks_count 结构正确
+
+    注意：知识库为空时 answer 为固定提示语（非 LLM 生成），依然视为链路通过。
+
+    额外跳过条件：
+        - DATABASE_URL / EMBEDDING_API_KEY 未配置（RAG 依赖 DB + 向量化）
+    """
+    from backend.app.config import settings
+
+    if not settings.llm.api_key:
+        pytest.skip("LLM_API_KEY 未配置；请在 .env 中设置后重试")
+    if not settings.llm.base_url:
+        pytest.skip("LLM_BASE_URL 未配置")
+    if not settings.llm.model:
+        pytest.skip("LLM_MODEL 未配置")
+    if not settings.database.url:
+        pytest.skip("DATABASE_URL 未配置；无法执行真实 RAG 链路")
+    if not settings.embedding.api_key:
+        pytest.skip("EMBEDDING_API_KEY 未配置；无法执行真实 RAG 链路")
+
+    from fastapi.testclient import TestClient
+
+    from backend.app.main import app
+
+    with TestClient(app) as c:
+        response = c.post("/api/chat", json={"message": "采购入库怎么操作？"})
+
+    assert response.status_code == 200, f"HTTP {response.status_code}: {response.text[:200]}"
+    payload = response.json()
+    assert isinstance(payload["answer"], str)
+    assert payload["answer"].strip(), "answer 为空字符串"
+    assert isinstance(payload["sources"], list)
+    assert isinstance(payload["used_chunks_count"], int)
+    assert payload["used_chunks_count"] >= 0
+    # 安全：响应不得泄露内部敏感信息
+    body = response.text
+    for secret in ("sk-", "Authorization", "Bearer ", "postgresql://", "Traceback"):
+        assert secret not in body, f"响应泄露敏感信息: {secret!r}"

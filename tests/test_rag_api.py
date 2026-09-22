@@ -391,24 +391,35 @@ class TestResponseMapping:
 
 class TestChatUnchanged:
     def test_chat_endpoint_still_works(self, monkeypatch) -> None:
-        """新增 RAG 路由不影响既有 /api/chat（回归保护）。"""
+        """新增 RAG 路由不影响既有 /api/chat（回归保护）。
+
+        Phase 3.5.6 起 /api/chat 经由 ChatService → RagService；
+        此处用 Fake RagService 验证链路仍然打通。
+        """
         from backend.app.api import chat as chat_module
         from backend.app.services.chat_service import ChatService
 
-        class _FakeChatLLM:
-            async def generate(self, prompt: str) -> str:
-                return "chat-ok"
+        class _FakeRag:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
 
-            async def chat(self, messages: list[dict[str, str]]) -> str:
-                return "chat-ok"
+            async def answer(self, query: str, *, top_k: int | None = None):
+                self.calls.append(query)
+                return RagResponse(
+                    answer="chat-via-rag",
+                    sources=(),
+                    used_chunks_count=0,
+                )
 
+        fake = _FakeRag()
         monkeypatch.setattr(
-            chat_module, "_chat_service", ChatService(llm_client=_FakeChatLLM())
+            chat_module, "_chat_service", ChatService(rag_service=fake)
         )
         with TestClient(app) as c:
             response = c.post("/api/chat", json={"message": "hi"})
         assert response.status_code == 200
-        assert response.json()["answer"] == "chat-ok"
+        assert response.json()["answer"] == "chat-via-rag"
+        assert fake.calls == ["hi"]
 
 
 __all__ = [

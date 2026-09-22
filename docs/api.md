@@ -1,6 +1,6 @@
 # WMS AI Assistant — API 设计
 
-> 当前文档对应 MVP Phase 2 实现。后续阶段（Phase 3+）按 `docs/requirements.md` 演进。
+> 当前文档对应 MVP Phase 3.5.6 实现（Chat + RAG）。后续阶段按 `docs/requirements.md` 演进。
 
 ---
 
@@ -9,11 +9,12 @@
 | 项目     | 内容                                              |
 | -------- | ------------------------------------------------- |
 | 项目名称 | WMS AI Assistant                                  |
-| 当前阶段 | MVP — Phase 2（LLM API 接入）                     |
+| 当前阶段 | MVP — Phase 3.5.6（Chat + RAG）                   |
 | Base URL | `/api`                                            |
 | 数据格式 | JSON                                              |
-| 鉴权     | Phase 2 无；Phase 6+ 引入 JWT/RBAC                |
+| 鉴权     | 当前无；Phase 6+ 引入 JWT/RBAC                    |
 | LLM 协议 | OpenAI Chat Completions（兼容 OpenAI / DeepSeek / Qwen / Ollama / 自部署） |
+| RAG 存储 | PostgreSQL + pgvector                            |
 
 ---
 
@@ -45,13 +46,19 @@
 
 ### 2.2 POST /api/chat
 
-对话接口。Phase 2 根据 `.env` 配置调用真实 LLM，或在 `LLM_API_KEY` 缺失时回退 Mock。
+对话接口。Phase 3.5.6 起基于 RAG 知识库回答：
+
+```text
+ChatService → RagService → Vector Search → Context Builder → LLMClient
+```
+
+知识库无命中时返回固定提示语（`sources=[]`），**不**回退闲聊 LLM。
 
 #### 请求
 
 ```json
 {
-  "message": "你好"
+  "message": "采购入库怎么操作？"
 }
 ```
 
@@ -63,13 +70,79 @@
 
 ```json
 {
-  "answer": "你好，我是 WMS AI Assistant。"
+  "answer": "采购入库主要包括收货、核对、质检和上架……",
+  "sources": [
+    {
+      "chunk_id": 3,
+      "document_id": 1,
+      "chunk_index": 0,
+      "similarity": 0.91,
+      "metadata": {
+        "heading_path": ["采购入库", "操作步骤"]
+      }
+    }
+  ],
+  "used_chunks_count": 1
 }
 ```
 
-| 字段    | 类型   | 说明                                    |
-| ------- | ------ | --------------------------------------- |
-| answer  | string | AI 回答（来自真实 LLM 或 Mock）         |
+| 字段              | 类型   | 说明                                                       |
+| ----------------- | ------ | ---------------------------------------------------------- |
+| answer            | string | AI 回答（经 RAG 链路生成；空知识库时为固定提示语）         |
+| sources           | array  | RAG 命中来源（**仅元数据**，不含 chunk content；可扩展）   |
+| used_chunks_count | int    | 实际纳入 Context 的片段数                                  |
+
+> `sources` / `used_chunks_count` 为 Phase 3.5.6 向后兼容新增字段；
+> 旧客户端可忽略。`message` / `answer` 协议与 Phase 2 保持一致。
+
+---
+
+### 2.3 POST /api/rag/answer
+
+独立 RAG 问答接口（Phase 3.5.5），与 `/api/chat` 共用 RagService，
+可显式指定召回片段数。
+
+#### 请求
+
+```json
+{
+  "query": "采购入库怎么操作？",
+  "top_k": 5
+}
+```
+
+| 字段   | 类型    | 必填 | 说明                                            |
+| ------ | ------- | ---- | ----------------------------------------------- |
+| query  | string  | ✅   | 用户问题（不可为空或纯空白）                    |
+| top_k  | integer | ❌   | 召回片段数，范围 [1, 50]；省略用服务端默认值    |
+
+#### 响应 200
+
+```json
+{
+  "answer": "采购入库主要包括……",
+  "sources": [
+    {
+      "chunk_id": 3,
+      "document_id": 1,
+      "chunk_index": 0,
+      "content": "采购入库操作步骤……",
+      "similarity": 0.91,
+      "metadata": {"heading_path": ["采购入库", "操作步骤"]}
+    }
+  ],
+  "used_chunks_count": 1
+}
+```
+
+| 字段              | 类型   | 说明                                             |
+| ----------------- | ------ | ------------------------------------------------ |
+| answer            | string | LLM 生成的回答；空检索时为固定提示语             |
+| sources           | array  | 命中来源（RAG 专用，含 chunk content）           |
+| used_chunks_count | int    | 实际纳入 Context 的片段数                         |
+
+> `/api/rag/answer` 面向调试 / 前端需要完整片段的场景，返回 `content`；
+> `/api/chat` 面向对话，sources 仅返回元数据。
 
 ---
 
@@ -86,39 +159,56 @@
 FastAPI 默认 `HTTPException` 走 `{"detail": ...}` 形式。
 后续阶段会扩展为 `{code, message, details}` 结构。
 
-### 3.2 HTTP 状态码映射（Phase 2）
+### 3.2 HTTP 状态码映射（Phase 3.5.6）
+
+`/api/chat` 与 `/api/rag/answer` 共享同一异常映射
+（`backend/app/api/_rag_error_mapping.py`）：
 
 | HTTP | 触发条件                                                         | detail 示例                          |
 | ---- | ---------------------------------------------------------------- | ------------------------------------ |
-| 200  | 正常                                                              | —                                    |
-| 422  | Pydantic 校验失败：`message` 为空 / 缺字段 / 类型错误            | FastAPI 默认错误列表                  |
-| 502  | LLM 上游错误（连接失败 / 超时 / HTTP 非 2xx / 响应解析失败）      | `"LLM 请求失败: 无法连接 ..."`       |
-| 503  | LLM 配置错误（`LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` 缺失）  | `"LLM 配置错误: LLM_API_KEY 未配置"` |
-| 500  | 兜底：未预期的 LLM 异常                                           | `"LLM 调用异常: ..."`                |
+| 200  | 正常（含空知识库）                                                | —                                    |
+| 400  | Pydantic 外的空消息（服务层校验）/ VectorSearchInputError        | `"message 不能为空"`                |
+| 422  | Pydantic 校验失败：空 / 缺字段 / 类型错误 / top_k 越界           | FastAPI 默认错误列表                  |
+| 502  | 上游错误：Embedding / pgvector / LLM（连接失败、超时、非 2xx）    | `"LLM 请求失败: 无法连接 ..."`       |
+| 503  | 配置错误（`LLM_API_KEY` / `EMBEDDING_API_KEY` 等缺失）            | `"LLM 配置错误: LLM_API_KEY 未配置"` |
+| 500  | 兜底：未预期的 RAG / Embedding / LLM 异常                        | `"RAG 服务内部错误: ..."`            |
 
-> **不暴露**：响应中禁止出现 Authorization header、API Key、Python traceback、SQL 语句。
+> **不暴露**：响应中禁止出现 Authorization header、API Key、Python traceback、SQL 语句、embedding 向量、数据库连接串。
 
-### 3.3 异常分层（`backend/app/llm/client.py`）
+### 3.3 异常分层
 
 ```
-LLMError（基类）
-    ├── LLMConfigError        配置缺失
-    ├── LLMRequestError       网络 / 超时 / 非 2xx
-    └── LLMResponseError      响应解析失败 / 结构异常
+LLMError（基类）                        llm/client.py
+    ├── LLMConfigError                  配置缺失
+    ├── LLMRequestError                 网络 / 超时 / 非 2xx
+    └── LLMResponseError               响应解析失败 / 结构异常
+
+EmbeddingError（基类）                   embedding/exceptions.py
+    ├── EmbeddingConfigurationError      配置缺失 / 非法
+    ├── EmbeddingInputError              输入非法
+    ├── EmbeddingAPIError                网络 / 超时 / HTTP 非 2xx
+    ├── EmbeddingResponseError           响应解析失败
+    └── EmbeddingDimensionError          维度不一致
+
+VectorSearchError（基类）                services/vector_search_service.py
+    ├── VectorSearchInputError           query 非法
+    └── VectorSearchParameterError       top_k 越界
+
+RagError                                services/rag_service.py（RAG 自身错误）
 ```
 
 ---
 
 ## 4. 后续计划中的接口（**当前未实现**）
 
-按 `docs/requirements.md` Phase 3+ 演进：
+按 `docs/requirements.md` Phase 4+ 演进：
 
 | 方法 | 路径                          | 阶段    | 说明                       |
 | ---- | ----------------------------- | ------- | -------------------------- |
-| GET  | `/api/conversations`          | Phase 2.5 | 会话列表                   |
-| GET  | `/api/conversations/{id}`     | Phase 2.5 | 会话详情                   |
-| POST | `/api/knowledge/documents`    | Phase 3 | 知识库文档入库             |
-| POST | `/api/knowledge/search`       | Phase 3 | 知识库检索（内部接口）     |
+| GET  | `/api/conversations`          | Phase 2.5 | 会话列表                 |
+| GET  | `/api/conversations/{id}`     | Phase 2.5 | 会话详情                 |
+| POST | `/api/knowledge/documents`    | Phase 3.6+ | 知识库文档入库（API 化） |
+| POST | `/api/knowledge/search`       | Phase 3.6+ | 知识库检索（内部接口）   |
 | GET  | `/api/tools`                  | Phase 4 | Tool 注册清单              |
 | POST | `/api/tools/{tool_name}`      | Phase 4 | Tool 调用                  |
 | POST | `/api/auth/login`             | Phase 6 | 用户登录                   |
@@ -132,5 +222,6 @@ LLMError（基类）
 - **OpenAPI 自动生成**：所有接口必须能被 FastAPI 自动文档化。
 - **响应统一**：错误响应遵循一致结构。
 - **可演进**：接口路径与字段命名考虑后续扩展，避免过早锁定。
-- **不暴露内部细节**：错误信息对用户友好，敏感信息（API Key、SQL、堆栈、Authorization header）禁止出现在响应中。
-- **LLM 抽象**：ChatService 不直接调用任何 LLM SDK；通过 `LLMClient` Protocol 解耦。
+- **向后兼容**：新增响应字段（如 `sources`）不破坏既有客户端；不擅自变更既有字段语义。
+- **不暴露内部细节**：错误信息对用户友好，敏感信息（API Key、SQL、堆栈、Authorization header、embedding 向量）禁止出现在响应中。
+- **单一 LLM 调用**：一次对话请求只允许一次 Embedding + 一次 LLM 调用；Chat 与 RAG 共享同一条链路。

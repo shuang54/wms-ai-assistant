@@ -1,6 +1,6 @@
 # WMS AI Assistant
 
-> 企业级 WMS / ERP 自然语言助手 —— MVP 阶段（Phase 2：LLM API 接入）
+> 企业级 WMS / ERP 自然语言助手 —— MVP 阶段（Phase 3.5.6：Chat + RAG）
 
 通过自然语言查询企业 WMS / ERP 数据，并基于受控 Tool 调用企业系统 API。
 本项目遵循 `AGENTS.md` 与 `docs/` 下的最高级约束，**不会绕过企业业务规则和权限体系**。
@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-**Phase 2：LLM API 接入**
+**Phase 3.5.6：Chat + RAG**
 
 - ✅ Python + FastAPI 工程结构（Phase 1）
 - ✅ Health Check API（Phase 1）
@@ -18,14 +18,19 @@
 - ✅ **异常处理 + 超时 + 结构化日志**（Phase 2）
 - ✅ **LLM Client / ChatService / API 全链路测试**（Phase 2）
 - ✅ `.env` 环境变量驱动，未配置 Key 时自动回退 Mock
+- ✅ **PostgreSQL + pgvector 知识库基础设施**（Phase 3.1–3.2）
+- ✅ **文档解析 + Chunking + Embedding 入库流水线**（Phase 3.3–3.5.2）
+- ✅ **向量检索（Vector Search）**（Phase 3.5.3）
+- ✅ **最小 RAG（RagService：检索 → Context → LLM）**（Phase 3.5.4）
+- ✅ **RAG API（POST /api/rag/answer）**（Phase 3.5.5）
+- ✅ **Chat + RAG（/api/chat 经知识库回答，含来源元数据）**（Phase 3.5.6）
 
-明确**未实现**（后续阶段按 `docs/requirements.md` Phase 3+ 逐步推进）：
+明确**未实现**（后续阶段按 `docs/requirements.md` 逐步推进）：
 
-- ❌ RAG / Embedding / pgvector（Phase 3）
 - ❌ Tool Calling / WMS 集成（Phase 4–5）
 - ❌ Agent / LangGraph / MCP（Phase 6+）
 - ❌ 复杂权限 / 写操作 / 私有化部署（Phase 6+）
-- ❌ 多轮会话上下文（Phase 2.5+）
+- ❌ 多轮会话上下文 / Intent 分类 / 闲聊兜底（Phase 2.5+）
 - ❌ Streaming（Phase 6+）
 
 ---
