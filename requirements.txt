@@ -17,6 +17,10 @@ python-dotenv>=1.0.0,<2.0
 # YAML parsing (Phase 3.7.3: project business semantic config files)
 PyYAML>=6.0,<7.0
 
+# SQL parser (Phase 3.7.5: read-only SQL validation, AST-based)
+# 纯 Python、无 DB / LLM 依赖；只负责把 SQL 字符串解析成 AST。
+sqlglot>=25.0,<28
+
 # HTTP client (for future WMS/ERP API calls and tests)
 httpx>=0.27.0,<2.0
 
