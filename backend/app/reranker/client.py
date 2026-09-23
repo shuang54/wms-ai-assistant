@@ -92,16 +92,45 @@ class BGERerankerClient(RerankerClient):
         model_name: str | None = None,
         device: str | None = None,
         max_length: int | None = None,
+        batch_size: int | None = None,
     ) -> None:
         self._model_name = model_name or settings.reranker.model
         self._device_override = device if device is not None else settings.reranker.device
         self._max_length = (
             max_length if max_length is not None else settings.reranker.max_length
         )
+        self._batch_size = (
+            batch_size if batch_size is not None else settings.reranker.batch_size
+        )
         # 已加载的模型与 tokenizer（懒加载；torch / transformers 缺失时保持 None）
         self._model = None
         self._tokenizer = None
         self._resolved_device: str | None = None
+
+    # ---------- batch_size 控制（Phase 3.5.13 benchmark 用）----------
+
+    @property
+    def batch_size(self) -> int:
+        """当前生效的 forward batch size（仅对后续 rerank 生效，不重加载模型）。"""
+        return self._batch_size
+
+    def set_batch_size(self, batch_size: int) -> None:
+        """设置后续 rerank 的 forward batch size（无需 reload）。
+
+        Raises:
+            RerankerConfigurationError: batch_size < 1
+        """
+        try:
+            bs = int(batch_size)
+        except (TypeError, ValueError) as exc:
+            raise RerankerConfigurationError(
+                f"batch_size 必须为整数（got {batch_size!r}）"
+            ) from exc
+        if bs < 1:
+            raise RerankerConfigurationError(
+                f"batch_size 必须 >= 1（got {bs}）"
+            )
+        self._batch_size = bs
 
     # ---------- 校验 ----------
 
@@ -197,26 +226,38 @@ class BGERerankerClient(RerankerClient):
     # ---------- 打分 ----------
 
     def _score_pairs(self, query: str, documents: list[str]) -> list[float]:
-        """对 (query, doc) pairs 执行 Cross-Encoder 推理。
+        """对 (query, doc) pairs 执行 Cross-Encoder 推理（按 batch_size 分块）。
 
         Returns:
             sigmoid(logit) ∈ [0, 1]，与 documents 一一对应。
+
+        性能（Phase 3.5.13）：
+            - 单次 forward 处理 self._batch_size 个 (q, d) 对，
+              累计到全量 documents 后拼接
+            - 每批 padding 在该批内动态计算 → 与「全量一次 forward」相比
+              单条分数可能有非常小的浮点差异（任务书 § 二十允许）；
+              rank 顺序一致
         """
         import torch
 
         assert self._model is not None and self._tokenizer is not None
         device = self._resolved_device or "cpu"
+        bs = max(1, int(self._batch_size))
+        scores: list[float] = []
         with torch.inference_mode():
-            inputs = self._tokenizer(
-                [(query, doc) for doc in documents],
-                padding=True,
-                truncation=True,
-                max_length=self._max_length,
-                return_tensors="pt",
-            ).to(device)
-            logits = self._model(**inputs).logits.squeeze(-1)
-            scores = torch.sigmoid(logits)
-        return [float(s) for s in scores.tolist()]
+            for start in range(0, len(documents), bs):
+                batch_docs = documents[start : start + bs]
+                inputs = self._tokenizer(
+                    [(query, d) for d in batch_docs],
+                    padding=True,
+                    truncation=True,
+                    max_length=self._max_length,
+                    return_tensors="pt",
+                ).to(device)
+                logits = self._model(**inputs).logits.squeeze(-1)
+                probs = torch.sigmoid(logits)
+                scores.extend(float(x) for x in probs.tolist())
+        return scores
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
         started = time.perf_counter()

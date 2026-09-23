@@ -198,6 +198,9 @@ class RerankerSettings:
     )
     device: str = field(default_factory=lambda: _get_str("RERANKER_DEVICE", ""))
     max_length: int = field(default_factory=lambda: _get_int("RERANKER_MAX_LENGTH", 512))
+    batch_size: int = field(
+        default_factory=lambda: _get_int("RERANKER_BATCH_SIZE", 8)
+    )
 
 
 # ============================================================
