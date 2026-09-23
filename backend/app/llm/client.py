@@ -1,4 +1,4 @@
-"""LLM Client 抽象层与实现（Phase 2）。
+"""LLM Client 抽象层与实现（Phase 2；Phase 3.6.2 扩展 Tool Calling）。
 
 抽象边界：
 
@@ -24,13 +24,26 @@
         ├── LLMConfigError      配置缺失 / 非法
         ├── LLMRequestError     网络 / 超时 / 非 2xx 响应
         └── LLMResponseError    响应解析失败 / 结构异常
+                └── LLMToolCallFormatError   tool_calls 结构非法
+                                              （Phase 3.6.2）
+
+Phase 3.6.2 Tool Calling：
+
+    chat(messages)                 → str          （行为与 Phase 2 完全一致）
+    chat(messages, tools=[...])    → LLMResponse  （content + tool_calls）
+
+    * tools schema 由 backend/app/llm/tool_schema.py 从 ToolDefinition 转换；
+    * 本阶段协议约束：单次响应最多 1 个 tool call（超过 → LLMToolCallFormatError，
+      不静默截断 / 不并行执行）。
 
 详见 docs/architecture.md §8、AGENTS.md §9。
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -80,6 +93,58 @@ class LLMResponseError(LLMError):
     """LLM 响应解析失败（JSON 非法、结构不符合预期）。"""
 
 
+class LLMToolCallFormatError(LLMResponseError):
+    """tool_calls 结构非法（Phase 3.6.2）。
+
+    触发条件：
+        * tool_call 缺 id / function.name
+        * arguments 不是合法 JSON object
+        * 单次响应包含多个 tool call（本阶段仅支持单个）
+    """
+
+
+# ============================================================
+# Tool Calling DTO（Phase 3.6.2）
+# ============================================================
+
+@dataclass(frozen=True)
+class ToolCall:
+    """LLM 请求调用某个 Tool 的结构化表达。
+
+    Attributes:
+        id:        tool call 唯一标识（OpenAI 协议要求，用于 role=tool 回传）。
+        name:      Tool 名称（对应 ToolDefinition.name）。
+        arguments: 已解析为 dict 的调用参数。
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id:
+            raise ValueError("ToolCall.id 不能为空")
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("ToolCall.name 不能为空")
+        if not isinstance(self.arguments, dict):
+            raise ValueError(
+                f"ToolCall.arguments 必须为 dict（got {type(self.arguments).__name__}）"
+            )
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    """``chat(messages, tools=...)`` 的统一返回 DTO（Phase 3.6.2）。
+
+    Attributes:
+        content:    LLM 文本回答；请求 Tool 时通常为 None。
+        tool_calls: LLM 请求的 Tool 调用列表（本阶段最多 1 个，协议保证）。
+    """
+
+    content: str | None
+    tool_calls: tuple[ToolCall, ...] = ()
+
+
 # ============================================================
 # 抽象接口
 # ============================================================
@@ -88,17 +153,36 @@ class LLMClient(Protocol):
     """LLM Client 抽象接口。
 
     ChatService 仅依赖此接口，不直接引用具体实现。
+
+    Phase 3.6.2 起支持 Tool Calling：
+
+        chat(messages)              → str          （向后兼容，Phase 2 行为）
+        chat(messages, tools=...)   → LLMResponse  （content + tool_calls）
     """
 
     async def generate(self, prompt: str) -> str:
         """单轮文本生成（无 system prompt）。"""
         ...
 
-    async def chat(self, messages: list[dict[str, str]]) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str | LLMResponse:
         """多轮对话生成。
 
-        messages 每项形如 {"role": "system|user|assistant", "content": "..."}。
-        返回 assistant 的 content。
+        messages 每项形如 {"role": "system|user|assistant|tool", ...}；
+        Tool Calling 链路中 content 可能为 None、arguments 为 JSON 字符串。
+
+        Args:
+            messages: 对话消息列表。
+            tools:    OpenAI-compatible tool schema 列表
+                      （由 ``llm.tool_schema.definitions_to_openai_tools`` 转换）。
+
+        Returns:
+            tools 为空 / None 时：assistant 的 content（str，Phase 2 行为不变）。
+            tools 非空时：``LLMResponse``（content + tool_calls）。
         """
         ...
 
@@ -120,12 +204,23 @@ class MockLLMClient:
     async def generate(self, prompt: str) -> str:
         return f"[mock] 已收到消息：{prompt}"
 
-    async def chat(self, messages: list[dict[str, str]]) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str | LLMResponse:
         last_user = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 last_user = msg.get("content", "")
                 break
+        if tools is not None:
+            # Mock 不伪造 tool call：无 Key 场景下返回普通回答
+            return LLMResponse(
+                content=f"[mock] 已收到消息：{last_user}",
+                tool_calls=(),
+            )
         return f"[mock] 已收到消息：{last_user}"
 
 
@@ -209,11 +304,18 @@ class OpenAICompatibleClient:
             "Content-Type": "application/json",
         }
 
-    def _build_payload(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        return {
+    def _build_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
         }
+        if tools:
+            payload["tools"] = tools
+        return payload
 
     def _extract_answer(self, data: dict[str, Any]) -> str:
         try:
@@ -231,6 +333,95 @@ class OpenAICompatibleClient:
             )
         return content
 
+    def _extract_assistant_message(self, data: dict[str, Any]) -> dict[str, Any]:
+        """提取 choices[0].message 原始 dict（Tool Calling 路径）。"""
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMResponseError(
+                f"LLM 响应结构不符合预期（缺 choices[0].message）: {exc}"
+            ) from exc
+        if not isinstance(message, dict):
+            raise LLMResponseError(
+                f"LLM 响应 message 类型不是 object：{type(message).__name__}"
+            )
+        return message
+
+    def _parse_tool_arguments(self, call_id: str, raw: Any) -> dict[str, Any]:
+        """解析 tool_call 的 arguments（JSON 字符串 → dict）。"""
+        if raw is None or raw == "":
+            return {}
+        if isinstance(raw, dict):
+            # 部分兼容实现直接返回 dict
+            return dict(raw)
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except ValueError as exc:
+                raise LLMToolCallFormatError(
+                    f"tool_call {call_id!r} arguments 不是合法 JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise LLMToolCallFormatError(
+                    f"tool_call {call_id!r} arguments 必须为 JSON object"
+                    f"（got {type(parsed).__name__}）"
+                )
+            return parsed
+        raise LLMToolCallFormatError(
+            f"tool_call {call_id!r} arguments 类型非法: {type(raw).__name__}"
+        )
+
+    def _parse_tool_calls(self, raw_tool_calls: Any) -> tuple[ToolCall, ...]:
+        """解析 message.tool_calls → ToolCall 元组。
+
+        Phase 3.6.2 协议约束：单次响应最多 1 个 tool call；
+        超过 → LLMToolCallFormatError（不静默截断、不并行执行）。
+        """
+        if not isinstance(raw_tool_calls, list):
+            raise LLMToolCallFormatError(
+                f"tool_calls 必须为 list（got {type(raw_tool_calls).__name__}）"
+            )
+        if len(raw_tool_calls) > 1:
+            raise LLMToolCallFormatError(
+                f"LLM 返回 {len(raw_tool_calls)} 个 tool call，"
+                "当前阶段仅支持单个 tool call"
+            )
+        calls: list[ToolCall] = []
+        for item in raw_tool_calls:
+            if not isinstance(item, dict):
+                raise LLMToolCallFormatError(
+                    f"tool_call 必须为 object（got {type(item).__name__}）"
+                )
+            call_id = item.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                raise LLMToolCallFormatError("tool_call 缺少 id")
+            function = item.get("function")
+            if not isinstance(function, dict):
+                raise LLMToolCallFormatError(
+                    f"tool_call {call_id!r} 缺少 function 对象"
+                )
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                raise LLMToolCallFormatError(
+                    f"tool_call {call_id!r} 缺少 function.name"
+                )
+            arguments = self._parse_tool_arguments(call_id, function.get("arguments"))
+            calls.append(
+                ToolCall(id=call_id, name=name, arguments=arguments)
+            )
+        return tuple(calls)
+
+    def _extract_llm_response(self, data: dict[str, Any]) -> LLMResponse:
+        """Tool Calling 路径：解析完整 assistant message（content + tool_calls）。"""
+        message = self._extract_assistant_message(data)
+        content = message.get("content")
+        if content is not None and not isinstance(content, str):
+            raise LLMResponseError(
+                f"LLM 响应 content 类型不是 string：{type(content).__name__}"
+            )
+        tool_calls = self._parse_tool_calls(message.get("tool_calls") or [])
+        return LLMResponse(content=content, tool_calls=tool_calls)
+
     def _log_common(self) -> dict[str, Any]:
         return {
             "llm_provider": self._provider,
@@ -239,10 +430,26 @@ class OpenAICompatibleClient:
 
     # ---------- public API ----------
 
-    async def chat(self, messages: list[dict[str, str]]) -> str:
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str | LLMResponse:
+        """多轮对话生成（Phase 3.6.2 起支持 Tool Calling）。
+
+        Args:
+            messages: 对话消息（system / user / assistant / tool）。
+            tools:    OpenAI-compatible tool schema 列表；
+                      None / 空 → 不携带 tools（Phase 2 行为）。
+
+        Returns:
+            tools 为空时：str（assistant content，与 Phase 2 完全一致）。
+            tools 非空时：LLMResponse（content 可能为 None + tool_calls）。
+        """
         url = self._endpoint_url()
         headers = self._headers()
-        payload = self._build_payload(messages)
+        payload = self._build_payload(messages, tools)
         client_kwargs: dict[str, Any] = {"timeout": self._timeout}
         if self._transport is not None:
             client_kwargs["transport"] = self._transport
@@ -251,7 +458,12 @@ class OpenAICompatibleClient:
         logger.info(
             "LLM request start: messages=%d",
             len(messages),
-            extra={**extra_base, "message_count": len(messages)},
+            extra={
+                **extra_base,
+                "message_count": len(messages),
+                "tool_calling": bool(tools),
+                "tool_count": len(tools) if tools else 0,
+            },
         )
         start_time = time.perf_counter()
 
@@ -326,23 +538,33 @@ class OpenAICompatibleClient:
             )
             raise LLMResponseError(f"LLM 响应不是合法 JSON: {exc}") from exc
 
-        answer = self._extract_answer(data)
+        if tools:
+            result: str | LLMResponse = self._extract_llm_response(data)
+            answer_length = len(result.content or "")
+        else:
+            result = self._extract_answer(data)
+            answer_length = len(result)
 
         logger.info(
             "LLM request success: elapsed=%.1fms answer_len=%d",
             elapsed_ms,
-            len(answer),
+            answer_length,
             extra={
                 **extra_base,
                 "elapsed_ms": elapsed_ms,
-                "answer_length": len(answer),
+                "answer_length": answer_length,
+                "tool_calling": bool(tools),
             },
         )
-        return answer
+        return result
 
     async def generate(self, prompt: str) -> str:
         messages = [{"role": "user", "content": prompt}]
-        return await self.chat(messages)
+        result = await self.chat(messages)
+        if isinstance(result, LLMResponse):
+            # generate 不传 tools，正常不会走到这里；防御性兜底
+            return result.content or ""
+        return result
 
 
 # ============================================================
@@ -405,6 +627,9 @@ __all__ = [
     "LLMConfigError",
     "LLMRequestError",
     "LLMResponseError",
+    "LLMToolCallFormatError",
+    "LLMResponse",
+    "ToolCall",
     "MockLLMClient",
     "OpenAICompatibleClient",
     "create_llm_client",

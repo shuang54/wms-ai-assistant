@@ -3,6 +3,7 @@
 > 当前文档对应 MVP Phase 3.5.8 实现（Chat + RAG + Retrieval Evaluation + 真实知识库加载）。
 > Phase 3.5.7 起增加 RAG 检索质量评估（见 § 5）。
 > Phase 3.5.8 起增加真实知识库加载 CLI（见 § 6）。
+> Phase 3.6.2 起增加 Tool Calling 对话接口 `POST /api/chat/with-tools`（见 § 2.4）。
 > 后续阶段按 `docs/requirements.md` 演进。
 
 ---
@@ -146,6 +147,68 @@ ChatService → RagService → Vector Search → Context Builder → LLMClient
 
 > `/api/rag/answer` 面向调试 / 前端需要完整片段的场景，返回 `content`；
 > `/api/chat` 面向对话，sources 仅返回元数据。
+
+---
+
+### 2.4 POST /api/chat/with-tools
+
+对话接口（Phase 3.6.2：LLM Function Calling + Tool Framework）。
+**不经过 RAG**，是独立的 Tool Calling 链路；`/api/chat` 行为不变。
+
+```text
+ToolChatService → LLM #1（携带 tools）
+              → 判断是否需要 Tool
+              → 需要：ToolRegistry.execute() → ToolResult → role=tool 消息
+              → LLM #2 → 最终回答
+```
+
+当前阶段约束（Phase 3.6.2）：
+
+- 单轮最多 **1 次** Tool Call、最多 **2 轮** LLM；
+- LLM 返回多个 tool call → 502（明确拒绝，不并行执行）；
+- Tool 参数错误 / 未注册 Tool 不打断请求：错误以 tool message 回传 LLM，
+  由 LLM 生成自然语言错误说明；
+- 注册的 Tool 为两个 **Mock**（`get_inventory` / `get_work_order`），不接真实 WMS / ERP。
+
+#### 请求
+
+```json
+{
+  "message": "查询 MAT001 的库存"
+}
+```
+
+| 字段    | 类型   | 必填 | 说明                     |
+| ------- | ------ | ---- | ------------------------ |
+| message | string | ✅   | 用户自然语言消息（非空） |
+
+#### 响应 200
+
+```json
+{
+  "answer": "MAT001 当前库存为 1000 PCS。",
+  "tool_calls": [
+    {
+      "tool_name": "get_inventory"
+    }
+  ]
+}
+```
+
+| 字段       | 类型  | 说明                                                        |
+| ---------- | ----- | ----------------------------------------------------------- |
+| answer     | string | AI 最终回答（无需 Tool 时直接来自 LLM #1）                 |
+| tool_calls | array  | 实际发生的 Tool 调用（**仅 tool_name**，最多 1 个；无需 Tool 时为 `[]`） |
+
+#### 错误映射（在 §3.2 基础上新增）
+
+| HTTP | 触发条件                                      | detail 示例                              |
+| ---- | --------------------------------------------- | ---------------------------------------- |
+| 502  | LLM 返回多个 tool call（MultipleToolCallsError） | `"LLM 返回多个 Tool Call（当前不支持）"` |
+| 500  | ToolChatError（编排内部错误）                  | `"Tool Chat 服务内部错误: ..."`           |
+
+LLM 家族异常（LLMConfigError 503 / LLMRequestError、LLMResponseError 502）
+沿用 §3.2 映射。
 
 ---
 
