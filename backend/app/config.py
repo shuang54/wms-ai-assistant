@@ -171,6 +171,36 @@ class RagSettings:
 
 
 # ============================================================
+# Reranker 配置（Phase 3.5.12，离线实验）
+# ============================================================
+
+@dataclass(frozen=True)
+class RerankerSettings:
+    """Cross-Encoder Reranker 配置（Phase 3.5.12 引入）。
+
+    **仅用于离线实验**（tests/test_reranker_real.py +
+    RerankerEvaluationService），**未接入生产 RAG**：
+    RagService / ChatService / VectorSearchService / API 均不读取本配置。
+
+    字段：
+        enabled:    总开关，默认 False（生产默认关闭）。
+        model:      HuggingFace 模型名，默认 BAAI/bge-reranker-v2-m3
+                    （Cross-Encoder，与 BGE-M3 embedding 同家族）。
+        device:     推理设备。空字符串 = 自动（CUDA 可用 → cuda，
+                    否则 cpu）。允许显式指定 cpu / cuda，
+                    但**不**据此修改任何生产配置。
+        max_length:  tokenizer 的 max_length（query+doc 拼接后截断长度）。
+    """
+
+    enabled: bool = field(default_factory=lambda: _get_bool("RERANKER_ENABLED", False))
+    model: str = field(
+        default_factory=lambda: _get_str("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+    )
+    device: str = field(default_factory=lambda: _get_str("RERANKER_DEVICE", ""))
+    max_length: int = field(default_factory=lambda: _get_int("RERANKER_MAX_LENGTH", 512))
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -186,6 +216,7 @@ class Settings:
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     rag: RagSettings = field(default_factory=RagSettings)
+    reranker: RerankerSettings = field(default_factory=RerankerSettings)
 
 
 settings = Settings()
@@ -196,5 +227,6 @@ __all__ = [
     "DatabaseSettings",
     "EmbeddingSettings",
     "RagSettings",
+    "RerankerSettings",
     "settings",
 ]
