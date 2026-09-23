@@ -1,16 +1,20 @@
-"""ToolChatService 单元测试（Phase 3.6.2）。
+"""ToolChatService 单元测试（Phase 3.6.2 引入；Phase 3.6.3 扩展 Multi-Step）。
 
 使用 ScriptedLLMClient（按脚本返回 LLMResponse / str / 异常）+ 真实
-ToolRegistry + Mock Tools，覆盖任务书 §十四 的五个场景：
+ToolRegistry + Mock Tools，覆盖 Phase 3.6.3 任务书 §十四 的八个 Case：
 
-    场景 1：无需 Tool（1 轮 LLM / 0 次 Tool）
-    场景 2：库存查询（2 轮 LLM / 1 次 Tool）
-    场景 3：工单查询（get_work_order）
-    场景 4：Tool 参数错误（ToolResult 失败 → tool message → LLM #2）
-    场景 5：未知 Tool（安全失败）
+    Case 1：无需 Tool（1 轮 LLM / 0 次 Tool）
+    Case 2：单个 Tool（2 轮 LLM / 1 次 Tool）
+    Case 3：两个顺序 Tool（3 轮 LLM / 2 次 Tool，完整消息历史）
+    Case 4：三个顺序 Tool（4 轮 LLM / 3 次 Tool，含测试专用 Tool）
+    Case 5：预算耗尽（MAX_TOOL_ROUNDS=2，第 3 个 Tool 绝不执行）
+    Case 6：多个 Tool Call 仍然拒绝（多轮 ≠ 并行）
+    Case 7：Tool 失败后允许继续下一轮
+    Case 8：未知 Tool 不崩溃，可继续
 
-附加覆盖：多 tool call 拒绝、LLM 轮数上限、空 registry、
-LLM 异常透传、tool message 协议结构、安全（不泄露敏感信息）。
+附加覆盖：每轮 tools schema 传递、消息历史不被污染、
+LLM 异常透传、tool message 协议结构、安全（不泄露敏感信息）、
+配置（TOOL_MAX_ROUNDS 钳制）。
 """
 from __future__ import annotations
 
@@ -25,9 +29,11 @@ from backend.app.llm.client import (
 )
 from backend.app.services.tool_chat_service import (
     MultipleToolCallsError,
+    ToolCallingBudgetExceededError,
     ToolChatResponse,
     ToolChatService,
 )
+from backend.app.tools.base import ToolDefinition
 from backend.app.tools.mock_tools import register_mock_tools
 from backend.app.tools.registry import ToolRegistry
 
@@ -82,6 +88,29 @@ def registry() -> ToolRegistry:
     r = ToolRegistry()
     register_mock_tools(r)
     return r
+
+
+# 测试专用 Tool（任务书 §十三：只用于多轮流程测试，不是正式 Tool）
+
+class _TestNoteHandler:
+    async def __call__(self, arguments: dict) -> dict:
+        return {"note": arguments.get("note", ""), "source": "test"}
+
+_TEST_NOTE_TOOL = ToolDefinition(
+    name="get_test_note",
+    description="测试专用 Tool（仅用于多轮流程测试，不是正式 Tool）",
+    parameters={
+        "type": "object",
+        "properties": {
+            "note": {"type": "string", "description": "备注内容"},
+        },
+        "required": [],
+    },
+)
+
+
+def _register_test_note_tool(r: ToolRegistry) -> None:
+    r.register(_TEST_NOTE_TOOL, _TestNoteHandler())
 
 
 # ============================================================
@@ -195,8 +224,8 @@ class TestInventoryQuery:
             },
         }
 
-    async def test_second_llm_call_has_no_tools(self, registry) -> None:
-        """LLM #2 不携带 tools（结构上保证最多 2 轮 / 1 次 Tool）。"""
+    async def test_every_llm_round_carries_tools(self, registry) -> None:
+        """多轮链路中每一轮 LLM 调用都携带 tools（LLM 可继续请求 Tool）。"""
         llm = ScriptedLLMClient(
             [
                 _tool_call_llm_response(
@@ -208,8 +237,13 @@ class TestInventoryQuery:
         service = ToolChatService(llm_client=llm)
         await service.chat("q", registry=registry)
 
-        assert llm.calls[0]["tools"] is not None
-        assert llm.calls[1]["tools"] is None
+        assert len(llm.calls) == 2
+        for call in llm.calls:
+            assert call["tools"] is not None
+            assert [t["function"]["name"] for t in call["tools"]] == [
+                "get_inventory",
+                "get_work_order",
+            ]
 
 
 # ============================================================
@@ -353,24 +387,334 @@ class TestMultipleToolCallsRejected:
 
 
 # ============================================================
-# LLM 轮数上限
+# Case 3：两个顺序 Tool（LLM = 3 / Tool = 2）+ 完整消息历史
 # ============================================================
 
-class TestLLMRoundLimit:
-    async def test_never_exceeds_two_llm_rounds(self, registry) -> None:
-        """即使 LLM #2 仍返回 tool call 形态，也绝不发起第三轮。"""
-        # 脚本只有一项且是 tool call：两轮都返回同一响应（脚本耗尽重复）
+class TestTwoSequentialTools:
+    async def test_two_sequential_tools_full_flow(self, registry) -> None:
+        """先查库存再查工单：LLM = 3、Tool = 2、tool_calls 按执行顺序。"""
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory",
+                    {"material_code": "MAT001"},
+                    call_id="call_001",
+                ),
+                _tool_call_llm_response(
+                    "get_work_order",
+                    {"work_order_no": "MO001"},
+                    call_id="call_002",
+                ),
+                "MAT001 库存 1000 PCS；工单 MO001 状态 RELEASED。",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+
+        result = await service.chat(
+            "先查询 MAT001 库存，然后查询工单 MO001 的状态", registry=registry
+        )
+
+        assert result.answer == "MAT001 库存 1000 PCS；工单 MO001 状态 RELEASED。"
+        assert [info.tool_name for info in result.tool_calls] == [
+            "get_inventory",
+            "get_work_order",
+        ]
+        assert len(llm.calls) == 3  # LLM 恰好 3 次
+
+    async def test_each_llm_round_receives_full_history(
+        self, registry
+    ) -> None:
+        """每一轮 LLM 收到完整累积历史（不是只发最新 ToolResult）。"""
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory",
+                    {"material_code": "MAT001"},
+                    call_id="call_001",
+                ),
+                _tool_call_llm_response(
+                    "get_work_order",
+                    {"work_order_no": "MO001"},
+                    call_id="call_002",
+                ),
+                "最终回答",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+        await service.chat("先查库存再查工单", registry=registry)
+
+        # LLM #1：仅 user
+        assert len(llm.calls[0]["messages"]) == 1
+        assert llm.calls[0]["messages"][0] == {
+            "role": "user",
+            "content": "先查库存再查工单",
+        }
+
+        # LLM #2：user + (assistant tool_call + tool result) × 1 = 3
+        m2 = llm.calls[1]["messages"]
+        assert [m["role"] for m in m2] == ["user", "assistant", "tool"]
+        assert m2[1]["tool_calls"][0]["id"] == "call_001"
+        assert m2[2]["tool_call_id"] == "call_001"
+
+        # LLM #3：user + (assistant tool_call + tool result) × 2 = 5
+        m3 = llm.calls[2]["messages"]
+        assert [m["role"] for m in m3] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert m3[3]["tool_calls"][0]["id"] == "call_002"
+        assert m3[4]["tool_call_id"] == "call_002"
+
+    async def test_history_messages_never_mutated(self, registry) -> None:
+        """消息历史只增不改：后续轮次的每条历史消息与首轮完全一致。"""
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory", {"material_code": "MAT001"}
+                ),
+                _tool_call_llm_response(
+                    "get_work_order", {"work_order_no": "MO001"}
+                ),
+                "最终回答",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+        await service.chat("先查库存再查工单", registry=registry)
+
+        # 第 3 轮的前 3 条消息 == 第 2 轮的全部消息（严格前缀，未被改写）
+        assert llm.calls[2]["messages"][:3] == llm.calls[1]["messages"]
+        # user 消息在所有轮次中保持不变
+        for call in llm.calls:
+            assert call["messages"][0] == {
+                "role": "user",
+                "content": "先查库存再查工单",
+            }
+
+
+# ============================================================
+# Case 4：三个顺序 Tool（LLM = 4 / Tool = 3）
+# ============================================================
+
+class TestThreeSequentialTools:
+    async def test_three_sequential_tools_all_executed(self) -> None:
+        r = ToolRegistry()
+        register_mock_tools(r)
+        _register_test_note_tool(r)
+
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory",
+                    {"material_code": "MAT001"},
+                    call_id="call_001",
+                ),
+                _tool_call_llm_response(
+                    "get_work_order",
+                    {"work_order_no": "MO001"},
+                    call_id="call_002",
+                ),
+                _tool_call_llm_response(
+                    "get_test_note", {"note": "三步验证"}, call_id="call_003"
+                ),
+                "三步结果汇总完成。",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+
+        result = await service.chat(
+            "依次执行三步查询", registry=r
+        )
+
+        assert result.answer == "三步结果汇总完成。"
+        assert [info.tool_name for info in result.tool_calls] == [
+            "get_inventory",
+            "get_work_order",
+            "get_test_note",
+        ]
+        assert len(llm.calls) == 4  # LLM 恰好 4 次
+
+        # 第 4 轮 LLM 看到 3 组完整的 tool_call + tool 消息对
+        m4 = llm.calls[3]["messages"]
+        assert [m["role"] for m in m4] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert m4[6]["tool_call_id"] == "call_003"
+        payload = json.loads(m4[6]["content"])
+        assert payload == {
+            "success": True,
+            "data": {"note": "三步验证", "source": "test"},
+        }
+
+
+# ============================================================
+# Case 5：预算耗尽（MAX_TOOL_ROUNDS 硬上限）
+# ============================================================
+
+class TestBudgetExhausted:
+    async def test_budget_two_rounds_third_tool_never_executed(
+        self, registry
+    ) -> None:
+        """max_tool_rounds=2：Tool 1 / Tool 2 执行，Tool 3 绝不执行。"""
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory",
+                    {"material_code": "MAT001"},
+                    call_id="call_001",
+                ),
+                _tool_call_llm_response(
+                    "get_work_order",
+                    {"work_order_no": "MO001"},
+                    call_id="call_002",
+                ),
+                _tool_call_llm_response(
+                    "get_test_note", {"note": "第三个"}, call_id="call_003"
+                ),
+            ]
+        )
+        service = ToolChatService(
+            llm_client=llm, max_tool_rounds=2
+        )
+
+        with pytest.raises(ToolCallingBudgetExceededError) as exc_info:
+            await service.chat("q", registry=registry)
+
+        assert exc_info.value.max_rounds == 2
+        assert exc_info.value.requested_tool == "get_test_note"
+
+        # Tool 3 未执行：LLM 恰好 3 次（预算 2 → 2 Tool + 1 次拒绝）
+        assert len(llm.calls) == 3
+        # 第 3 轮只包含前两组消息对（没有 call_003 的 tool result）
+        m3 = llm.calls[2]["messages"]
+        assert len(m3) == 5
+        assert all(
+            m.get("tool_call_id") != "call_003" for m in m3
+        )
+
+    async def test_default_budget_five_rounds(self, registry) -> None:
+        """默认预算（settings.tool.max_rounds=5）：5 Tool 执行 + 第 6 轮拒绝。"""
         llm = ScriptedLLMClient(
             [_tool_call_llm_response("get_inventory", {"material_code": "M"})]
         )
         service = ToolChatService(llm_client=llm)
 
-        result = await service.chat("q", registry=registry)
+        assert service.max_tool_rounds == 5
 
-        assert len(llm.calls) == 2  # 硬上限
-        # 第二轮返回 LLMResponse（fake 忽略 tools）→ 取 content（None → ""）
-        assert result.answer == ""
+        with pytest.raises(ToolCallingBudgetExceededError):
+            await service.chat("q", registry=registry)
 
+        # 最坏情况硬上限：6 次 LLM / 5 次 Tool，绝无第 7 次调用
+        assert len(llm.calls) == 6
+
+    async def test_budget_zero_rejected_in_constructor(self) -> None:
+        with pytest.raises(ValueError):
+            ToolChatService(llm_client=None, max_tool_rounds=0)
+
+    async def test_max_rounds_defaults_to_settings(self) -> None:
+        from backend.app.config import settings
+
+        service = ToolChatService(llm_client=ScriptedLLMClient([]))
+        assert service.max_tool_rounds == settings.tool.max_rounds
+
+
+# ============================================================
+# Case 7：Tool 失败后允许继续下一轮
+# ============================================================
+
+class TestToolFailureContinues:
+    async def test_failed_tool_then_next_tool_then_final(
+        self, registry
+    ) -> None:
+        """Tool 失败 ≠ 整个链路失败：LLM 可继续请求下一个 Tool。"""
+        llm = ScriptedLLMClient(
+            [
+                # 第 1 轮：参数类型错误 → ToolResult(success=False)
+                _tool_call_llm_response(
+                    "get_inventory", {"material_code": 123}, call_id="call_001"
+                ),
+                # 第 2 轮：LLM 换一个 Tool 继续
+                _tool_call_llm_response(
+                    "get_work_order",
+                    {"work_order_no": "MO001"},
+                    call_id="call_002",
+                ),
+                "虽然库存查询失败，但工单 MO001 状态为 RELEASED。",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+
+        result = await service.chat("查一下库存和工单", registry=registry)
+
+        assert (
+            result.answer
+            == "虽然库存查询失败，但工单 MO001 状态为 RELEASED。"
+        )
+        # 失败的 Tool 也记录在 tool_calls 中（按执行顺序）
+        assert [info.tool_name for info in result.tool_calls] == [
+            "get_inventory",
+            "get_work_order",
+        ]
+        assert len(llm.calls) == 3
+
+        # 第 2 轮历史中的 tool message 是失败信息
+        failure_payload = json.loads(llm.calls[1]["messages"][2]["content"])
+        assert failure_payload["success"] is False
+        # 第 3 轮历史中两组消息对：第 1 组失败、第 2 组成功
+        m3 = llm.calls[2]["messages"]
+        assert json.loads(m3[2]["content"])["success"] is False
+        assert json.loads(m3[4]["content"])["success"] is True
+
+
+# ============================================================
+# Case 8：未知 Tool 后可继续（安全失败）
+# ============================================================
+
+class TestUnknownToolContinues:
+    async def test_unknown_tool_then_known_tool_then_final(
+        self, registry
+    ) -> None:
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_unknown_tool", {"x": 1}, call_id="call_unk"
+                ),
+                _tool_call_llm_response(
+                    "get_inventory",
+                    {"material_code": "MAT001"},
+                    call_id="call_002",
+                ),
+                "改用库存查询：MAT001 库存 1000 PCS。",
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+
+        result = await service.chat("查一下", registry=registry)
+
+        assert result.answer == "改用库存查询：MAT001 库存 1000 PCS。"
+        assert [info.tool_name for info in result.tool_calls] == [
+            "get_unknown_tool",
+            "get_inventory",
+        ]
+        assert len(llm.calls) == 3
+        unknown_payload = json.loads(llm.calls[1]["messages"][2]["content"])
+        assert unknown_payload["success"] is False
+        assert "get_unknown_tool" in unknown_payload["error"]
+
+
+# ============================================================
+# LLM 异常透传
+# ============================================================
+
+class TestLLMErrorPropagation:
     async def test_llm_round1_error_propagates(self, registry) -> None:
         llm = ScriptedLLMClient([LLMRequestError("DeepSeek 500")])
         service = ToolChatService(llm_client=llm)
@@ -391,6 +735,24 @@ class TestLLMRoundLimit:
         with pytest.raises(LLMRequestError):
             await service.chat("q", registry=registry)
         assert len(llm.calls) == 2
+
+    async def test_llm_round3_error_propagates(self, registry) -> None:
+        llm = ScriptedLLMClient(
+            [
+                _tool_call_llm_response(
+                    "get_inventory", {"material_code": "MAT001"}
+                ),
+                _tool_call_llm_response(
+                    "get_work_order", {"work_order_no": "MO001"}
+                ),
+                LLMRequestError("DeepSeek 500"),
+            ]
+        )
+        service = ToolChatService(llm_client=llm)
+
+        with pytest.raises(LLMRequestError):
+            await service.chat("q", registry=registry)
+        assert len(llm.calls) == 3
 
 
 # ============================================================
@@ -418,6 +780,36 @@ class TestInputValidation:
         assert result.tool_calls == ()
         assert len(llm.calls) == 1
         assert llm.calls[0]["tools"] is None
+
+
+# ============================================================
+# 配置：TOOL_MAX_ROUNDS 钳制（Phase 3.6.3 任务书 §十七）
+# ============================================================
+
+class TestToolSettings:
+    def test_default_is_five(self, monkeypatch) -> None:
+        monkeypatch.delenv("TOOL_MAX_ROUNDS", raising=False)
+        from backend.app.config import ToolSettings
+
+        assert ToolSettings().max_rounds == 5
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("1", 1),     # 下边界
+            ("20", 20),   # 上边界
+            ("0", 1),     # 低于下界 → 钳制到 1
+            ("-3", 1),
+            ("99", 20),   # 高于上界 → 钳制到 20
+            ("abc", 5),   # 解析失败 → 默认
+            ("", 5),
+        ],
+    )
+    def test_max_rounds_clamped(self, monkeypatch, raw: str, expected: int) -> None:
+        monkeypatch.setenv("TOOL_MAX_ROUNDS", raw)
+        from backend.app.config import ToolSettings
+
+        assert ToolSettings().max_rounds == expected
 
 
 # ============================================================
@@ -500,7 +892,13 @@ __all__ = [
     "TestToolValidationError",
     "TestUnknownTool",
     "TestMultipleToolCallsRejected",
-    "TestLLMRoundLimit",
+    "TestTwoSequentialTools",
+    "TestThreeSequentialTools",
+    "TestBudgetExhausted",
+    "TestToolFailureContinues",
+    "TestUnknownToolContinues",
+    "TestLLMErrorPropagation",
     "TestInputValidation",
+    "TestToolSettings",
     "TestSecurity",
 ]

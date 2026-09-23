@@ -7,6 +7,7 @@
 - 应用层：APP_NAME / APP_ENV / APP_HOST / APP_PORT
 - LLM 层：LLM_PROVIDER / LLM_MODEL / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT_*
 - Database 层（Phase 3.1）：DATABASE_URL / DATABASE_ECHO / DATABASE_POOL_SIZE / DATABASE_MAX_OVERFLOW
+- Tool 层（Phase 3.6.3）：TOOL_MAX_ROUNDS（默认 5，钳制 [1, 20]）
 
 DATABASE_URL 为空时，DB 相关功能自动禁用：
 - get_engine() 返回 None
@@ -60,6 +61,24 @@ def _get_bool(key: str, default: bool = False) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_int_clamped(
+    key: str, default: int, lo: int, hi: int
+) -> int:
+    """读取整数环境变量并限制在 [lo, hi] 区间。
+
+    解析失败回退默认值；越界时钳制到边界（而非报错），
+    用于防御性上限（如 Tool Calling 最大轮数，Phase 3.6.3）。
+    """
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, value))
 
 
 # ============================================================
@@ -204,6 +223,35 @@ class RerankerSettings:
 
 
 # ============================================================
+# Tool Calling 配置（Phase 3.6.3）
+# ============================================================
+
+# TOOL_MAX_ROUNDS 允许区间（Phase 3.6.3 任务书 §十七：>=1，上限 20）
+TOOL_MAX_ROUNDS_MIN = 1
+TOOL_MAX_ROUNDS_MAX = 20
+
+
+@dataclass(frozen=True)
+class ToolSettings:
+    """Tool Calling 配置（Phase 3.6.3 引入）。
+
+    字段：
+        max_rounds: 单次请求允许执行的**最大 Tool Calling 轮数**
+                    （sequential；每轮最多 1 个 Tool Call）。
+                    含义：最多 max_rounds 次 Tool 执行 + max_rounds+1 次 LLM 调用，
+                    超出后 LLM 仍请求 Tool → ToolCallingBudgetExceededError。
+                    环境变量 TOOL_MAX_ROUNDS，默认 5，
+                    钳制到 [1, 20]（防止误配导致无限循环 / 天价账单）。
+    """
+
+    max_rounds: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "TOOL_MAX_ROUNDS", 5, TOOL_MAX_ROUNDS_MIN, TOOL_MAX_ROUNDS_MAX
+        )
+    )
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -220,6 +268,7 @@ class Settings:
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     rag: RagSettings = field(default_factory=RagSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
+    tool: ToolSettings = field(default_factory=ToolSettings)
 
 
 settings = Settings()
@@ -231,5 +280,6 @@ __all__ = [
     "EmbeddingSettings",
     "RagSettings",
     "RerankerSettings",
+    "ToolSettings",
     "settings",
 ]

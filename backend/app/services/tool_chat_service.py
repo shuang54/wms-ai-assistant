@@ -1,26 +1,37 @@
-"""Tool Chat Service（Phase 3.6.2：LLM Function Calling 接入 Tool Framework）。
+"""Tool Chat Service（Phase 3.6.2 引入；Phase 3.6.3 升级为 Multi-Step）。
 
-链路（任务书 §一）：
+链路（Phase 3.6.3 任务书 §一）：
 
     用户问题
         ↓ LLM #1（携带 registry 中全部 Tool Schema）
     判断是否需要 Tool
         ↓ 否 → 直接返回回答（1 轮 LLM / 0 次 Tool）
         ↓ 是 → ToolRegistry.execute() → ToolResult
-    ToolResult 序列化为 role=tool 消息
-        ↓ LLM #2（**不**携带 tools，结构性保证最多 2 轮）
+              → 序列化为 role=tool 消息（append 到消息历史）
+        ↓ LLM #2（携带 tools，可继续请求 Tool）
+    ... 循环 ...
+        ↓ LLM 最终轮（不再请求 Tool）
     最终自然语言回答
 
-阶段约束（任务书 §二 / §十）：
+阶段约束（Phase 3.6.3 任务书 §三 / §四 / §九）：
 
-    * max_llm_rounds = 2（第二次调用不传 tools，LLM 结构上无法再发起 tool call）
-    * max_tool_calls = 1（LLM 返回多个 tool call → MultipleToolCallsError，
-      不并行执行、不静默截断）
-    * Tool 执行失败（参数错误 / 未注册）**不**打断请求：
-      ToolResult(success=False) 转为 tool message 回传 LLM，由 LLM 生成
-      自然语言错误说明（任务书 §十二）
+    * MAX_TOOL_ROUNDS = settings.tool.max_rounds（默认 5，钳制 [1, 20]）
+      —— 每轮 LLM 请求的 Tool 执行完毕后，**下一轮 LLM 若仍请求 Tool 且
+      预算已耗尽 → ToolCallingBudgetExceededError**（不执行、不再请求 LLM）
+    * 每个 LLM response 最多 1 个 tool call：
+      多个 → MultipleToolCallsError（多轮 ≠ 并行，仅 sequential）
+    * Tool 执行失败（参数错误 / 未注册）不打断链路：
+      ToolResult(success=False) 转 tool message 回传 LLM，允许继续下一轮
+    * 最坏情况有硬上限：max_rounds 次 Tool 执行 + max_rounds+1 次 LLM 调用
 
-依赖方向（任务书 §二十）：
+消息历史（任务书 §七 / §八）：
+
+    * 每一轮 LLM 都收到**完整**消息历史（user + 历次 assistant tool_call
+      + 历次 tool result），不是只发最新 ToolResult；
+    * messages 由 Service 内部独立构建（不接收 / 不修改调用方传入的列表），
+      只 append、不改写历史消息。
+
+依赖方向（Phase 3.6.2 任务书 §二十，保持不变）：
 
     ToolChatService
         ↓
@@ -30,11 +41,10 @@
         ↓
     Tool
 
-    不允许出现 RagService → ToolRegistry / ToolRegistry → LLMClient / Tool → DB。
-
 不在本层做：
 
-    * 多轮循环 Agent / 自动规划
+    * 并行 Tool / Tool 依赖图 / Retry / Cache / Timeout
+    * 对话历史（多轮用户 session）
     * RAG 检索（RagService 保持独立）
     * Tool 权限 / 持久化 / 审计
 """
@@ -46,6 +56,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from backend.app.config import settings
 from backend.app.llm.client import (
     LLMClient,
     LLMResponse,
@@ -64,6 +75,7 @@ __all__ = [
     "ToolChatService",
     "ToolChatError",
     "MultipleToolCallsError",
+    "ToolCallingBudgetExceededError",
 ]
 
 
@@ -76,7 +88,7 @@ class ToolChatError(Exception):
 
 
 class MultipleToolCallsError(ToolChatError):
-    """LLM 单次响应返回多个 tool call（本阶段仅支持单个）。
+    """LLM 单次响应返回多个 tool call（仅支持 sequential 单 Tool）。
 
     Attributes:
         count: LLM 返回的 tool call 数量。
@@ -84,9 +96,30 @@ class MultipleToolCallsError(ToolChatError):
 
     def __init__(self, count: int) -> None:
         super().__init__(
-            f"LLM 返回 {count} 个 tool call，当前阶段仅支持单个"
+            f"LLM 返回 {count} 个 tool call，当前仅支持单轮单个 tool call"
         )
         self.count = count
+
+
+class ToolCallingBudgetExceededError(ToolChatError):
+    """Tool Calling 预算耗尽（Phase 3.6.3）。
+
+    含义：已执行 max_rounds 个 Tool 后，LLM 仍返回 tool call。
+    行为：不执行该 Tool、不再请求 LLM，直接抛出本异常（由 API 层
+    映射为 5xx），绝不静默截断。
+
+    Attributes:
+        max_rounds:       配置的最大 Tool 轮数。
+        requested_tool:   预算耗尽后 LLM 仍请求的 Tool 名称（公开信息）。
+    """
+
+    def __init__(self, max_rounds: int, requested_tool: str) -> None:
+        super().__init__(
+            f"Tool Calling 预算耗尽（max_rounds={max_rounds}），"
+            f"LLM 仍请求调用 Tool {requested_tool!r}"
+        )
+        self.max_rounds = max_rounds
+        self.requested_tool = requested_tool
 
 
 # ============================================================
@@ -109,7 +142,8 @@ class ToolChatResponse:
 
     Attributes:
         answer:     最终自然语言回答（无 Tool 时直接来自 LLM #1）。
-        tool_calls: 本次请求实际发生的 Tool 调用（本阶段最多 1 个；
+        tool_calls: 本次请求**实际执行过**的 Tool（按执行顺序；
+                    上限 = settings.tool.max_rounds；
                     仅含 tool_name，不含内部执行细节）。
     """
 
@@ -171,21 +205,46 @@ def _build_tool_messages(
 # ============================================================
 
 class ToolChatService:
-    """LLM Function Calling 编排（Phase 3.6.2）。
+    """LLM Function Calling 编排（Phase 3.6.3：Multi-Step，顺序、有限预算）。
 
-    单轮、单个 Tool Call 的最小闭环；不做循环 Agent。
+    每一轮：LLM（携带 tools）→ 无 tool call 则返回最终回答；
+    有则执行单个 Tool 并 append 消息历史，进入下一轮。
+    不是 Agent / 不是无限循环：`max_tool_rounds` 是硬上限。
     """
 
-    def __init__(self, llm_client: LLMClient | None = None) -> None:
+    def __init__(
+        self,
+        llm_client: LLMClient | None = None,
+        *,
+        max_tool_rounds: int | None = None,
+    ) -> None:
         """构造 ToolChatService。
 
         Args:
-            llm_client: LLM Client；为 None 时使用模块默认实例
-                        （主要用于测试注入 Scripted Fake）。
+            llm_client:      LLM Client；为 None 时使用模块默认实例
+                             （主要用于测试注入 Scripted Fake）。
+            max_tool_rounds: 最大 Tool Calling 轮数（>=1）；
+                             为 None 时读取 settings.tool.max_rounds
+                             （环境变量 TOOL_MAX_ROUNDS，默认 5）。
+
+        Raises:
+            ValueError: max_tool_rounds < 1。
         """
+        if max_tool_rounds is None:
+            max_tool_rounds = settings.tool.max_rounds
+        if max_tool_rounds < 1:
+            raise ValueError(
+                f"max_tool_rounds 必须 >= 1（got {max_tool_rounds}）"
+            )
+        self._max_tool_rounds = max_tool_rounds
         self._llm_client = (
             llm_client if llm_client is not None else get_default_llm_client()
         )
+
+    @property
+    def max_tool_rounds(self) -> int:
+        """最大 Tool Calling 轮数（只读）。"""
+        return self._max_tool_rounds
 
     async def chat(
         self,
@@ -193,20 +252,24 @@ class ToolChatService:
         *,
         registry: ToolRegistry,
     ) -> ToolChatResponse:
-        """处理单轮用户消息（最多 1 次 Tool Call + 2 轮 LLM）。
+        """处理单轮用户消息（顺序多步 Tool Calling，预算内循环）。
+
+        每轮 LLM 调用都携带完整消息历史 + 全部 Tool Schema；
+        LLM 不再请求 Tool 时返回最终回答。
 
         Args:
             message:  用户自然语言消息。
             registry: Tool 注册中心（只读取 list_definitions / execute）。
 
         Returns:
-            ToolChatResponse（answer + tool_calls 元信息）。
+            ToolChatResponse（answer + 按执行顺序的 tool_calls 元信息）。
 
         Raises:
-            ValueError: message 为空或纯空白。
-            MultipleToolCallsError: LLM 返回多个 tool call。
-            LLMError 家族: LLM 配置 / 请求 / 响应异常（原样透传，
-                           由 API 层映射为 HTTP 状态码）。
+            ValueError:                       message 为空或纯空白。
+            ToolCallingBudgetExceededError:   预算耗尽后 LLM 仍请求 Tool。
+            MultipleToolCallsError:           LLM 单次返回多个 tool call。
+            LLMError 家族:                    LLM 配置 / 请求 / 响应异常
+                                              （原样透传，API 层映射 HTTP）。
         """
         if not message or not message.strip():
             raise ValueError("message 不能为空")
@@ -214,63 +277,80 @@ class ToolChatService:
         start_time = time.perf_counter()
         definitions = registry.list_definitions()
         tools = definitions_to_openai_tools(definitions)
+        # Service 内部独立构建消息历史：只 append，不改写历史消息，
+        # 不接收调用方传入的 list（避免意外污染）。
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
 
-        # ---- LLM #1（携带 tools；空 registry 时不携带） ----
-        if tools:
-            first = await self._llm_client.chat(messages, tools=tools)
-        else:
-            first = await self._llm_client.chat(messages)
-        if not isinstance(first, LLMResponse):
-            # 防御：tools 路径实现方必须返回 LLMResponse（Protocol 约定）
-            first = LLMResponse(content=first, tool_calls=())
-        llm_rounds = 1
+        executed_calls: list[ToolChatCallInfo] = []
+        tool_round = 0
+        llm_rounds = 0
 
-        # ---- 无 Tool Call：直接返回 ----
-        if not first.tool_calls:
-            response = ToolChatResponse(
-                answer=first.content or "",
-                tool_calls=(),
-            )
+        while True:
+            # ---- LLM（每轮都携带 tools，使 LLM 可以继续请求下一个 Tool） ----
+            if tools:
+                raw = await self._llm_client.chat(messages, tools=tools)
+            else:
+                raw = await self._llm_client.chat(messages)
+            llm_rounds += 1
+            if not isinstance(raw, LLMResponse):
+                # 防御：tools 路径实现方必须返回 LLMResponse（Protocol 约定）
+                response = LLMResponse(content=raw, tool_calls=())
+            else:
+                response = raw
+
+            # ---- 1) 无 Tool Call：最终回答 ----
+            if not response.tool_calls:
+                answer = response.content or ""
+                logger.info(
+                    "tool chat completed",
+                    extra={
+                        "llm_rounds": llm_rounds,
+                        "tool_call_count": tool_round,
+                        "elapsed_ms": (time.perf_counter() - start_time)
+                        * 1000,
+                    },
+                )
+                return ToolChatResponse(
+                    answer=answer,
+                    tool_calls=tuple(executed_calls),
+                )
+
+            # ---- 2) 预算检查：先于一切执行（任务书 §九） ----
+            if tool_round >= self._max_tool_rounds:
+                logger.warning(
+                    "tool calling budget exceeded",
+                    extra={
+                        "max_rounds": self._max_tool_rounds,
+                        "requested_tool": response.tool_calls[0].name,
+                        "llm_rounds": llm_rounds,
+                        "tool_call_count": tool_round,
+                    },
+                )
+                raise ToolCallingBudgetExceededError(
+                    self._max_tool_rounds, response.tool_calls[0].name
+                )
+
+            # ---- 3) 单 Tool Call 校验（多轮 ≠ 并行） ----
+            if len(response.tool_calls) > 1:
+                raise MultipleToolCallsError(len(response.tool_calls))
+            call = response.tool_calls[0]
+
+            # ---- 4) 执行 Tool（失败也归一为 ToolResult，允许继续下一轮） ----
+            tool_round += 1
+            result = await registry.execute(call.name, call.arguments)
+
+            # ---- 5) append 完整消息对，保留历史（任务书 §七） ----
+            messages.extend(_build_tool_messages(call, result))
+            executed_calls.append(ToolChatCallInfo(tool_name=call.name))
+
             logger.info(
-                "tool chat completed without tool call",
+                "tool round executed",
                 extra={
+                    "tool_round": tool_round,
+                    "tool_name": call.name,
+                    "tool_success": result.success,
                     "llm_rounds": llm_rounds,
-                    "tool_call_count": 0,
+                    "tool_call_count": tool_round,
                     "elapsed_ms": (time.perf_counter() - start_time) * 1000,
                 },
             )
-            return response
-
-        # ---- 单 Tool Call 校验（客户端已拒绝多个，此处防御性兜底） ----
-        if len(first.tool_calls) > 1:
-            raise MultipleToolCallsError(len(first.tool_calls))
-        call = first.tool_calls[0]
-
-        # ---- 执行 Tool（失败也归一为 ToolResult，不打断链路） ----
-        result = await registry.execute(call.name, call.arguments)
-        messages.extend(_build_tool_messages(call, result))
-
-        # ---- LLM #2（不携带 tools → 结构上保证最多 2 轮） ----
-        second = await self._llm_client.chat(messages)
-        llm_rounds = 2
-        if isinstance(second, LLMResponse):
-            # 防御：不传 tools 时实现方按 Phase 2 行为返回 str
-            answer = second.content or ""
-        else:
-            answer = second
-
-        logger.info(
-            "tool chat completed with tool call",
-            extra={
-                "tool_name": call.name,
-                "tool_success": result.success,
-                "llm_rounds": llm_rounds,
-                "tool_call_count": 1,
-                "elapsed_ms": (time.perf_counter() - start_time) * 1000,
-            },
-        )
-        return ToolChatResponse(
-            answer=answer,
-            tool_calls=(ToolChatCallInfo(tool_name=call.name),),
-        )

@@ -4,6 +4,7 @@
 > Phase 3.5.7 起增加 RAG 检索质量评估（见 § 5）。
 > Phase 3.5.8 起增加真实知识库加载 CLI（见 § 6）。
 > Phase 3.6.2 起增加 Tool Calling 对话接口 `POST /api/chat/with-tools`（见 § 2.4）。
+> Phase 3.6.3 起该接口升级为 Multi-Step Tool Calling（顺序多步 + TOOL_MAX_ROUNDS 预算）。
 > 后续阶段按 `docs/requirements.md` 演进。
 
 ---
@@ -152,29 +153,32 @@ ChatService → RagService → Vector Search → Context Builder → LLMClient
 
 ### 2.4 POST /api/chat/with-tools
 
-对话接口（Phase 3.6.2：LLM Function Calling + Tool Framework）。
+对话接口（Phase 3.6.2 引入；Phase 3.6.3 升级为 **Multi-Step Tool Calling**）。
 **不经过 RAG**，是独立的 Tool Calling 链路；`/api/chat` 行为不变。
 
 ```text
-ToolChatService → LLM #1（携带 tools）
-              → 判断是否需要 Tool
-              → 需要：ToolRegistry.execute() → ToolResult → role=tool 消息
-              → LLM #2 → 最终回答
+ToolChatService → LLM（携带 tools）
+                → 判断是否需要 Tool
+                → 需要：ToolRegistry.execute() → ToolResult → role=tool 消息
+                       （append 到完整消息历史）→ LLM（可继续请求 Tool）
+                → ... 顺序循环 ...
+                → LLM 不再请求 Tool → 最终回答
 ```
 
-当前阶段约束（Phase 3.6.2）：
+当前阶段约束（Phase 3.6.3）：
 
-- 单轮最多 **1 次** Tool Call、最多 **2 轮** LLM；
-- LLM 返回多个 tool call → 502（明确拒绝，不并行执行）；
-- Tool 参数错误 / 未注册 Tool 不打断请求：错误以 tool message 回传 LLM，
-  由 LLM 生成自然语言错误说明；
+- **顺序多步**：每轮最多 **1 个** Tool Call（LLM 单次返回多个 → 502 拒绝，不做并行）；
+- **总轮数硬上限** `TOOL_MAX_ROUNDS`（默认 5，钳制 [1, 20]）：
+  最坏情况 = 5 次 Tool 执行 + 6 次 LLM 调用；预算耗尽后 LLM 仍请求 Tool → 502；
+- Tool 参数错误 / 未注册 Tool **不打断请求**：错误以 tool message 回传 LLM，
+  由 LLM 生成自然语言错误说明，并允许继续下一轮；
 - 注册的 Tool 为两个 **Mock**（`get_inventory` / `get_work_order`），不接真实 WMS / ERP。
 
 #### 请求
 
 ```json
 {
-  "message": "查询 MAT001 的库存"
+  "message": "先查询 MAT001 的库存，然后查询工单 MO001 的状态"
 }
 ```
 
@@ -186,10 +190,13 @@ ToolChatService → LLM #1（携带 tools）
 
 ```json
 {
-  "answer": "MAT001 当前库存为 1000 PCS。",
+  "answer": "MAT001 当前库存为 1000 PCS；工单 MO001 状态为 RELEASED。",
   "tool_calls": [
     {
       "tool_name": "get_inventory"
+    },
+    {
+      "tool_name": "get_work_order"
     }
   ]
 }
@@ -198,17 +205,21 @@ ToolChatService → LLM #1（携带 tools）
 | 字段       | 类型  | 说明                                                        |
 | ---------- | ----- | ----------------------------------------------------------- |
 | answer     | string | AI 最终回答（无需 Tool 时直接来自 LLM #1）                 |
-| tool_calls | array  | 实际发生的 Tool 调用（**仅 tool_name**，最多 1 个；无需 Tool 时为 `[]`） |
+| tool_calls | array  | 本次请求**实际执行过**的 Tool 调用（**按执行顺序**；仅 `tool_name`，数量上限 = `TOOL_MAX_ROUNDS`；无需 Tool 时为 `[]`） |
 
 #### 错误映射（在 §3.2 基础上新增）
 
-| HTTP | 触发条件                                      | detail 示例                              |
-| ---- | --------------------------------------------- | ---------------------------------------- |
-| 502  | LLM 返回多个 tool call（MultipleToolCallsError） | `"LLM 返回多个 Tool Call（当前不支持）"` |
-| 500  | ToolChatError（编排内部错误）                  | `"Tool Chat 服务内部错误: ..."`           |
+| HTTP | 触发条件                                       | detail 示例                                        |
+| ---- | ---------------------------------------------- | -------------------------------------------------- |
+| 502  | LLM 返回多个 tool call（MultipleToolCallsError） | `"LLM 返回多个 Tool Call（当前不支持）"`           |
+| 502  | Tool Calling 预算耗尽（ToolCallingBudgetExceededError） | `"Tool Calling 预算耗尽（max_rounds=5）…"` |
+| 500  | ToolChatError（编排内部错误）                   | `"Tool Chat 服务内部错误: ..."`                     |
 
 LLM 家族异常（LLMConfigError 503 / LLMRequestError、LLMResponseError 502）
 沿用 §3.2 映射。
+
+> 配置：`TOOL_MAX_ROUNDS`（环境变量，默认 5，钳制 [1, 20]），
+> 读取自 `settings.tool.max_rounds`。
 
 ---
 

@@ -1,15 +1,18 @@
-"""Tool Chat API 测试（Phase 3.6.2：POST /api/chat/with-tools）。
+"""Tool Chat API 测试（Phase 3.6.2 引入；Phase 3.6.3 扩展 Multi-Step）。
 
 通过 monkeypatch 替换 api.tool_chat._tool_chat_service，
 验证：
 
     - 正常路径：普通问题（tool_calls=[]）/ Tool 问题（tool_calls 非空）
+    - Multi-Step：tool_calls 按执行顺序返回
     - 协议：response 只含 answer + tool_calls；tool_calls 项只含 tool_name
     - 入参校验：空 / 缺失 / 非法类型
-    - 错误映射：LLM 家族 / MultipleToolCallsError / ToolChatError / 未知异常
+    - 错误映射：LLM 家族 / MultipleToolCallsError /
+      ToolCallingBudgetExceededError（502） / ToolChatError / 未知异常
     - 安全：错误响应不泄露敏感信息
     - OpenAPI 注册
     - 接线：真实 ToolChatService + Scripted LLM + Mock Tools 端到端
+      （含多步链路 + 预算耗尽 → 502）
 
 全部 Mock，不发起真实 DB / LLM 调用。
 """
@@ -32,6 +35,7 @@ from backend.app.llm.client import (
 from backend.app.main import app
 from backend.app.services.tool_chat_service import (
     MultipleToolCallsError,
+    ToolCallingBudgetExceededError,
     ToolChatCallInfo,
     ToolChatError,
     ToolChatResponse,
@@ -124,6 +128,30 @@ class TestNormalRequest:
         assert payload["answer"] == "MAT001 当前库存为 1000 PCS。"
         assert payload["tool_calls"] == [{"tool_name": "get_inventory"}]
 
+    def test_multi_step_response_preserves_execution_order(self, client) -> None:
+        """多步 Tool Calling：tool_calls 按执行顺序返回（仅 tool_name）。"""
+        tool_response = ToolChatResponse(
+            answer="库存 1000 PCS，工单状态 RELEASED。",
+            tool_calls=(
+                ToolChatCallInfo(tool_name="get_inventory"),
+                ToolChatCallInfo(tool_name="get_work_order"),
+            ),
+        )
+        with client(response=tool_response) as (c, _fake):
+            response = c.post(
+                "/api/chat/with-tools",
+                json={"message": "先查 MAT001 库存，再查工单 MO001"},
+            )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["tool_calls"] == [
+            {"tool_name": "get_inventory"},
+            {"tool_name": "get_work_order"},
+        ]
+        # tool_calls 项只有 tool_name 字段（无 arguments / 内部细节）
+        for item in payload["tool_calls"]:
+            assert set(item.keys()) == {"tool_name"}
+
     def test_response_schema_only_exposes_expected_fields(self, client) -> None:
         with client() as (c, _fake):
             payload = c.post(
@@ -206,6 +234,11 @@ class TestErrorMapping:
                 "LLM 响应解析失败",
             ),
             (MultipleToolCallsError(2), 502, "多个 Tool Call"),
+            (
+                ToolCallingBudgetExceededError(2, "get_test_note"),
+                502,
+                "预算耗尽",
+            ),
         ],
     )
     def test_known_errors_map_to_status(
@@ -262,7 +295,7 @@ class TestErrorMapping:
 # ============================================================
 
 class _ScriptedLLM:
-    """两轮脚本：tool call → 最终回答。"""
+    """按脚本依次返回：tool call(get_inventory) → tool call(get_work_order) → 最终回答。"""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -280,7 +313,38 @@ class _ScriptedLLM:
                     ),
                 ),
             )
-        return "MAT001 当前库存为 1000 PCS。"
+        if len(self.calls) == 2:
+            return LLMResponse(
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        id="call_002",
+                        name="get_work_order",
+                        arguments={"work_order_no": "MO001"},
+                    ),
+                ),
+            )
+        return "MAT001 库存 1000 PCS；工单 MO001 状态 RELEASED。"
+
+
+class _InfiniteToolLLM:
+    """永远返回 tool call 的 LLM（用于触发预算耗尽）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def chat(self, messages, *, tools=None):
+        self.calls.append({"messages": [dict(m) for m in messages], "tools": tools})
+        return LLMResponse(
+            content=None,
+            tool_calls=(
+                ToolCall(
+                    id=f"call_{len(self.calls):03d}",
+                    name="get_inventory",
+                    arguments={"material_code": "MAT001"},
+                ),
+            ),
+        )
 
 
 class TestRealServiceWiring:
@@ -300,9 +364,12 @@ class TestRealServiceWiring:
 
         assert response.status_code == 200
         payload = response.json()
-        assert payload["answer"] == "MAT001 当前库存为 1000 PCS。"
-        assert payload["tool_calls"] == [{"tool_name": "get_inventory"}]
-        assert len(llm.calls) == 2
+        assert payload["answer"] == "MAT001 库存 1000 PCS；工单 MO001 状态 RELEASED。"
+        assert payload["tool_calls"] == [
+            {"tool_name": "get_inventory"},
+            {"tool_name": "get_work_order"},
+        ]
+        assert len(llm.calls) == 3  # Multi-Step：3 轮 LLM
 
         # 第二轮 LLM 收到 role=tool 消息（Mock Tool 真实执行结果）
         tool_msg = llm.calls[1]["messages"][2]
@@ -310,6 +377,39 @@ class TestRealServiceWiring:
         import json as _json
 
         assert _json.loads(tool_msg["content"])["data"]["quantity"] == 1000
+        # 第三轮 LLM 收到两组完整的 tool_call + tool 消息对
+        m3 = llm.calls[2]["messages"]
+        assert [m["role"] for m in m3] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+
+    def test_budget_exceeded_maps_to_502(self, monkeypatch) -> None:
+        """真实 Service + 无限 tool call 的 LLM：预算耗尽 → 502，不泄露内部信息。"""
+        llm = _InfiniteToolLLM()
+        monkeypatch.setattr(
+            tool_chat_module,
+            "_tool_chat_service",
+            ToolChatService(llm_client=llm, max_tool_rounds=2),
+        )
+        with TestClient(app) as c:
+            response = c.post(
+                "/api/chat/with-tools",
+                json={"message": "查询库存"},
+            )
+
+        assert response.status_code == 502
+        detail = response.json()["detail"]
+        assert "预算耗尽" in detail
+        assert "max_rounds=2" in detail
+        # 硬上限：2 次 Tool + 1 次拒绝 = 3 次 LLM，绝无第 4 次
+        assert len(llm.calls) == 3
+        # 不泄露敏感信息
+        for fragment in ("Traceback", "sk-", "DATABASE_URL", "handler"):
+            assert fragment not in response.text
 
 
 __all__ = [

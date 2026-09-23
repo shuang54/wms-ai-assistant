@@ -1,4 +1,4 @@
-"""Tool Chat API（Phase 3.6.2：LLM Function Calling）。
+"""Tool Chat API（Phase 3.6.2 引入；Phase 3.6.3 升级为 Multi-Step）。
 
 边界：
 
@@ -6,25 +6,33 @@
         ↓
     /api/chat/with-tools
         ↓
-    ToolChatService
+    ToolChatService（预算内多轮循环）
         ↓
-    LLMClient（tools）→ ToolRegistry（Mock Tools）→ LLMClient（最终回答）
+    LLMClient（tools）→ ToolRegistry（Mock Tools）→ ... → LLMClient（最终回答）
         ↓
-    Tool Chat Response（纯 DTO：answer + tool 名称列表）
+    Tool Chat Response（纯 DTO：answer + Tool 名称列表，按执行顺序）
 
 与 /api/chat 的关系：
 
     * /api/chat（RAG 链路）行为完全不变（Phase 3.5.6 协议保持）；
     * 本端点是独立的 Tool Calling 链路，**不**经过 RAG。
 
+Multi-Step 约束（Phase 3.6.3）：
+
+    * 顺序多步：LLM → Tool → LLM → Tool → ... → LLM 最终回答；
+    * 每个 LLM 响应最多 1 个 Tool Call（多个 → 502）；
+    * 总轮数硬上限 TOOL_MAX_ROUNDS（默认 5，钳制 [1, 20]）：
+      预算耗尽后 LLM 仍请求 Tool → 502（不执行、不再请求 LLM）。
+
 错误映射（沿用项目既有原则）：
 
-    ValueError                      → 400  （空消息，服务层校验）
-    MultipleToolCallsError          → 502  （LLM 返回多个 Tool Call）
-    LLMConfigError                  → 503
+    ValueError                                 → 400  （空消息，服务层校验）
+    MultipleToolCallsError                     → 502  （LLM 返回多个 Tool Call）
+    ToolCallingBudgetExceededError             → 502  （Tool Calling 预算耗尽）
+    LLMConfigError                             → 503
     LLMRequestError / LLMResponseError（含 LLMToolCallFormatError）→ 502
-    ToolChatError                   → 500
-    未知异常                        → 原样上抛（全局中间件兜底 500）
+    ToolChatError                              → 500
+    未知异常                                   → 原样上抛（全局中间件兜底 500）
 
 安全：响应体与错误 detail 均不包含 API Key / Authorization /
 DATABASE_URL / SQL / traceback / Tool handler / embedding。
@@ -39,6 +47,7 @@ from pydantic import BaseModel, Field
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http
 from backend.app.services.tool_chat_service import (
     MultipleToolCallsError,
+    ToolCallingBudgetExceededError,
     ToolChatError,
     ToolChatResponse,
     ToolChatService,
@@ -59,7 +68,7 @@ class ToolChatRequest(BaseModel):
 class ToolChatCallInfoResponse(BaseModel):
     """Tool 调用元信息（仅 Tool 名称，不含 arguments / 执行细节）。"""
 
-    tool_name: str = Field(..., description="本次请求实际调用的 Tool 名称")
+    tool_name: str = Field(..., description="实际执行的 Tool 名称")
 
 
 class ToolChatApiResponse(BaseModel):
@@ -68,7 +77,10 @@ class ToolChatApiResponse(BaseModel):
     answer: str = Field(..., description="AI 最终回答（经 Tool Calling 链路生成）")
     tool_calls: list[ToolChatCallInfoResponse] = Field(
         default_factory=list,
-        description="本次请求实际发生的 Tool 调用（仅名称；最多 1 个）",
+        description=(
+            "本次请求实际执行过的 Tool 调用（仅名称，按执行顺序；"
+            "数量上限 = TOOL_MAX_ROUNDS，默认 5）"
+        ),
     )
 
 
@@ -81,14 +93,16 @@ _tool_chat_service = ToolChatService()
 
 @router.post("/chat/with-tools", response_model=ToolChatApiResponse)
 async def chat_with_tools(request: ToolChatRequest) -> ToolChatApiResponse:
-    """对话接口（Phase 3.6.2：LLM Function Calling + Mock Tools）。
+    """对话接口（Phase 3.6.3：Multi-Step Tool Calling + Mock Tools）。
 
     Pipeline：
 
-        ToolChatService → LLM #1（tools）→ [ToolRegistry.execute]
-                       → LLM #2 → answer
+        ToolChatService → LLM（tools）
+                       → [ToolRegistry.execute → tool message → LLM] × N
+                       → answer（N <= TOOL_MAX_ROUNDS，默认 5）
 
-    约束：单轮最多 1 次 Tool Call、最多 2 轮 LLM。
+    约束：每轮最多 1 个 Tool Call（顺序执行）；总轮数受
+    TOOL_MAX_ROUNDS 硬限制。
     """
     try:
         result: ToolChatResponse = await _tool_chat_service.chat(
@@ -108,6 +122,21 @@ async def chat_with_tools(request: ToolChatRequest) -> ToolChatApiResponse:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"LLM 返回多个 Tool Call（当前不支持）: {exc}",
+        )
+    except ToolCallingBudgetExceededError as exc:
+        logger.warning(
+            "tool chat budget exceeded",
+            extra={
+                "error_type": "ToolCallingBudgetExceededError",
+                "max_rounds": exc.max_rounds,
+                "requested_tool": exc.requested_tool,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Tool Calling 预算耗尽（max_rounds={exc.max_rounds}），"
+            f"LLM 仍请求调用 Tool {exc.requested_tool!r}；"
+            "请缩小问题范围或调整 TOOL_MAX_ROUNDS",
         )
     except ToolChatError as exc:
         logger.error(
