@@ -1,0 +1,54 @@
+# Vietnam WMS — 项目业务语义（Phase 3.7.3 最小验证集）
+#
+# 原则：
+#   Schema   = 数据库事实（Schema Explorer 产出）
+#   Semantic = 人工定义的业务含义（本文件）
+#
+# 本阶段只配置当前知识库两张表的最小语义，用于验证机制；
+# 大规模 WMS 业务语义（库存 / 订单 / 物料等）留待真实业务表接入后补充。
+# 所有内容均为人工配置，禁止自动推断 / LLM 生成。
+
+tables:
+  - table: public.knowledge_document
+    business_name: 知识文档
+    description: 知识库文档元数据表
+    aliases:
+      - 知识文档
+      - 文档
+  - table: public.knowledge_chunk
+    business_name: 知识文档分片
+    description: 文档切分后的知识片段，含向量数据
+    aliases:
+      - 知识分片
+      - 分片
+
+columns:
+  - table: public.knowledge_document
+    column: title
+    business_name: 文档标题
+    description: 文档展示标题
+    aliases:
+      - 标题
+  - table: public.knowledge_document
+    column: file_name
+    business_name: 文件名
+    description: 原始上传文件名
+    aliases:
+      - 文件
+  - table: public.knowledge_chunk
+    column: content
+    business_name: 分片内容
+    description: 分片文本内容
+    aliases:
+      - 内容
+  - table: public.knowledge_chunk
+    column: embedding
+    business_name: 向量
+    description: 分片文本的向量表示（用于检索）
+
+relationships:
+  - source_table: public.knowledge_chunk
+    source_column: document_id
+    target_table: public.knowledge_document
+    target_column: id
+    description: 分片属于文档

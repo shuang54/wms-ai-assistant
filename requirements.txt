@@ -14,6 +14,9 @@ pydantic>=2.7.0,<3.0
 # Environment variable loader
 python-dotenv>=1.0.0,<2.0
 
+# YAML parsing (Phase 3.7.3: project business semantic config files)
+PyYAML>=6.0,<7.0
+
 # HTTP client (for future WMS/ERP API calls and tests)
 httpx>=0.27.0,<2.0
 

@@ -70,6 +70,7 @@ __all__ = [
     "SchemaSerializerInputError",
     "SchemaSerializationError",
     "SchemaSerializer",
+    "apply_line_budget",
     "DEFAULT_MAX_CHARS",
 ]
 
@@ -186,6 +187,34 @@ def _sorted_foreign_keys(
 def _sorted_tables(tables: Sequence[SchemaTable]) -> list[SchemaTable]:
     """稳定排序：schema → table（与 Schema Explorer 输出顺序一致）。"""
     return sorted(tables, key=lambda t: (t.schema_name, t.name))
+
+
+def apply_line_budget(
+    lines: Sequence[str], *, max_chars: int, marker_prefix: str = "Schema"
+) -> tuple[str, bool]:
+    """按整行应用字符预算（Phase 3.7.2 抽为公共函数，Phase 3.7.3 起供 Composer 复用）。
+
+    规则：
+        - 逐行累加，任何一行放不下即停止（绝不输出半截行）；
+        - 停止后移除尾部空行，追加 truncation marker
+          （marker 本身不计入预算，保证截断事实永远可见）；
+        - 全部行都放得下 → 不加 marker，not truncated。
+    """
+    kept: list[str] = []
+    used = 0
+    truncated = False
+    for line in lines:
+        line_len = len(line) + (1 if kept else 0)  # 换行符
+        if used + line_len > max_chars:
+            truncated = True
+            break
+        kept.append(line)
+        used += line_len
+    if truncated:
+        while kept and not kept[-1]:
+            kept.pop()
+        kept.append(f"[{marker_prefix} truncated: max_chars={max_chars}]")
+    return "\n".join(kept), truncated
 
 
 # ============================================================
@@ -363,28 +392,4 @@ class SchemaSerializer:
 
     # ---------- 预算 / 截断 ----------
 
-    @staticmethod
-    def _apply_budget(lines: Sequence[str], *, max_chars: int) -> tuple[str, bool]:
-        """按整行应用字符预算。
-
-        规则：
-            - 逐行累加，任何一行放不下即停止（绝不输出半截行）；
-            - 停止后移除尾部空行，追加 truncation marker
-              （marker 本身不计入预算，保证截断事实永远可见）；
-            - 全部行都放得下 → 不加 marker，not truncated。
-        """
-        kept: list[str] = []
-        used = 0
-        truncated = False
-        for line in lines:
-            line_len = len(line) + (1 if kept else 0)  # 换行符
-            if used + line_len > max_chars:
-                truncated = True
-                break
-            kept.append(line)
-            used += line_len
-        if truncated:
-            while kept and not kept[-1]:
-                kept.pop()
-            kept.append(f"[Schema truncated: max_chars={max_chars}]")
-        return "\n".join(kept), truncated
+    _apply_budget = staticmethod(apply_line_budget)
