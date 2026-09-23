@@ -27,6 +27,13 @@
   （DATABASE_URL 未配置时返回 None → inspect 抛 RuntimeError，
   与 get_db / VectorSearchService 的行为一致）。
 
+- **Provider 架构（Phase 3.7.1.1 起）**：
+  `SchemaExplorerService`（业务编排）只依赖
+  `DatabaseMetadataProvider` 协议，PostgreSQL 的 pg_catalog 查询全部
+  下沉到 `PostgreSQLMetadataProvider`（Phase 3.7.1 的逻辑原样迁入，
+  行为与 SQL 零改动）。未来接入新数据源时新增 Provider 实现即可，
+  本模块业务 API 与既有测试零改动。
+
 - **默认 schema 策略**：`schema=None` 时使用 `public`
   （PostgreSQL 默认 schema；当前项目全部业务表均在 public，
   已于 Phase 3.7.1 前置调研确认：库中唯一用户 schema 即 public，
@@ -61,7 +68,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -79,6 +86,8 @@ __all__ = [
     "SchemaExplorerError",
     "SchemaExplorerInputError",
     "SchemaNotFoundError",
+    "DatabaseMetadataProvider",
+    "PostgreSQLMetadataProvider",
     "SchemaExplorerService",
     "DEFAULT_SCHEMA",
 ]
@@ -284,24 +293,88 @@ ORDER BY sc.relname, src.ord
 
 
 # ============================================================
-# Service
+# Service / Provider 架构（Phase 3.7.1.1 起）
 # ============================================================
 
-class SchemaExplorerService:
-    """PostgreSQL 数据库结构探索器（Phase 3.7.1，只读 metadata）。
+def _validate_schema(schema: str | None) -> str:
+    """校验 schema 参数，返回解析后的 schema 名。
 
-    只负责：pg_catalog → 结构化 DTO。
-    不负责：AI 理解 Schema、Text-to-SQL、任何数据读写。
+    规则（全部在发起数据库查询之前拒绝）：
+        - None → DEFAULT_SCHEMA（"public"）
+        - 非 str / 空 / 纯空白 → SchemaExplorerInputError
+        - 不满足 PostgreSQL 未加引号标识符格式 → SchemaExplorerInputError
+          （'public"; DROP TABLE ...' 等注入串在此被拒绝）
+        - pg_catalog / information_schema / pg_* 系统 schema
+          → SchemaExplorerInputError（系统表不暴露给 AI）
+    """
+    if schema is None:
+        return DEFAULT_SCHEMA
+
+    if not isinstance(schema, str):
+        raise SchemaExplorerInputError(
+            f"schema 必须是 str（当前: {type(schema).__name__}）"
+        )
+    stripped = schema.strip()
+    if not stripped:
+        raise SchemaExplorerInputError("schema 不能为空或纯空白")
+
+    if not _SCHEMA_NAME_RE.match(stripped):
+        raise SchemaExplorerInputError(
+            f"schema {schema!r} 不是合法的 PostgreSQL 标识符，已拒绝"
+        )
+    if (
+        stripped in _FORBIDDEN_SCHEMAS
+        or stripped.startswith(_FORBIDDEN_SCHEMA_PREFIX)
+    ):
+        raise SchemaExplorerInputError(
+            f"schema {stripped!r} 是 PostgreSQL 系统 schema，拒绝探索"
+        )
+    return stripped
+
+
+class DatabaseMetadataProvider(Protocol):
+    """数据库 metadata 读取器协议（Phase 3.7.1.1 引入）。
+
+    SchemaExplorerService 只依赖本协议，不依赖具体数据库方言：
+
+        SchemaExplorerService
+                ↓
+        DatabaseMetadataProvider（Protocol）
+                ↓
+        PostgreSQLMetadataProvider（当前唯一实现）
+                ↓
+        PostgreSQL pg_catalog
+
+    未来支持新数据源（mysql / sqlserver / api）时新增实现即可，
+    SchemaExplorerService 与其全部测试零改动。
+    """
+
+    async def inspect(
+        self,
+        *,
+        schema: str | None = None,
+    ) -> DatabaseSchema:
+        """读取指定 schema 的结构，返回不可变 DatabaseSchema。"""
+        ...
+
+
+class PostgreSQLMetadataProvider:
+    """PostgreSQL metadata 读取器（Phase 3.7.1 的 pg_catalog 逻辑原样迁入）。
+
+    职责（与 Phase 3.7.1 的 SchemaExplorerService 实现完全一致）：
+        - schema 校验（标识符白名单 + 系统 schema 拒绝）
+        - Engine 懒加载（复用 db.session.get_engine）
+        - 只读 SELECT：表 / 列 / 主键 / 外键 / COMMENT
+        - SQLAlchemyError → SchemaExplorerError（只含异常类名）
     """
 
     def __init__(self, *, engine: Engine | None = None) -> None:
-        """构造 SchemaExplorerService。
+        """构造 PostgreSQLMetadataProvider。
 
         Args:
             engine: SQLAlchemy Engine；None 时懒加载全局
                     `get_engine()`（DATABASE_URL 未配置时 inspect 抛
-                    RuntimeError，与项目其他 DB 能力一致）。
-                    测试可注入独立 Engine。
+                    RuntimeError）。测试可注入独立 Engine。
         """
         self._engine = engine
 
@@ -316,45 +389,7 @@ class SchemaExplorerService:
             )
         return engine
 
-    # ---------- 校验（先于一切 DB 访问） ----------
-
-    @staticmethod
-    def _validate_schema(schema: str | None) -> str:
-        """校验 schema 参数，返回解析后的 schema 名。
-
-        规则（全部在发起数据库查询之前拒绝）：
-            - None → DEFAULT_SCHEMA（"public"）
-            - 非 str / 空 / 纯空白 → SchemaExplorerInputError
-            - 不满足 PostgreSQL 未加引号标识符格式 → SchemaExplorerInputError
-              （'public"; DROP TABLE ...' 等注入串在此被拒绝）
-            - pg_catalog / information_schema / pg_* 系统 schema
-              → SchemaExplorerInputError（系统表不暴露给 AI）
-        """
-        if schema is None:
-            return DEFAULT_SCHEMA
-
-        if not isinstance(schema, str):
-            raise SchemaExplorerInputError(
-                f"schema 必须是 str（当前: {type(schema).__name__}）"
-            )
-        stripped = schema.strip()
-        if not stripped:
-            raise SchemaExplorerInputError("schema 不能为空或纯空白")
-
-        if not _SCHEMA_NAME_RE.match(stripped):
-            raise SchemaExplorerInputError(
-                f"schema {schema!r} 不是合法的 PostgreSQL 标识符，已拒绝"
-            )
-        if (
-            stripped in _FORBIDDEN_SCHEMAS
-            or stripped.startswith(_FORBIDDEN_SCHEMA_PREFIX)
-        ):
-            raise SchemaExplorerInputError(
-                f"schema {stripped!r} 是 PostgreSQL 系统 schema，拒绝探索"
-            )
-        return stripped
-
-    # ---------- 主流程 ----------
+    # ---------- 主流程（Phase 3.7.1 逻辑，行为不变） ----------
 
     async def inspect(
         self,
@@ -363,20 +398,13 @@ class SchemaExplorerService:
     ) -> DatabaseSchema:
         """探索指定 schema 的全部表结构，返回不可变 DatabaseSchema。
 
-        Args:
-            schema: 目标 schema；None 时使用 DEFAULT_SCHEMA（public）。
-                    必须是合法 PostgreSQL 标识符；系统 schema 被拒绝。
-
-        Returns:
-            DatabaseSchema（空 schema 时 tables=()）。
-
         Raises:
             SchemaExplorerInputError: schema 参数非法 / 系统 schema。
             SchemaNotFoundError:      schema 在数据库中不存在。
             RuntimeError:             DATABASE_URL 未配置。
             SchemaExplorerError:      查询执行失败（包装，不泄露连接串）。
         """
-        resolved_schema = self._validate_schema(schema)
+        resolved_schema = _validate_schema(schema)
         engine = self._get_engine()
 
         start_time = time.perf_counter()
@@ -462,3 +490,73 @@ class SchemaExplorerService:
             },
         )
         return result
+
+
+class SchemaExplorerService:
+    """PostgreSQL 数据库结构探索器（Phase 3.7.1，业务层入口）。
+
+    Phase 3.7.1.1 起架构：
+
+        SchemaExplorerService（业务入口，只做编排）
+                ↓
+        DatabaseMetadataProvider（Protocol）
+                ↓
+        PostgreSQLMetadataProvider（pg_catalog 只读查询）
+
+    兼容性：旧用法 `SchemaExplorerService(engine=...)` 与
+    `SchemaExplorerService().inspect(schema=...)` 行为完全不变
+    （engine 会被包装成 PostgreSQLMetadataProvider）。
+
+    只负责：编排 Provider、暴露稳定业务 API。
+    不负责：具体方言的 catalog 查询（下沉到 Provider）、
+            AI 理解 Schema、Text-to-SQL、任何数据读写。
+    """
+
+    def __init__(
+        self,
+        *,
+        engine: Engine | None = None,
+        provider: DatabaseMetadataProvider | None = None,
+    ) -> None:
+        """构造 SchemaExplorerService。
+
+        Args:
+            engine:  兼容旧签名——注入 Engine 时自动包装为
+                     PostgreSQLMetadataProvider(engine=engine)。
+            provider: 显式注入 DatabaseMetadataProvider（测试可注入
+                     fake；未来接入新数据源时注入对应实现）。
+                     engine 与 provider 不能同时指定。
+        """
+        if engine is not None and provider is not None:
+            raise ValueError("engine 与 provider 不能同时指定")
+        if provider is not None:
+            self._provider: DatabaseMetadataProvider = provider
+        else:
+            self._provider = PostgreSQLMetadataProvider(engine=engine)
+
+    # ---------- 兼容保留：Phase 3.7.1 的静态校验入口 ----------
+
+    _validate_schema = staticmethod(_validate_schema)
+
+    # ---------- 业务 API ----------
+
+    async def inspect(
+        self,
+        *,
+        schema: str | None = None,
+    ) -> DatabaseSchema:
+        """探索指定 schema 的全部表结构（委托给 Provider）。
+
+        Args:
+            schema: 目标 schema；None 时使用 DEFAULT_SCHEMA（public）。
+
+        Returns:
+            DatabaseSchema（空 schema 时 tables=()）。
+
+        Raises:
+            SchemaExplorerInputError: schema 参数非法 / 系统 schema。
+            SchemaNotFoundError:      schema 在数据库中不存在。
+            RuntimeError:             DATABASE_URL 未配置。
+            SchemaExplorerError:      查询执行失败（包装，不泄露连接串）。
+        """
+        return await self._provider.inspect(schema=schema)

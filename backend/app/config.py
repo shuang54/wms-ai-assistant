@@ -8,6 +8,7 @@
 - LLM 层：LLM_PROVIDER / LLM_MODEL / LLM_API_KEY / LLM_BASE_URL / LLM_TIMEOUT_*
 - Database 层（Phase 3.1）：DATABASE_URL / DATABASE_ECHO / DATABASE_POOL_SIZE / DATABASE_MAX_OVERFLOW
 - Tool 层（Phase 3.6.3）：TOOL_MAX_ROUNDS（默认 5，钳制 [1, 20]）
+- Project 层（Phase 3.7.1.1）：PROJECT_ID / PROJECT_NAME / PROJECT_DESCRIPTION（非敏感 metadata）
 
 DATABASE_URL 为空时，DB 相关功能自动禁用：
 - get_engine() 返回 None
@@ -223,6 +224,37 @@ class RerankerSettings:
 
 
 # ============================================================
+# Project 配置（Phase 3.7.1.1）
+# ============================================================
+
+@dataclass(frozen=True)
+class ProjectSettings:
+    """项目身份配置（Phase 3.7.1.1，仅供 projects 抽象读取）。
+
+    只包含**非敏感**项目 metadata；数据库连接继续由 DatabaseSettings
+    （DATABASE_URL）管理，本节**绝不**复制 / 引用任何连接凭据。
+
+    默认值 vietnam-wms / Vietnam WMS 是当前项目的配置层取值，
+    不是 Core 层依赖——换项目只需改环境变量，代码零修改。
+
+    字段：
+        project_id:          项目唯一标识。
+        project_name:        项目显示名。
+        project_description: 项目说明（空 → ProjectContext 中为 None）。
+    """
+
+    project_id: str = field(
+        default_factory=lambda: _get_str("PROJECT_ID", "vietnam-wms")
+    )
+    project_name: str = field(
+        default_factory=lambda: _get_str("PROJECT_NAME", "Vietnam WMS")
+    )
+    project_description: str = field(
+        default_factory=lambda: _get_str("PROJECT_DESCRIPTION", "")
+    )
+
+
+# ============================================================
 # Tool Calling 配置（Phase 3.6.3）
 # ============================================================
 
@@ -269,6 +301,7 @@ class Settings:
     rag: RagSettings = field(default_factory=RagSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
     tool: ToolSettings = field(default_factory=ToolSettings)
+    project: ProjectSettings = field(default_factory=ProjectSettings)
 
 
 settings = Settings()
@@ -281,5 +314,6 @@ __all__ = [
     "RagSettings",
     "RerankerSettings",
     "ToolSettings",
+    "ProjectSettings",
     "settings",
 ]
