@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from backend.app.api import chat, health, rag, tool_chat
+from backend.app.api import (
+    chat,
+    health,
+    orchestrator_chat,
+    rag,
+    tool_chat,
+)
 from backend.app.config import settings
 
 
@@ -30,6 +36,9 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api", tags=["chat"])
     app.include_router(rag.router, prefix="/api", tags=["rag"])
     app.include_router(tool_chat.router, prefix="/api", tags=["chat"])
+    app.include_router(
+        orchestrator_chat.router, prefix="/api", tags=["ai-chat"]
+    )
     return app
 
 
