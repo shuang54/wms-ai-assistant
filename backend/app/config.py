@@ -334,6 +334,26 @@ SQL_EXECUTOR_MAX_RESULT_BYTES_MIN = 64 * 1024
 SQL_EXECUTOR_MAX_RESULT_BYTES_MAX = 64 * 1024 * 1024
 
 
+# ============================================================
+# AI Router 配置（Phase 3.7.8）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class AIRouterSettings:
+    """AI Router 配置（Phase 3.7.8 引入）。
+
+    字段：
+        llm_fallback_enabled: 规则无法判断时是否允许调用 LLM。
+                              默认 true；false 时直接 RAG 兜底，
+                              适合离线 / 高安全场景。
+    """
+
+    llm_fallback_enabled: bool = field(
+        default_factory=lambda: _get_bool("AI_ROUTER_LLM_FALLBACK_ENABLED", True)
+    )
+
+
 @dataclass(frozen=True)
 class SQLExecutorSettings:
     """Read-only SQL Executor 配置（Phase 3.7.7 引入）。
@@ -392,6 +412,7 @@ class Settings:
     project: ProjectSettings = field(default_factory=ProjectSettings)
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
+    ai_router: AIRouterSettings = field(default_factory=AIRouterSettings)
 
 
 settings = Settings()
@@ -407,5 +428,6 @@ __all__ = [
     "ProjectSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",
+    "AIRouterSettings",
     "settings",
 ]
