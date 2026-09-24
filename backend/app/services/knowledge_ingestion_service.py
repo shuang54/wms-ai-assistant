@@ -1,4 +1,4 @@
-"""Knowledge Ingestion Service（Phase 3.5.2）。
+"""Knowledge Ingestion Service（Phase 3.5.2；Phase 3.8.5 扩展 Project Context）。
 
 把已完成的模块连接为单文件导入流水线：
 
@@ -13,6 +13,31 @@
     KnowledgeDocument + KnowledgeChunk[]
         ↓ COMMIT
     PostgreSQL + pgvector vector(1024)
+
+Phase 3.8.5 —— Project Knowledge Ingestion Context：
+
+    project_id（服务端调用上下文，非 HTTP 可注入）
+        ↓ ProjectKnowledgeProvider.get_scope()（Phase 3.8.4 复用，DI 注入）
+    ProjectKnowledgeScope.namespace
+        ↓ 强制写入
+    knowledge_document.meta_data.project_id
+        ↓ （检索侧由 Phase 3.8.4 VectorSearch scope 过滤消费）
+    Project-scoped Retrieval
+
+写入规则：
+
+- **只写 scope.namespace**；`includes_global` / `includes_legacy` 是检索
+  策略，绝不写入 metadata（任务书 §四）；
+- 调用方 metadata 中的 `project_id` 一律剥离后由服务器端 Provider 结果
+  **强制覆盖**（任务书 §五：不信任调用方 metadata）；
+- `project_id=None`（旧调用形态）保持旧行为：meta_data 无 project_id
+  → 按 Phase 3.8.4 规则属于 legacy（仅 vietnam-wms 可检索）；
+  **绝不**自动伪装成 `__global__` / `vietnam-wms`（任务书 §六）；
+- 文档 `content_hash` 参与项目身份：namespace 有值时
+  `sha256(namespace + "\\0" + content)`，None 时保持纯内容 SHA-256
+  （旧行完全兼容；满足 content_hash UNIQUE 约束的同时实现
+  per-project 去重——project-a 与 project-b 的相同内容是两份独立知识，
+  任务书 §十）。chunk 级 hash 不变。
 
 设计要点：
 
@@ -32,13 +57,15 @@
 
 异常约定（可区分）：
 
+- 项目 scope 解析：`KnowledgeIngestionProjectScopeError`（Phase 3.8.5；
+  Provider 未注册 / 输入非法，**绝不 fallback 到其他项目 / global**）
 - Parser 阶段：`DocumentNotFoundError` / `UnsupportedDocumentTypeError` /
   `DocumentParseError`（原样透传）
 - 空文档：`EmptyDocumentError`（不调 Embedding、不写库）
 - Embedding 阶段：`EmbeddingAPIError` / `EmbeddingDimensionError` 等（原样透传）
 - 写库阶段：`KnowledgeIngestionDatabaseError`（已回滚）
 
-日志只记录 file_name / chunk_count / duration / status，
+日志只记录 file_name / chunk_count / duration / status / namespace，
 **绝不**记录 API Key、Authorization header 或完整 embedding 向量。
 
 本阶段**不做**（后续 Phase）：
@@ -66,6 +93,11 @@ from backend.app.db.models import KnowledgeChunk, KnowledgeDocument
 from backend.app.db.session import get_session_factory
 from backend.app.embedding.client import EmbeddingClient, get_default_embedding_client
 from backend.app.embedding.exceptions import EmbeddingDimensionError
+from backend.app.projects.knowledge_provider import (
+    ProjectKnowledgeProvider,
+    ProjectKnowledgeProviderError,
+    get_default_project_knowledge_provider,
+)
 from backend.app.rag.chunking.text_chunker import TextChunker, default_chunker
 
 logger = logging.getLogger(__name__)
@@ -77,6 +109,7 @@ __all__ = [
     "KnowledgeIngestionError",
     "EmptyDocumentError",
     "KnowledgeIngestionDatabaseError",
+    "KnowledgeIngestionProjectScopeError",
     "KnowledgeIngestionService",
 ]
 
@@ -100,6 +133,14 @@ class EmptyDocumentError(KnowledgeIngestionError):
 
 class KnowledgeIngestionDatabaseError(KnowledgeIngestionError):
     """数据库写入失败（事务已回滚，无半成品残留）。"""
+
+
+class KnowledgeIngestionProjectScopeError(KnowledgeIngestionError):
+    """项目知识 scope 解析失败（Phase 3.8.5）。
+
+    Provider 未注册该 project_id / 输入非法时抛出；
+    **绝不** fallback 到其他项目 / vietnam-wms / __global__。
+    """
 
 
 class KnowledgeDocumentNotFoundError(KnowledgeIngestionError):
@@ -134,6 +175,26 @@ class IngestionResult:
 def _sha256_hex(content: str) -> str:
     """计算文本的 SHA-256 hex 摘要。"""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _document_content_hash(content: str, namespace: str | None) -> str:
+    """文档级 content_hash（Phase 3.8.5：参与项目身份判断）。
+
+    - ``namespace=None``（旧调用形态）→ 纯内容 SHA-256，
+      与历史存量行、既有测试**逐字节兼容**；
+    - ``namespace="project-a"`` → ``sha256(b"project-a\\0" + content)``：
+      满足 ``content_hash`` UNIQUE 约束的同时实现 per-project 去重
+      （project-a 与 project-b 的相同内容是两份独立知识）。
+
+    注意：chunk 级 hash 仍用 ``_sha256_hex``（chunk 身份与项目无关）。
+    """
+    if namespace is None:
+        return _sha256_hex(content)
+    h = hashlib.sha256()
+    h.update(namespace.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(content.encode("utf-8"))
+    return h.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -190,6 +251,7 @@ class KnowledgeIngestionService:
         embedding_client: EmbeddingClient | None = None,
         chunker: TextChunker | None = None,
         session_factory: Callable[[], Session] | None = None,
+        knowledge_provider: ProjectKnowledgeProvider | None = None,
     ) -> None:
         """
         Args:
@@ -199,10 +261,15 @@ class KnowledgeIngestionService:
             session_factory: Session 工厂；None 时用全局
                 get_session_factory()（DATABASE_URL 为空则 ingest 时抛
                 KnowledgeIngestionDatabaseError）。测试可注入 Mock。
+            knowledge_provider: Phase 3.8.5 —— project_id → KnowledgeScope
+                的服务器端解析器（复用 Phase 3.8.4 协议）；None 时懒加载
+                默认 Provider。仅在 ``ingest_one(project_id=...)`` 有值时
+                被调用（旧调用形态 project_id=None 不触碰 Provider）。
         """
         self._embedding_client = embedding_client
         self._chunker = chunker if chunker is not None else default_chunker()
         self._session_factory = session_factory
+        self._knowledge_provider = knowledge_provider
 
     # ---------- 依赖解析（懒加载） ----------
 
@@ -210,6 +277,12 @@ class KnowledgeIngestionService:
         if self._embedding_client is None:
             self._embedding_client = get_default_embedding_client()
         return self._embedding_client
+
+    def _get_knowledge_provider(self) -> ProjectKnowledgeProvider:
+        """解析 Knowledge Provider（惰性；测试可注入 InMemory/Fake）。"""
+        if self._knowledge_provider is None:
+            self._knowledge_provider = get_default_project_knowledge_provider()
+        return self._knowledge_provider
 
     def _get_session_factory(self) -> Callable[[], Session]:
         if self._session_factory is not None:
@@ -243,15 +316,94 @@ class KnowledgeIngestionService:
             # lazy="selectin"：chunks 在 session 存活期间加载
             return existing.id, len(existing.chunks)
 
-    # ---------- 主流程 ----------
+    # ---------- Project Knowledge Scope（Phase 3.8.5） ----------
 
-    async def ingest_one(self, file_path: str | Path) -> IngestionResult:
-        """导入单个知识文档（TXT / Markdown）。
-
-        流程：parse → 空检查 → content_hash → 重复检测（跳过 Embedding）
-        → chunk → embed（逐个，维度校验）→ 单事务写库 → commit。
+    def _resolve_knowledge_namespace(self, project_id: str | None) -> str | None:
+        """project_id → scope.namespace（服务器端解析；None → None）。
 
         Raises:
+            KnowledgeIngestionProjectScopeError: Provider 未注册该 project_id
+                或输入非法（**绝不 fallback** 到其他项目 / global / legacy）。
+        """
+        if project_id is None:
+            return None
+        provider = self._get_knowledge_provider()
+        try:
+            scope = provider.get_scope(project_id)
+        except ProjectKnowledgeProviderError as exc:
+            raise KnowledgeIngestionProjectScopeError(
+                f"项目 {project_id!r} 的知识 scope 解析失败"
+                f"（不会回退到其他项目 / global / legacy）: {exc}"
+            ) from exc
+        # 只取 namespace；includes_global / includes_legacy 是检索策略，
+        # 不写入 metadata（任务书 §四）
+        return scope.namespace
+
+    @staticmethod
+    def _build_document_metadata(
+        metadata: dict | None,
+        namespace: str | None,
+        source_type: str | None,
+    ) -> dict:
+        """合并文档 metadata（Phase 3.8.5，任务书 §五 / §八）。
+
+        规则：
+
+        - ``metadata=None`` → 空 dict 起步；非 dict → clear error
+          （现有数据契约：此前调用方根本没有 metadata 入参）；
+        - 调用方 metadata 中的 ``project_id`` 一律**先剥离**——
+          该键只能来自服务器端 Provider 解析，调用方无法注入归属；
+        - ``namespace`` 非 None → 强制写 ``project_id=namespace``
+          （覆盖一切调用方值）；None → 不写该键（legacy 旧行为，
+          绝不伪装成 __global__ / vietnam-wms）；
+        - ``source_type`` 保持既有行为（parser 权威）。
+        """
+        if metadata is None:
+            meta: dict = {}
+        elif isinstance(metadata, dict):
+            meta = dict(metadata)
+        else:
+            raise KnowledgeIngestionError(
+                "metadata 必须是 dict 或 None"
+                f"（当前: {type(metadata).__name__}）"
+            )
+        # project_id 只能来自服务器端 Provider；调用方传入的一律剥离
+        meta.pop("project_id", None)
+        if namespace is not None:
+            meta["project_id"] = namespace
+        meta["source_type"] = source_type
+        return meta
+
+    # ---------- 主流程 ----------
+
+    async def ingest_one(
+        self,
+        file_path: str | Path,
+        *,
+        project_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> IngestionResult:
+        """导入单个知识文档（TXT / Markdown）。
+
+        流程：输入校验 → scope 解析（Phase 3.8.5）→ parse → 空检查 →
+        content_hash（namespace 参与，Phase 3.8.5）→ 重复检测（跳过
+        Embedding）→ chunk → embed（逐个，维度校验）→ 单事务写库 → commit。
+
+        Args:
+            file_path: 文档路径（.md / .txt）。
+            project_id: Phase 3.8.5 —— 服务端调用上下文的项目 ID。
+                有值时通过注入的 ``ProjectKnowledgeProvider`` 解析
+                namespace，并**强制**写入 ``meta_data.project_id``
+                （调用方 metadata 中的同名键被剥离 / 覆盖）；
+                ``None`` = 旧调用形态（旧行为完全不变：meta_data 不含
+                project_id，属于 legacy，仅 vietnam-wms 可检索）。
+            metadata: Phase 3.8.5 —— 调用方业务元数据（可选）；与
+                ``source_type`` 合并；其中 ``project_id`` 一律被服务器端
+                解析结果覆盖（不可注入归属）。
+
+        Raises:
+            KnowledgeIngestionProjectScopeError: project_id 的知识 scope
+                未注册 / 非法（不 fallback 到其他项目）。
             UnsupportedDocumentTypeError: 扩展名不受支持（.pdf / .docx 等）。
             DocumentNotFoundError: 文件不存在。
             DocumentParseError: 编码 / IO 等解析错误。
@@ -263,6 +415,11 @@ class KnowledgeIngestionService:
         started = time.perf_counter()
         path = Path(file_path)
         file_name = path.name
+
+        # ---- 0. Phase 3.8.5：输入校验 + 项目 scope 解析（未触碰 DB） ----
+        # metadata 类型校验（clear error，早失败）
+        self._build_document_metadata(metadata, None, None)
+        namespace = self._resolve_knowledge_namespace(project_id)
 
         # ---- 1. Parser（异常在此抛出，未触碰 DB） ----
         from backend.app.rag.parsers.factory import get_parser
@@ -276,8 +433,9 @@ class KnowledgeIngestionService:
                 f"文档内容为空或纯空白，已拒绝导入: {file_name}"
             )
 
-        # ---- 3. content_hash（SHA-256，用于重复检测） ----
-        content_hash = _sha256_hex(document_text)
+        # ---- 3. content_hash（Phase 3.8.5：namespace 参与文档身份，
+        #      实现同内容跨项目共存 + 项目内去重） ----
+        content_hash = _document_content_hash(document_text, namespace)
 
         # ---- 4. 重复检测（在 Embedding 之前，避免重复调用 API） ----
         existing = self._find_existing_document(content_hash)
@@ -337,7 +495,11 @@ class KnowledgeIngestionService:
                     source="local",
                     content_hash=content_hash,
                     status="ready",
-                    meta_data={"source_type": parser.file_type},
+                    # Phase 3.8.5：project_id 由服务器端 Provider 结果
+                    # 强制写入（调用方 metadata 中的同名键已被剥离/覆盖）
+                    meta_data=self._build_document_metadata(
+                        metadata, namespace, parser.file_type
+                    ),
                 )
                 session.add(doc)
                 session.flush()
@@ -368,6 +530,7 @@ class KnowledgeIngestionService:
                 "chunk_count": len(chunks),
                 "embedding_count": len(vectors),
                 "status": "ready",
+                "knowledge_namespace": namespace,
                 "elapsed_ms": elapsed_ms,
             },
         )
@@ -432,10 +595,12 @@ class KnowledgeIngestionService:
                 f"文档内容为空或纯空白，已拒绝更新: {file_name}"
             )
 
-        new_hash = _sha256_hex(new_text)
         factory = self._get_session_factory()
 
         # ---- Phase A: 加载旧文档 + 对比 content_hash ----
+        # Phase 3.8.5：hash 以文档自身的 meta_data.project_id（归属）
+        # 计算——与创建时一致，保证 unchanged 检测不回归；文档归属
+        # 在 update 过程中保持不变（meta_data 不被触碰）。
         old_chunk_count = 0
         old_hash: str | None = None
         with factory() as session:
@@ -446,6 +611,14 @@ class KnowledgeIngestionService:
                 )
             old_hash = existing.content_hash
             old_chunk_count = len(existing.chunks)
+            existing_meta = existing.meta_data
+            existing_namespace = (
+                existing_meta.get("project_id")
+                if isinstance(existing_meta, dict)
+                else None
+            )
+
+        new_hash = _document_content_hash(new_text, existing_namespace)
 
         if old_hash == new_hash:
             elapsed_ms = (time.perf_counter() - started) * 1000
