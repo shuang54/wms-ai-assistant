@@ -136,11 +136,20 @@ class TestProjectRegistrationValidation:
         """ProjectRegistration / ProjectContext 不含敏感字段（任务书 §五）。"""
         r = _make_registration()
         # dataclass 字段白名单（拒绝未来意外加入 password/url 等字段）
-        assert {f.name for f in dataclasses.fields(r)} == {"context", "schema_name"}
+        # Phase 3.8.2：新增 capabilities（能力配置，非敏感）
+        assert {f.name for f in dataclasses.fields(r)} == {
+            "context", "schema_name", "capabilities"
+        }
         ctx_fields = {f.name for f in dataclasses.fields(r.context)}
         assert ctx_fields == {"project_id", "project_name", "description", "data_source"}
         ds_fields = {f.name for f in dataclasses.fields(r.context.data_source)}
         assert ds_fields == {"name", "type"}
+        cap_fields = {
+            f.name for f in dataclasses.fields(r.capabilities)
+        }
+        assert cap_fields == {
+            "tool_names", "knowledge_enabled", "text_to_sql_enabled"
+        }
 
     def test_project_context_validation_still_enforced(self) -> None:
         """嵌套 ProjectContext 校验仍然生效（empty project_id → ProjectContextError）。"""

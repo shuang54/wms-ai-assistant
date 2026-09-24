@@ -364,6 +364,8 @@ class AIRouterService:
         llm_client: LLMClient | None = None,
         tool_capabilities: ToolCapabilityRegistry | None = None,
         llm_fallback_enabled: bool | None = None,
+        knowledge_enabled: bool = True,
+        text_to_sql_enabled: bool = True,
         system_prompt: str | None = None,
         user_prompt_template: str | None = None,
     ) -> None:
@@ -372,16 +374,49 @@ class AIRouterService:
         Args:
             llm_client:           LLM 客户端（fallback 使用）。
             tool_capabilities:    Tool 能力元数据；None 时为空。
+                                  **调用方负责注入"当前项目允许的"
+                                  Tool 元数据**（Phase 3.8.2 §七：
+                                  Router 只能看到项目可用 Tool，
+                                  过滤发生在 Tool Registry 组装层）。
             llm_fallback_enabled: 是否启用 LLM fallback。
                                   None 时使用 settings.ai_router.llm_fallback_enabled。
+            knowledge_enabled:    Phase 3.8.2 —— 该路由上下文是否允许 RAG。
+                                  False 时知识规则不再选择 RAG
+                                  （但保守兜底仍可能落到 RAG 决策，
+                                  由上层编排服务做最终硬校验）。
+                                  默认 True（旧行为不变）。
+            text_to_sql_enabled:  Phase 3.8.2 —— 是否允许 Text-to-SQL。
+                                  False 时分析类规则跳过 TEXT_TO_SQL，
+                                  落到后续知识 / 兜底规则。
+                                  默认 True（旧行为不变）。
             system_prompt:        覆盖默认 system prompt（测试用）。
             user_prompt_template: 覆盖默认 user prompt 模板（测试用）。
+
+        设计（任务书 §十 / §十一）：
+
+            Router 是**分类器，不是安全边界**：
+            - 它根据能力开关避免"选中已禁用的能力"（干净路由）；
+            - 最终拦截始终由上层编排服务的 capability 硬校验完成 ——
+              即使 LLM fallback 返回了被禁用的 route，也会在执行前
+              被拒绝。
         """
         self._llm = llm_client
         self._tools = tool_capabilities
         if llm_fallback_enabled is None:
             llm_fallback_enabled = settings.ai_router.llm_fallback_enabled
         self._llm_fallback_enabled = bool(llm_fallback_enabled)
+        if not isinstance(knowledge_enabled, bool):
+            raise AIRouterInputError(
+                "knowledge_enabled 必须是 bool"
+                f"（当前: {type(knowledge_enabled).__name__}）"
+            )
+        if not isinstance(text_to_sql_enabled, bool):
+            raise AIRouterInputError(
+                "text_to_sql_enabled 必须是 bool"
+                f"（当前: {type(text_to_sql_enabled).__name__}）"
+            )
+        self._knowledge_enabled = knowledge_enabled
+        self._text_to_sql_enabled = text_to_sql_enabled
         self._system_prompt = (
             system_prompt
             if system_prompt is not None
@@ -432,13 +467,17 @@ class AIRouterService:
             raise AIRouterInputError("question 不能为空或纯空白")
 
         # ---- 1) Rule-first: TOOL capability 匹配（最具体） ----
+        # Phase 3.8.2：tool_capabilities 由调用方按项目过滤注入，
+        # Router 无需（也不会）看到项目不允许的 Tool。
         tool_decision = _match_tool(normalized, self._get_capabilities())
         if tool_decision is not None:
             return tool_decision
 
         # ---- 2) Rule-first: 数据分析特征（优先级高于知识，避免"是什么"
         #        这类宽泛词误吞"库存最多是什么"等分析问句） ----
-        if _looks_like_analytics(normalized):
+        # Phase 3.8.2：text_to_sql_enabled=False 时跳过本规则，
+        # 让问题落到后续知识 / 兜底规则（不选中已禁用的能力）。
+        if self._text_to_sql_enabled and _looks_like_analytics(normalized):
             return RouteDecision(
                 route=RouteType.TEXT_TO_SQL,
                 confidence=0.9,
@@ -447,7 +486,8 @@ class AIRouterService:
             )
 
         # ---- 3) Rule-first: 知识 / 流程特征 ----
-        if _looks_like_knowledge(normalized):
+        # Phase 3.8.2：knowledge_enabled=False 时跳过本规则。
+        if self._knowledge_enabled and _looks_like_knowledge(normalized):
             return RouteDecision(
                 route=RouteType.RAG,
                 confidence=0.9,
@@ -519,6 +559,17 @@ class AIRouterService:
         if route_value not in valid_routes:
             raise AIRouterClassificationError(
                 f"LLM 输出未知 route: {route_value!r}"
+            )
+        # Phase 3.8.2：LLM 选中已被能力开关禁用的 route → 分类失败
+        # （落入保守兜底；最终拦截仍由上层编排服务硬校验保证）
+        if (
+            route_value == RouteType.RAG.value and not self._knowledge_enabled
+        ) or (
+            route_value == RouteType.TEXT_TO_SQL.value
+            and not self._text_to_sql_enabled
+        ):
+            raise AIRouterClassificationError(
+                f"LLM 输出已被禁用的 route: {route_value!r}"
             )
 
         # 安全：reason 长度截断，避免异常 payload 把大字符串塞进来

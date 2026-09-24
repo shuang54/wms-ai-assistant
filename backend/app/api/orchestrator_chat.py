@@ -53,6 +53,7 @@ from backend.app.projects.registry import ProjectNotFoundError
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http  # noqa: E501
 from backend.app.services.ai_orchestrator_service import (
     AIOrchestrationResult,
+    AIOrchestratorCapabilityError,
     AIOrchestratorError,
     AIOrchestratorExecutionError,
     AIOrchestratorInputError,
@@ -336,6 +337,7 @@ def _to_chat_response(result: AIOrchestrationResult) -> ChatResponse:
     response_model=ChatResponse,
     responses={
         400: {"description": "请求参数非法（question 等）"},
+        403: {"description": "项目能力未启用（Phase 3.8.2 capability denied）"},
         404: {"description": "project_id 未注册（Phase 3.8.1）"},
         422: {"description": "请求体校验失败（Pydantic）"},
         500: {"description": "AI 服务内部错误"},
@@ -395,6 +397,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"项目未注册: {exc}",
+        )
+    except AIOrchestratorCapabilityError as exc:
+        # Phase 3.8.2：项目能力未启用（服务器端 ProjectRegistry 决定，
+        # 用户无法通过 HTTP 参数开启；Orchestrator 在任何下游调用前拦截）
+        logger.warning(
+            "project capability denied",
+            extra={
+                "project_id": request.project_id,
+                "capability": exc.capability,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"项目能力未启用: {exc}",
         )
     except AIOrchestratorInputError as exc:
         # 服务层兜底（Pydantic 已覆盖大部分）

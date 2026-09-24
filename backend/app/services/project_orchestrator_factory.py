@@ -30,9 +30,10 @@
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
+from typing import Any
 
+from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.engine_provider import (
     DatabaseEngineProvider,
     DatabaseEngineProviderError,
@@ -56,7 +57,9 @@ from backend.app.services.sql_executor_service import SQLExecutorService
 from backend.app.tools.get_inventory import (
     GetInventoryHandler,
     build_default_tool_registry,
+    register_get_inventory_tool,
 )
+from backend.app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +98,6 @@ def build_orchestrator_for_project(
         AIOrchestratorUnavailableError: 数据源不可用（连接未注册 /
                                    DATABASE_URL 为空等，API 层映射 503）。
     """
-    from backend.app.config import settings
-
     resolved_registry = (
         registry if registry is not None else get_default_project_registry()
     )
@@ -110,6 +111,7 @@ def build_orchestrator_for_project(
     registration = resolved_registry.get(project_id)
     context = registration.context
     schema_name = registration.schema_name
+    capabilities = registration.capabilities
 
     # ---- 2) DataSource → 受控 Engine（同一 Engine 贯穿全链路） ----
     try:
@@ -127,16 +129,14 @@ def build_orchestrator_for_project(
         schema_name=schema_name,
     )
     executor = SQLExecutorService(engine=engine)
-    # get_inventory：schema 跟随项目注册条目（table 名等其余配置沿用全局）
-    inv_settings = dataclasses.replace(
-        settings.inventory_tool, schema_name=schema_name
-    )
-    tool_registry = build_default_tool_registry(
-        handler=GetInventoryHandler(
-            engine=engine,
-            inv_settings=inv_settings,
-            project_id=project_id,
-        )
+    # Phase 3.8.2：Tool Registry 只注册该项目允许的 Tool
+    # （Router 的 capability 元数据来自该 Registry → Router 天然
+    #  看不到被禁用的 Tool；任务书 §七）
+    tool_registry = _build_project_tool_registry(
+        capabilities,
+        engine=engine,
+        schema_name=schema_name,
+        project_id=project_id,
     )
 
     # ---- 4) base 依赖解析（RAG / T2S / Selector / Composer 复用） ----
@@ -149,27 +149,86 @@ def build_orchestrator_for_project(
             "project_id": project_id,
             "schema_name": schema_name,
             "data_source_name": context.data_source.name,
+            "tools": list(capabilities.tool_names),
+            "knowledge_enabled": capabilities.knowledge_enabled,
+            "text_to_sql_enabled": capabilities.text_to_sql_enabled,
         },
     )
 
     return AIOrchestratorService(
         # Router 新实例：capability 元数据来自 per-project Tool Registry
-        # （路由规则零改动；不共享 base router，避免 Tool 元数据指向
-        #  错误数据源的 handler）
+        # （只有该项目允许的 Tool）；路由规则本身不变。
+        # Phase 3.8.2：knowledge / text_to_sql 开关同步注入，
+        # 被禁用的能力不会被规则选中（任务书 §十）。
         router=AIRouterService(
             tool_capabilities=ToolRegistryCapabilityAdapter(tool_registry),
+            knowledge_enabled=capabilities.knowledge_enabled,
+            text_to_sql_enabled=capabilities.text_to_sql_enabled,
         ),
-        # RAG：知识库全局共享，不按项目拆分（任务书 §十三）
+        # RAG：知识库全局共享，不按项目拆分（任务书 §十三）；
+        # knowledge_enabled=False 时 Orchestrator 硬校验在调用前拦截
         rag_service=base._rag,  # type: ignore[attr-defined]
         tool_registry=tool_registry,
-        # Text-to-SQL Generator：纯 LLM + Validator，无 Engine 依赖，复用 base
+        # Text-to-SQL Generator：纯 LLM + Validator，无 Engine 依赖，复用 base；
+        # text_to_sql_enabled=False 时 Orchestrator 在任何 DB 访问前拦截
         text_to_sql=base._text_to_sql,  # type: ignore[attr-defined]
         # Executor：绑定该项目 Engine（任务书 §十一：不能 Schema B + Executor A）
         sql_executor=executor,
         table_selector=base._table_selector,  # type: ignore[attr-defined]
         context_composer=base._context_composer,  # type: ignore[attr-defined]
         project_context_provider=project_provider,
+        # Phase 3.8.2：执行前硬校验（Router 是分类器，不是安全边界）
+        capabilities=capabilities,
     )
+
+
+# ============================================================
+# Phase 3.8.2：按项目能力过滤 Tool Registry
+# ============================================================
+
+def _build_project_tool_registry(
+    capabilities: ProjectCapabilities,
+    *,
+    engine: Any,
+    schema_name: str,
+    project_id: str,
+) -> ToolRegistry:
+    """构造只包含该项目允许 Tool 的 ToolRegistry（§六 / §七）。
+
+    复用现有 ToolRegistry（不创建第二套注册中心）：全局 Tool 构建器
+    映射 → 按 capabilities.tool_names 白名单注册。
+
+    - 白名单为空 → 空 Registry（该项目无任何 Tool）；
+    - 白名单含未知 Tool 名（全局不存在）→ 记 warning 并跳过
+      （能力配置是静态服务器端注册，运行期不中断其它能力）。
+    """
+    import dataclasses as _dc
+
+    from backend.app.config import settings
+
+    registry = ToolRegistry()
+
+    if capabilities.allows_tool("get_inventory"):
+        inv_settings = _dc.replace(
+            settings.inventory_tool, schema_name=schema_name
+        )
+        register_get_inventory_tool(
+            registry,
+            handler=GetInventoryHandler(
+                engine=engine,
+                inv_settings=inv_settings,
+                project_id=project_id,
+            ),
+        )
+
+    known_tools = {"get_inventory"}
+    unknown = [n for n in capabilities.tool_names if n not in known_tools]
+    if unknown:
+        logger.warning(
+            "project capabilities reference unknown tools; skipped",
+            extra={"project_id": project_id, "unknown_tools": unknown},
+        )
+    return registry
 
 
 def _build_default_base() -> AIOrchestratorService:

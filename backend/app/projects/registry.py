@@ -7,8 +7,10 @@
     ProjectRegistry.get(project_id)
         ↓
     ProjectRegistration
-        ├── context     ProjectContext（非敏感 metadata，含 DataSource 身份）
-        └── schema_name 该项目业务数据所在的数据库 schema
+        ├── context      ProjectContext（非敏感 metadata，含 DataSource 身份）
+        ├── schema_name  该项目业务数据所在的数据库 schema
+        └── capabilities 该项目允许的业务能力（Phase 3.8.2：
+                         tool_names / knowledge_enabled / text_to_sql_enabled）
 
 设计约束：
 
@@ -34,6 +36,11 @@ import threading
 from dataclasses import dataclass
 from typing import Final, Protocol
 
+from backend.app.projects.capabilities import (
+    DEFAULT_PROJECT_CAPABILITIES,
+    ProjectCapabilities,
+    ProjectCapabilityError,
+)
 from backend.app.projects.context import get_default_project_context
 from backend.app.projects.models import ProjectContext
 
@@ -90,15 +97,20 @@ class ProjectRegistration:
     """项目注册条目（非敏感）。
 
     Attributes:
-        context:     项目上下文（含 DataSource 身份描述，
-                     Engine 由 DatabaseEngineProvider 解析）。
-        schema_name: 该项目业务数据所在的数据库 schema
-                     （如 "public" / "project_a"）。
-                     **不包含**任何连接凭据。
+        context:      项目上下文（含 DataSource 身份描述，
+                      Engine 由 DatabaseEngineProvider 解析）。
+        schema_name:  该项目业务数据所在的数据库 schema
+                      （如 "public" / "project_a"）。
+                      **不包含**任何连接凭据。
+        capabilities: 该项目允许的业务能力（Phase 3.8.2）。
+                      默认值 ``DEFAULT_PROJECT_CAPABILITIES`` 等价于
+                      Phase 3.8.1 行为（get_inventory + Knowledge +
+                      Text-to-SQL 全开），保证既有构造调用零改动。
     """
 
     context: ProjectContext
     schema_name: str
+    capabilities: ProjectCapabilities = DEFAULT_PROJECT_CAPABILITIES
 
     def __post_init__(self) -> None:
         if not isinstance(self.context, ProjectContext):
@@ -113,6 +125,11 @@ class ProjectRegistration:
         if not _SCHEMA_NAME_RE.match(self.schema_name):
             raise ProjectRegistryError(
                 f"schema_name {self.schema_name!r} 不是合法的 PostgreSQL 标识符，已拒绝"
+            )
+        if not isinstance(self.capabilities, ProjectCapabilities):
+            raise ProjectRegistryError(
+                "capabilities 必须是 ProjectCapabilities 实例"
+                f"（当前: {type(self.capabilities).__name__}）"
             )
 
 

@@ -38,6 +38,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.context import DataSource, ProjectContext
 from backend.app.projects.semantic import ProjectSemantic
 from backend.app.services.ai_router_service import (
@@ -80,6 +81,7 @@ __all__ = [
     "AIOrchestratorRouteError",
     "AIOrchestratorExecutionError",
     "AIOrchestratorUnavailableError",
+    "AIOrchestratorCapabilityError",
     "ProjectContextProvider",
     "DefaultProjectContextProvider",
     "get_default_orchestrator",
@@ -131,6 +133,30 @@ class AIOrchestratorExecutionError(AIOrchestratorError):
 
 class AIOrchestratorUnavailableError(AIOrchestratorError):
     """Project context 无法获取（DB 不可用 / 语义配置缺失等）。"""
+
+
+class AIOrchestratorCapabilityError(AIOrchestratorError):
+    """项目能力被禁用（Phase 3.8.2）。
+
+    Router 只是分类器，**不能作为安全边界**；Orchestrator 在执行任何
+    下游能力（RagService / ToolRegistry / Schema Explorer / TextToSQL /
+    SQLExecutor）**之前**做硬校验：
+
+        - knowledge_enabled=False   → RAG 拒绝（RagService 0 次调用）
+        - tool_names 不含该 Tool    → TOOL 拒绝（Handler 0 次调用）
+        - text_to_sql_enabled=False → T2S 拒绝（**不访问数据库**：
+                                      Schema Explorer / Generator /
+                                      Executor 均 0 次调用）
+
+    Attributes:
+        capability: 被禁用的能力名（"knowledge" / "text_to_sql" / tool 名）。
+        project_id: 项目 ID（日志 / 测试断言用）。
+    """
+
+    def __init__(self, message: str, *, capability: str, project_id: str | None) -> None:
+        super().__init__(message)
+        self.capability = capability
+        self.project_id = project_id
 
 
 # ============================================================
@@ -231,9 +257,17 @@ class AIOrchestratorService:
         table_selector: RelevantTableSelector | None = None,
         context_composer: DatabaseContextComposer | None = None,
         project_context_provider: ProjectContextProvider | None = None,
+        capabilities: ProjectCapabilities | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
     ) -> None:
-        """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。"""
+        """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。
+
+        Args:
+            capabilities: Phase 3.8.2 —— 该项目的能力配置（执行前硬校验）。
+                          ``None`` = 不限制（默认 Orchestrator / 旧行为）；
+                          工厂 ``build_orchestrator_for_project`` 总是传入
+                          项目注册条目中的 capabilities。
+        """
         self._router = router if router is not None else AIRouterService()
         # Phase 3.7.13：rag_service 缺省改为真实 RagService（懒加载默认实例），
         # 修复 Phase 3.7.11 留下的"RAG 路径不可达"接线 bug。
@@ -267,6 +301,15 @@ class AIOrchestratorService:
             if project_context_provider is not None
             else DefaultProjectContextProvider()
         )
+        # Phase 3.8.2：None = 不限制（默认 Orchestrator 旧行为）
+        if capabilities is not None and not isinstance(
+            capabilities, ProjectCapabilities
+        ):
+            raise AIOrchestratorInputError(
+                "capabilities 必须是 ProjectCapabilities 实例或 None"
+                f"（当前: {type(capabilities).__name__}）"
+            )
+        self._capabilities = capabilities
         if isinstance(max_rows, bool) or not isinstance(max_rows, int):
             raise AIOrchestratorInputError(
                 f"max_rows 必须是整数（当前: {type(max_rows).__name__}）"
@@ -324,11 +367,53 @@ class AIOrchestratorService:
             f"未知 route: {decision.route!r}"
         )
 
+    # ---------- Phase 3.8.2：能力硬校验（Router 是分类器，不是安全边界） ----------
+
+    def _check_capability(self, capability: str) -> None:
+        """执行前硬校验；被禁用 → AIOrchestratorCapabilityError。
+
+        Args:
+            capability: "knowledge" / "text_to_sql" / Tool 名称。
+        """
+        if self._capabilities is None:
+            return  # 默认 Orchestrator：不限制（旧行为）
+        if capability == "knowledge" and not self._capabilities.knowledge_enabled:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用知识库（RAG）能力",
+                capability=capability,
+                project_id=self._capability_project_id(),
+            )
+        if capability == "text_to_sql" and not (
+            self._capabilities.text_to_sql_enabled
+        ):
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Text-to-SQL 能力",
+                capability=capability,
+                project_id=self._capability_project_id(),
+            )
+        if (
+            capability not in ("knowledge", "text_to_sql")
+            and not self._capabilities.allows_tool(capability)
+        ):
+            raise AIOrchestratorCapabilityError(
+                f"Tool {capability!r} 未在该项目启用",
+                capability=capability,
+                project_id=self._capability_project_id(),
+            )
+
+    def _capability_project_id(self) -> str | None:
+        """能力校验错误中携带的 project_id（尽力而为，不触发解析）。"""
+        provider = self._project_provider
+        context = getattr(provider, "_project_context", None)
+        return getattr(context, "project_id", None)
+
     # ---------- RAG 路径 ----------
 
     async def _run_rag(
         self, decision: RouteDecision, question: str
     ) -> AIOrchestrationResult:
+        # Phase 3.8.2：能力硬校验（RagService 0 次调用）
+        self._check_capability("knowledge")
         if self._rag is None:
             raise AIOrchestratorExecutionError("RAG service 未配置")
         try:
@@ -362,6 +447,10 @@ class AIOrchestratorService:
             raise AIOrchestratorRouteError(
                 "TOOL 路由未命中任何已注册 Tool"
             )
+        # Phase 3.8.2：能力硬校验（Handler 0 次调用）。
+        # 正常情况下 Router 已看不到被禁用的 Tool（工厂过滤了
+        # capability 元数据），此处是纵深防御的第二层。
+        self._check_capability(tool_name)
 
         # ---- Phase 3.7.12 最小兼容性 layer ----
         # 历史行为：_run_tool 向 registry.execute() 传入 arguments=None，
@@ -411,6 +500,10 @@ class AIOrchestratorService:
     async def _run_text_to_sql(
         self, decision: RouteDecision, question: str
     ) -> AIOrchestrationResult:
+        # Phase 3.8.2：能力硬校验 —— 在解析 ProjectContext / inspect
+        # Schema / 生成 / 执行 SQL **之前**拦截（0 次数据库访问）。
+        self._check_capability("text_to_sql")
+
         # a) Project context（Phase 3.8.1 修复：to_thread 包裹）
         #    历史 bug：直接在事件循环内同步调用 resolve()，而
         #    DefaultProjectContextProvider.resolve 内部用 asyncio.run
