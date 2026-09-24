@@ -56,6 +56,7 @@ from typing import Final
 
 from backend.app.config import settings
 from backend.app.llm.client import LLMClient, get_default_llm_client
+from backend.app.projects.knowledge_provider import ProjectKnowledgeScope
 from backend.app.reranker.client import (
     RerankerClient,
     get_default_reranker_client,
@@ -241,11 +242,14 @@ class RagService:
         query: str,
         *,
         top_k: int | None = None,
+        knowledge_scope: ProjectKnowledgeScope | None = None,
     ) -> RagResponse:
         """对 query 执行 RAG，返回 RagResponse。
 
         Pipeline:
-            1. Vector Search（top_k 默认 settings.rag.default_top_k）
+            1. Vector Search（top_k 默认 settings.rag.default_top_k；
+               knowledge_scope 非 None 时检索被显式限制在该项目
+               知识范围内，Phase 3.8.4）
             2. [Phase 3.7.14] Reranker（仅 enabled=true：candidate_k 召回 →
                重排序 → 截断至 top_k；默认 top_k 取 settings.reranker.top_k）
             3. 空结果 → 直接返回 canned answer（**不调 LLM / 不调 Reranker**）
@@ -259,6 +263,11 @@ class RagService:
             top_k:  **最终**纳入回答的片段数；
                     None 时：Reranker 关闭 → settings.rag.default_top_k；
                              Reranker 开启 → settings.reranker.top_k。
+            knowledge_scope: Phase 3.8.4 —— 项目知识检索范围（frozen DTO），
+                    由上层（Factory → Orchestrator）通过服务器端
+                    Provider 解析后传入；本 Service **不读取**
+                    ProjectRegistry（依赖倒置）。None = 旧行为
+                    （不带 scope 的全局检索，历史端点兼容）。
 
         Returns:
             RagResponse(answer, sources, used_chunks_count)。
@@ -285,6 +294,9 @@ class RagService:
             )
 
         # ---- 1. Vector Search（Reranker 开启时扩大召回窗口）----
+        # Phase 3.8.4：knowledge_scope 非 None 时显式传递（项目内检索）；
+        # None → 旧调用形态（兼容既有 Fake / Mock 的
+        # search(query, *, top_k) 签名与历史端点全局检索行为）。
         vector_search_service = self._get_vector_search_service()
         if reranker is not None:
             # 召回条数：max(top_k, candidate_top_k)（钳制到 [1, 50]，
@@ -293,9 +305,23 @@ class RagService:
                 top_k,
                 settings.reranker.candidate_top_k,
             )
-            results = await vector_search_service.search(query, top_k=candidate_k)
+            if knowledge_scope is None:
+                results = await vector_search_service.search(
+                    query, top_k=candidate_k
+                )
+            else:
+                results = await vector_search_service.search(
+                    query, top_k=candidate_k, knowledge_scope=knowledge_scope
+                )
         else:
-            results = await vector_search_service.search(query, top_k=top_k)
+            if knowledge_scope is None:
+                results = await vector_search_service.search(
+                    query, top_k=top_k
+                )
+            else:
+                results = await vector_search_service.search(
+                    query, top_k=top_k, knowledge_scope=knowledge_scope
+                )
 
         # ---- 2. 空检索 → 不调 Reranker、不调 LLM ----
         if not results:

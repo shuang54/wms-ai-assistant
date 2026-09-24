@@ -71,13 +71,17 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from sqlalchemy import Float, cast, select
+from sqlalchemy import Float, cast, or_, select
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.db.models import KnowledgeChunk
+from backend.app.db.models import KnowledgeChunk, KnowledgeDocument
 from backend.app.db.session import get_session_factory
 from backend.app.embedding.client import EmbeddingClient, get_default_embedding_client
+from backend.app.projects.knowledge_provider import (
+    GLOBAL_NAMESPACE,
+    ProjectKnowledgeScope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +226,45 @@ class VectorSearchService:
             )
         return top_k
 
+    # ---------- Project Knowledge Scope（Phase 3.8.4） ----------
+
+    @staticmethod
+    def _validate_knowledge_scope(
+        knowledge_scope: ProjectKnowledgeScope | None,
+    ) -> None:
+        """校验 scope 类型（None = 旧行为：不带 scope 的全局检索）。"""
+        if knowledge_scope is not None and not isinstance(
+            knowledge_scope, ProjectKnowledgeScope
+        ):
+            raise VectorSearchParameterError(
+                "knowledge_scope 必须是 ProjectKnowledgeScope 实例或 None"
+                f"（当前: {type(knowledge_scope).__name__}）"
+            )
+
+    @staticmethod
+    def _scope_filter(
+        scope: ProjectKnowledgeScope,
+    ):
+        """构造 scope 的显式 WHERE 条件（Phase 3.8.4，补充要求 §3）。
+
+        过滤语义（针对 knowledge_document.meta_data->>'project_id'）：
+
+        - 普通项目：``= scope.namespace OR = '__global__'``
+        - legacy 项目（vietnam-wms）：额外 ``IS NULL``（历史知识兼容）
+
+        **scope 存在时永不省略过滤**（global 也有显式命名空间，
+        绝不退化为全库检索）。
+        """
+        doc_project = KnowledgeDocument.meta_data["project_id"].astext
+        conditions = [doc_project == scope.namespace]
+        if scope.includes_global:
+            conditions.append(doc_project == GLOBAL_NAMESPACE)
+        if scope.includes_legacy:
+            # meta_data 为 NULL 或不含 project_id 键时 ->>'project_id'
+            # 均为 SQL NULL → 一次 IS NULL 即覆盖两种 legacy 形态
+            conditions.append(doc_project.is_(None))
+        return or_(*conditions)
+
     # ---------- 主流程 ----------
 
     async def search(
@@ -229,22 +272,31 @@ class VectorSearchService:
         query: str,
         *,
         top_k: int = DEFAULT_TOP_K,
+        knowledge_scope: ProjectKnowledgeScope | None = None,
     ) -> list[VectorSearchResult]:
         """对 query 执行向量检索，返回 top_k 个最相似的 KnowledgeChunk。
 
         Pipeline:
             1. 校验 query（空 / 纯空白 → VectorSearchInputError）
-            2. 校验 top_k（非法 → VectorSearchParameterError）
+            2. 校验 top_k / knowledge_scope（非法 → VectorSearchParameterError）
             3. 调用 EmbeddingClient.embed(query) → query_embedding
                （EmbeddingError 家族原样透传）
             4. 校验 query_embedding 维度 == settings.embedding.dimension
                （维度错 → EmbeddingDimensionError，不发起 DB 查询）
             5. SQL：SELECT ... FROM knowledge_chunk
+                [JOIN knowledge_document + scope 过滤（Phase 3.8.4）]
                 WHERE embedding IS NOT NULL
                 ORDER BY embedding <=> :query_embedding
                 LIMIT :top_k
             6. ORM 行 → VectorSearchResult DTO
             7. 返回 DTO 列表（按 distance 升序）
+
+        Args:
+            knowledge_scope: Phase 3.8.4 —— 项目知识检索范围。
+                None = 不带 scope 的旧行为（历史端点 /api/chat、
+                /api/rag/answer 全局检索，保持向后兼容）；
+                非 None = **显式过滤** knowledge_document.meta_data
+                的 project_id（绝不退化为全库检索）。
 
         Returns:
             命中结果列表（无命中 → []）。列表已按 cosine distance 升序，
@@ -252,7 +304,7 @@ class VectorSearchService:
 
         Raises:
             VectorSearchInputError:      query 为空 / 纯空白 / 非 str
-            VectorSearchParameterError:  top_k 非法
+            VectorSearchParameterError:  top_k 非法 / knowledge_scope 类型非法
             EmbeddingConfigurationError / EmbeddingInputError /
             EmbeddingAPIError / EmbeddingResponseError /
             EmbeddingDimensionError:     Embedding 阶段错误（**原样透传**）
@@ -263,6 +315,7 @@ class VectorSearchService:
         # ---- 1. 校验 ----
         query = self._validate_query(query)
         top_k = self._validate_top_k(top_k)
+        self._validate_knowledge_scope(knowledge_scope)
 
         # ---- 2. Embedding（异常原样透传）----
         embedding_client = self._get_embedding_client()
@@ -305,6 +358,14 @@ class VectorSearchService:
             .order_by(distance_expr)
             .limit(top_k)
         )
+        # Phase 3.8.4：显式 Project Knowledge Scope 过滤
+        # （scope 存在时 JOIN 文档表并强制 project_id 条件；
+        #  scope=None → 旧行为：不带过滤的全局检索）
+        if knowledge_scope is not None:
+            stmt = stmt.join(
+                KnowledgeDocument,
+                KnowledgeChunk.document_id == KnowledgeDocument.id,
+            ).where(self._scope_filter(knowledge_scope))
 
         factory = self._get_session_factory()
         with factory() as session:
@@ -336,6 +397,11 @@ class VectorSearchService:
                 "top_k": top_k,
                 "result_count": len(results),
                 "embedding_dimension": expected_dim,
+                "knowledge_scope": (
+                    knowledge_scope.namespace
+                    if knowledge_scope is not None
+                    else None
+                ),
                 "elapsed_ms": elapsed_ms,
             },
         )

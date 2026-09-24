@@ -225,7 +225,9 @@ class _FakeRag:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def answer(self, question: str):
+    async def answer(self, question: str, *, top_k=None, knowledge_scope=None):
+        # Phase 3.8.4：工厂默认为启用知识的项目解析 knowledge_scope；
+        # Fake 接受该参数以保证与真实 RagService 签名兼容。
         self.calls += 1
         return SimpleNamespace(
             answer="知识库回答", used_chunks_count=1, sources=()

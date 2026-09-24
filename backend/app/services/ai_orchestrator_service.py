@@ -40,6 +40,7 @@ from typing import Any, Protocol
 
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.context import DataSource, ProjectContext
+from backend.app.projects.knowledge_provider import ProjectKnowledgeScope
 from backend.app.projects.semantic import ProjectSemantic
 from backend.app.services.ai_router_service import (
     AIRouter,
@@ -289,6 +290,7 @@ class AIOrchestratorService:
         context_composer: DatabaseContextComposer | None = None,
         project_context_provider: ProjectContextProvider | None = None,
         capabilities: ProjectCapabilities | None = None,
+        knowledge_scope: ProjectKnowledgeScope | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
     ) -> None:
         """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。
@@ -298,6 +300,13 @@ class AIOrchestratorService:
                           ``None`` = 不限制（默认 Orchestrator / 旧行为）；
                           工厂 ``build_orchestrator_for_project`` 总是传入
                           项目注册条目中的 capabilities。
+            knowledge_scope: Phase 3.8.4 —— 该项目的知识检索范围
+                          （frozen DTO，由 Factory 通过服务器端
+                          ProjectKnowledgeProvider 解析后注入）。
+                          Orchestrator 只负责把它传递给 RAG，
+                          **不访问 Knowledge DB / 不读 Registry**。
+                          ``None`` = 旧行为（不带 scope 的全局 RAG，
+                          默认 Orchestrator / knowledge_enabled=False）。
         """
         self._router = router if router is not None else AIRouterService()
         # Phase 3.7.13：rag_service 缺省改为真实 RagService（懒加载默认实例），
@@ -341,6 +350,15 @@ class AIOrchestratorService:
                 f"（当前: {type(capabilities).__name__}）"
             )
         self._capabilities = capabilities
+        # Phase 3.8.4：项目知识 scope（frozen DTO；None = 旧行为）
+        if knowledge_scope is not None and not isinstance(
+            knowledge_scope, ProjectKnowledgeScope
+        ):
+            raise AIOrchestratorInputError(
+                "knowledge_scope 必须是 ProjectKnowledgeScope 实例或 None"
+                f"（当前: {type(knowledge_scope).__name__}）"
+            )
+        self._knowledge_scope = knowledge_scope
         if isinstance(max_rows, bool) or not isinstance(max_rows, int):
             raise AIOrchestratorInputError(
                 f"max_rows 必须是整数（当前: {type(max_rows).__name__}）"
@@ -448,7 +466,15 @@ class AIOrchestratorService:
         if self._rag is None:
             raise AIOrchestratorExecutionError("RAG service 未配置")
         try:
-            rag_response = await self._rag.answer(question)
+            # Phase 3.8.4：把项目知识 scope 传给 RAG（Orchestrator 只传递
+            # 上下文，不访问 Knowledge DB）。scope=None → 旧调用形态
+            # （兼容既有 Fake RagService 的 answer(query, *, top_k) 签名）。
+            if self._knowledge_scope is None:
+                rag_response = await self._rag.answer(question)
+            else:
+                rag_response = await self._rag.answer(
+                    question, knowledge_scope=self._knowledge_scope
+                )
         except Exception as exc:
             raise AIOrchestratorExecutionError(
                 f"RAG 执行失败: {type(exc).__name__}"
@@ -460,6 +486,12 @@ class AIOrchestratorService:
             metadata={
                 "decision_source": decision.source,
                 "route_reason": decision.reason,
+                # Phase 3.8.4：回显实际使用的知识 scope（非敏感，仅 namespace）
+                "knowledge_scope": (
+                    self._knowledge_scope.namespace
+                    if self._knowledge_scope is not None
+                    else None
+                ),
                 "rag_used_chunks": getattr(
                     rag_response, "used_chunks_count", None
                 ),

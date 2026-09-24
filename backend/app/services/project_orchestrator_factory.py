@@ -20,8 +20,9 @@
 
 - **不修改** Router 路由规则 / Orchestrator 核心执行逻辑 /
   SQL Validator 安全规则 / Tool Framework 业务能力；
-- **不修改** RAG：RAG 继续复用 base 的全局 RagService
-  （知识库不按项目拆分，任务书 §十三）；
+- **不修改** RAG 核心：RagService / Reranker / ContextBuilder /
+  Embedding 均复用 base 实例；Phase 3.8.4 仅通过 per-project
+  ``knowledge_scope`` 在 VectorSearch 调用点显式过滤（不重构 RAG）；
 - **不让 Orchestrator 创建数据库连接**：Engine 统一由
   DatabaseEngineProvider（服务器端注册表）解析；
 - 本模块位于 Service 层（API 层的静态 import 禁令
@@ -38,6 +39,12 @@ from backend.app.projects.engine_provider import (
     DatabaseEngineProvider,
     DatabaseEngineProviderError,
     get_default_engine_provider,
+)
+from backend.app.projects.knowledge_provider import (
+    ProjectKnowledgeProvider,
+    ProjectKnowledgeProviderError,
+    ProjectKnowledgeScope,
+    get_default_project_knowledge_provider,
 )
 from backend.app.projects.registry import (
     ProjectRegistry,
@@ -79,6 +86,7 @@ def build_orchestrator_for_project(
     registry: ProjectRegistry | None = None,
     engine_provider: DatabaseEngineProvider | None = None,
     semantic_provider: ProjectSemanticProvider | None = None,
+    knowledge_provider: ProjectKnowledgeProvider | None = None,
 ) -> AIOrchestratorService:
     """构造绑定到指定项目数据源的 Orchestrator（Phase 3.8.1）。
 
@@ -93,6 +101,13 @@ def build_orchestrator_for_project(
                             的服务器端解析器；None 时使用默认 Provider
                             （LoaderBacked，文件名 == project_id，
                             旧行为完全等价）。
+        knowledge_provider: Phase 3.8.4 —— project_id → KnowledgeScope
+                            的服务器端解析器；None 时使用默认 Provider
+                            （vietnam-wms legacy 兼容）。仅当该项目
+                            ``knowledge_enabled=True`` 时解析（禁用 RAG 的
+                            项目不触碰 KnowledgeProvider，任务书 §十三）；
+                            解析失败 → AIOrchestratorUnavailableError
+                            （API 层映射 503，绝不回退其他项目知识）。
 
     Returns:
         新的 ``AIOrchestratorService``：
@@ -100,13 +115,14 @@ def build_orchestrator_for_project(
           路由规则本身不变）；
         - RAG / T2S Generator / TableSelector / ContextComposer：复用 base；
         - ProjectContextProvider（含 **per-project Semantic**，
-          Phase 3.8.3）/ SchemaExplorer / SQLExecutor / Tool Registry：
-          绑定该项目。
+          Phase 3.8.3）/ SchemaExplorer / SQLExecutor / Tool Registry /
+          **KnowledgeScope**（Phase 3.8.4）：绑定该项目。
 
     Raises:
         ProjectNotFoundError:      project_id 未注册（API 层映射 404）。
-        AIOrchestratorUnavailableError: 数据源不可用（连接未注册 /
-                                   DATABASE_URL 为空等，API 层映射 503）。
+        AIOrchestratorUnavailableError: 数据源 / 知识 scope 不可用
+                                   （连接未注册 / DATABASE_URL 为空 /
+                                   知识 scope 未注册等，API 层映射 503）。
     """
     resolved_registry = (
         registry if registry is not None else get_default_project_registry()
@@ -156,6 +172,24 @@ def build_orchestrator_for_project(
         project_id=project_id,
     )
 
+    # ---- 3.5) Phase 3.8.4：Project Knowledge Scope ----
+    # 仅 knowledge_enabled=True 时解析（禁用 RAG 的项目不触碰
+    # KnowledgeProvider / VectorSearch / RagService，任务书 §十三）；
+    # 显式 Provider 下未注册 → clear error → 503（绝不回退其他项目）。
+    knowledge_scope: ProjectKnowledgeScope | None = None
+    if capabilities.knowledge_enabled:
+        resolved_knowledge_provider = (
+            knowledge_provider
+            if knowledge_provider is not None
+            else get_default_project_knowledge_provider()
+        )
+        try:
+            knowledge_scope = resolved_knowledge_provider.get_scope(project_id)
+        except ProjectKnowledgeProviderError as exc:
+            raise AIOrchestratorUnavailableError(
+                f"项目 {project_id!r} 的知识库上下文不可用: {exc}"
+            ) from exc
+
     # ---- 4) base 依赖解析（RAG / T2S / Selector / Composer 复用） ----
     if base is None:
         base = _build_default_base()
@@ -169,6 +203,11 @@ def build_orchestrator_for_project(
             "tools": list(capabilities.tool_names),
             "knowledge_enabled": capabilities.knowledge_enabled,
             "text_to_sql_enabled": capabilities.text_to_sql_enabled,
+            "knowledge_namespace": (
+                knowledge_scope.namespace
+                if knowledge_scope is not None
+                else None
+            ),
         },
     )
 
@@ -182,7 +221,9 @@ def build_orchestrator_for_project(
             knowledge_enabled=capabilities.knowledge_enabled,
             text_to_sql_enabled=capabilities.text_to_sql_enabled,
         ),
-        # RAG：知识库全局共享，不按项目拆分（任务书 §十三）；
+        # RAG：RagService 实例复用 base（无状态，可共享），
+        # 但检索范围由 Phase 3.8.4 的 per-project knowledge_scope
+        # 在调用点限定（VectorSearch 显式过滤，绝不跨项目检索）；
         # knowledge_enabled=False 时 Orchestrator 硬校验在调用前拦截
         rag_service=base._rag,  # type: ignore[attr-defined]
         tool_registry=tool_registry,
@@ -196,6 +237,9 @@ def build_orchestrator_for_project(
         project_context_provider=project_provider,
         # Phase 3.8.2：执行前硬校验（Router 是分类器，不是安全边界）
         capabilities=capabilities,
+        # Phase 3.8.4：项目知识检索范围（服务器端 Provider 解析；
+        # knowledge_enabled=False 时为 None，且 RAG 不可达）
+        knowledge_scope=knowledge_scope,
     )
 
 
