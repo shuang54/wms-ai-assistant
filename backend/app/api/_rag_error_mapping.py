@@ -33,6 +33,12 @@ from backend.app.llm.client import (
     LLMRequestError,
     LLMResponseError,
 )
+from backend.app.reranker.exceptions import (
+    RerankerConfigurationError,
+    RerankerError,
+    RerankerInputError,
+    RerankerModelError,
+)
 from backend.app.services.rag_service import RagError
 from backend.app.services.vector_search_service import (
     VectorSearchError,
@@ -110,6 +116,42 @@ def rag_pipeline_error_to_http(exc: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"向量检索失败: {exc}",
+        )
+    # ---- Reranker（Phase 3.7.14：RAG 链路新增阶段）----
+    # 子类必须先于基类 RerankerError 判断（except 顺序敏感）
+    if isinstance(exc, RerankerConfigurationError):
+        logger.warning(
+            "Reranker config error: %s",
+            exc,
+            extra={"error_type": "RerankerConfigurationError"},
+        )
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Reranker 配置错误: {exc}",
+        )
+    if isinstance(exc, RerankerModelError):
+        logger.warning(
+            "Reranker model error: %s",
+            exc,
+            extra={"error_type": "RerankerModelError"},
+        )
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Reranker 推理失败: {exc}",
+        )
+    if isinstance(exc, RerankerInputError):
+        # Reranker 输入非法属于 RAG 内部数据不一致（query 已由 Vector Search
+        # 校验非空；content 来自 DB 非空 chunk），映射 500 而非 400
+        logger.exception("Reranker input error")
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reranker 输入异常: {exc}",
+        )
+    if isinstance(exc, RerankerError):
+        logger.exception("Reranker unknown error")
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reranker 调用异常: {exc}",
         )
     if isinstance(exc, LLMConfigError):
         logger.warning(

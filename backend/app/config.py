@@ -191,25 +191,45 @@ class RagSettings:
 
 
 # ============================================================
-# Reranker 配置（Phase 3.5.12，离线实验）
+# Reranker 配置（Phase 3.5.12 离线实验；Phase 3.7.14 正式接入 RAG）
 # ============================================================
+
+# Reranker top_k 允许区间（与 VectorSearchService.MAX_TOP_K=50 对齐，
+# 防止误配导致无限资源消耗）
+RERANKER_TOP_K_MIN = 1
+RERANKER_TOP_K_MAX = 50
+
 
 @dataclass(frozen=True)
 class RerankerSettings:
-    """Cross-Encoder Reranker 配置（Phase 3.5.12 引入）。
+    """Cross-Encoder Reranker 配置（Phase 3.5.12 引入，Phase 3.7.14 接入 RAG）。
 
-    **仅用于离线实验**（tests/test_reranker_real.py +
-    RerankerEvaluationService），**未接入生产 RAG**：
-    RagService / ChatService / VectorSearchService / API 均不读取本配置。
+    Phase 3.7.14 起，``enabled=true`` 时 RagService 在 Vector Search 之后、
+    ContextBuilder 之前对候选片段重排序：
+
+        Vector Search（candidate_top_k 条）
+                ↓
+        Reranker（重排序）
+                ↓
+        截断至 top_k 条
+                ↓
+        ContextBuilder
 
     字段：
-        enabled:    总开关，默认 False（生产默认关闭）。
-        model:      HuggingFace 模型名，默认 BAAI/bge-reranker-v2-m3
-                    （Cross-Encoder，与 BGE-M3 embedding 同家族）。
-        device:     推理设备。空字符串 = 自动（CUDA 可用 → cuda，
-                    否则 cpu）。允许显式指定 cpu / cuda，
-                    但**不**据此修改任何生产配置。
-        max_length:  tokenizer 的 max_length（query+doc 拼接后截断长度）。
+        enabled:         总开关，默认 False（生产默认关闭，保证既有
+                         RAG 行为不变，便于灰度）。
+        model:           HuggingFace 模型名，默认 BAAI/bge-reranker-v2-m3
+                         （Cross-Encoder，与 BGE-M3 embedding 同家族）。
+        device:          推理设备。空字符串 = 自动（CUDA 可用 → cuda，
+                         否则 cpu）。允许显式指定 cpu / cuda。
+        max_length:      tokenizer 的 max_length（query+doc 拼接后截断长度）。
+        batch_size:      单次 forward 的 (query, doc) 对数。
+        candidate_top_k: 开启 Reranker 后 Vector Search 的召回条数。
+                         环境变量 RERANKER_CANDIDATE_TOP_K，默认 10，
+                         钳制到 [1, 50]（与 VectorSearchService 上界一致）。
+        top_k:           开启 Reranker 后最终送入 ContextBuilder 的
+                         片段条数（调用方未显式传 top_k 时的默认值）。
+                         环境变量 RERANKER_TOP_K，默认 3，钳制到 [1, 50]。
     """
 
     enabled: bool = field(default_factory=lambda: _get_bool("RERANKER_ENABLED", False))
@@ -220,6 +240,18 @@ class RerankerSettings:
     max_length: int = field(default_factory=lambda: _get_int("RERANKER_MAX_LENGTH", 512))
     batch_size: int = field(
         default_factory=lambda: _get_int("RERANKER_BATCH_SIZE", 8)
+    )
+    candidate_top_k: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "RERANKER_CANDIDATE_TOP_K", 10,
+            RERANKER_TOP_K_MIN, RERANKER_TOP_K_MAX,
+        )
+    )
+    top_k: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "RERANKER_TOP_K", 3,
+            RERANKER_TOP_K_MIN, RERANKER_TOP_K_MAX,
+        )
     )
 
 

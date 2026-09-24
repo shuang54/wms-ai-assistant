@@ -1,4 +1,4 @@
-"""RAG Service（Phase 3.5.4：最小可用 RAG）。
+"""RAG Service（Phase 3.5.4：最小可用 RAG；Phase 3.7.14 接入 Reranker）。
 
 Pipeline：
     validate query (non-empty / non-whitespace)
@@ -6,6 +6,9 @@ Pipeline：
 VectorSearchService.search(query, top_k=top_k)
                 ↓
 VectorSearchResult[]  （按 similarity 降序）
+        ↓
+[Phase 3.7.14] RerankerClient.rerank(query, contents)
+                ↓（仅 RERANKER_ENABLED=true 时；重排序并截断至 top_k）
         ↓
 ContextBuilder.build(results)
                 ↓
@@ -15,16 +18,19 @@ RagResponse(answer, sources)
 
 设计要点：
 
-- 职责清晰：仅做检索 + 拼装 + 调用 LLM；不实现多 Agent / 工具调用 / 对话管理。
+- 职责清晰：仅做检索 + 重排 + 拼装 + 调用 LLM；不实现多 Agent / 工具调用 / 对话管理。
 - 不做 Function Calling、不实现 OpenAI / DeepSeek 协议；全部委托 LLMClient。
 - 复用既有：
         * VectorSearchService         （Phase 3.5.3）
+        * RerankerClient (抽象)       （Phase 3.5.12，BGERerankerClient 实现）
         * LLMClient (Protocol)       （Phase 2+）
         * EmbeddingClient            （通过 VectorSearchService 间接使用）
         * KnowledgeChunk / Database  （Phase 3.1+）
-- 异常透传：Vector Search / Embedding / LLM 任何失败，原样向上传播，**绝不**吞掉
-  或返回"系统暂时正常"等掩盖真实错误的字符串。
-- 空检索：不调 LLM，直接返回"知识库中没有找到与该问题相关的信息" +
+- Reranker 接入位置（Phase 3.7.14）：**Vector Search 之后、ContextBuilder 之前**。
+  RERANKER_ENABLED=false（默认）时链路与 Phase 3.5.4 完全一致。
+- 异常透传：Vector Search / Embedding / Reranker / LLM 任何失败，原样向上传播，
+  **绝不**吞掉或返回"系统暂时正常"等掩盖真实错误的字符串。
+- 空检索：不调 LLM 也不调 Reranker，直接返回"知识库中没有找到与该问题相关的信息" +
   sources=[]。理由：无 Context 时调用 LLM 极易产生幻觉。
 - Prompt：
         * System prompt：从 `backend/app/prompts/rag_system.txt` 加载（外置）。
@@ -32,11 +38,13 @@ RagResponse(answer, sources)
           仅替换 `{context}` 与 `{question}`，不再泄露 database / embedding /
           distance / similarity 等内部字段。
 - 日志：
-        * 只记录 query_length / top_k / result_count / elapsed_ms
+        * 只记录 query_length / top_k / result_count / elapsed_ms /
+          reranker_used / rerank_elapsed_ms
         * 不记录完整 prompt / 完整 answer / 任何 embedding vector / API Key。
 - 安全：
         * API Key / Authorization Header 一律由 LLMClient / EmbeddingClient
           内部处理；本 Service 不读、不写、不打印。
+        * Reranker 不执行数据库操作、不调用 LLM、不修改知识库数据。
 """
 from __future__ import annotations
 
@@ -48,8 +56,15 @@ from typing import Final
 
 from backend.app.config import settings
 from backend.app.llm.client import LLMClient, get_default_llm_client
+from backend.app.reranker.client import (
+    RerankerClient,
+    get_default_reranker_client,
+)
 from backend.app.services.context_builder import ContextBuilder
-from backend.app.services.vector_search_service import VectorSearchService
+from backend.app.services.vector_search_service import (
+    VectorSearchResult,
+    VectorSearchService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,15 +147,20 @@ class RagResponse:
 # ============================================================
 
 class RagService:
-    """RAG Service（Phase 3.5.4）。
+    """RAG Service（Phase 3.5.4；Phase 3.7.14 接入 Reranker）。
 
     依赖：
-        - VectorSearchService（Phase 3.5.3）—— 默认通过 get_default_vector_search_service() 懒加载
+        - VectorSearchService（Phase 3.5.3）—— 默认通过懒加载构造
+        - RerankerClient（Phase 3.5.12 抽象）—— 仅 RERANKER_ENABLED=true 时参与；
+          默认通过 get_default_reranker_client() 懒加载（进程内单例）
         - LLMClient（Phase 2+）—— 默认通过 get_default_llm_client() 懒加载
         - ContextBuilder（Phase 3.5.4 本模块）—— 默认 max_context_chars 来自 settings.rag
 
     可注入项（用于测试）：
         - vector_search_service: None 时懒加载默认
+        - reranker_client:       Reranker 抽象（RerankerClient 子类 / Fake）；
+                                 **仅当 settings.reranker.enabled=true 时参与链路**
+                                 （配置开关是链路形态的唯一权威）
         - llm_client: None 时懒加载默认
         - context_builder: None 时按 max_context_chars 构造
         - system_prompt: None 时从文件加载
@@ -152,6 +172,7 @@ class RagService:
         self,
         *,
         vector_search_service: VectorSearchService | None = None,
+        reranker_client: RerankerClient | None = None,
         llm_client: LLMClient | None = None,
         context_builder: ContextBuilder | None = None,
         system_prompt: str | None = None,
@@ -159,6 +180,7 @@ class RagService:
         empty_answer_text: str = DEFAULT_EMPTY_ANSWER,
     ) -> None:
         self._vector_search_service = vector_search_service
+        self._reranker_client = reranker_client
         self._llm_client = llm_client
         self._context_builder = context_builder
         self._system_prompt = system_prompt
@@ -172,6 +194,23 @@ class RagService:
             # VectorSearchService 内部已懒加载 EmbeddingClient / SessionFactory
             self._vector_search_service = VectorSearchService()
         return self._vector_search_service
+
+    def _get_reranker(self) -> RerankerClient | None:
+        """解析 Reranker（Phase 3.7.14）。
+
+        返回 None 的两种情况：
+            1. settings.reranker.enabled=False（默认）——链路保持原样
+            2. （不会发生）enabled=True 且注入了 client / 默认单例
+
+        配置开关是链路形态的唯一权威：即使注入了 reranker_client，
+        enabled=False 时也不会参与链路（保证"关闭=完全旁路"的可测试性）。
+        """
+        if not settings.reranker.enabled:
+            return None
+        if self._reranker_client is not None:
+            return self._reranker_client
+        # 进程内单例（BGERerankerClient 内部线程锁保证只加载一次模型）
+        return get_default_reranker_client()
 
     def _get_llm_client(self) -> LLMClient:
         if self._llm_client is None:
@@ -207,15 +246,19 @@ class RagService:
 
         Pipeline:
             1. Vector Search（top_k 默认 settings.rag.default_top_k）
-            2. 空结果 → 直接返回 canned answer（**不调 LLM**）
-            3. Context Builder → 拼装结构化 Context
-            4. LLM.chat([system, user]) → 生成回答
-            5. 映射 VectorSearchResult[] → RagSource[]
-            6. 返回 RagResponse
+            2. [Phase 3.7.14] Reranker（仅 enabled=true：candidate_k 召回 →
+               重排序 → 截断至 top_k；默认 top_k 取 settings.reranker.top_k）
+            3. 空结果 → 直接返回 canned answer（**不调 LLM / 不调 Reranker**）
+            4. Context Builder → 拼装结构化 Context
+            5. LLM.chat([system, user]) → 生成回答
+            6. 映射 VectorSearchResult[] → RagSource[]
+            7. 返回 RagResponse
 
         Args:
             query:  用户问题（任意由调用方传入；VectorSearchService 会校验非空）。
-            top_k:  召回片段数；None 时用 settings.rag.default_top_k。
+            top_k:  **最终**纳入回答的片段数；
+                    None 时：Reranker 关闭 → settings.rag.default_top_k；
+                             Reranker 开启 → settings.reranker.top_k。
 
         Returns:
             RagResponse(answer, sources, used_chunks_count)。
@@ -224,18 +267,37 @@ class RagService:
             VectorSearchInputError / VectorSearchParameterError:  query / top_k 非法
             EmbeddingError 家族 / VectorSearchError / LLMError 家族:
                 任一阶段错误**原样透传**，不掩盖。
+            RerankerError 家族（RerankerInputError / RerankerModelError /
+            RerankerConfigurationError）: Reranker 阶段错误**原样透传**，不掩盖、
+            不降级为未排序结果。
             RuntimeError: 必要依赖未配置（如 DATABASE_URL 空）。
-            RagError:      Prompt 模板读取失败或缺失占位符。
+            RagError:      Prompt 模板读取失败 / 缺失占位符 /
+                           Reranker 返回分数数量与候选数不一致。
         """
         started = time.perf_counter()
+        reranker = self._get_reranker()
+
         if top_k is None:
-            top_k = settings.rag.default_top_k
+            top_k = (
+                settings.reranker.top_k
+                if reranker is not None
+                else settings.rag.default_top_k
+            )
 
-        # ---- 1. Vector Search ----
+        # ---- 1. Vector Search（Reranker 开启时扩大召回窗口）----
         vector_search_service = self._get_vector_search_service()
-        results = await vector_search_service.search(query, top_k=top_k)
+        if reranker is not None:
+            # 召回条数：max(top_k, candidate_top_k)（钳制到 [1, 50]，
+            # 与 VectorSearchService.MAX_TOP_K 一致，防止异常配置）
+            candidate_k = max(
+                top_k,
+                settings.reranker.candidate_top_k,
+            )
+            results = await vector_search_service.search(query, top_k=candidate_k)
+        else:
+            results = await vector_search_service.search(query, top_k=top_k)
 
-        # ---- 2. 空检索 → 不调 LLM ----
+        # ---- 2. 空检索 → 不调 Reranker、不调 LLM ----
         if not results:
             elapsed_ms = (time.perf_counter() - started) * 1000
             logger.info(
@@ -244,6 +306,7 @@ class RagService:
                     "query_length": len(query or ""),
                     "top_k": top_k,
                     "result_count": 0,
+                    "reranker_used": reranker is not None,
                     "elapsed_ms": elapsed_ms,
                 },
             )
@@ -253,11 +316,20 @@ class RagService:
                 used_chunks_count=0,
             )
 
-        # ---- 3. Context ----
+        # ---- 3. Reranker（仅 enabled=true；位于 Vector Search 之后、Context 之前）----
+        rerank_elapsed_ms: float | None = None
+        if reranker is not None:
+            rerank_started = time.perf_counter()
+            results = await _rerank_chunks(
+                reranker, query, results, top_k=top_k
+            )
+            rerank_elapsed_ms = (time.perf_counter() - rerank_started) * 1000
+
+        # ---- 4. Context ----
         context_builder = self._get_context_builder()
         context_result = context_builder.build(results)
 
-        # ---- 4. LLM ----
+        # ---- 5. LLM ----
         system_prompt = self._get_system_prompt()
         user_prompt_template = self._get_user_prompt_template()
         user_prompt = _format_user_prompt(user_prompt_template, context_result.text, query)
@@ -270,7 +342,7 @@ class RagService:
             ],
         )
 
-        # ---- 5. 映射 sources（与 Context 一致：可能少于 results，因 Context 截断） ----
+        # ---- 6. 映射 sources（与 Context 一致：可能少于 results，因 Context 截断） ----
         sources = tuple(
             RagSource(
                 chunk_id=r.chunk_id,
@@ -293,6 +365,8 @@ class RagService:
                 "used_chunks_count": len(sources),
                 "context_truncated": context_result.truncated,
                 "context_chars": context_result.total_chars,
+                "reranker_used": reranker is not None,
+                "rerank_elapsed_ms": rerank_elapsed_ms,
                 "elapsed_ms": elapsed_ms,
             },
         )
@@ -307,6 +381,58 @@ class RagService:
 # ============================================================
 # Helpers（私有）
 # ============================================================
+
+async def _rerank_chunks(
+    reranker: RerankerClient,
+    query: str,
+    results: list[VectorSearchResult],
+    *,
+    top_k: int,
+) -> list[VectorSearchResult]:
+    """对 Vector Search 候选执行 Rerank 并截断至 top_k（Phase 3.7.14）。
+
+    位置：Vector Search **之后**、ContextBuilder **之前**。
+
+    行为：
+        1. 空候选 → 直接返回 []（不调 Reranker，由调用方短路，此处防御）
+        2. reranker.rerank(query, [r.content ...]) → scores
+           （RerankerError 家族**原样透传**，绝不吞掉 / 降级为未排序结果）
+        3. 分数数量与候选数不一致 → RagError（防御 Fake / 自定义实现）
+        4. 按 score 降序稳定排序（同分保持 Vector Search 原顺序）
+        5. 截断至 top_k
+
+    不做的事情：
+        - 不修改 VectorSearchResult 内容（similarity 等字段保持原值）
+        - 不执行数据库操作、不调用 LLM、不修改知识库数据
+    """
+    if not results:
+        return list(results)
+
+    scores = await reranker.rerank(query, [r.content for r in results])
+
+    if len(scores) != len(results):
+        raise RagError(
+            f"Reranker 返回 score 数量与候选数不一致"
+            f"（{len(scores)} vs {len(results)}）；已阻止未排序结果进入 Context。"
+        )
+
+    # 稳定排序：score 降序；同分保持 Vector Search 原顺序
+    order = sorted(
+        range(len(results)),
+        key=lambda i: -float(scores[i]),
+    )
+    reranked = [results[i] for i in order[:top_k]]
+
+    logger.info(
+        "RAG rerank applied",
+        extra={
+            "candidate_count": len(results),
+            "kept_count": len(reranked),
+            "top_k": top_k,
+        },
+    )
+    return reranked
+
 
 def _load_prompt_file(path: Path) -> str:
     """读取 Prompt 模板文件；缺失抛 RagError。"""

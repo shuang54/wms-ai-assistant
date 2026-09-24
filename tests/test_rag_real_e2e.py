@@ -64,6 +64,9 @@ def _env_flag(name: str) -> bool:
 
 _RUN_REAL_RAG_E2E = _env_flag("RUN_REAL_RAG_E2E")
 _RUN_DB_TESTS = _env_flag("RUN_DB_TESTS")
+# Phase 3.7.14：真实 Reranker E2E 需要显式同意加载本地 Cross-Encoder 模型
+# （与 tests/test_reranker_real.py 的门控约定一致）
+_RUN_REAL_RERANKER = _env_flag("RERANKER_ENABLED")
 
 
 # ============================================================
@@ -74,6 +77,13 @@ _RUN_DB_TESTS = _env_flag("RUN_DB_TESTS")
 _requires_full_real_chain = pytest.mark.skipif(
     not (_RUN_REAL_RAG_E2E and _RUN_DB_TESTS),
     reason="set RUN_REAL_RAG_E2E=1 and RUN_DB_TESTS=1",
+)
+
+# Phase 3.7.14：真实 Reranker E2E（额外需要 RERANKER_ENABLED=true 显式同意）
+_requires_real_reranker = pytest.mark.skipif(
+    not (_RUN_REAL_RAG_E2E and _RUN_DB_TESTS and _RUN_REAL_RERANKER),
+    reason="set RUN_REAL_RAG_E2E=1 RUN_DB_TESTS=1 RERANKER_ENABLED=true "
+    "to enable real Reranker E2E",
 )
 
 
@@ -167,7 +177,13 @@ def app_client():
 
 @_requires_full_real_chain
 class TestRealRagEndToEnd:
-    """Phase 3.7.13 真实 RAG E2E：POST /api/ai/chat 全链路。"""
+    """Phase 3.7.13 真实 RAG E2E：POST /api/ai/chat 全链路。
+
+    Phase 3.7.14 起，本测试**显式固定 RERANKER_ENABLED=false**：
+    作为"无 Reranker 基线"验证既有行为不变（即使环境变量
+    RERANKER_ENABLED=true 也不受影响）；Reranker 路径见
+    ``TestRealRagRerankerEndToEnd``。
+    """
 
     async def test_real_rag_end_to_end_via_api(
         self,
@@ -176,6 +192,7 @@ class TestRealRagEndToEnd:
         session,
         app_client,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """完整链路：
 
@@ -206,6 +223,19 @@ class TestRealRagEndToEnd:
             KnowledgeIngestionService,
         )
         from backend.app.services.rag_service import DEFAULT_EMPTY_ANSWER
+
+        # ---- 0. 固定 Reranker 禁用（Phase 3.7.14：本测试为无 Reranker 基线）----
+        import dataclasses
+
+        import backend.app.services.rag_service as rag_service_module
+
+        monkeypatch.setattr(
+            rag_service_module,
+            "settings",
+            dataclasses.replace(
+                settings, reranker=dataclasses.replace(settings.reranker, enabled=False)
+            ),
+        )
 
         # ---- 1. 准备唯一测试文档（避免与 CLI 加载数据冲突） ----
         unique_marker = f"e2e{random_hex()}"
@@ -358,6 +388,281 @@ class TestRealRagEndToEnd:
         print(f"  Content (前 100) : {content[:100]}...")
         print(f"  metadata       : {metadata}")
         print("======================================")
+
+
+# ============================================================
+# Phase 3.7.14：真实 RAG + Reranker E2E（opt-in）
+# ============================================================
+
+@_requires_real_reranker
+class TestRealRagRerankerEndToEnd:
+    """Phase 3.7.14 真实 Reranker E2E。
+
+    门控（三层）：
+        1. RUN_REAL_RAG_E2E=1 + RUN_DB_TESTS=1（真实链路同意）
+        2. RERANKER_ENABLED=true（显式同意加载本地 bge-reranker-v2-m3 模型）
+        3. .env 依赖齐备（DB / Embedding / LLM Key）→ 否则 skip
+
+    验证链路：
+
+        POST /api/ai/chat
+            ↓
+        Router → rag
+            ↓
+        RagService（RERANKER_ENABLED=true）
+            ↓
+        VectorSearchService（candidate_top_k 召回）
+            ↓
+        EmbeddingClient（BGE-M3, 真实 SiliconFlow API）
+            ↓
+        PostgreSQL + pgvector（真实）
+            ↓
+        BGERerankerClient（真实本地 bge-reranker-v2-m3 Cross-Encoder）
+            ↓
+        ContextBuilder（重排后 top_k 条）
+            ↓
+        LLMClient（真实 DeepSeek）
+            ↓
+        ChatResponse
+
+    成本控制（任务书 §二十）：单次执行 = 1 次 Embedding（ingestion）
+    + 1 次 Embedding（query）+ 1 次 Reranker（本地 CPU，无 API 费用）
+    + 1 次 DeepSeek。
+    """
+
+    async def test_real_rag_reranker_end_to_end_via_api(
+        self,
+        engine,
+        _tracked_doc_ids,
+        session,
+        app_client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import time as time_module
+
+        import dataclasses
+
+        from backend.app.config import settings
+        from backend.app.reranker.client import get_default_reranker_client
+        from backend.app.services.knowledge_ingestion_service import (
+            KnowledgeIngestionService,
+        )
+        import backend.app.services.rag_service as rag_service_module
+        from backend.app.services.rag_service import DEFAULT_EMPTY_ANSWER
+
+        _require_real_dependencies()
+
+        # 检查 torch / transformers 可用（不可用则 skip，不硬跑失败）
+        try:
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+        except ImportError:  # pragma: no cover
+            pytest.skip("torch / transformers 未安装，无法执行真实 Reranker E2E")
+
+        # ---- 1. 显式开启 Reranker（钳制候选窗口，控制 CPU 耗时）----
+        candidate_top_k = 10
+        reranker_top_k = 3
+        monkeypatch.setattr(
+            rag_service_module,
+            "settings",
+            dataclasses.replace(
+                settings,
+                reranker=dataclasses.replace(
+                    settings.reranker,
+                    enabled=True,
+                    candidate_top_k=candidate_top_k,
+                    top_k=reranker_top_k,
+                ),
+            ),
+        )
+
+        # ---- 2. 准备唯一测试文档（与基线 E2E 同策略）----
+        # 注：chunk_size=800——每个小节必须 ≥800 字符才能独立成 chunk，
+        # 否则 MarkdownAwareChunker 会把相邻小节合并（首轮实测 3 小节被并成 1 块）。
+        unique_marker = f"rrk{random_hex()}"
+        unique_doc = tmp_path / f"wms_rag_rrk_{unique_marker}.md"
+        sections = [
+            (
+                "采购入库流程",
+                "供应商送货到达仓库后，收货员首先在系统中打开对应的采购入库通知单，"
+                "核对供应商名称、采购订单号与物料清单。第一步是卸货与初步清点："
+                "按箱核对物料编码、名称与数量，检查外包装是否破损。"
+                "第二步是扫码收货：逐箱扫描物料条码，系统自动比对采购订单明细，"
+                "数量一致则登记实收数量，不一致时登记差异并通知采购部门确认。"
+                "第三步是质检：IQC 按抽样标准检查来料质量，合格批次放行，"
+                "不合格批次转入退货或让步接收流程。第四步是上架："
+                "系统根据库位策略推荐上架库位，仓管员将物料搬运至指定库位"
+                "并扫描库位条码完成上架确认。第五步是库存入账："
+                "上架完成后系统自动增加对应库位的在库数量，采购入库单状态"
+                "更新为已完成，同时在操作日志中记录经手人与时间戳。"
+                "整个过程中收货、质检、上架三个环节必须由不同人员执行，"
+                "以保证职责分离。若当日无法完成上架，物料应暂存待上架区，"
+                "并在次日优先处理。紧急物料可申请加急质检通道。"
+                "注意事项：采购入库单必须在当月财务结账前全部关闭，"
+                "否则会影响应付账款的暂估入账；收货时发现供应商多发物料，"
+                "应单独登记暂存，不得直接混入正常库存；"
+                "所有条码扫描失败的情况都应改用人工录入并双人复核，"
+                "严禁跳过扫码直接确认；入库单据与质检报告需归档保存"
+                "至少两年以备审计；对批次管理的物料还必须录入生产日期"
+                "与有效期，系统会按先进先出原则推荐出库批次。",
+            ),
+            (
+                "销售出库流程",
+                "销售订单审核通过后，系统自动生成销售出库单并释放对应库存。"
+                "仓库主管按波次将出库单分配给拣货员。第一步是波次规划："
+                "系统按订单优先级、承运商截单时间自动聚单，生成拣货路径。"
+                "第二步是拣货：拣货员使用手持终端按路径指引到达指定库位，"
+                "扫描库位与物料条码，按拣货数量取货放入周转箱。"
+                "第三步是复核：复核员扫描周转箱内所有物料，系统核对"
+                "订单明细与拣货结果，多拣、少拣、错拣均会被拦截。"
+                "第四步是包装与发运：按客户要求打包、贴物流面单、"
+                "称重复核重量，交接给承运商并登记运单号。"
+                "第五步是出库确认：系统扣减对应库位库存，出库单关闭，"
+                "同时生成应收台账同步给财务系统。"
+                "出库过程中如发现库位实物数量不足，应立即创建库存差异报告，"
+                "由仓库主管组织循环盘点定位差异原因，再继续执行出库。"
+                "客户自提订单需核验提货凭证与身份信息后方可放行。"
+                "注意事项：出库单必须在承运商截单时间前完成交接，"
+                "逾期订单自动顺延至下一波次；拣货员在库位发现物料"
+                "批次临期或包装破损时，应调用换批或换箱流程，"
+                "不得将异常物料直接发出；复核环节的拦截记录"
+                "会纳入拣货员的绩效考核；对需要温控运输的物料，"
+                "包装环节必须加装温度记录仪并在出库单上登记设备编号；"
+                "所有出库操作都会在轨迹表中留痕，支持后续追溯"
+                "到具体的操作人、时间与库位。",
+            ),
+            (
+                "库存盘点流程",
+                "盘点用于保证账实一致，分为全盘、循环盘点与专项盘点三类。"
+                "第一步是创建盘点任务：仓管主管选择盘点范围（仓库、库区、"
+                "库位或物料），设定盘点类型与计划时间，系统冻结相关库位的"
+                "收发操作或采用动态盘点模式。第二步是任务分配："
+                "系统将盘点明细按库位拆分给盘点员，盲盘模式下盘点员"
+                "看不到系统账面数量，避免先入为主。第三步是实物清点："
+                "盘点员到指定库位逐一清点物料，扫描库位与物料条码，"
+                "录入实盘数量。第四步是差异分析：系统自动比对账面与实盘，"
+                "生成差异清单；差异率超过阈值的库位需复盘，由第二人复核。"
+                "第五步是差异处理：经仓库经理审批后，盘盈生成盘盈入库单，"
+                "盘亏生成盘亏出库单，账面库存随之调整。"
+                "第六步是归档：盘点报告存档，差异原因归类统计，"
+                "用于后续改善库位管理 accuracy。盘点期间发现的呆滞料"
+                "应标记并通知计划部门评估处理方式。"
+                "注意事项：全盘每年至少执行一次，通常安排在财务"
+                "年度结账前；循环盘点按 ABC 分类设定频次，A 类物料"
+                "每月一次、B 类每季度一次、C 类每半年一次；"
+                "盲盘结果录入后系统立即锁定，复盘需要仓库经理授权；"
+                "差异率连续三个月超过警戒线的库区应启动专项治理，"
+                "排查条码管理、库位标识与人员操作规范；"
+                "盘点的所有调整单据必须附差异原因代码，"
+                "便于后续做根因分析与趋势统计。",
+            ),
+        ]
+        body = f"# WMS Reranker 测试文档 {unique_marker}\n\n" + "\n\n".join(
+            f"## {title}\n\n{content}" for title, content in sections
+        )
+        unique_doc.write_text(body, encoding="utf-8")
+
+        ingestion = KnowledgeIngestionService()
+        result = await ingestion.ingest_one(unique_doc)
+        _tracked_doc_ids.add(result.document_id)
+
+        assert result.status == "ready", (
+            f"ingestion 失败: status={result.status}"
+        )
+        assert result.chunk_count >= 3, (
+            f"测试文档应至少切成 3 个 chunk（实际 {result.chunk_count}），"
+            "否则 rerank 无区分度"
+        )
+
+        # ---- 3. 记录测试前 DB 数量（验证无额外写入）----
+        doc_count_before = session.execute(
+            text("SELECT COUNT(*) FROM knowledge_document")
+        ).scalar_one()
+
+        # ---- 4. POST /api/ai/chat（真实全链路 + Reranker）----
+        question = "采购入库怎么操作？"
+        with caplog.at_level("INFO", logger="backend.app.services.rag_service"):
+            t0 = time_module.perf_counter()
+            response = app_client.post(
+                "/api/ai/chat",
+                json={"question": question, "project_id": "vietnam-wms"},
+            )
+            total_wall_s = time_module.perf_counter() - t0
+
+        # ---- 5. 验证 HTTP / Router / Content ----
+        assert response.status_code == 200, (
+            f"HTTP {response.status_code}: {response.text[:300]}"
+        )
+        payload = response.json()
+        assert payload["route"] == "rag", payload
+        content = payload.get("content") or ""
+        assert content and content != DEFAULT_EMPTY_ANSWER
+        assert len(content) > 5
+
+        # ---- 6. 验证 Reranker 真实参与 ----
+        # 6a. 本地模型确实被加载（懒加载发生在本次请求内）
+        default_reranker = get_default_reranker_client()
+        assert default_reranker._model is not None, (
+            "BGERerankerClient 模型未加载——Reranker 未参与链路"
+        )
+        # 6b. "RAG rerank applied" 日志存在（说明走了 rerank 分支）
+        rerank_records = [
+            r for r in caplog.records if r.getMessage() == "RAG rerank applied"
+        ]
+        assert rerank_records, "未捕获 'RAG rerank applied' 日志"
+        rr = rerank_records[-1]
+        assert rr.candidate_count >= 1
+        assert 1 <= rr.kept_count <= reranker_top_k
+
+        # 6c. "RAG answered" 日志存在且 reranker_used=True
+        answered = [
+            r for r in caplog.records if r.getMessage() == "RAG answered"
+        ]
+        assert answered
+        ans = answered[-1]
+        assert ans.reranker_used is True
+        assert ans.rerank_elapsed_ms is not None and ans.rerank_elapsed_ms >= 0
+
+        # ---- 7. 验证 Sources（重排 + 截断至 reranker top_k）----
+        data = payload.get("data") or {}
+        sources = data.get("sources") or []
+        assert sources, "sources 为空"
+        assert len(sources) <= reranker_top_k, (
+            f"sources 数量 {len(sources)} 超过 reranker top_k {reranker_top_k}"
+        )
+        first = sources[0]
+        assert "document_id" in first and "chunk_id" in first
+        assert 0.0 <= first["similarity"] <= 1.0
+        # 命中本次插入的文档
+        hit_doc_ids = {s["document_id"] for s in sources}
+        assert hit_doc_ids & _tracked_doc_ids, (
+            f"sources 未命中本次插入文档: {hit_doc_ids} vs {_tracked_doc_ids}"
+        )
+
+        # ---- 8. 验证 DB 只读（RAG 链路无写入）----
+        doc_count_after = session.execute(
+            text("SELECT COUNT(*) FROM knowledge_document")
+        ).scalar_one()
+        assert doc_count_after == doc_count_before, (
+            f"RAG 链路写入了数据库（before={doc_count_before}, "
+            f"after={doc_count_after}）"
+        )
+
+        # ---- 9. 性能记录（任务书 §十）----
+        print("\n=== Phase 3.7.14 Real RAG + Reranker E2E Result ===")
+        print(f"  Question         : {question}")
+        print(f"  Route            : {payload['route']}")
+        print(f"  Candidates       : {rr.candidate_count}")
+        print(f"  Kept (rerank)    : {rr.kept_count}")
+        print(f"  Rerank elapsed   : {ans.rerank_elapsed_ms:.1f} ms")
+        print(f"  Total RAG        : {ans.elapsed_ms:.1f} ms")
+        print(f"  API wall time    : {total_wall_s * 1000:.1f} ms")
+        print(f"  Sources          : {len(sources)}")
+        print(f"  Top similarity   : {first['similarity']:.4f}")
+        print(f"  Content (前 100) : {content[:100]}...")
+        print("====================================================")
 
 
 # ============================================================
@@ -574,5 +879,6 @@ def random_hex() -> str:
 
 __all__ = [
     "TestRealRagEndToEnd",
+    "TestRealRagRerankerEndToEnd",
     "TestRagFailureUnitTests",
 ]
