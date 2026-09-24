@@ -176,12 +176,18 @@ class ProjectContextProvider(Protocol):
 
 
 class DefaultProjectContextProvider:
-    """生产实现：复用 ``SchemaExplorerService`` + ``ProjectSemanticLoader``。
+    """生产实现：复用 ``SchemaExplorerService`` + Semantic Provider/Loader。
 
     Orchestrator 仍**不**创建 Engine / Session，仅调用上层 Service
     暴露的方法。``resolve()`` 是同步桥接：内部用 ``asyncio.run``
     调 async inspector（Orchestrator 在 async 主路径里再 ``to_thread``
     包一层避免阻塞事件循环）。
+
+    Phase 3.8.3：语义解析优先使用注入的 ``semantic_provider``
+    （服务器端 project_id → ProjectSemantic 映射）；Provider 异常
+    **不吞**（配置错误显式暴露，映射 AIOrchestratorUnavailableError）。
+    未注入 provider 时回退旧路径（semantic_loader / 默认 Loader，
+    加载失败 → 空语义，保持既有行为兼容）。
     """
 
     def __init__(
@@ -190,11 +196,13 @@ class DefaultProjectContextProvider:
         project_context: ProjectContext | None = None,
         explorer: Any = None,
         semantic_loader: Any = None,
+        semantic_provider: Any = None,
         schema_name: str | None = None,
     ) -> None:
         self._project_context = project_context
         self._explorer = explorer
         self._semantic_loader = semantic_loader
+        self._semantic_provider = semantic_provider
         self._schema_name = schema_name
 
     def resolve(
@@ -206,7 +214,6 @@ class DefaultProjectContextProvider:
         from backend.app.projects.semantic_loader import ProjectSemanticLoader
 
         explorer = self._explorer or SchemaExplorerService()
-        loader = self._semantic_loader or ProjectSemanticLoader()
         project = self._project_context or _load_default_project_context()
         try:
             schema = _inspect_sync(explorer, schema_name=self._schema_name)
@@ -214,6 +221,30 @@ class DefaultProjectContextProvider:
             raise AIOrchestratorUnavailableError(
                 f"无法解析 DatabaseSchema: {type(exc).__name__}"
             ) from exc
+
+        # Phase 3.8.3：显式 Provider 优先（服务器端 project_id → 语义映射；
+        # 异常不吞——未注册 / 配置错误 → 503，绝不静默回退其他项目语义）
+        if self._semantic_provider is not None:
+            from backend.app.projects.semantic_loader import (
+                ProjectSemanticError,
+            )
+
+            try:
+                semantic = self._semantic_provider.get(project.project_id)
+            except AIOrchestratorError:
+                raise
+            except ProjectSemanticError as exc:
+                raise AIOrchestratorUnavailableError(
+                    f"项目 {project.project_id!r} 的业务语义不可用: {exc}"
+                ) from exc
+            except Exception as exc:  # 自定义 Provider 的其它异常
+                raise AIOrchestratorUnavailableError(
+                    f"Semantic Provider 解析失败: {type(exc).__name__}"
+                ) from exc
+            return project, schema, semantic
+
+        # 旧路径（兼容）：Loader 文件名约定；失败回退空语义
+        loader = self._semantic_loader or ProjectSemanticLoader()
         try:
             semantic = loader.load(project.project_id)
         except Exception as exc:

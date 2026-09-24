@@ -43,6 +43,10 @@ from backend.app.projects.registry import (
     ProjectRegistry,
     get_default_project_registry,
 )
+from backend.app.projects.semantic_provider import (
+    ProjectSemanticProvider,
+    get_default_project_semantic_provider,
+)
 from backend.app.services.ai_orchestrator_service import (
     AIOrchestratorService,
     AIOrchestratorUnavailableError,
@@ -74,24 +78,30 @@ def build_orchestrator_for_project(
     base: AIOrchestratorService | None = None,
     registry: ProjectRegistry | None = None,
     engine_provider: DatabaseEngineProvider | None = None,
+    semantic_provider: ProjectSemanticProvider | None = None,
 ) -> AIOrchestratorService:
     """构造绑定到指定项目数据源的 Orchestrator（Phase 3.8.1）。
 
     Args:
-        project_id:      请求中的 project_id（服务器端注册表解析）。
-        base:            共享下游依赖的基准 Orchestrator（Router 之外的
-                         RAG / Text-to-SQL Generator / Selector / Composer
-                         均复用 base 的实例）；None 时使用全局默认工厂。
-        registry:        项目注册表；None 时使用默认注册表。
-        engine_provider: Engine Provider；None 时使用默认 Provider。
+        project_id:         请求中的 project_id（服务器端注册表解析）。
+        base:               共享下游依赖的基准 Orchestrator（Router 之外的
+                            RAG / Text-to-SQL Generator / Selector / Composer
+                            均复用 base 的实例）；None 时使用全局默认工厂。
+        registry:           项目注册表；None 时使用默认注册表。
+        engine_provider:    Engine Provider；None 时使用默认 Provider。
+        semantic_provider:  Phase 3.8.3 —— project_id → ProjectSemantic
+                            的服务器端解析器；None 时使用默认 Provider
+                            （LoaderBacked，文件名 == project_id，
+                            旧行为完全等价）。
 
     Returns:
         新的 ``AIOrchestratorService``：
         - Router：新实例（capability 适配 per-project Tool Registry，
           路由规则本身不变）；
         - RAG / T2S Generator / TableSelector / ContextComposer：复用 base；
-        - ProjectContextProvider / SchemaExplorer / SQLExecutor /
-          Tool Registry：绑定该项目数据源。
+        - ProjectContextProvider（含 **per-project Semantic**，
+          Phase 3.8.3）/ SchemaExplorer / SQLExecutor / Tool Registry：
+          绑定该项目。
 
     Raises:
         ProjectNotFoundError:      project_id 未注册（API 层映射 404）。
@@ -121,12 +131,19 @@ def build_orchestrator_for_project(
             f"项目 {project_id!r} 的数据源不可用: {exc}"
         ) from exc
 
-    # ---- 3) per-project 依赖（Schema / Executor / Tool 同源） ----
+    # ---- 3) per-project 依赖（Schema / Executor / Tool / Semantic 同源） ----
     explorer = SchemaExplorerService(engine=engine)
     project_provider = DefaultProjectContextProvider(
         project_context=context,
         explorer=explorer,
         schema_name=schema_name,
+        # Phase 3.8.3：Semantic 成为 Project Runtime Context 的正式组成部分
+        # （project_id 唯一决定 Semantic；服务器端 Provider，HTTP 不可注入）
+        semantic_provider=(
+            semantic_provider
+            if semantic_provider is not None
+            else get_default_project_semantic_provider()
+        ),
     )
     executor = SQLExecutorService(engine=engine)
     # Phase 3.8.2：Tool Registry 只注册该项目允许的 Tool
