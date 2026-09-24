@@ -59,8 +59,12 @@ from backend.app.services.ai_orchestrator_service import (
     AIOrchestratorService,
     AIOrchestratorUnavailableError,
     ProjectContextProvider,
-    get_default_orchestrator,
 )
+from backend.app.services.ai_router_service import (
+    AIRouterService,
+    ToolRegistryCapabilityAdapter,
+)
+from backend.app.tools.get_inventory import build_default_tool_registry
 
 
 logger = logging.getLogger(__name__)
@@ -168,7 +172,23 @@ class ChatResponse(BaseModel):
 # 模块级 Orchestrator 单例（懒加载：首次请求时才构造，避免 import 时拉起 Engine）。
 # 测试中可通过 monkeypatch 替换 ``_default_orchestrator`` 或
 # ``_build_orchestrator_for_project_id`` 注入 fake orchestrator。
-_default_orchestrator: AIOrchestratorService = get_default_orchestrator()
+#
+# Phase 3.7.12：默认 Orchestrator 工厂 ``get_default_orchestrator()`` 本身
+# 不注册任何 Tool；此处显式注入预注册 ``get_inventory`` 真实 Tool 的 Registry，
+# 使得 TOOL 路由可达。Engine / LLMClient / Embedding Client 均不重建。
+#
+# 注意：只注入 tool_registry 是不够的 —— Router 需要 Tool **能力元数据**
+# （ToolRegistryCapabilityAdapter，只读 name/description/aliases，不暴露 handler）
+# 才能把"查询物料 10001 当前库存"规则命中到 TOOL；否则会被判为数据分析
+# 意图而进入 Text-to-SQL（决策文档 §十九 / §二十二）。
+_TOOL_REGISTRY = build_default_tool_registry()
+
+_default_orchestrator: AIOrchestratorService = AIOrchestratorService(
+    router=AIRouterService(
+        tool_capabilities=ToolRegistryCapabilityAdapter(_TOOL_REGISTRY),
+    ),
+    tool_registry=_TOOL_REGISTRY,
+)
 
 
 def _build_orchestrator_for_project_id(

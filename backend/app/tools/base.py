@@ -97,6 +97,7 @@ class ToolDefinition:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
+    aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # name —— frozen dataclass 用 object.__setattr__ 已被禁用，
@@ -109,6 +110,10 @@ class ToolDefinition:
             raise ValueError(
                 f"Tool parameters 必须为 dict（got {type(self.parameters).__name__}）"
             )
+        if not isinstance(self.aliases, (tuple, list)):
+            raise ValueError("Tool aliases 必须为 tuple/list[str]")
+        if not all(isinstance(a, str) and a.strip() for a in self.aliases):
+            raise ValueError("Tool aliases 元素必须为非空 str")
 
 
 # ============================================================

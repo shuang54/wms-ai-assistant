@@ -353,9 +353,28 @@ class AIOrchestratorService:
             raise AIOrchestratorRouteError(
                 "TOOL 路由未命中任何已注册 Tool"
             )
+
+        # ---- Phase 3.7.12 最小兼容性 layer ----
+        # 历史行为：_run_tool 向 registry.execute() 传入 arguments=None，
+        # 导致 Handler 收到 {}；真实 Tool 无法从空 arguments 提取 material_code。
+        # 本阶段：从 ToolDefinition.parameters 中按字段名做"关键字命中 + 兜底提取"，
+        # 将构造好的 arguments 传给 Handler。
+        # - 保留 routes 路由语义（_resolve_tool_name 仍然走原有流程）
+        # - 保留 ToolRegistry.execute() 现有签名
+        # - 仅在字段无值时不传递该字段（Handler 仍可校验失败 → ToolResult(success=False)）
+        try:
+            definition = self._tools.get_definition(tool_name)
+        except Exception:  # noqa: BLE001
+            definition = None
+        arguments: dict[str, Any] | None = (
+            _extract_tool_arguments_from_question(question, definition)
+            if definition is not None
+            else None
+        )
+
         try:
             tool_result: ToolResult = await self._tools.execute(
-                tool_name, arguments=None
+                tool_name, arguments=arguments
             )
         except ToolError as exc:
             raise AIOrchestratorExecutionError(
@@ -501,6 +520,72 @@ def _resolve_tool_name(
     return None
 
 
+# ============================================================
+# Phase 3.7.12 — Tool 参数最小提取器
+# ============================================================
+#
+# 历史：_run_tool 调用 ``registry.execute(tool_name, arguments=None)``，
+#       Handler 收到 ``{}``；对真实业务 Tool（如 get_inventory）来说，
+#       无法从空 arguments 取得用户输入。
+#
+# 本阶段最小修改：从 ToolDefinition.parameters["properties"] 按字段名
+#       + 一个保守的字面量提取器抽取（最常见是 ``material_code``）。
+#
+# 设计纪律：
+# - **不**修改 routes 路由语义：仍然走 _resolve_tool_name 旧路径
+# - **不**修改 ToolRegistry.execute() 现有签名
+# - 仅当字段名是 "material_code"（与 Phase 3.7.12 一致）才提取；
+#   其它字段（如未来 warehouse_code）扩展时再增加，不提前实现
+# - 提取失败（无匹配字面量）→ 字段不出现在 arguments 中；
+#   Tool 参数 Schema 校验失败 → ToolResult(success=False)
+# - 提取的值**不**进入 SQL 拼接，仅作为 Tool 入参（Tool 内部会再次校验）
+
+_TOOL_ARG_LITERAL_PATTERN: re.Pattern[str] = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._\-]{0,63}"
+)
+
+
+def _extract_tool_arguments_from_question(
+    question: str,
+    definition: ToolDefinition | None,
+) -> dict[str, Any] | None:
+    """从 question 中按 Tool 参数 properties 提取（Phase 3.7.12）。
+
+    当前支持：
+        * ``material_code``：从 question 中匹配第一个合法字面量
+                              （字母 / 数字 / dash / dot / underscore，长度 ≤ 64）。
+
+    Args:
+        question: 用户问题（已 strip 过）。
+        definition: 已选中的 ToolDefinition；None → 返回 None。
+
+    Returns:
+        dict 或 None。
+            - dict：提取到的字段（仅含确实匹配到的字段）
+            - None：definition 为空（不传递 arguments，让 Handler 默认空）
+    """
+    if definition is None:
+        return None
+    properties = (getattr(definition, "parameters", {}) or {}).get("properties") or {}
+    if not properties:
+        return None
+
+    out: dict[str, Any] = {}
+
+    # material_code：取 question 中第一个合法字面量
+    if "material_code" in properties:
+        match = _TOOL_ARG_LITERAL_PATTERN.search(question)
+        if match is not None:
+            candidate = match.group(0)
+            if candidate.strip():
+                out["material_code"] = candidate
+
+    # 其它字段（如 warehouse_code / work_order_no）暂不提取；
+    # 扩展新 Tool 时按需增加。
+
+    return out or None
+
+
 def _tool_result_to_content(result: ToolResult) -> str:
     """把 ToolResult 转成给用户看的 content（不泄露内部对象）。"""
     if not result.success:
@@ -545,12 +630,7 @@ def _load_default_project_context() -> ProjectContext:
         project_id=settings.project.project_id,
         project_name=settings.project.project_name,
         description=settings.project.description,
-        data_source=DataSource(
-            database_type="postgresql",
-            host="",
-            database_name=None,
-            schema_name=None,
-        ),
+        data_source=DataSource(name="primary", type="postgresql"),
     )
 
 

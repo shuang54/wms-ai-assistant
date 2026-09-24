@@ -152,6 +152,13 @@ class ToolRegistryCapabilityAdapter:
                 description = ""
             params = getattr(d, "parameters", None) or {}
             aliases = _extract_param_aliases(name, params)
+            # Phase 3.7.12：ToolDefinition 可携带业务别名（如 "库存" /
+            # "查库存"），Router 据此做 tool_match 规则命中。
+            definition_aliases = getattr(d, "aliases", None) or ()
+            if isinstance(definition_aliases, (tuple, list)):
+                aliases = tuple(dict.fromkeys(
+                    (*aliases, *(str(a) for a in definition_aliases))
+                ))
             out.append(ToolCapability(
                 name=name, description=description, aliases=aliases
             ))

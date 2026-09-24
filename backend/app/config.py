@@ -284,6 +284,57 @@ class ToolSettings:
 
 
 # ============================================================
+# Inventory Tool 配置（Phase 3.7.12）
+# ============================================================
+
+INVENTORY_TOOL_MATERIAL_CODE_MAX_LEN = 64
+INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MIN = 1
+INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MAX = 60
+
+
+@dataclass(frozen=True)
+class InventoryToolSettings:
+    """真实 ``get_inventory`` Tool 配置（Phase 3.7.12 引入）。
+
+    字段：
+        schema_name:      库存表所在 schema。环境变量 ``WMS_INVENTORY_SCHEMA``，
+                          默认 ``public``。必须是 SQL 安全标识符
+                          （字母/数字/下划线/点；不接受引号）。
+        table_name:       库存表名。环境变量 ``WMS_INVENTORY_TABLE``，
+                          默认 ``inventory``。同 schema_name 约束。
+        material_code_max_len:
+                          ``material_code`` 长度上限。环境变量
+                          ``WMS_INVENTORY_MATERIAL_CODE_MAX_LEN``，
+                          默认 64，钳制到 [1, 256]。
+        query_timeout_seconds:
+                          PostgreSQL ``statement_timeout``（秒）。
+                          环境变量 ``WMS_INVENTORY_QUERY_TIMEOUT_SECONDS``，
+                          默认 10，钳制到 [1, 60]。
+    """
+
+    schema_name: str = field(
+        default_factory=lambda: _get_str("WMS_INVENTORY_SCHEMA", "public")
+    )
+    table_name: str = field(
+        default_factory=lambda: _get_str("WMS_INVENTORY_TABLE", "inventory")
+    )
+    material_code_max_len: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_INVENTORY_MATERIAL_CODE_MAX_LEN",
+            INVENTORY_TOOL_MATERIAL_CODE_MAX_LEN,
+            1, 256,
+        )
+    )
+    query_timeout_seconds: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_INVENTORY_QUERY_TIMEOUT_SECONDS", 10,
+            INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MIN,
+            INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MAX,
+        )
+    )
+
+
+# ============================================================
 # Text-to-SQL 配置（Phase 3.7.6）
 # ============================================================
 
@@ -409,6 +460,9 @@ class Settings:
     rag: RagSettings = field(default_factory=RagSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
     tool: ToolSettings = field(default_factory=ToolSettings)
+    inventory_tool: InventoryToolSettings = field(
+        default_factory=InventoryToolSettings
+    )
     project: ProjectSettings = field(default_factory=ProjectSettings)
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
@@ -425,6 +479,7 @@ __all__ = [
     "RagSettings",
     "RerankerSettings",
     "ToolSettings",
+    "InventoryToolSettings",
     "ProjectSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",
