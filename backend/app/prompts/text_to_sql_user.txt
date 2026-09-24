@@ -1,0 +1,19 @@
+Convert the following question into ONE read-only PostgreSQL SELECT query.
+
+【DATABASE CONTEXT】
+
+{database_context}
+
+【ALLOWED TABLES】
+
+{allowed_tables_block}
+
+【MAX ROWS】
+
+{max_rows}
+
+【QUESTION】
+
+{question}
+
+Return the SQL query only. No explanation, no markdown fences, no comments.

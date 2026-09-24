@@ -284,6 +284,45 @@ class ToolSettings:
 
 
 # ============================================================
+# Text-to-SQL 配置（Phase 3.7.6）
+# ============================================================
+
+TEXT_TO_SQL_MAX_ATTEMPTS_MIN = 1
+TEXT_TO_SQL_MAX_ATTEMPTS_MAX = 10
+TEXT_TO_SQL_MAX_ROWS_MIN = 1
+TEXT_TO_SQL_MAX_ROWS_MAX = 100000
+
+
+@dataclass(frozen=True)
+class TextToSQLSettings:
+    """Text-to-SQL Generator 配置（Phase 3.7.6 引入）。
+
+    字段：
+        max_attempts: 单次 generate() 最多发起的 LLM 生成次数
+                      （含首次；Validator 拒绝后携带错误重试）。
+                      环境变量 TEXT_TO_SQL_MAX_ATTEMPTS，默认 3，
+                      钳制到 [1, 10]（不允许无限制重试）。
+        max_rows:     生成 SQL 的 LIMIT 上限（与 SQLValidator
+                      的 max_rows 配合使用）。
+                      环境变量 TEXT_TO_SQL_MAX_ROWS，默认 1000，
+                      钳制到 [1, 100000]。
+    """
+
+    max_attempts: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "TEXT_TO_SQL_MAX_ATTEMPTS", 3,
+            TEXT_TO_SQL_MAX_ATTEMPTS_MIN, TEXT_TO_SQL_MAX_ATTEMPTS_MAX,
+        )
+    )
+    max_rows: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "TEXT_TO_SQL_MAX_ROWS", 1000,
+            TEXT_TO_SQL_MAX_ROWS_MIN, TEXT_TO_SQL_MAX_ROWS_MAX,
+        )
+    )
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -302,6 +341,7 @@ class Settings:
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
     tool: ToolSettings = field(default_factory=ToolSettings)
     project: ProjectSettings = field(default_factory=ProjectSettings)
+    text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
 
 
 settings = Settings()
@@ -315,5 +355,6 @@ __all__ = [
     "RerankerSettings",
     "ToolSettings",
     "ProjectSettings",
+    "TextToSQLSettings",
     "settings",
 ]
