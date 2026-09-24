@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -63,6 +64,12 @@ from backend.app.services.sql_validator_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Phase 3.8.1：schema_name 进入 SET LOCAL search_path（标识符位置），
+# 与 SchemaExplorerService._SCHEMA_NAME_RE 同一白名单（未加引号 PG 标识符）
+_SEARCH_PATH_IDENTIFIER_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*$"
+)
 
 __all__ = [
     "SQLExecutorError",
@@ -312,6 +319,7 @@ class SQLExecutorService:
                 self._execute_read_only,
                 engine, sql, max_rows, timeout_seconds,
                 self._max_result_bytes,
+                schema_name=(schema.schema_name if schema is not None else None),
             )
         except _TimeoutCancelSignal as exc:
             raise SQLExecutorTimeoutError(timeout_seconds) from exc.cause
@@ -360,6 +368,19 @@ class SQLExecutorService:
                 f"schema 必须是 DatabaseSchema 或 None"
                 f"（当前: {type(schema).__name__}）"
             )
+        if schema is not None:
+            # Phase 3.8.1：schema_name 会进入 SET LOCAL search_path
+            # （标识符位置，不接受绑定参数），必须在一切数据库访问前
+            # 严格校验（防伪造 DatabaseSchema 注入标识符）
+            schema_name = getattr(schema, "schema_name", None)
+            if (
+                not isinstance(schema_name, str)
+                or not _SEARCH_PATH_IDENTIFIER_RE.match(schema_name)
+            ):
+                raise SQLExecutorInputError(
+                    "schema.schema_name 必须是合法 PostgreSQL 标识符"
+                    f"（当前: {schema_name!r}）"
+                )
         if isinstance(max_rows, bool) or not isinstance(max_rows, int):
             raise SQLExecutorInputError(
                 f"max_rows 必须是整数（当前: {type(max_rows).__name__}）"
@@ -411,8 +432,19 @@ class SQLExecutorService:
         max_rows: int,
         timeout_seconds: int,
         max_result_bytes: int,
+        *,
+        schema_name: str | None = None,
     ) -> tuple[tuple[str, ...], tuple[tuple[Any, ...], ...], bool]:
         """在 BEGIN READ ONLY 事务中执行 SQL（同步，由 to_thread 调）。
+
+        Args:
+            schema_name: Phase 3.8.1 —— 项目业务 schema。非 None 时在
+                事务内 ``SET LOCAL search_path``，使 LLM 生成的未加
+                schema 前缀的表名解析到该项目 schema（与 Validator 的
+                schema 归一化保持同一命名空间）。**不影响任何安全规则**：
+                READ ONLY / statement_timeout / max_rows / 结果大小 /
+                re-validation 全部保留；跨 schema 引用仍需显式限定名，
+                由 Validator 的 allowlist 拒绝。
 
         Returns:
             (columns, rows, truncated)。rows <= max_rows 且
@@ -421,6 +453,13 @@ class SQLExecutorService:
         timeout_ms = timeout_seconds * 1000
         # SET 不接受绑定参数；timeout_ms 是钳制后的 int，可安全内插
         set_timeout_sql = f"SET LOCAL statement_timeout = {timeout_ms}"
+        # schema_name 是校验过的标识符（与 SchemaExplorer 的
+        # _SCHEMA_NAME_RE 同一白名单），可安全加引号内插
+        set_search_path_sql = (
+            f'SET LOCAL search_path TO "{schema_name}"'
+            if schema_name is not None
+            else None
+        )
 
         with engine.connect() as conn:
             # AUTOCOMMIT：由我们显式控制事务边界
@@ -428,6 +467,8 @@ class SQLExecutorService:
             try:
                 conn.execute(text("BEGIN READ ONLY"))
                 conn.execute(text(set_timeout_sql))
+                if set_search_path_sql is not None:
+                    conn.execute(text(set_search_path_sql))
                 cursor = conn.execute(text(sql))  # 执行的正是验证过的 sql
                 fetched = cursor.fetchmany(max_rows + 1)
             except SQLAlchemyError as exc:

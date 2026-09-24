@@ -48,8 +48,8 @@ from pydantic import BaseModel, Field, field_validator
 from backend.app.config import settings
 from backend.app.projects.context import (
     ProjectContext,
-    get_default_project_context,
 )
+from backend.app.projects.registry import ProjectNotFoundError
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http  # noqa: E501
 from backend.app.services.ai_orchestrator_service import (
     AIOrchestrationResult,
@@ -205,53 +205,41 @@ _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
 def _build_orchestrator_for_project_id(
     project_id: str,
 ) -> AIOrchestratorService:
-    """根据 ``project_id`` 构造临时 Orchestrator 实例。
+    """根据 ``project_id`` 构造项目数据源绑定的 Orchestrator（Phase 3.8.1）。
 
-    复用默认 Orchestrator 的所有下游依赖（Router / RAG / Tool / T2S / Executor），
-    仅替换 ``ProjectContextProvider``，使其 ``resolve()`` 返回 project_id 与
-    传入值匹配的 ProjectContext。Engine / LLMClient / Embedding Client
-    不重新创建。
+    **Phase 3.8.1 起真正切换数据源**：
+
+        project_id
+            ↓
+        ProjectRegistry（服务器端注册表；未注册 → ProjectNotFoundError → 404）
+            ↓
+        DataSource → DatabaseEngineProvider（受控连接，不接受用户传 URL）
+            ↓
+        同一 Engine 贯穿 Schema Explorer / Text-to-SQL / SQL Executor /
+        get_inventory Tool
+
+    组装逻辑在 Service 层工厂 ``project_orchestrator_factory``
+    （本模块不直接 import 底层服务，保持
+    ``test_api_module_does_not_import_forbidden_services`` 约束）。
+    RAG 继续复用 base 的全局 RagService（知识库不按项目拆分）。
 
     Args:
         project_id: 来自请求的 project_id（已通过 Pydantic 校验非空）。
 
     Returns:
-        新构造的 ``AIOrchestratorService``，下游依赖与默认实例共享。
+        绑定该项目数据源的 ``AIOrchestratorService``。
+
+    Raises:
+        ProjectNotFoundError:          project_id 未注册（→ HTTP 404）。
+        AIOrchestratorUnavailableError: 项目数据源不可用（→ HTTP 503）。
     """
-    base = _default_orchestrator
+    from backend.app.services.project_orchestrator_factory import (
+        build_orchestrator_for_project,
+    )
 
-    class _ProjectedProvider(ProjectContextProvider):
-        """把 project_id 写入 ProjectContext，其他字段从默认 ProjectContext 复用。"""
-
-        def __init__(self) -> None:
-            self._cached = self._build_context(project_id)
-
-        @staticmethod
-        def _build_context(pid: str) -> ProjectContext:
-            base_ctx = get_default_project_context()
-            # 保留 data_source（来自默认配置），只覆盖 id / name / description
-            return ProjectContext(
-                project_id=pid,
-                project_name=pid,
-                description=base_ctx.description,
-                data_source=base_ctx.data_source,
-            )
-
-        def resolve(self):
-            return (
-                self._cached,
-                *base._project_provider.resolve()[1:],  # type: ignore[attr-defined]
-            )
-
-    return AIOrchestratorService(
-        router=base._router,  # type: ignore[attr-defined]
-        rag_service=base._rag,  # type: ignore[attr-defined]
-        tool_registry=base._tools,  # type: ignore[attr-defined]
-        text_to_sql=base._text_to_sql,  # type: ignore[attr-defined]
-        sql_executor=base._sql_executor,  # type: ignore[attr-defined]
-        table_selector=base._table_selector,  # type: ignore[attr-defined]
-        context_composer=base._context_composer,  # type: ignore[attr-defined]
-        project_context_provider=_ProjectedProvider(),
+    return build_orchestrator_for_project(
+        project_id,
+        base=_default_orchestrator,
     )
 
 
@@ -348,6 +336,7 @@ def _to_chat_response(result: AIOrchestrationResult) -> ChatResponse:
     response_model=ChatResponse,
     responses={
         400: {"description": "请求参数非法（question 等）"},
+        404: {"description": "project_id 未注册（Phase 3.8.1）"},
         422: {"description": "请求体校验失败（Pydantic）"},
         500: {"description": "AI 服务内部错误"},
         502: {"description": "路由决策失败（Router / Tool 路由未命中）"},
@@ -397,6 +386,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
         # 注意：question 已被 Pydantic strip + 非空校验；不再预处理。
         result = await orchestrator.execute(request.question)
+    except ProjectNotFoundError as exc:
+        # Phase 3.8.1：project_id 只能选择服务器端已注册的数据源（§八）
+        logger.warning(
+            "project not registered",
+            extra={"project_id": request.project_id},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"项目未注册: {exc}",
+        )
     except AIOrchestratorInputError as exc:
         # 服务层兜底（Pydantic 已覆盖大部分）
         raise HTTPException(

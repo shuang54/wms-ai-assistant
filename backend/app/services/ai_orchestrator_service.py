@@ -411,9 +411,15 @@ class AIOrchestratorService:
     async def _run_text_to_sql(
         self, decision: RouteDecision, question: str
     ) -> AIOrchestrationResult:
-        # a) Project context（同步 → to_thread）
+        # a) Project context（Phase 3.8.1 修复：to_thread 包裹）
+        #    历史 bug：直接在事件循环内同步调用 resolve()，而
+        #    DefaultProjectContextProvider.resolve 内部用 asyncio.run
+        #    桥接 async SchemaExplorer → "asyncio.run() cannot be called
+        #    from a running event loop" RuntimeError。Provider docstring
+        #    一直声明"由 to_thread 包裹"，本阶段按声明补上（最小修复，
+        #    不改变任何业务逻辑）。
         try:
-            ctx = self._project_provider.resolve()
+            ctx = await asyncio.to_thread(self._project_provider.resolve)
         except AIOrchestratorUnavailableError:
             raise
         except Exception as exc:
