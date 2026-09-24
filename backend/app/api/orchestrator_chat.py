@@ -50,6 +50,7 @@ from backend.app.projects.context import (
     ProjectContext,
     get_default_project_context,
 )
+from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http  # noqa: E501
 from backend.app.services.ai_orchestrator_service import (
     AIOrchestrationResult,
     AIOrchestratorError,
@@ -181,6 +182,16 @@ class ChatResponse(BaseModel):
 # （ToolRegistryCapabilityAdapter，只读 name/description/aliases，不暴露 handler）
 # 才能把"查询物料 10001 当前库存"规则命中到 TOOL；否则会被判为数据分析
 # 意图而进入 Text-to-SQL（决策文档 §十九 / §二十二）。
+# Phase 3.7.13：依赖 AIOrchestratorService 默认注入的真实 RagService。
+#
+# 历史（Phase 3.7.11）：_default_orchestrator 仅注入 tool_registry，
+# rag_service 留为 None；当 Router 规则命中 RAG 时，Orchestrator._run_rag
+# 直接抛 "RAG service 未配置"，RAG 路径完全不可达。
+#
+# 修复（Phase 3.7.13）：AIOrchestratorService.__init__ 已将 rag_service 默认值
+# 从 None 改为 RagService()（懒加载默认实例），所以此处无需显式注入。
+# API 层**不**直接 import RagService（保持 `test_api_module_does_not_import_forbidden_services`
+# 的纵深防御约束）。
 _TOOL_REGISTRY = build_default_tool_registry()
 
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(

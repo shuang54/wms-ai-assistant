@@ -224,7 +224,7 @@ class AIOrchestratorService:
         self,
         *,
         router: AIRouter | None = None,
-        rag_service: Any = None,
+        rag_service: Any | None = None,
         tool_registry: ToolRegistry | None = None,
         text_to_sql: TextToSQLGenerator | None = None,
         sql_executor: SQLExecutor | None = None,
@@ -235,6 +235,15 @@ class AIOrchestratorService:
     ) -> None:
         """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。"""
         self._router = router if router is not None else AIRouterService()
+        # Phase 3.7.13：rag_service 缺省改为真实 RagService（懒加载默认实例），
+        # 修复 Phase 3.7.11 留下的"RAG 路径不可达"接线 bug。
+        # 保持 ``None`` 显式注入依然有效（用于测试或项目自定义场景）。
+        # 延迟 import：避免 ai_orchestrator_service → rag_service 的循环依赖
+        # （RagService 内部不依赖 Orchestrator，但模块级加载顺序仍要保持稳定）。
+        if rag_service is None:
+            from backend.app.services.rag_service import RagService
+
+            rag_service = RagService()
         self._rag = rag_service
         self._tools = tool_registry
         self._text_to_sql = (
