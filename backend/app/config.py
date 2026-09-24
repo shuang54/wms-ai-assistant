@@ -323,6 +323,55 @@ class TextToSQLSettings:
 
 
 # ============================================================
+# SQL Executor 配置（Phase 3.7.7）
+# ============================================================
+
+SQL_EXECUTOR_TIMEOUT_SECONDS_MIN = 1
+SQL_EXECUTOR_TIMEOUT_SECONDS_MAX = 600
+SQL_EXECUTOR_MAX_ROWS_MIN = 1
+SQL_EXECUTOR_MAX_ROWS_MAX = 100000
+SQL_EXECUTOR_MAX_RESULT_BYTES_MIN = 64 * 1024
+SQL_EXECUTOR_MAX_RESULT_BYTES_MAX = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class SQLExecutorSettings:
+    """Read-only SQL Executor 配置（Phase 3.7.7 引入）。
+
+    字段：
+        timeout_seconds:  单条 SQL 语句级超时（PostgreSQL
+                          statement_timeout，事务内 SET LOCAL，
+                          不污染连接池）。默认 10s，钳制 [1, 600]。
+        max_rows:         单次执行返回的最大行数（Validator
+                          LIMIT 校验之外的运行时第二层保护）。
+                          默认 1000，钳制 [1, 100000]。
+        max_result_bytes: 结果总大小保护（按字段字符串化估算，
+                          MVP 粗粒度）。默认 1MB，
+                          钳制 [64KB, 64MB]。
+    """
+
+    timeout_seconds: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "SQL_EXECUTOR_TIMEOUT_SECONDS", 10,
+            SQL_EXECUTOR_TIMEOUT_SECONDS_MIN, SQL_EXECUTOR_TIMEOUT_SECONDS_MAX,
+        )
+    )
+    max_rows: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "SQL_EXECUTOR_MAX_ROWS", 1000,
+            SQL_EXECUTOR_MAX_ROWS_MIN, SQL_EXECUTOR_MAX_ROWS_MAX,
+        )
+    )
+    max_result_bytes: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "SQL_EXECUTOR_MAX_RESULT_BYTES", 1024 * 1024,
+            SQL_EXECUTOR_MAX_RESULT_BYTES_MIN,
+            SQL_EXECUTOR_MAX_RESULT_BYTES_MAX,
+        )
+    )
+
+
+# ============================================================
 # 顶层 Settings
 # ============================================================
 
@@ -342,6 +391,7 @@ class Settings:
     tool: ToolSettings = field(default_factory=ToolSettings)
     project: ProjectSettings = field(default_factory=ProjectSettings)
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
+    sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
 
 
 settings = Settings()
@@ -356,5 +406,6 @@ __all__ = [
     "ToolSettings",
     "ProjectSettings",
     "TextToSQLSettings",
+    "SQLExecutorSettings",
     "settings",
 ]
