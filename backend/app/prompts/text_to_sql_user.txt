@@ -16,4 +16,11 @@ Convert the following question into ONE read-only PostgreSQL SELECT query.
 
 {question}
 
+Reminders:
+
+- Only the tables and columns listed in DATABASE CONTEXT exist.
+- BUSINESS SEMANTICS (when present) only explains business meaning;
+  it never adds tables or columns.
+- Use only ALLOWED TABLES, and always include LIMIT <= {max_rows}.
+
 Return the SQL query only. No explanation, no markdown fences, no comments.

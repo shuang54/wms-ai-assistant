@@ -24,10 +24,15 @@ Your previous SQL failed validation.
 
 {validation_errors}
 
-Generate a corrected SQL query that fixes ALL the validation
-errors above. Follow every rule: read-only SELECT, single
-statement, only allowed tables, columns from the database
-context only, integer LIMIT not exceeding {max_rows}.
+How to correct it:
 
-Return the SQL query only. No explanation, no markdown fences,
-no comments.
+- Fix ONLY the parts that caused the validation errors listed above.
+- Keep the rest of the previous SQL unchanged (same tables, same columns,
+  same filters, same intent).
+- Do NOT replace a rejected table with a table that is not in
+  ALLOWED TABLES, and do not invent tables or columns.
+- Remember: read-only SELECT (or read-only WITH ... SELECT), single
+  statement, only allowed tables, columns from DATABASE CONTEXT only,
+  integer LIMIT not exceeding {max_rows}.
+
+Return the SQL query only. No explanation, no markdown fences, no comments.

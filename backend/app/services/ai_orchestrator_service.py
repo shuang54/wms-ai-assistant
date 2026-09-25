@@ -50,6 +50,9 @@ from backend.app.services.ai_router_service import (
     RouteDecision,
     RouteType,
 )
+from backend.app.services.business_semantic_serializer import (
+    BusinessSemanticSerializer,
+)
 from backend.app.services.database_context_composer import DatabaseContextComposer
 from backend.app.services.relevant_table_selector import (
     RelevantTableSelector,
@@ -63,6 +66,7 @@ from backend.app.services.sql_executor_service import (
     SQLExecutorService,
 )
 from backend.app.services.sql_validator_service import DEFAULT_MAX_ROWS
+from backend.app.services.text_to_sql_context import TextToSQLContext
 from backend.app.services.text_to_sql_service import (
     TextToSQLGenerator,
     TextToSQLService,
@@ -288,6 +292,7 @@ class AIOrchestratorService:
         sql_executor: SQLExecutor | None = None,
         table_selector: RelevantTableSelector | None = None,
         context_composer: DatabaseContextComposer | None = None,
+        semantic_serializer: BusinessSemanticSerializer | None = None,
         project_context_provider: ProjectContextProvider | None = None,
         capabilities: ProjectCapabilities | None = None,
         knowledge_scope: ProjectKnowledgeScope | None = None,
@@ -335,6 +340,12 @@ class AIOrchestratorService:
             context_composer
             if context_composer is not None
             else DatabaseContextComposer()
+        )
+        # Phase 3.9.1：业务语义单独序列化，进入 TextToSQLContext.business_context
+        self._semantic_serializer = (
+            semantic_serializer
+            if semantic_serializer is not None
+            else BusinessSemanticSerializer()
         )
         self._project_provider = (
             project_context_provider
@@ -590,22 +601,36 @@ class AIOrchestratorService:
         )
         allowed_tables = tuple(s.table for s in selection.selections)
 
-        # c) 数据库上下文组装
+        # c) 数据库上下文组装（Phase 3.9.1：三层上下文结构化）
+        #    1) database_context = Database Schema 事实（Composer 只出事实）
+        #    2) business_context = 业务语义（独立段，Schema 不覆盖语义、
+        #       语义也不覆盖 Schema，由 Prompt 明确优先级）
+        #    3) SQL Constraints = Prompt 指令（真正拦截仍由 SQLValidator）
         database_context = self._context_composer.compose(
             project=project,
             schema=schema,
-            semantic=semantic,
+            semantic=None,
             tables=allowed_tables or None,
+        )
+        business_context = self._semantic_serializer.serialize(semantic) or None
+        generation_context = TextToSQLContext(
+            database_context=database_context,
+            business_context=business_context,
+            allowed_tables=allowed_tables,
+            max_rows=self._max_rows,
+            project_id=project.project_id,
         )
 
         # d) 生成 SQL（Generator 内部已调 Validator）
+        #    注：generate() 契约保持 Phase 3.7.6 原样（不新增参数），
+        #    结构化上下文经 render() 渲染为单段文本传入。
         try:
             sql_result = await self._text_to_sql.generate(
                 question,
-                database_context=database_context,
-                allowed_tables=allowed_tables or None,
+                database_context=generation_context.render(),
+                allowed_tables=generation_context.allowed_tables or None,
                 schema=schema,
-                max_rows=self._max_rows,
+                max_rows=generation_context.max_rows,
             )
         except Exception as exc:
             raise AIOrchestratorExecutionError(
