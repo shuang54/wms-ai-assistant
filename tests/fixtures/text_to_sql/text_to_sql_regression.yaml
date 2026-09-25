@@ -1,0 +1,179 @@
+# Text-to-SQL Regression Dataset（Phase 3.9.3）
+#
+# 用途：以后修改 Prompt / Semantic / RelevantTableSelector / Model /
+#       Context 时，用固定问题集自动验证是否发生回归。
+#
+# 设计原则：
+#   1. **结构期望，不是精确 SQL** —— 同一问题存在多种合法 SQL，
+#      字符串相等会制造大量假失败；
+#   2. **不虚构字段** —— 所有 table / column 都取自当前真实 Schema：
+#        public.knowledge_document（含 file_type / status / created_at / ...）
+#        public.knowledge_chunk（含 document_id / token_count / created_at / ...）
+#        FK / 业务关系：knowledge_chunk.document_id → knowledge_document.id
+#      （project-a / project-b 的 inventory 表见 §十 隔离 fixture）；
+#   3. **默认不执行 SQL** —— 全数据集可在无数据库环境下运行；
+#      DB 测试按需用 with_execution_required() 打开；
+#   4. table / column 期望由 sqlglot AST 判定（含 alias 解析），
+#      must_not_contain 也是 AST 判定（字符串字面量不算命中）。
+
+_schema_doc: >-
+  Text-to-SQL Regression Cases (Phase 3.9.3). Structural expectations only —
+  no exact expected SQL. Cases run offline with a deterministic Fake Generator
+  by default; must_execute stays unset so pytest never requires a database.
+_schema_version: "1.0"
+_fields:
+  id: "string, required, unique across the dataset"
+  question: "string, required, non-empty natural language question"
+  project_id: "string, optional, resolved by EvaluationContextResolver"
+  expected.must_pass_validation: "bool, optional; false = SQL must be REJECTED by SQLValidator (security boundary)"
+  expected.must_contain_tables: "list of 'table' or 'schema.table', all must appear in the AST"
+  expected.must_contain_columns: "list of 'column' or 'table.column', all must appear in the AST (aliases resolved)"
+  expected.must_not_contain: "list of forbidden identifiers; any hit fails the case"
+  expected.must_execute: "bool, optional; true = SQL must execute successfully (requires executor)"
+
+cases:
+  # ---- Case 1：简单查询 ----
+  - id: simple_document_list
+    question: "查询知识文档列表"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+
+  # ---- Case 2：Top N ----
+  - id: top_n_chunks_by_token_count
+    question: "查询分词数量最多的10个知识分片"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_chunk
+      must_contain_columns:
+        - knowledge_chunk.token_count
+
+  # ---- Case 3：条件过滤 ----
+  - id: filtered_documents_by_file_type
+    question: "查询文件类型为指定类型的知识文档"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+      must_contain_columns:
+        - knowledge_document.file_type
+
+  # ---- Case 4：排序 ----
+  - id: chunks_ordered_by_token_count
+    question: "查询知识分片并按照分词数量从高到低排序"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_chunk
+      must_contain_columns:
+        - knowledge_chunk.token_count
+
+  # ---- Case 5：聚合 ----
+  - id: aggregate_document_count
+    question: "统计知识文档总数"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+
+  # ---- Case 6：GROUP BY ----
+  - id: group_by_chunk_count_per_document
+    question: "统计每个知识文档的知识分片数量"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_chunk
+      must_contain_columns:
+        - knowledge_chunk.document_id
+
+  # ---- Case 7：HAVING ----
+  - id: having_chunk_count_greater_than
+    question: "查询知识分片数量超过2个的知识文档"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_chunk
+      must_contain_columns:
+        - knowledge_chunk.document_id
+
+  # ---- Case 8：JOIN（真实 FK / 业务关系） ----
+  - id: join_chunk_with_parent_document
+    question: "查询知识分片及其所属知识文档的标题"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_chunk
+        - public.knowledge_document
+      must_contain_columns:
+        - knowledge_chunk.document_id
+        - knowledge_document.title
+
+  # ---- Case 9：日期条件（Schema 确有 created_at） ----
+  - id: date_filter_created_after
+    question: "查询2026年1月1日之后创建的知识文档"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+      must_contain_columns:
+        - knowledge_document.created_at
+
+  # ---- Case 10：LIMIT ----
+  - id: limit_first_10_documents
+    question: "查询前10条知识文档"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+
+  # ---- Case 11：Semantic-dependent（依赖业务语义才能理解 文档 / 分片） ----
+  - id: semantic_dependent_document_and_chunk
+    question: "查询每个文档包含多少个分片"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - public.knowledge_document
+        - public.knowledge_chunk
+      must_contain_columns:
+        - knowledge_chunk.document_id
+
+  # ---- Case 12：安全边界（必须被 SQLValidator 拒绝） ----
+  - id: safety_delete_all_documents
+    question: "删除知识文档表中的所有数据"
+    project_id: vietnam-wms
+    expected:
+      must_pass_validation: false
+
+  # ---- Case 13/14：Project Isolation（同问句，不同项目） ----
+  - id: project_a_inventory
+    question: "查询库存明细"
+    project_id: eval-project-a
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - project_a.inventory
+      must_not_contain:
+        - project_b.inventory
+
+  - id: project_b_inventory
+    question: "查询库存明细"
+    project_id: eval-project-b
+    expected:
+      must_pass_validation: true
+      must_contain_tables:
+        - project_b.inventory
+      must_not_contain:
+        - project_a.inventory
