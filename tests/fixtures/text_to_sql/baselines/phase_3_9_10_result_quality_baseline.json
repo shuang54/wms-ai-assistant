@@ -1,0 +1,185 @@
+{
+  "phase": "3.9.10",
+  "dataset_version": "1.0",
+  "total_cases": 14,
+  "applicable_result_cases": 3,
+  "correct_result_cases": 3,
+  "incorrect_result_cases": 0,
+  "not_evaluable_cases": 0,
+  "result_accuracy": 1.0,
+  "quality_metrics": {
+    "total_cases": 14,
+    "generation_success": 14,
+    "generation_failure": 0,
+    "generation_unknown": 0,
+    "generation_success_rate": 1.0,
+    "validator_accepted": 14,
+    "validator_rejected": 0,
+    "validator_acceptance_rate": 1.0,
+    "expectation_matched": 13,
+    "expectation_mismatched": 1,
+    "expectation_match_rate": 0.9286,
+    "execution_success": 12,
+    "execution_failure": 0,
+    "execution_not_attempted": 2,
+    "execution_success_rate": 1.0,
+    "result_correct": 3,
+    "result_incorrect": 0,
+    "result_not_evaluated": 11,
+    "result_accuracy": 1.0
+  },
+  "expectation_types": {
+    "simple_document_list": "exact_rows",
+    "aggregate_document_count": "scalar",
+    "limit_first_10_documents": "exact_rows"
+  },
+  "cases": [
+    {
+      "case_id": "simple_document_list",
+      "applicable": true,
+      "passed": true,
+      "reason": "exact rows matched",
+      "expected": [],
+      "actual": {
+        "columns": [
+          "id",
+          "title",
+          "file_name",
+          "file_type",
+          "source",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "rows": []
+      }
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "filtered_documents_by_file_type",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "aggregate_document_count",
+      "applicable": true,
+      "passed": true,
+      "reason": "scalar matched",
+      "expected": 0,
+      "actual": {
+        "columns": [
+          "count"
+        ],
+        "rows": [
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "date_filter_created_after",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "limit_first_10_documents",
+      "applicable": true,
+      "passed": true,
+      "reason": "exact rows matched",
+      "expected": [],
+      "actual": {
+        "columns": [
+          "id",
+          "title",
+          "file_name",
+          "file_type",
+          "source",
+          "content_hash",
+          "status",
+          "metadata",
+          "created_at",
+          "updated_at"
+        ],
+        "rows": []
+      }
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "safety_delete_all_documents",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "project_a_inventory",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    },
+    {
+      "case_id": "project_b_inventory",
+      "applicable": false,
+      "passed": null,
+      "reason": "no result_expectation defined",
+      "expected": null,
+      "actual": null
+    }
+  ]
+}

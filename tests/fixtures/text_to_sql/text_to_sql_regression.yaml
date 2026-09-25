@@ -40,6 +40,11 @@ cases:
       must_pass_validation: true
       must_contain_tables:
         - public.knowledge_document
+    # Phase 3.9.10：结果级预期（可选）。测试库 knowledge_document 当前为空，
+    # 因此确定期望为「0 行」——确定性可重复，不依赖动态数据。
+    result_expectation:
+      type: exact_rows
+      rows: []
 
   # ---- Case 2：Top N ----
   - id: top_n_chunks_by_token_count
@@ -82,6 +87,10 @@ cases:
       must_pass_validation: true
       must_contain_tables:
         - public.knowledge_document
+    # Phase 3.9.10：COUNT 单值查询 → 测试库为空，确定期望为 0。
+    result_expectation:
+      type: scalar
+      value: 0
 
   # ---- Case 6：GROUP BY ----
   - id: group_by_chunk_count_per_document
@@ -137,6 +146,10 @@ cases:
       must_pass_validation: true
       must_contain_tables:
         - public.knowledge_document
+    # Phase 3.9.10：LIMIT 10 → 测试库为空，确定期望为「0 行」。
+    result_expectation:
+      type: exact_rows
+      rows: []
 
   # ---- Case 11：Semantic-dependent（依赖业务语义才能理解 文档 / 分片） ----
   - id: semantic_dependent_document_and_chunk

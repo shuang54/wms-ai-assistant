@@ -126,7 +126,10 @@ _TOP_LEVEL_KEYS: Final[frozenset[str]] = frozenset({"cases"})
 
 #: case 允许键
 _CASE_KEYS: Final[frozenset[str]] = frozenset(
-    {"id", "question", "project_id", "expected"}
+    # ``result_expectation``（Phase 3.9.10）是**可选**的结果级预期：
+    # 本 Loader 只接受并忽略它（语义由 text_to_sql_result_evaluation_service
+    # 单独解析），缺少该键的 dataset 行为完全不变（向后兼容）。
+    {"id", "question", "project_id", "expected", "result_expectation"}
 )
 
 #: expected 允许键（未知键一律拒绝，防止拼写错误静默失效）
