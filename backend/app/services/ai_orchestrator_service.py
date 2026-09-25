@@ -65,6 +65,7 @@ from backend.app.services.sql_executor_service import (
     SQLExecutor,
     SQLExecutorService,
 )
+from backend.app.services.semantic_schema_filter import SemanticSchemaFilter
 from backend.app.services.sql_validator_service import DEFAULT_MAX_ROWS
 from backend.app.services.text_to_sql_context import TextToSQLContext
 from backend.app.services.text_to_sql_service import (
@@ -293,6 +294,7 @@ class AIOrchestratorService:
         table_selector: RelevantTableSelector | None = None,
         context_composer: DatabaseContextComposer | None = None,
         semantic_serializer: BusinessSemanticSerializer | None = None,
+        semantic_filter: SemanticSchemaFilter | None = None,
         project_context_provider: ProjectContextProvider | None = None,
         capabilities: ProjectCapabilities | None = None,
         knowledge_scope: ProjectKnowledgeScope | None = None,
@@ -346,6 +348,12 @@ class AIOrchestratorService:
             semantic_serializer
             if semantic_serializer is not None
             else BusinessSemanticSerializer()
+        )
+        # Phase 3.9.2：语义 → 当前 Schema + 本次 selected tables 对齐过滤
+        self._semantic_filter = (
+            semantic_filter
+            if semantic_filter is not None
+            else SemanticSchemaFilter()
         )
         self._project_provider = (
             project_context_provider
@@ -612,7 +620,15 @@ class AIOrchestratorService:
             semantic=None,
             tables=allowed_tables or None,
         )
-        business_context = self._semantic_serializer.serialize(semantic) or None
+        #    2') Phase 3.9.2：Semantic 先按"当前 Schema + 本次 selected
+        #        tables"对齐过滤——Schema 是事实来源，Semantic 只解释可见表；
+        #        不存在 / 未选中的表、字段与关系一律删除（绝不回推 Schema）。
+        filtered_semantic = self._semantic_filter.filter(
+            semantic, schema, allowed_tables=allowed_tables
+        )
+        business_context = (
+            self._semantic_serializer.serialize(filtered_semantic) or None
+        )
         generation_context = TextToSQLContext(
             database_context=database_context,
             business_context=business_context,
