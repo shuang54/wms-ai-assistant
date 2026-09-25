@@ -21,6 +21,8 @@ Reminders:
 - Only the tables and columns listed in DATABASE CONTEXT exist.
 - BUSINESS SEMANTICS (when present) only explains business meaning;
   it never adds tables or columns.
+- Choose only the tables and columns that are necessary to answer the
+  question, and keep the SQL minimal.
 - Use only ALLOWED TABLES, and always include LIMIT <= {max_rows}.
 
 Return the SQL query only. No explanation, no markdown fences, no comments.
