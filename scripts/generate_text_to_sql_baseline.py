@@ -46,18 +46,6 @@ from sqlalchemy import text as sa_text  # noqa: E402
 from backend.app.config import settings  # noqa: E402
 from backend.app.db import reset_engine_cache  # noqa: E402
 from backend.app.db.session import get_engine  # noqa: E402
-from backend.app.projects.models import DataSource, ProjectContext  # noqa: E402
-from backend.app.projects.semantic import (  # noqa: E402
-    ColumnSemantic,
-    ProjectSemantic,
-    TableSemantic,
-)
-from backend.app.projects.semantic_loader import ProjectSemanticLoader  # noqa: E402
-from backend.app.services.schema_explorer_service import (  # noqa: E402
-    DatabaseSchema,
-    SchemaColumn,
-    SchemaTable,
-)
 from backend.app.services.text_to_sql_baseline_service import (  # noqa: E402
     BASELINE_REPORT_PATH,
     BASELINE_SNAPSHOT_PATH,
@@ -66,11 +54,14 @@ from backend.app.services.text_to_sql_baseline_service import (  # noqa: E402
     run_baseline,
 )
 from backend.app.services.text_to_sql_evaluation_service import (  # noqa: E402
-    EvaluationProjectBinding,
     StaticEvaluationContextResolver,
     load_text_to_sql_regression_dataset,
 )
 from backend.app.services.text_to_sql_service import TextToSQLResult  # noqa: E402
+from scripts._text_to_sql_offline_bindings import (  # noqa: E402
+    OFFLINE_SCHEMA_BY_PROJECT,
+    build_offline_project_bindings,
+)
 
 RESPONSES_PATH = (
     _REPO_ROOT
@@ -81,112 +72,8 @@ RESPONSES_PATH = (
     / "deterministic_generator_responses.json"
 )
 
-#: case_id → 所属 binding 使用的 schema_name（见 _bindings()）
-_SCHEMA_BY_PROJECT: dict[str, str] = {
-    "vietnam-wms": "public",
-    "eval-project-a": "project_a",
-    "eval-project-b": "project_b",
-}
-
 #: Baseline 对比时忽略的字段（非确定性 / 环境相关）
 _IGNORED_COMPARE_KEYS: tuple[str, ...] = ("generated_at", "environment")
-
-
-# ============================================================
-# Schema builders（结构与真实库一致，不虚构字段）
-# ============================================================
-
-def _column(name: str, position: int) -> SchemaColumn:
-    return SchemaColumn(
-        name=name, data_type="character varying", nullable=True,
-        default=None, ordinal_position=position, is_primary_key=False,
-        description=None,
-    )
-
-
-def _table(schema_name: str, name: str, columns: tuple[str, ...]) -> SchemaTable:
-    return SchemaTable(
-        schema_name=schema_name,
-        name=name,
-        description=None,
-        columns=tuple(_column(c, i + 1) for i, c in enumerate(columns)),
-        foreign_keys=(),
-    )
-
-
-def _knowledge_schema() -> DatabaseSchema:
-    return DatabaseSchema(
-        schema_name="public",
-        tables=(
-            _table("public", "knowledge_document", (
-                "id", "title", "file_name", "file_type", "source",
-                "status", "created_at", "updated_at",
-            )),
-            _table("public", "knowledge_chunk", (
-                "id", "document_id", "chunk_index", "content",
-                "token_count", "created_at",
-            )),
-        ),
-    )
-
-
-def _inventory_schema(schema_name: str) -> DatabaseSchema:
-    return DatabaseSchema(
-        schema_name=schema_name,
-        tables=(_table(schema_name, "inventory", ("material_code", "qty")),),
-    )
-
-
-def _inventory_semantic(schema_name: str) -> ProjectSemantic:
-    return ProjectSemantic(
-        tables=(
-            TableSemantic(
-                table=f"{schema_name}.inventory",
-                business_name="库存",
-                aliases=("库存",),
-            ),
-        ),
-        columns=(
-            ColumnSemantic(
-                table=f"{schema_name}.inventory", column="material_code",
-                business_name="物料编码",
-            ),
-            ColumnSemantic(
-                table=f"{schema_name}.inventory", column="qty",
-                business_name="库存数量",
-            ),
-        ),
-    )
-
-
-def _project(project_id: str, name: str) -> ProjectContext:
-    return ProjectContext(
-        project_id=project_id,
-        project_name=name,
-        description=None,
-        data_source=DataSource(name="primary", type="postgresql"),
-    )
-
-
-def _bindings() -> dict[str, EvaluationProjectBinding]:
-    """三套静态绑定：真实知识库语义 + Project A/B 隔离 schema。"""
-    return {
-        "vietnam-wms": EvaluationProjectBinding(
-            project=_project("vietnam-wms", "Vietnam WMS"),
-            schema=_knowledge_schema(),
-            semantic=ProjectSemanticLoader().load("vietnam-wms"),
-        ),
-        "eval-project-a": EvaluationProjectBinding(
-            project=_project("eval-project-a", "Project A"),
-            schema=_inventory_schema("project_a"),
-            semantic=_inventory_semantic("project_a"),
-        ),
-        "eval-project-b": EvaluationProjectBinding(
-            project=_project("eval-project-b", "Project B"),
-            schema=_inventory_schema("project_b"),
-            semantic=_inventory_semantic("project_b"),
-        ),
-    }
 
 
 # ============================================================
@@ -234,7 +121,7 @@ def load_responses(cases) -> dict[tuple[str, str], str]:
         )
     responses: dict[tuple[str, str], str] = {}
     for case in cases:
-        schema_name = _SCHEMA_BY_PROJECT.get(case.project_id or "", "")
+        schema_name = OFFLINE_SCHEMA_BY_PROJECT.get(case.project_id or "", "")
         responses[(case.question, schema_name)] = by_case_id[case.case_id]
     return responses
 
@@ -268,7 +155,9 @@ async def _run(*, check: bool) -> int:
 
     baseline = await run_baseline(
         generator=generator,
-        context_resolver=StaticEvaluationContextResolver(bindings=_bindings()),
+        context_resolver=StaticEvaluationContextResolver(
+            bindings=build_offline_project_bindings()
+        ),
         cases=cases,
         phase=PHASE,
         environment=environment,
