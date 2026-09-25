@@ -18,6 +18,11 @@
 
 纪律（任务书 §二 严格范围）：
 
+- Phase 3.8.6 —— 本工厂不再分别调用 Registry / SemanticProvider /
+  KnowledgeProvider，统一通过 ``ProjectConfigurationProvider.get(project_id)``
+  获取 ``ProjectConfiguration``（context / schema_name / capabilities /
+  semantic / knowledge_scope），消除多源配置漂移；Core Orchestrator
+  职责边界不变（§十一：不把整个 ProjectConfiguration 注入 Orchestrator）；
 - **不修改** Router 路由规则 / Orchestrator 核心执行逻辑 /
   SQL Validator 安全规则 / Tool Framework 业务能力；
 - **不修改** RAG 核心：RagService / Reranker / ContextBuilder /
@@ -35,6 +40,11 @@ import logging
 from typing import Any
 
 from backend.app.projects.capabilities import ProjectCapabilities
+from backend.app.projects.configuration import (
+    DefaultProjectConfigurationProvider,
+    ProjectConfiguration,
+    ProjectConfigurationProvider,
+)
 from backend.app.projects.engine_provider import (
     DatabaseEngineProvider,
     DatabaseEngineProviderError,
@@ -43,12 +53,15 @@ from backend.app.projects.engine_provider import (
 from backend.app.projects.knowledge_provider import (
     ProjectKnowledgeProvider,
     ProjectKnowledgeProviderError,
-    ProjectKnowledgeScope,
     get_default_project_knowledge_provider,
 )
 from backend.app.projects.registry import (
     ProjectRegistry,
     get_default_project_registry,
+)
+from backend.app.projects.semantic_loader import (
+    ProjectSemanticError,
+    ProjectSemanticNotFoundError,
 )
 from backend.app.projects.semantic_provider import (
     ProjectSemanticProvider,
@@ -87,6 +100,7 @@ def build_orchestrator_for_project(
     engine_provider: DatabaseEngineProvider | None = None,
     semantic_provider: ProjectSemanticProvider | None = None,
     knowledge_provider: ProjectKnowledgeProvider | None = None,
+    configuration_provider: ProjectConfigurationProvider | None = None,
 ) -> AIOrchestratorService:
     """构造绑定到指定项目数据源的 Orchestrator（Phase 3.8.1）。
 
@@ -108,6 +122,12 @@ def build_orchestrator_for_project(
                             项目不触碰 KnowledgeProvider，任务书 §十三）；
                             解析失败 → AIOrchestratorUnavailableError
                             （API 层映射 503，绝不回退其他项目知识）。
+        configuration_provider:
+                            Phase 3.8.6 —— project_id → ProjectConfiguration
+                            的统一装配器；None 时由上面的 registry /
+                            semantic_provider / knowledge_provider 组合
+                            构造 ``DefaultProjectConfigurationProvider``
+                            （Factory 不再分别调用各 Provider）。
 
     Returns:
         新的 ``AIOrchestratorService``：
@@ -124,20 +144,51 @@ def build_orchestrator_for_project(
                                    （连接未注册 / DATABASE_URL 为空 /
                                    知识 scope 未注册等，API 层映射 503）。
     """
-    resolved_registry = (
-        registry if registry is not None else get_default_project_registry()
-    )
     resolved_provider = (
         engine_provider
         if engine_provider is not None
         else get_default_engine_provider()
     )
+    # Phase 3.8.6：统一配置入口（Factory 不再分别调用 registry /
+    # semantic_provider / knowledge_provider；未显式注入时按既有 DI
+    # 语义组合默认装配器，保持旧调用与 monkeypatch 行为不变）。
+    resolved_configuration_provider = (
+        configuration_provider
+        if configuration_provider is not None
+        else DefaultProjectConfigurationProvider(
+            registry=(
+                registry if registry is not None
+                else get_default_project_registry()
+            ),
+            semantic_provider=(
+                semantic_provider
+                if semantic_provider is not None
+                else get_default_project_semantic_provider()
+            ),
+            knowledge_provider=(
+                knowledge_provider
+                if knowledge_provider is not None
+                else get_default_project_knowledge_provider()
+            ),
+        )
+    )
 
-    # ---- 1) project_id → ProjectRegistration（未注册 → clear error） ----
-    registration = resolved_registry.get(project_id)
-    context = registration.context
-    schema_name = registration.schema_name
-    capabilities = registration.capabilities
+    # ---- 1) project_id → ProjectConfiguration（§七：Registry 先行） ----
+    # ProjectNotFoundError 原样透传（→ 404）；Semantic / Knowledge 缺失
+    # → clear error → 503（§二十：绝不 fallback 到 vietnam-wms / global）。
+    try:
+        configuration = resolved_configuration_provider.get(project_id)
+    except ProjectSemanticError as exc:
+        raise AIOrchestratorUnavailableError(
+            f"项目 {project_id!r} 的业务语义不可用: {exc}"
+        ) from exc
+    except ProjectKnowledgeProviderError as exc:
+        raise AIOrchestratorUnavailableError(
+            f"项目 {project_id!r} 的知识库上下文不可用: {exc}"
+        ) from exc
+    context = configuration.context
+    schema_name = configuration.schema_name
+    capabilities = configuration.capabilities
 
     # ---- 2) DataSource → 受控 Engine（同一 Engine 贯穿全链路） ----
     try:
@@ -153,13 +204,9 @@ def build_orchestrator_for_project(
         project_context=context,
         explorer=explorer,
         schema_name=schema_name,
-        # Phase 3.8.3：Semantic 成为 Project Runtime Context 的正式组成部分
-        # （project_id 唯一决定 Semantic；服务器端 Provider，HTTP 不可注入）
-        semantic_provider=(
-            semantic_provider
-            if semantic_provider is not None
-            else get_default_project_semantic_provider()
-        ),
+        # Phase 3.8.3 + 3.8.6：Semantic 来自统一聚合配置（不再各自解析），
+        # 仍然遵循"由服务器端 project_id 唯一决定"（HTTP 不可注入）。
+        semantic_provider=_ResolvedSemanticProvider(configuration),
     )
     executor = SQLExecutorService(engine=engine)
     # Phase 3.8.2：Tool Registry 只注册该项目允许的 Tool
@@ -172,23 +219,10 @@ def build_orchestrator_for_project(
         project_id=project_id,
     )
 
-    # ---- 3.5) Phase 3.8.4：Project Knowledge Scope ----
-    # 仅 knowledge_enabled=True 时解析（禁用 RAG 的项目不触碰
-    # KnowledgeProvider / VectorSearch / RagService，任务书 §十三）；
-    # 显式 Provider 下未注册 → clear error → 503（绝不回退其他项目）。
-    knowledge_scope: ProjectKnowledgeScope | None = None
-    if capabilities.knowledge_enabled:
-        resolved_knowledge_provider = (
-            knowledge_provider
-            if knowledge_provider is not None
-            else get_default_project_knowledge_provider()
-        )
-        try:
-            knowledge_scope = resolved_knowledge_provider.get_scope(project_id)
-        except ProjectKnowledgeProviderError as exc:
-            raise AIOrchestratorUnavailableError(
-                f"项目 {project_id!r} 的知识库上下文不可用: {exc}"
-            ) from exc
+    # ---- 3.5) Phase 3.8.4 / 3.8.6：Project Knowledge Scope ----
+    # scope 已在 ProjectConfiguration 装配阶段解析（仅 knowledge_enabled=True
+    # 的项目；禁用 RAG 的项目 KnowledgeProvider 0 次解析，任务书 §十三）。
+    knowledge_scope = configuration.knowledge_scope
 
     # ---- 4) base 依赖解析（RAG / T2S / Selector / Composer 复用） ----
     if base is None:
@@ -241,6 +275,36 @@ def build_orchestrator_for_project(
         # knowledge_enabled=False 时为 None，且 RAG 不可达）
         knowledge_scope=knowledge_scope,
     )
+
+
+# ============================================================
+# Phase 3.8.6：已聚合 Semantic → 既有 ProjectContextProvider
+# ============================================================
+
+class _ResolvedSemanticProvider:
+    """把 ProjectConfiguration.semantic 交给既有 DefaultProjectContextProvider。
+
+    目的：Core 层（``ai_orchestrator_service.DefaultProjectContextProvider``）
+    **零改动**（任务书 §十一）——它仍然只看到一个 "SemanticProvider"，
+    但语义结果来自 Phase 3.8.6 的统一聚合配置。
+
+    - project_id 一致 → 返回已装配的 semantic；
+    - project_id 不一致 → ``ProjectSemanticNotFoundError``（clear error，
+      Core 层已将其映射为 ``AIOrchestratorUnavailableError`` → 503），
+      绝不返回其它项目的语义。
+    """
+
+    def __init__(self, configuration: ProjectConfiguration) -> None:
+        self._configuration = configuration
+
+    def get(self, project_id: str) -> ProjectSemantic:  # noqa: ANN401
+        from backend.app.projects.semantic import ProjectSemantic
+
+        if project_id != self._configuration.project_id:
+            raise ProjectSemanticNotFoundError(project_id)
+        semantic = self._configuration.semantic
+        assert isinstance(semantic, ProjectSemantic)  # noqa: S101
+        return semantic
 
 
 # ============================================================
