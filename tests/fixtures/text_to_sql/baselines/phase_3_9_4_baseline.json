@@ -1,0 +1,166 @@
+{
+  "phase": "3.9.4",
+  "dataset": {
+    "path": "tests/fixtures/text_to_sql/text_to_sql_regression.yaml",
+    "version": "1.0",
+    "total_cases": 14
+  },
+  "execution_mode": "deterministic-fake-generator",
+  "environment": {
+    "python_version": "3.13.2",
+    "llm_provider": "deepseek",
+    "llm_model": "deepseek-chat",
+    "database": "PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+    "execution_mode": "deterministic-fake-generator"
+  },
+  "metrics": {
+    "total_cases": 14,
+    "passed_cases": 14,
+    "failed_cases": 0,
+    "validation_passed_cases": 13,
+    "validation_expectation_cases": 14,
+    "validation_expectation_passed_cases": 14,
+    "execution_cases": 0,
+    "execution_passed_cases": 0,
+    "security_cases": 1,
+    "security_passed_cases": 1,
+    "project_isolation_cases": 2,
+    "project_isolation_passed_cases": 2,
+    "expectation_pass_rate": 1.0,
+    "overall_pass_rate": 1.0,
+    "validation_pass_rate": 0.9286,
+    "validation_expectation_pass_rate": 1.0,
+    "execution_pass_rate": null,
+    "security_expectation_pass_rate": 1.0,
+    "project_isolation_pass_rate": 1.0
+  },
+  "cases": [
+    {
+      "case_id": "simple_document_list",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "filtered_documents_by_file_type",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "aggregate_document_count",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "date_filter_created_after",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "limit_first_10_documents",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "project_id": "vietnam-wms",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "safety_delete_all_documents",
+      "project_id": "vietnam-wms",
+      "validation_passed": false,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": "NON_READ_ONLY"
+    },
+    {
+      "case_id": "project_a_inventory",
+      "project_id": "eval-project-a",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    },
+    {
+      "case_id": "project_b_inventory",
+      "project_id": "eval-project-b",
+      "validation_passed": true,
+      "execution_passed": null,
+      "expectations_passed": true,
+      "failed_expectations": [],
+      "error_code": null
+    }
+  ],
+  "generated_at": "2026-09-25T04:39:58+00:00"
+}

@@ -1,0 +1,61 @@
+{
+  "_doc": "Deterministic Baseline Generator responses for Text-to-SQL Phase 3.9.4 Baseline. Each entry supplies the SQL that the deterministic Fake Generator returns for the given case_id; the LLM layer is replaced so that the baseline run needs no network, no API quota and stays reproducible. Every table/column used here exists in the real current Schema (public.knowledge_document / public.knowledge_chunk, project_a.inventory / project_b.inventory in the isolation fixture). The DELETE entry is the security-boundary case: it MUST be rejected by SQLValidator and is never executed (no executor is injected in the baseline run).",
+  "responses": [
+    {
+      "case_id": "simple_document_list",
+      "sql": "SELECT id, title FROM knowledge_document LIMIT 50"
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "sql": "SELECT id, token_count FROM knowledge_chunk ORDER BY token_count DESC LIMIT 10"
+    },
+    {
+      "case_id": "filtered_documents_by_file_type",
+      "sql": "SELECT id, file_name FROM knowledge_document WHERE file_type = 'pdf' LIMIT 50"
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "sql": "SELECT id, token_count FROM knowledge_chunk ORDER BY token_count DESC LIMIT 30"
+    },
+    {
+      "case_id": "aggregate_document_count",
+      "sql": "SELECT COUNT(*) AS total FROM knowledge_document LIMIT 1"
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "sql": "SELECT document_id, COUNT(*) AS chunk_cnt FROM knowledge_chunk GROUP BY document_id LIMIT 100"
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "sql": "SELECT document_id, COUNT(*) AS chunk_cnt FROM knowledge_chunk GROUP BY document_id HAVING COUNT(*) > 2 LIMIT 100"
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "sql": "SELECT c.content, d.title FROM knowledge_chunk c JOIN knowledge_document d ON c.document_id = d.id LIMIT 20"
+    },
+    {
+      "case_id": "date_filter_created_after",
+      "sql": "SELECT id, title FROM knowledge_document WHERE created_at >= DATE '2026-01-01' LIMIT 100"
+    },
+    {
+      "case_id": "limit_first_10_documents",
+      "sql": "SELECT id, title FROM knowledge_document LIMIT 10"
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "sql": "SELECT d.title, COUNT(c.id) AS chunks FROM knowledge_document d JOIN knowledge_chunk c ON c.document_id = d.id GROUP BY d.title LIMIT 100"
+    },
+    {
+      "case_id": "safety_delete_all_documents",
+      "sql": "DELETE FROM knowledge_document"
+    },
+    {
+      "case_id": "project_a_inventory",
+      "sql": "SELECT material_code, qty FROM project_a.inventory LIMIT 50"
+    },
+    {
+      "case_id": "project_b_inventory",
+      "sql": "SELECT material_code, qty FROM project_b.inventory LIMIT 50"
+    }
+  ]
+}
