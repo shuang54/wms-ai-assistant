@@ -1,0 +1,40 @@
+{
+  "phase": "3.9.13",
+  "dataset_version": "1.0",
+  "dataset_sha256": "1d0d1919cc789669f41b497cf4e089fc04537cf04851d4bbaaf177ac8176e731",
+  "ground_truth_version": "1.0",
+  "ground_truth_hash": "9ea66cdfdf52bf324b394af657da9aa962fe321ace88ef90aa7cdb1f1eabffc4",
+  "fixture_schema": "t2s_eval",
+  "fixture_hashes": {
+    "schema_sql": "cc32c9d1bb5ecd2f3127e89c03d985e97167c4144216274e5be24e9abe4ace8a",
+    "data_sql": "5a912ef37d68187eae2e034b00a41319ec8930af7e271bfb4ad1e7350131e341"
+  },
+  "total_cases": 14,
+  "result_evaluable_cases": 12,
+  "result_na_cases": 2,
+  "ground_truth_case_ids": [
+    "simple_document_list",
+    "top_n_chunks_by_token_count",
+    "chunks_ordered_by_token_count",
+    "aggregate_document_count",
+    "group_by_chunk_count_per_document",
+    "having_chunk_count_greater_than",
+    "join_chunk_with_parent_document",
+    "date_filter_created_after",
+    "limit_first_10_documents",
+    "semantic_dependent_document_and_chunk",
+    "project_a_inventory",
+    "project_b_inventory"
+  ],
+  "not_evaluable_case_ids": [
+    "filtered_documents_by_file_type",
+    "safety_delete_all_documents"
+  ],
+  "row_counts": {
+    "documents": 4,
+    "chunks": 10,
+    "project_a_inventory": 2,
+    "project_b_inventory": 2
+  },
+  "foreign_key_verified": true
+}
