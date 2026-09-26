@@ -696,6 +696,39 @@ LLMResponse（内部，统一含 usage / model / finish_reason / metadata）
 
 ---
 
+## 8.13 LLM Usage & Cost Consumption Boundary（Phase 3.10.13）
+
+```text
+LLMResponse → LLMObservation → LLMUsage
+                                  ↓
+                        Usage Consumer（纯函数，request-level）
+                                  ↓
+                             LLMUsage | None
+
+LLMUsage + 显式 LLMPricing → calculate_llm_cost → LLMCost
+（Cost Consumer 只做边界转发，复用现有计算）
+```
+
+* **三层语义**：Usage = provider 事实（非估算 / 非计算 / 非 billing
+  token）；Pricing = 外部显式输入；Cost = 计算结果；
+* **Consumer**（`llm/accounting_consumer.py`，optional API）：
+  `consume_usage(observation)` / `consume_cost(observation, pricing)`
+  ——纯函数、无 IO、无状态、request-level；
+* **Identity 保持**：`consume_usage(observation) is observation.usage`
+  ——不复制、不重算 total、不补全、不 round、不估算；
+  usage=None → None（不是 0）；partial 原样；
+* **Cost 必须显式 Pricing**：`pricing=None` → `None`（不猜价、
+  不硬编码 model→price、不自动获取、不做货币转换）；
+  currency 由 `LLMPricing` 显式提供（不默认 USD/CNY/VND）；
+* **不新增重复 DTO**：消费结果就是 `LLMUsage` / `LLMCost`
+  （无 UsageRecord / AccountingRecord）；
+* **No persistence / aggregation / billing / automatic pricing /
+  automatic cost**；Client 不负责 Cost；现有
+  `LLMObservationSink` / `LLMAccountingSink` / `create_llm_client`
+  契约不变（不使用 Consumer 行为完全不变）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
