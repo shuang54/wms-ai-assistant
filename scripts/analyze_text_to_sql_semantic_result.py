@@ -97,14 +97,29 @@ def check_existing() -> int:
 
     semantic_truth = load_semantic_expectations()
     cases = stored.get("cases", [])
-    if stored.get("total_cases") != len(semantic_truth):
-        problems.append("total_cases != ground truth count")
-    if len(cases) != len(semantic_truth):
-        problems.append(f"len(cases) ({len(cases)}) != truth ({len(semantic_truth)})")
+    # Phase 3.9.17: the YAML gained more ``semantic_expectation`` entries
+    # (3 -> 12, full coverage). The 3.9.16 snapshot is a frozen 3-case
+    # artifact; its --check validates INTERNAL consistency only. The
+    # ``stored.total_cases`` value MUST be preserved (history), and the
+    # 3.9.16 case_ids MUST still be present in the current YAML (so the
+    # 3.9.16 ground truth was not accidentally deleted).
+    if stored.get("total_cases") != len(cases):
+        problems.append(
+            f"total_cases ({stored.get('total_cases')}) "
+            f"!= len(cases) ({len(cases)})"
+        )
+    if len(cases) != stored.get("semantic_evaluable_cases"):
+        problems.append(
+            f"len(cases) ({len(cases)}) != "
+            f"semantic_evaluable_cases ({stored.get('semantic_evaluable_cases')})"
+        )
     stored_ids = [c.get("case_id") for c in cases]
-    truth_ids = list(semantic_truth)
-    if stored_ids != truth_ids:
-        problems.append(f"case_id order mismatch: {stored_ids}")
+    missing_in_truth = [cid for cid in stored_ids if cid not in semantic_truth]
+    if missing_in_truth:
+        # The 3.9.16 ground truth was deleted -> real regression.
+        problems.append(
+            f"3.9.16 case_ids no longer in dataset: {missing_in_truth}"
+        )
 
     correct = sum(1 for c in cases if c.get("semantic_passed") is True)
     incorrect = sum(1 for c in cases if c.get("semantic_passed") is False)
@@ -142,7 +157,8 @@ def check_existing() -> int:
             print(f"  - {problem}")
         return 1
 
-    print(f"OK: 3.9.16 semantic snapshot consistent ({len(semantic_truth)} cases)")
+    stored_total = stored.get("total_cases", len(cases))
+    print(f"OK: 3.9.16 semantic snapshot consistent ({stored_total} cases)")
     print(f"    source={stored.get('source_snapshot')} "
           f"sha={stored.get('source_snapshot_sha256')[:12]}")
     print(f"    correct={stored.get('semantic_correct_cases')} "

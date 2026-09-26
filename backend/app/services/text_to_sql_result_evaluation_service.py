@@ -160,6 +160,34 @@ class SemanticExpectation:
                 f"{sorted(SEMANTIC_ROW_MATCHING_VALUES)}, "
                 f"got {self.row_matching!r}"
             )
+        # Phase 3.9.17 consistency rules (section §十二).
+        req_set = {str(c).lower() for c in self.required_columns}
+        opt_set = {str(c).lower() for c in self.optional_columns}
+        forbidden_set = {str(c).lower() for c in self.forbidden_columns}
+        # Rule 2: required ∩ optional == ∅.
+        if req_set & opt_set:
+            raise ResultExpectationError(
+                "semantic_expectation: required_columns and "
+                "optional_columns must be disjoint; "
+                f"intersection={sorted(req_set & opt_set)}"
+            )
+        # Rule 3: required ∩ forbidden == ∅.
+        if req_set & forbidden_set:
+            raise ResultExpectationError(
+                "semantic_expectation: required_columns and "
+                "forbidden_columns must be disjoint; "
+                f"intersection={sorted(req_set & forbidden_set)}"
+            )
+        # Rule 4: each expected_row must have width == len(required_columns).
+        if self.expected_rows:
+            expected_width = len(self.required_columns)
+            for index, row in enumerate(self.expected_rows):
+                if len(row) != expected_width:
+                    raise ResultExpectationError(
+                        f"semantic_expectation.expected_rows[{index}] has "
+                        f"{len(row)} values but required_columns has "
+                        f"{expected_width} columns"
+                    )
 
 
 @dataclass(frozen=True)

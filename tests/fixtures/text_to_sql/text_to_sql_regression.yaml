@@ -34,6 +34,19 @@ _fields:
 cases:
   # ---- Case 1：简单查询 ----
   - id: simple_document_list
+    semantic_expectation:
+      # Phase 3.9.17: question "查询知识文档列表" 只要求文档标识符
+      # ("列表" 的最小回答 = 每个文档一个标识符)。
+      # 其他列（title / file_type / created_at）属于合理附加信息，不是 question 强制要求。
+      required_columns: [id]
+      optional_columns: [title, file_type, created_at]
+      forbidden_columns: []
+      expected_rows:
+        - [1]
+        - [2]
+        - [3]
+        - [4]
+      row_matching: unordered
     question: "查询知识文档列表"
     project_id: vietnam-wms
     expected:
@@ -48,6 +61,26 @@ cases:
 
   # ---- Case 2：Top N ----
   - id: top_n_chunks_by_token_count
+    semantic_expectation:
+      # Phase 3.9.17: "分词数量最多" 明确把 token_count 作为排序与筛选标准 → required。
+      # "知识分片" 的最小标识符是 chunk id → required。
+      # 排序是 question 语义的一部分（"最多"），因此 row_matching: ordered。
+      # document_id / content 是合理附加列，非 question 强制要求。
+      required_columns: [id, token_count]
+      optional_columns: [document_id, content]
+      forbidden_columns: []
+      expected_rows:
+        - [10, 100]
+        - [9, 90]
+        - [8, 80]
+        - [7, 70]
+        - [6, 60]
+        - [5, 50]
+        - [4, 40]
+        - [3, 30]
+        - [2, 20]
+        - [1, 10]
+      row_matching: ordered
     question: "查询分词数量最多的10个知识分片"
     project_id: vietnam-wms
     expected:
@@ -70,6 +103,26 @@ cases:
 
   # ---- Case 4：排序 ----
   - id: chunks_ordered_by_token_count
+    semantic_expectation:
+      # Phase 3.9.17: question 明确要求"从高到低排序" → row_matching: ordered。
+      # token_count 是排序与展示的核心值 → required。
+      # chunk id 是分片标识符 → required。
+      # document_id / content 是附加信息，非 question 强制。
+      required_columns: [id, token_count]
+      optional_columns: [document_id, content]
+      forbidden_columns: []
+      expected_rows:
+        - [10, 100]
+        - [9, 90]
+        - [8, 80]
+        - [7, 70]
+        - [6, 60]
+        - [5, 50]
+        - [4, 40]
+        - [3, 30]
+        - [2, 20]
+        - [1, 10]
+      row_matching: ordered
     question: "查询知识分片并按照分词数量从高到低排序"
     project_id: vietnam-wms
     expected:
@@ -81,6 +134,20 @@ cases:
 
   # ---- Case 5：聚合 ----
   - id: aggregate_document_count
+    semantic_expectation:
+      # Phase 3.9.17: COUNT(*) 产生 1×1 scalar。
+      # PostgreSQL 默认列名为 "count"；与 3.9.16 报告口径一致，
+      # 实际 saved actual 列名正是 "count"。
+      # ⚠ 已知限制（PHASE_3_9_18_CANDIDATE）：
+      #   若 SQL 改写为 COUNT(c.id) AS total_documents，
+      #   本期望将因 MISSING_REQUIRED_COLUMN 而 FAIL。
+      #   通用列名 alias mapping 在 3.9.18 之前**不实现**。
+      required_columns: [count]
+      optional_columns: []
+      forbidden_columns: []
+      expected_rows:
+        - [4]
+      row_matching: unordered
     question: "统计知识文档总数"
     project_id: vietnam-wms
     expected:
@@ -138,6 +205,25 @@ cases:
 
   # ---- Case 8：JOIN（真实 FK / 业务关系） ----
   - id: join_chunk_with_parent_document
+    semantic_expectation:
+      # Phase 3.9.17: question 明确要求"知识分片**及其所属知识文档的标题**"——
+      # 既要分片，又要文档标题。两项都是 question 直接要求 → 都是 required。
+      # chunk content 是分片的天然属性，但 question 没明说 → optional。
+      required_columns: [id, title]
+      optional_columns: [content, document_id]
+      forbidden_columns: []
+      expected_rows:
+        - [1, "Alpha Report"]
+        - [2, "Alpha Report"]
+        - [3, "Beta Notes"]
+        - [4, "Beta Notes"]
+        - [5, "Beta Notes"]
+        - [6, "Gamma Guide"]
+        - [7, "Delta Manual"]
+        - [8, "Delta Manual"]
+        - [9, "Delta Manual"]
+        - [10, "Delta Manual"]
+      row_matching: unordered
     question: "查询知识分片及其所属知识文档的标题"
     project_id: vietnam-wms
     expected:
@@ -151,6 +237,17 @@ cases:
 
   # ---- Case 9：日期条件（Schema 确有 created_at） ----
   - id: date_filter_created_after
+    semantic_expectation:
+      # Phase 3.9.17: 日期过滤只决定 row set，不改变 projection 语义。
+      # question 问的是"哪些文档"→ 文档标识符 (id) 是 required。
+      # title / file_type / created_at 都是附加展示列，question 未强制。
+      required_columns: [id]
+      optional_columns: [title, file_type, created_at]
+      forbidden_columns: []
+      expected_rows:
+        - [2]
+        - [3]
+      row_matching: unordered
     question: "查询2026年1月1日之后创建的知识文档"
     project_id: vietnam-wms
     expected:
@@ -162,6 +259,21 @@ cases:
 
   # ---- Case 10：LIMIT ----
   - id: limit_first_10_documents
+    semantic_expectation:
+      # Phase 3.9.17: LIMIT 10 ≠ "特定投影"。
+      # row count requirement = 不超过 10；
+      # row identity = 所有 4 个文档（fixture 中实际只有 4 个文档）；
+      # projection = id 是 question 唯一明确的字段。
+      # question 未指定排序 → unordered。
+      required_columns: [id]
+      optional_columns: [title, file_type, created_at]
+      forbidden_columns: []
+      expected_rows:
+        - [1]
+        - [2]
+        - [3]
+        - [4]
+      row_matching: unordered
     question: "查询前10条知识文档"
     project_id: vietnam-wms
     expected:
@@ -205,6 +317,17 @@ cases:
 
   # ---- Case 13/14：Project Isolation（同问句，不同项目） ----
   - id: project_a_inventory
+    semantic_expectation:
+      # Phase 3.9.17: "库存明细" 的最小回答 = item_code (标识) + qty (业务答案)。
+      # 两条都是核心数据 → 全部 required。
+      # 3.9.14 实际投影 (item_code, qty) 与 expected 完全一致。
+      required_columns: [item_code, qty]
+      optional_columns: []
+      forbidden_columns: []
+      expected_rows:
+        - ["item_x", 100]
+        - ["item_y", 5]
+      row_matching: unordered
     question: "查询库存明细"
     project_id: eval-project-a
     expected:
@@ -215,6 +338,16 @@ cases:
         - project_b.inventory
 
   - id: project_b_inventory
+    semantic_expectation:
+      # Phase 3.9.17: 与 project_a 同形，但 qty 不同（隔离验证）。
+      # A != B 的项目隔离语义由 strict 已覆盖；此处只保证值正确。
+      required_columns: [item_code, qty]
+      optional_columns: []
+      forbidden_columns: []
+      expected_rows:
+        - ["item_x", 999]
+        - ["item_y", 7]
+      row_matching: unordered
     question: "查询库存明细"
     project_id: eval-project-b
     expected:

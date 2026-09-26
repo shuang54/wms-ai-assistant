@@ -636,9 +636,10 @@ class TestDiagnosisScriptCheckMode:
 
     def test_dataset_hash_matches_3910_recorded_value(self) -> None:
         """§23：dataset hash 必须仍为 3.9.10 记录的值；
-        3.9.16 因新增 semantic_expectation 块漂移到新值（§25 允许）。"""
+        3.9.16 / 3.9.17 因新增 semantic_expectation 块漂移到新值（§25 允许）。"""
         expected = frozenset({
             "1d0d1919cc789669f41b497cf4e089fc04537cf04851d4bbaaf177ac8176e731",
             "838c50946bc53b2deda3dfe8d5b154b047c2c0866c2946d2f074fac08942d419",
+            "a9328e2d63565d7079f6e31977f9ba82ffc88e726069caf15357f9aa3d8e543b",
         })
         assert dataset_sha256(DATASET_PATH) in expected

@@ -29,11 +29,17 @@ from backend.app.services.text_to_sql_result_evaluation_service import (
     ResultExpectation,
 )
 from backend.app.services.text_to_sql_semantic_result_evaluation_service import (
+    NA_CASE_IDS,
     PHASE_3_9_16,
+    PHASE_3_9_17,
+    RESULT_EVALUABLE_CASE_IDS,
     SNAPSHOT_3_9_16_PATH,
+    SNAPSHOT_3_9_17_PATH,
     SemanticResultCaseOutcome,
     analyze_phase_3_9_14_for_semantic,
+    analyze_phase_3_9_14_for_full_semantic,
     compute_semantic_summary,
+    validate_semantic_consistency,
 )
 
 
@@ -309,16 +315,311 @@ class TestSemanticSummary:
 
 
 class TestOfflineAnalysis:
-    def test_analyze_phase_3_9_14_for_semantic(self) -> None:
+    def test_analyze_phase_3_9_14_for_semantic_3_9_16_subset(self) -> None:
+        """The 3.9.16 snapshot file stays at 3 cases; this analyzer
+        iterates over current YAML semantic_expectation entries (now 12)
+        — verify the 3.9.16 cases are still all correct.
+        """
         summary = analyze_phase_3_9_14_for_semantic()
-        assert summary.total_cases == 3
-        assert summary.semantic_evaluable_cases == 3
-        assert summary.semantic_correct_cases == 3
+        # Phase 3.9.17 extended semantic_expectation to 12 cases; the
+        # analyzer therefore yields 12 outcomes, all passing.
+        assert summary.total_cases == 12
+        assert summary.semantic_evaluable_cases == 12
+        assert summary.semantic_correct_cases == 12
         assert summary.semantic_incorrect_cases == 0
         assert summary.semantic_result_correctness == 1.0
         assert summary.source_snapshot == (
             "phase_3_9_14_result_llm_baseline.json"
         )
+        # The 3.9.16 snapshot file remains a frozen 3-case artifact.
+        from backend.app.services.text_to_sql_semantic_result_evaluation_service import (
+            SNAPSHOT_3_9_16_PATH,
+        )
+        if SNAPSHOT_3_9_16_PATH.exists():
+            import json as _json
+            blob = _json.loads(
+                SNAPSHOT_3_9_16_PATH.read_text(encoding="utf-8")
+            )
+            assert blob["total_cases"] == 3
+            assert blob["semantic_result_correctness"] == 1.0
+
+
+
+
+
+class TestParseSemanticExpectationRules3917:
+    """Phase 3.9.17 consistency rules (#2-#4)."""
+
+    def test_rule2_required_and_optional_must_be_disjoint(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            parse_semantic_expectation({
+                "required_columns": ["id", "count"],
+                "optional_columns": ["id"],
+            })
+
+    def test_rule3_required_and_forbidden_must_be_disjoint(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            parse_semantic_expectation({
+                "required_columns": ["id"],
+                "forbidden_columns": ["ID"],  # case-insensitive
+            })
+
+    def test_rule4_expected_rows_must_match_required_columns_width(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            parse_semantic_expectation({
+                "required_columns": ["id", "count"],
+                "expected_rows": [[1]],  # 1 value, 2 required cols
+            })
+
+    def test_dto_post_init_enforces_rule2(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            SemanticExpectation(
+                required_columns=("id",),
+                optional_columns=("id",),
+            )
+
+    def test_dto_post_init_enforces_rule3(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            SemanticExpectation(
+                required_columns=("id",),
+                forbidden_columns=("Id",),
+            )
+
+    def test_dto_post_init_enforces_rule4(self) -> None:
+        with pytest.raises(ResultExpectationError):
+            SemanticExpectation(
+                required_columns=("id", "count"),
+                expected_rows=((1,),),
+            )
+
+
+class TestSemanticConsistency3917:
+    """Phase 3.9.17 cross-check (#5-#6) of the dataset's semantic ground truth."""
+
+    def test_no_consistency_violations(self) -> None:
+        problems = validate_semantic_consistency()
+        assert problems == (), problems
+
+    def test_result_evaluable_case_ids_size(self) -> None:
+        assert len(RESULT_EVALUABLE_CASE_IDS) == 12
+
+    def test_na_case_ids_size(self) -> None:
+        assert len(NA_CASE_IDS) == 2
+
+    def test_evaluable_and_na_are_disjoint(self) -> None:
+        assert RESULT_EVALUABLE_CASE_IDS.isdisjoint(NA_CASE_IDS)
+
+    def test_load_semantic_covers_all_evaluable(self) -> None:
+        from backend.app.services.text_to_sql_result_evaluation_service import (
+            load_semantic_expectations,
+        )
+        truth = load_semantic_expectations()
+        assert set(truth) == RESULT_EVALUABLE_CASE_IDS
+        for na_id in NA_CASE_IDS:
+            assert na_id not in truth
+
+
+class TestPerCaseSemanticResult3917:
+    """Phase 3.9.17: each of the 12 result-evaluable cases evaluated against
+    the saved 3.9.14 actual result columns/rows (must remain unchanged)."""
+
+    def test_all_12_evaluable_pass(self) -> None:
+        summary = analyze_phase_3_9_14_for_full_semantic()
+        assert summary.semantic_evaluable_cases == 12
+        assert summary.semantic_correct_cases == 12
+        assert summary.semantic_incorrect_cases == 0
+        assert summary.semantic_result_correctness == 1.0
+        assert summary.semantic_ground_truth_coverage == 1.0
+
+    def test_simple_document_list_pass(self) -> None:
+        # saved actual: [id, title, file_type, created_at] x 4
+        self._assert_case(
+            "simple_document_list",
+            expected_columns=("id", "title", "file_type", "created_at"),
+            expected_rows=(
+                (1, "Alpha Report", "md", "2025-06-10"),
+                (2, "Beta Notes", "md", "2026-02-14"),
+                (3, "Gamma Guide", "md", "2026-05-20"),
+                (4, "Delta Manual", "txt", "2025-11-05"),
+            ),
+            required=("id",),
+        )
+
+    def test_top_n_chunks_by_token_count_pass(self) -> None:
+        # saved actual: [id, document_id, content, token_count] x 10, ordered DESC
+        rows = (
+            (10, 4, "delta summary", 100), (9, 4, "delta extra", 90),
+            (8, 4, "delta details", 80), (7, 4, "delta intro", 70),
+            (6, 3, "gamma intro", 60), (5, 2, "beta summary", 50),
+            (4, 2, "beta details", 40), (3, 2, "beta intro", 30),
+            (2, 1, "alpha details", 20), (1, 1, "alpha intro", 10),
+        )
+        self._assert_case(
+            "top_n_chunks_by_token_count",
+            expected_columns=("id", "document_id", "content", "token_count"),
+            expected_rows=rows,
+            required=("id", "token_count"),
+        )
+
+    def test_chunks_ordered_by_token_count_pass(self) -> None:
+        rows = (
+            (10, 4, "delta summary", 100), (9, 4, "delta extra", 90),
+            (8, 4, "delta details", 80), (7, 4, "delta intro", 70),
+            (6, 3, "gamma intro", 60), (5, 2, "beta summary", 50),
+            (4, 2, "beta details", 40), (3, 2, "beta intro", 30),
+            (2, 1, "alpha details", 20), (1, 1, "alpha intro", 10),
+        )
+        self._assert_case(
+            "chunks_ordered_by_token_count",
+            expected_columns=("id", "document_id", "content", "token_count"),
+            expected_rows=rows,
+            required=("id", "token_count"),
+        )
+
+    def test_aggregate_document_count_pass(self) -> None:
+        self._assert_case(
+            "aggregate_document_count",
+            expected_columns=("count",),
+            expected_rows=((4,),),
+            required=("count",),
+        )
+
+    def test_group_by_chunk_count_per_document_pass(self) -> None:
+        # saved actual: [id, title, chunk_count] x 4 (3.9.14 strict-fail)
+        self._assert_case(
+            "group_by_chunk_count_per_document",
+            expected_columns=("id", "title", "chunk_count"),
+            expected_rows=(
+                (4, "Delta Manual", 4),
+                (2, "Beta Notes", 3),
+                (3, "Gamma Guide", 1),
+                (1, "Alpha Report", 2),
+            ),
+            required=("id", "chunk_count"),
+        )
+
+    def test_having_chunk_count_greater_than_pass(self) -> None:
+        self._assert_case(
+            "having_chunk_count_greater_than",
+            expected_columns=("id", "title"),
+            expected_rows=((4, "Delta Manual"), (2, "Beta Notes")),
+            required=("id",),
+        )
+
+    def test_join_chunk_with_parent_document_pass(self) -> None:
+        rows = (
+            (1, "alpha intro", "Alpha Report"),
+            (2, "alpha details", "Alpha Report"),
+            (3, "beta intro", "Beta Notes"),
+            (4, "beta details", "Beta Notes"),
+            (5, "beta summary", "Beta Notes"),
+            (6, "gamma intro", "Gamma Guide"),
+            (7, "delta intro", "Delta Manual"),
+            (8, "delta details", "Delta Manual"),
+            (9, "delta extra", "Delta Manual"),
+            (10, "delta summary", "Delta Manual"),
+        )
+        self._assert_case(
+            "join_chunk_with_parent_document",
+            expected_columns=("id", "content", "title"),
+            expected_rows=rows,
+            required=("id", "title"),
+        )
+
+    def test_date_filter_created_after_pass(self) -> None:
+        rows = (
+            (2, "Beta Notes", "md", "2026-02-14"),
+            (3, "Gamma Guide", "md", "2026-05-20"),
+        )
+        self._assert_case(
+            "date_filter_created_after",
+            expected_columns=("id", "title", "file_type", "created_at"),
+            expected_rows=rows,
+            required=("id",),
+        )
+
+    def test_limit_first_10_documents_pass(self) -> None:
+        rows = (
+            (1, "Alpha Report", "md", "2025-06-10"),
+            (2, "Beta Notes", "md", "2026-02-14"),
+            (3, "Gamma Guide", "md", "2026-05-20"),
+            (4, "Delta Manual", "txt", "2025-11-05"),
+        )
+        self._assert_case(
+            "limit_first_10_documents",
+            expected_columns=("id", "title", "file_type", "created_at"),
+            expected_rows=rows,
+            required=("id",),
+        )
+
+    def test_semantic_dependent_document_and_chunk_pass(self) -> None:
+        self._assert_case(
+            "semantic_dependent_document_and_chunk",
+            expected_columns=("id", "title", "chunk_count"),
+            expected_rows=(
+                (4, "Delta Manual", 4),
+                (2, "Beta Notes", 3),
+                (3, "Gamma Guide", 1),
+                (1, "Alpha Report", 2),
+            ),
+            required=("id", "chunk_count"),
+        )
+
+    def test_project_a_inventory_pass(self) -> None:
+        self._assert_case(
+            "project_a_inventory",
+            expected_columns=("item_code", "qty"),
+            expected_rows=(("item_x", 100), ("item_y", 5)),
+            required=("item_code", "qty"),
+        )
+
+    def test_project_b_inventory_pass(self) -> None:
+        self._assert_case(
+            "project_b_inventory",
+            expected_columns=("item_code", "qty"),
+            expected_rows=(("item_x", 999), ("item_y", 7)),
+            required=("item_code", "qty"),
+        )
+
+    def _assert_case(self, case_id, expected_columns, expected_rows,
+                     required) -> None:
+        summary = analyze_phase_3_9_14_for_full_semantic()
+        outcome = next(o for o in summary.cases if o.case_id == case_id)
+        assert outcome.actual_columns == expected_columns
+        assert outcome.actual_rows == expected_rows
+        assert outcome.semantic_passed is True
+        assert tuple(outcome.expected_required_columns) == required
+        assert SEMANTIC_CATEGORY_MISSING_REQUIRED not in (
+            outcome.semantic_categories
+        )
+        assert SEMANTIC_CATEGORY_FORBIDDEN not in (
+            outcome.semantic_categories
+        )
+
+
+class Test3917Snapshot:
+    def test_snapshot_exists_and_valid(self) -> None:
+        if not SNAPSHOT_3_9_17_PATH.exists():
+            pytest.skip("snapshot not yet generated")
+        payload = json.loads(SNAPSHOT_3_9_17_PATH.read_text(encoding="utf-8"))
+        assert payload["phase"] == PHASE_3_9_17
+        assert payload["semantic_evaluable_cases"] == 12
+        assert payload["semantic_correct_cases"] == 12
+        assert payload["semantic_incorrect_cases"] == 0
+        assert payload["semantic_result_correctness"] == 1.0
+        assert payload["semantic_ground_truth_coverage"] == 1.0
+        assert payload["phase_3_9_14_strict_result_accuracy"] == 0.75
+        assert payload["phase_3_9_14_strict_result_correct"] == 9
+        assert payload["phase_3_9_14_strict_result_total"] == 12
+        assert sorted(payload["result_evaluable_case_ids"]) == sorted(
+            RESULT_EVALUABLE_CASE_IDS
+        )
+        assert sorted(payload["na_case_ids"]) == sorted(NA_CASE_IDS)
+        for key in (
+            "source_snapshot", "source_snapshot_sha256",
+            "result_evaluable_case_ids", "na_case_ids", "cases",
+        ):
+            assert key in payload
 
 
 class TestSnapshot:
