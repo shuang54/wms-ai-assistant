@@ -599,6 +599,37 @@ LLM request 产生 2 个 Observation，而非一个"整个 T2S 操作"
 
 ---
 
+## 8.10 LLM Accounting Integration（Phase 3.10.10）
+
+```text
+LLMResponse
+    ↓
+LLMUsage
+    ├──→ Observation（runtime facts，success 时 usage 同一对象）
+    └──→ Token Accounting（token_accounting_from_usage，usage 同一对象）
+
+LLMPricing + LLMUsage → calculate_llm_cost → LLMCost
+（显式、纯函数；synthetic pricing 仅测试使用）
+```
+
+* **request-level 关联**：`1 request → 1 Observation → 1 Accounting`；
+  Observation.usage 与 Accounting 是同一次 request 的同一
+  `LLMUsage` 对象（identity 链测试锁定）；
+* **str 契约路径**（`generate()` / 无 tools 的 `chat()` / T2S /
+  RAG / Router）无 usage → `observation.usage is None` →
+  `accounting=None`——不虚构 usage、不估算、不补 0；
+* **语义 retry / Tool Calling**：每个实际 request 独立
+  Observation + Accounting，不做任何合并 / aggregation；
+* **Accounting 不在生产关键路径**：Accounting / Cost 计算故障
+  不影响 LLM response、业务结果与 Observation；
+* **生产 Client 不自动计算 Cost**（client.py 不 import
+  accounting——结构性隔离 + spy 零调用双重锁定）；Cost 计算
+  始终是显式纯函数行为；
+* Observation / LLMResponse 契约保持不变（无 cost / pricing /
+  currency 字段）；当前仍无 Aggregation / Persistence / Billing。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
