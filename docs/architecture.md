@@ -394,6 +394,35 @@ Business semantic retry（如 Validator 拒绝后重新生成 SQL）
 
 ---
 
+## 8.4 LLM Structured Response Contract（Phase 3.10.3）
+
+```text
+Raw LLM Output（str）
+      ↓
+Structured Parser（llm/structured.py，严格 JSON object 提取）
+      ↓
+Pydantic Validation（schema + extra=forbid）
+      ↓
+Typed Structured Result（Pydantic model 实例）
+```
+
+* **支持**：bare JSON object、完整 ```` ```json ```` code fence
+  （前后仅允许 whitespace）；未知字段一律拒绝（LLM 输出视为
+  untrusted input）；只用 `json.loads` + Pydantic，禁止动态执行。
+* **拒绝**：JSON 语法错误、多个 JSON object、JSON 前后夹杂
+  自然语言、未闭合 / 夹带文字的 fence、非 object JSON、
+  类型错误 / 缺字段 / 未知字段 / Literal 越界。
+* **失败**：抛 `LLMStructuredOutputError`（`LLMError` 子类），
+  `reason` ∈ `empty_output / invalid_json / unsupported_format /
+  schema_validation_failed`；message 不携带原始 LLM 输出。
+* **Structured Response ≠ Tool Calling**：前者解析 LLM 普通文本
+  输出，后者是模型请求调用工具的协议，两者独立。
+* Structured Output 当前作为独立基础能力存在，**尚未接入**现有
+  Text-to-SQL / RAG / Tool production path（保持既有行为与
+  评估基线不变）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
