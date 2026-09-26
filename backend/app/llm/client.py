@@ -41,6 +41,13 @@ Phase 3.6.2 Tool Calling：
     * 本阶段协议约束：单次响应最多 1 个 tool call（超过 → LLMToolCallFormatError，
       不静默截断 / 不并行执行）。
 
+Phase 3.10.4 Metadata / Usage Contract：
+
+    LLMResponse 扩展 model / finish_reason / usage / metadata
+    （全部可选，缺失不虚构、不报错、不影响主调用）；
+    usage ≠ cost tracking；metadata ≠ observability system。
+    SDK response 只存在于 Client / Provider 层，上层只见 LLMResponse。
+
 详见 docs/architecture.md §8、AGENTS.md §9。
 """
 from __future__ import annotations
@@ -157,16 +164,74 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class LLMUsage:
+    """Token usage（Phase 3.10.4 Metadata / Usage Contract）。
+
+    字段允许 ``None``（provider 未返回时不得虚构数值）；
+    不允许负数；三字段齐备时要求 ``total == prompt + completion``
+    （数据非法即拒绝，绝不"修复"）。
+
+    Raises:
+        ValueError: 负数 token，或三字段齐备但 total 不一致。
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"LLMUsage.{name} 必须是 int 或 None"
+                    f"（got {type(value).__name__}）"
+                )
+            if value < 0:
+                raise ValueError(f"LLMUsage.{name} 不允许负数（got {value}）")
+        if (
+            self.prompt_tokens is not None
+            and self.completion_tokens is not None
+            and self.total_tokens is not None
+            and self.total_tokens != self.prompt_tokens + self.completion_tokens
+        ):
+            raise ValueError(
+                "LLMUsage.total_tokens 必须等于 prompt_tokens + completion_tokens"
+                f"（got {self.prompt_tokens} + {self.completion_tokens}"
+                f" != {self.total_tokens}）"
+            )
+
+
+@dataclass(frozen=True)
 class LLMResponse:
-    """``chat(messages, tools=...)`` 的统一返回 DTO（Phase 3.6.2）。
+    """``chat(messages, tools=...)`` 的统一返回 DTO
+    （Phase 3.6.2 引入；Phase 3.10.4 扩展 Metadata / Usage Contract）。
 
     Attributes:
-        content:    LLM 文本回答；请求 Tool 时通常为 None。
-        tool_calls: LLM 请求的 Tool 调用列表（本阶段最多 1 个，协议保证）。
+        content:       LLM 文本回答；请求 Tool 时通常为 None。
+        tool_calls:    LLM 请求的 Tool 调用列表（本阶段最多 1 个，协议保证）。
+        model:         Provider **实际响应**中返回的 model（非配置值）；
+                       缺失为 None（不虚构）。
+        finish_reason: Provider 返回的结束原因（stop / length / tool_calls
+                       ...）；缺失为 None（不人为构造）。
+        usage:         Token usage；provider 未返回 / 数据非法时为 None
+                       （usage 缺失不是错误，绝不影响主调用）。
+        metadata:      白名单辅助信息（provider / request_id）；
+                       不含 API Key / Authorization / 原始 SDK response /
+                       HTTP headers；metadata 缺失不影响正常调用。
+
+    SDK（httpx / OpenAI-compatible raw response）只存在于
+    Client / Provider 层；离开 Provider 后上层只能看到本 DTO。
     """
 
     content: str | None
     tool_calls: tuple[ToolCall, ...] = ()
+    model: str | None = None
+    finish_reason: str | None = None
+    usage: LLMUsage | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================
@@ -216,10 +281,12 @@ class MockLLMClient:
                 last_user = msg.get("content", "")
                 break
         if tools is not None:
-            # Mock 不伪造 tool call：无 Key 场景下返回普通回答
+            # Mock 不伪造 tool call / model / usage：缺失字段保持 None
+            # （不虚构 provider 数据）；仅诚实标识 provider 来源。
             return LLMResponse(
                 content=f"[mock] 已收到消息：{last_user}",
                 tool_calls=(),
+                metadata={"provider": "mock"},
             )
         return f"[mock] 已收到消息：{last_user}"
 
@@ -412,7 +479,12 @@ class OpenAICompatibleClient:
         return tuple(calls)
 
     def _extract_llm_response(self, data: dict[str, Any]) -> LLMResponse:
-        """Tool Calling 路径：解析完整 assistant message（content + tool_calls）。"""
+        """Tool Calling 路径：解析完整 assistant message
+        （content + tool_calls + metadata/usage，Phase 3.10.4）。
+
+        metadata / usage 属于辅助信息：缺失不是错误、类型异常降级为
+        None（带 warning），绝不因此让正常 LLM 调用失败。
+        """
         message = self._extract_assistant_message(data)
         content = message.get("content")
         if content is not None and not isinstance(content, str):
@@ -420,7 +492,87 @@ class OpenAICompatibleClient:
                 f"LLM 响应 content 类型不是 string：{type(content).__name__}"
             )
         tool_calls = self._parse_tool_calls(message.get("tool_calls") or [])
-        return LLMResponse(content=content, tool_calls=tool_calls)
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            model=self._extract_response_model(data),
+            finish_reason=self._extract_finish_reason(data),
+            usage=self._extract_usage(data),
+            metadata=self._build_response_metadata(data),
+        )
+
+    # ---------- Phase 3.10.4：Metadata / Usage 白名单提取 ----------
+
+    @staticmethod
+    def _extract_response_model(data: dict[str, Any]) -> str | None:
+        """提取 provider **实际响应**中的 model（非配置值）；缺失 → None。"""
+        value = data.get("model")
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _extract_finish_reason(data: dict[str, Any]) -> str | None:
+        """提取 choices[0].finish_reason；缺失 / 非字符串 → None
+        （不人为构造；message 结构错误由 _extract_assistant_message 负责）。"""
+        try:
+            choice = data["choices"][0]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if not isinstance(choice, dict):
+            return None
+        value = choice.get("finish_reason")
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _extract_optional_token_int(value: Any) -> int | None:
+        """usage 字段提取：仅接受 int（bool 排除）；缺失 / 类型异常 → None
+        （不 coerce、不虚构数值）。"""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    def _extract_usage(self, data: dict[str, Any]) -> LLMUsage | None:
+        """提取 usage → LLMUsage；缺失 / 结构异常 / 数据非法 → None。
+
+        usage 数据非法（如负数、total 不一致）不抛出——metadata
+        绝不破坏正常 LLM 调用（记 warning 后降级为 None）。
+        """
+        raw = data.get("usage")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return LLMUsage(
+                prompt_tokens=self._extract_optional_token_int(
+                    raw.get("prompt_tokens")
+                ),
+                completion_tokens=self._extract_optional_token_int(
+                    raw.get("completion_tokens")
+                ),
+                total_tokens=self._extract_optional_token_int(
+                    raw.get("total_tokens")
+                ),
+            )
+        except ValueError as exc:
+            logger.warning(
+                "LLM usage 数据非法，忽略 usage（不影响主调用）",
+                extra={
+                    "llm_provider": self._provider,
+                    "llm_model": self._model,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+    def _build_response_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
+        """构造白名单 metadata（Phase 3.10.4）。
+
+        只包含 provider / request_id（来自响应顶层 id）；绝不包含
+        API Key / Authorization / 原始 SDK response / HTTP headers。
+        """
+        metadata: dict[str, Any] = {"provider": self._provider}
+        request_id = data.get("id")
+        if isinstance(request_id, str):
+            metadata["request_id"] = request_id
+        return metadata
 
     def _log_common(self) -> dict[str, Any]:
         return {
@@ -635,6 +787,7 @@ __all__ = [
     "LLMResponseError",
     "LLMToolCallFormatError",
     "LLMResponse",
+    "LLMUsage",
     "ToolCall",
     "MockLLMClient",
     "OpenAICompatibleClient",

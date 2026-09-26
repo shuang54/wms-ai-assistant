@@ -423,6 +423,36 @@ Typed Structured Result（Pydantic model 实例）
 
 ---
 
+## 8.5 LLM Response Metadata Contract（Phase 3.10.4）
+
+```text
+LLM Provider
+    ↓
+LLMResponse（AI Core 内部统一 DTO）
+    ├── content
+    ├── tool_calls        （Tool Calling 路径）
+    ├── model             （实际响应返回的 model，非配置值）
+    ├── finish_reason     （stop / length / tool_calls ...）
+    ├── usage             （LLMUsage：prompt/completion/total tokens）
+    └── metadata          （白名单：provider / request_id）
+```
+
+* `chat(messages, tools=[...])` 返回 `LLMResponse`；
+  `generate()` / 无 tools 的 `chat()` 仍返回 `str`
+  （Phase 2 契约不变，业务层零修改）。
+* SDK（httpx / OpenAI-compatible raw response）只存在于
+  Client / Provider 层；上层不得访问 `choices` / `usage` /
+  `id` 等 SDK 专属字段。
+* 缺失即 `None`：usage / model / finish_reason / metadata 缺失
+  **不是错误**，不虚构数值、不影响主调用；usage 数据非法
+  （负数 / total 不一致）→ 降级为 `None` + warning。
+* `usage ≠ cost tracking`（成本计算留待后续阶段）；
+  `metadata ≠ observability system`（不含 tracing / metrics）；
+  metadata 绝不包含 API Key / Authorization / 原始 SDK
+  response / HTTP headers。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
