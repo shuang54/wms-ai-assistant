@@ -34,6 +34,7 @@ from backend.app.llm.client import (
     OpenAICompatibleClient,
     ToolCall,
 )
+from backend.app.llm.provider import LLMProvider
 from backend.app.llm.structured import parse_structured_response
 
 #: 最小合法 tool schema（非空即走 LLMResponse 路径）
@@ -441,3 +442,177 @@ async def test_generate_returns_str_unchanged() -> None:
 
     no_tools = await client.chat([{"role": "user", "content": "hi"}])
     assert isinstance(no_tools, str)
+
+
+# ============================================================
+# Phase 3.10.5 — Contract Hardening
+# ============================================================
+
+# ---- §七.1 最小响应（content only） ----
+
+async def test_minimal_response_content_only() -> None:
+    """响应体只有 content → model/finish_reason/usage 为 None，
+    metadata 仅含 provider（不虚构任何数据）。"""
+    body = {"choices": [{"message": {"role": "assistant", "content": "minimal"}}]}
+    response = await _chat(_json_handler(body))
+
+    assert response.content == "minimal"
+    assert response.model is None
+    assert response.finish_reason is None
+    assert response.usage is None
+    assert response.metadata == {"provider": "test"}
+
+
+# ---- §七.3/§七.4 非法 / 缺失字段不污染 Contract ----
+
+async def test_empty_request_id_excluded_from_metadata() -> None:
+    """空字符串 request_id 视同缺失（不进入 metadata）。"""
+    body = _response_body(id="")
+    response = await _chat(_json_handler(body))
+    assert "request_id" not in response.metadata
+    assert response.metadata == {"provider": "test"}
+
+
+async def test_non_dict_finish_reason_degrades_to_none() -> None:
+    """finish_reason = {}（非法类型）→ None，content 不受影响。"""
+    body = _response_body()
+    body["choices"][0]["finish_reason"] = {}
+    response = await _chat(_json_handler(body))
+    assert response.finish_reason is None
+    assert response.content == "hello"
+
+
+async def test_unknown_finish_reason_string_preserved() -> None:
+    """未知 finish_reason 字符串原样保留（不做猜测性转换 / 枚举过滤）。"""
+    body = _response_body()
+    body["choices"][0]["finish_reason"] = "some_new_future_reason"
+    response = await _chat(_json_handler(body))
+    assert response.finish_reason == "some_new_future_reason"
+
+
+# ---- §七.5 LLMUsage 类型矩阵（严格，无隐式转换） ----
+
+@pytest.mark.parametrize("bad_value", [True, False, "100", 100.0, [], {}])
+def test_llm_usage_rejects_non_int_token_types(bad_value: Any) -> None:
+    """bool / str / float / list / dict 一律拒绝（不允许隐式类型转换）。"""
+    with pytest.raises(ValueError):
+        LLMUsage(prompt_tokens=bad_value)
+
+
+def test_llm_usage_allows_documented_none_combinations() -> None:
+    """(None,None,None) / (100,None,None) / (None,20,None) / (100,20,120) 全部合法。"""
+    assert LLMUsage() == LLMUsage(None, None, None)
+    assert LLMUsage(prompt_tokens=100) == LLMUsage(100, None, None)
+    assert LLMUsage(completion_tokens=20) == LLMUsage(None, 20, None)
+    assert LLMUsage(100, 20, 120).total_tokens == 120
+
+
+async def test_usage_with_all_invalid_fields_degrades_to_none() -> None:
+    """加固：usage dict 存在但全部字段非法（无任何有效数据）→ usage=None
+    （不构造空壳 LLMUsage，"usage=None" 统一表示无可用 usage）。"""
+    body = _response_body(
+        usage={"prompt_tokens": "x", "completion_tokens": [], "total_tokens": {}},
+    )
+    response = await _chat(_json_handler(body))
+    assert response.usage is None
+    assert response.content == "hello"
+
+
+async def test_float_token_excluded_partial_usage_preserved() -> None:
+    """float token（100.0）被排除（不 coerce）；同响应中合法字段保留。"""
+    body = _response_body(
+        usage={"prompt_tokens": 100.0, "completion_tokens": 20},
+    )
+    response = await _chat(_json_handler(body))
+    assert response.usage == LLMUsage(prompt_tokens=None, completion_tokens=20)
+
+
+# ---- §七.6 Raw SDK isolation（含凭据类字段） ----
+
+async def test_response_with_credential_fields_isolated() -> None:
+    """响应中的 authorization / headers / api_key / secret 字段
+    完全不可见：不出现在 LLMResponse 属性或 metadata 中。"""
+    body = _response_body(
+        authorization="Bearer SK-CRED-X",
+        headers={"authorization": "Bearer SK-CRED-X"},
+        cookies={"session": "COOKIE-X"},
+        api_key="SK-CRED-X",
+        secret_field="LEAK-CANARY-5",
+    )
+    response = await _chat(_json_handler(body))
+
+    for sdk_attr in ("authorization", "headers", "cookies", "api_key", "secret_field"):
+        assert not hasattr(response, sdk_attr)
+    assert "SK-CRED-X" not in str(response.metadata)
+    assert "COOKIE-X" not in str(response.metadata)
+    assert "LEAK-CANARY-5" not in str(response.metadata)
+    assert set(response.metadata) <= {"provider", "request_id"}
+
+
+# ---- §九 Provider Isolation（模拟未来新增 Provider） ----
+
+class _FakeSdkResponse:
+    """模拟 SDK response 对象（只应存在于 Provider 边界内）。"""
+
+    def __init__(self) -> None:
+        self.choices = [
+            {"message": {"role": "assistant", "content": "future answer"}}
+        ]
+        self.authorization = "Bearer SK-FUTURE-KEY"
+        self.headers = {"x-secret": "HEADER-SECRET"}
+        self.api_key = "SK-FUTURE-KEY"
+        self.secret_field = "SDK-ONLY-CANARY"
+
+
+class FutureProvider:
+    """模拟未来新增 Provider：内部自行处理 raw SDK response，
+    向上层**只**暴露 LLMResponse——证明业务层不需要知道
+    DeepSeek / OpenAI / HTTP / SDK / choices / message 等实现细节。
+    """
+
+    def __init__(self) -> None:
+        self._sdk_response = _FakeSdkResponse()  # SDK 对象不离开本边界
+
+    async def generate(self, prompt: str) -> str:
+        return self._sdk_response.choices[0]["message"]["content"]
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
+        message = self._sdk_response.choices[0]["message"]
+        return LLMResponse(content=message["content"], metadata={"provider": "future"})
+
+
+async def _business_consumer(provider: LLMProvider) -> str | None:
+    """模拟业务层消费路径：只依赖 LLMProvider 抽象与 contract 字段。"""
+    response = await provider.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+    return response.content
+
+
+async def test_future_provider_satisfies_contract_and_isolation() -> None:
+    """未来 Provider 只产出 LLMResponse 即可接入同一消费路径；
+    SDK 字段（choices / authorization / headers / api_key /
+    secret_field）完全不可见。"""
+    provider: LLMProvider = FutureProvider()  # structural typing 满足抽象
+
+    # 同一业务消费路径对 Mock / 真实 Client / 未来 Provider 均可用
+    assert await _business_consumer(provider) == "future answer"
+    assert await _business_consumer(MockLLMClient(system_prompt="")) is not None
+
+    response = await provider.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+    assert isinstance(response, LLMResponse)
+    assert response.model is None
+    assert response.usage is None
+    for sdk_attr in (
+        "choices", "authorization", "headers", "api_key", "secret_field",
+    ):
+        assert not hasattr(response, sdk_attr)
+    assert "SDK-ONLY-CANARY" not in str(response.metadata)
+    assert "HEADER-SECRET" not in str(response.metadata)

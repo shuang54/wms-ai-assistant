@@ -535,12 +535,15 @@ class OpenAICompatibleClient:
 
         usage 数据非法（如负数、total 不一致）不抛出——metadata
         绝不破坏正常 LLM 调用（记 warning 后降级为 None）。
+        Phase 3.10.5 加固：usage dict 存在但无任何有效字段时
+        （全部非法类型 / 全缺失）同样返回 None——不构造空壳对象，
+        "usage=None" 统一表示"无可用的 usage 数据"。
         """
         raw = data.get("usage")
         if not isinstance(raw, dict):
             return None
         try:
-            return LLMUsage(
+            usage = LLMUsage(
                 prompt_tokens=self._extract_optional_token_int(
                     raw.get("prompt_tokens")
                 ),
@@ -561,16 +564,24 @@ class OpenAICompatibleClient:
                 },
             )
             return None
+        if (
+            usage.prompt_tokens is None
+            and usage.completion_tokens is None
+            and usage.total_tokens is None
+        ):
+            return None
+        return usage
 
     def _build_response_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
-        """构造白名单 metadata（Phase 3.10.4）。
+        """构造白名单 metadata（Phase 3.10.4；Phase 3.10.5 加固）。
 
-        只包含 provider / request_id（来自响应顶层 id）；绝不包含
-        API Key / Authorization / 原始 SDK response / HTTP headers。
+        只包含 provider / request_id（来自响应顶层 id，空字符串视同
+        缺失）；绝不包含 API Key / Authorization / 原始 SDK response /
+        HTTP headers / cookies。
         """
         metadata: dict[str, Any] = {"provider": self._provider}
         request_id = data.get("id")
-        if isinstance(request_id, str):
+        if isinstance(request_id, str) and request_id:
             metadata["request_id"] = request_id
         return metadata
 

@@ -451,6 +451,20 @@ LLMResponse（AI Core 内部统一 DTO）
   metadata 绝不包含 API Key / Authorization / 原始 SDK
   response / HTTP headers。
 
+Contract 不变量（Phase 3.10.5 加固）：
+
+* `content` 原样透传（无 strip / str() / JSON parse 等隐式转换）；
+* `model` 只来自实际响应，**不用配置 model 兜底**（缺失即 None）；
+* `finish_reason` 未知字符串原样保留（不做猜测性转换 / 枚举过滤）；
+* `usage` 字段严格类型（int | None，拒绝 bool / str / float /
+  负数 / total 不一致，无隐式转换）；usage dict 无任何有效字段时
+  → `None`（不构造空壳对象）；
+* `request_id` 空字符串视同缺失；metadata 白名单只有
+  `provider` / `request_id`；
+* Raw SDK response 只存在于 Provider 边界内——上层只依赖
+  `LLMResponse`；未来新增 Provider 只要产出本 DTO 即接入
+  同一消费路径。
+
 ---
 
 # 9. Prompt Architecture
