@@ -729,6 +729,55 @@ LLMUsage + 显式 LLMPricing → calculate_llm_cost → LLMCost
 
 ---
 
+## 8.14 LLM Usage Persistence Contract（Phase 3.10.14）
+
+```text
+LLMObservation
+      ↓
+LLMAccountingSink（DatabaseLLMAccountingSink）
+      ↓
+LLMUsagePersistenceService（复用 consume_usage 取 usage 事实）
+      ↓
+LLMUsageRepository.create()
+      ↓
+PostgreSQL: llm_usage_record
+```
+
+* **表**：`llm_usage_record`，一行 = 一次 LLM 请求的 Provider usage
+  事实。字段（精确白名单）：`id / request_id / provider / model /
+  prompt_tokens / completion_tokens / total_tokens / created_at`；
+* **独立 schema**：表位于 `ai_ops`，**不在业务 schema `public`**——
+  `PostgreSQLMetadataProvider.inspect(schema="public")` 会读取 public
+  下全部基表作为 Text-to-SQL 的业务 schema；若 AI 内部运维表混入
+  public，会被 LLM 当成业务表（并破坏业务表枚举）。`init_db()` 会
+  `CREATE SCHEMA IF NOT EXISTS ai_ops`（幂等）；
+* **来源约束**：`request_id` 来自 `LLMObservation.request_id`
+  （缺失存 NULL，**绝不生成 UUID 冒充**）；`provider` 原样保存
+  （不填 unknown / default）；`model` 来自实际响应
+  （禁止 `settings.model` 兜底）；token 字段原样保存 provider 值
+  （**NULL ≠ 0**，不重算 `total = prompt + completion`）；
+* **写入条件**：`usage is None` → 不写入。本表是
+  **LLM Usage Storage**，不是 request audit log（失败请求 /
+  无 usage 成功请求都不产生行）；
+* **Cost / Pricing**：本阶段**不落库**（数据库无 price / cost /
+  currency 字段，无 `llm_pricing` 表）；Cost 仍由显式
+  `LLMPricing` + `calculate_llm_cost()` 计算；
+* **Persistence failure must not change LLM business result**：
+  仓储写入失败 → 事务回滚 + sink 记 warning，LLM 业务结果与返回
+  值不变，且**无 retry / sleep / 队列**；
+* **默认不接入**：`create_llm_client()` 默认仍是
+  `NoopAccountingSink`，不会自动连接数据库；持久化由调用方显式
+  注入 `DatabaseLLMAccountingSink` 启用；
+* **Idempotency is not guaranteed in this phase**：同一
+  observation 被 `record()` 两次会产生两条记录
+  （at-least-once / caller-controlled）；`request_id` 允许 NULL，
+  不依赖唯一约束伪造幂等；
+* **不落库内容**：prompt / messages / SQL / RAG chunks /
+  tool arguments / tool results / raw response / headers /
+  API key / exception message / stack trace。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

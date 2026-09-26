@@ -19,13 +19,15 @@ from __future__ import annotations
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
+from backend.app.db.models.llm_usage_record import LLMUsageRecord
 
-_MODELS: tuple[type, ...] = (KnowledgeDocument, KnowledgeChunk)
+_MODELS: tuple[type, ...] = (KnowledgeDocument, KnowledgeChunk, LLMUsageRecord)
 
 
 __all__ = [
     "KnowledgeDocument",
     "KnowledgeChunk",
+    "LLMUsageRecord",
 ]
 
 

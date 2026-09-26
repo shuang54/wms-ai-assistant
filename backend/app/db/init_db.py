@@ -28,12 +28,18 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.db.base import Base
+from backend.app.db.models.llm_usage_record import LLM_USAGE_SCHEMA
 from backend.app.db.session import get_engine
 
 logger = logging.getLogger(__name__)
 
 # 幂等 SQL：重复执行不会报错。
 _ENABLE_PGVECTOR_SQL: Final[str] = "CREATE EXTENSION IF NOT EXISTS vector"
+# Phase 3.10.14：AI 内部运维 schema（与业务 schema public 隔离，
+# 避免 llm_usage_record 被 Text-to-SQL 的 schema 发现当作业务表）。
+_ENABLE_AI_OPS_SCHEMA_SQL: Final[str] = (
+    f"CREATE SCHEMA IF NOT EXISTS {LLM_USAGE_SCHEMA}"
+)
 
 
 def init_db() -> None:
@@ -56,12 +62,15 @@ def init_db() -> None:
             # 1. 启用 pgvector extension
             conn.execute(text(_ENABLE_PGVECTOR_SQL))
 
-            # 2. 确保所有 ORM Model 已注册到 Base.metadata。
+            # 2. 启用 AI 内部运维 schema（幂等；llm_usage_record 落在这里）
+            conn.execute(text(_ENABLE_AI_OPS_SCHEMA_SQL))
+
+            # 3. 确保所有 ORM Model 已注册到 Base.metadata。
             #    显式 import models 包（即使上层已经 import 过），
             #    保证 `python -m backend.app.db.init_db` 单独执行时仍能找到 Model。
             from backend.app.db import models  # noqa: F401
 
-            # 3. 创建所有未存在的表（幂等）
+            # 4. 创建所有未存在的表（幂等）
             Base.metadata.create_all(bind=conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
