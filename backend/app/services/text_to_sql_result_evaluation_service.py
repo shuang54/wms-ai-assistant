@@ -5,6 +5,10 @@ view (required columns + values correct). Both coexist; the same ground
 truth entry may carry both ``expectation`` (strict) and
 ``semantic_expectation`` (semantic).
 
+Phase 3.9.18 makes the semantic view alias-aware: a required column may be
+matched by an entity-scoped semantic alias instead of a literal name.
+Alias resolution NEVER applies to the strict projection checkers.
+
 ```text
 Question -> Pipeline -> SQL -> Validator -> Executor -> rows
                                                      -> ResultEvaluationService
@@ -28,6 +32,18 @@ from typing import Any, Final
 
 import yaml
 
+from backend.app.services.text_to_sql_column_alias_evaluation_service import (
+    DIAGNOSTIC_ALIAS_MATCH,
+    DIAGNOSTIC_EXACT_MATCH,
+    DIAGNOSTIC_UNKNOWN_COLUMN,
+    MATCH_ALIAS,
+    MATCH_EXACT,
+    MATCH_NONE,
+    ColumnAliasContext,
+    ColumnAliasResolution,
+    alias_context_for_case,
+    resolve_required_columns,
+)
 from backend.app.services.text_to_sql_evaluation_service import (
     DEFAULT_REGRESSION_DATASET_PATH,
 )
@@ -57,6 +73,17 @@ __all__ = [
     "parse_semantic_expectation",
     "load_result_expectations",
     "load_semantic_expectations",
+    # Phase 3.9.18 — re-exported alias primitives (evaluation layer only).
+    "DIAGNOSTIC_ALIAS_MATCH",
+    "DIAGNOSTIC_EXACT_MATCH",
+    "DIAGNOSTIC_UNKNOWN_COLUMN",
+    "MATCH_ALIAS",
+    "MATCH_EXACT",
+    "MATCH_NONE",
+    "ColumnAliasContext",
+    "ColumnAliasResolution",
+    "alias_context_for_case",
+    "resolve_required_columns",
 ]
 
 
@@ -209,6 +236,10 @@ class ResultCheckResult:
     reason: str
     semantic_reason: str = ""
     semantic_categories: tuple[str, ...] = ()
+    #: Phase 3.9.18 — per required-column alias diagnostics
+    #: (``matched_by`` = exact / alias / none). Informational only:
+    #: ALIAS_MATCH is neither a warning nor an error (section §九).
+    semantic_column_matches: tuple[ColumnAliasResolution, ...] = ()
     expected: Any = None
     actual: Any = None
 
@@ -221,6 +252,9 @@ class ResultCheckResult:
             "reason": self.reason,
             "semantic_reason": self.semantic_reason,
             "semantic_categories": list(self.semantic_categories),
+            "semantic_column_matches": [
+                item.to_dict() for item in self.semantic_column_matches
+            ],
             "expected": self.expected,
             "actual": self.actual,
         }
@@ -354,20 +388,41 @@ _CHECKERS = {
 }
 
 
-def _extract_required_values(actual_columns, actual_rows, required_columns):
+def _extract_required_values(
+    actual_columns, actual_rows, required_columns, resolutions=None
+):
+    """Extract required-column values from the actual rows.
+
+    Phase 3.9.18: when ``resolutions`` is supplied the column index comes
+    from the alias resolution (exact OR entity-scoped alias) instead of a
+    plain name lookup. Without ``resolutions`` the 3.9.16 behaviour
+    (strict name lookup) is preserved.
+    """
     lowered_actual = [str(c).lower() for c in actual_columns]
-    indices = [
-        lowered_actual.index(str(req).lower()) for req in required_columns
-    ]
+    if resolutions is None:
+        indices = [
+            lowered_actual.index(str(req).lower()) for req in required_columns
+        ]
+    else:
+        indices = [
+            lowered_actual.index(str(item.actual_column).lower())
+            for item in resolutions
+        ]
     return tuple(tuple(row[i] for i in indices) for row in actual_rows)
 
 
 def _check_semantic_result(payload, expectation):
-    """Business-semantic checker (3.9.16).
+    """Business-semantic checker (3.9.16; alias-aware since 3.9.18).
 
     Categories (multi-label): MISSING_REQUIRED / FORBIDDEN / WRONG_VALUE /
     WRONG_ROW_SET / WRONG_ORDER / UNDECLARED_EXTRA / DUPLICATE_ROW.
     Hard failure = any category other than UNDECLARED_EXTRA.
+
+    Returns ``(passed, reason, categories, resolutions)`` where
+    ``resolutions`` carries the per required-column alias diagnostic
+    (``matched_by`` = exact / alias / none). Alias matches are recorded as
+    diagnostics only — they never change the hard-failure rule, and they
+    are never applied to the strict projection checkers (section §八).
     """
     categories = []
     failures = []
@@ -376,7 +431,18 @@ def _check_semantic_result(payload, expectation):
     optional_lower = {str(c).lower() for c in expectation.optional_columns}
     forbidden_lower = {str(c).lower() for c in expectation.forbidden_columns}
 
-    missing_required = [c for c in required_lower if c not in actual_set]
+    # Phase 3.9.18: alias resolution applies to REQUIRED columns only and
+    # only inside semantic mode.
+    resolutions = resolve_required_columns(
+        expectation.required_columns,
+        payload.columns,
+        alias_context_for_case(payload.case_id),
+    )
+
+    missing_required = [
+        item.expected_column for item in resolutions
+        if item.match_kind == MATCH_NONE
+    ]
     if missing_required:
         categories.append(SEMANTIC_CATEGORY_MISSING_REQUIRED)
         failures.append(
@@ -389,6 +455,11 @@ def _check_semantic_result(payload, expectation):
         failures.append(f"forbidden columns present: {present_forbidden}")
 
     declared = set(required_lower) | optional_lower | forbidden_lower
+    # An alias-matched actual column is "declared" by construction: it is
+    # the same business concept, not an undeclared extra.
+    for item in resolutions:
+        if item.actual_column is not None:
+            declared.add(str(item.actual_column).lower())
     undeclared = sorted(
         str(c).lower() for c in payload.columns
         if str(c).lower() not in declared
@@ -401,7 +472,10 @@ def _check_semantic_result(payload, expectation):
 
     if not missing_required and not present_forbidden:
         extracted = _extract_required_values(
-            payload.columns, payload.rows, expectation.required_columns
+            payload.columns,
+            payload.rows,
+            expectation.required_columns,
+            resolutions,
         )
         expected = tuple(tuple(r) for r in expectation.expected_rows)
         if expectation.row_matching == SEMANTIC_ROW_MATCHING_ORDERED:
@@ -430,7 +504,7 @@ def _check_semantic_result(payload, expectation):
     hard = [c for c in categories if c != SEMANTIC_CATEGORY_UNDECLARED_EXTRA]
     passed = not hard
     reason = "; ".join(failures) if failures else "semantic result matched"
-    return passed, reason, tuple(categories)
+    return passed, reason, tuple(categories), resolutions
 
 
 class TextToSQLResultEvaluationService:
@@ -463,10 +537,12 @@ class TextToSQLResultEvaluationService:
         semantic_passed = None
         semantic_reason = ""
         semantic_categories = ()
+        semantic_column_matches = ()
         if semantic is not None:
-            semantic_passed, semantic_reason, semantic_categories = (
-                _check_semantic_result(payload, semantic)
-            )
+            (
+                semantic_passed, semantic_reason, semantic_categories,
+                semantic_column_matches,
+            ) = _check_semantic_result(payload, semantic)
 
         return ResultCheckResult(
             case_id=payload.case_id,
@@ -476,6 +552,7 @@ class TextToSQLResultEvaluationService:
             reason=reason,
             semantic_reason=semantic_reason,
             semantic_categories=semantic_categories,
+            semantic_column_matches=semantic_column_matches,
             expected=_expected_view(expectation) if expectation else None,
             actual=_actual_view(payload),
         )

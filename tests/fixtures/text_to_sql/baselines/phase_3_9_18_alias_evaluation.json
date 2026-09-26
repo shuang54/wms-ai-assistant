@@ -1,0 +1,991 @@
+{
+  "phase": "3.9.18",
+  "source_snapshot": "phase_3_9_14_result_llm_baseline.json",
+  "source_snapshot_sha256": "1ffe014fa050c915dd200fe6fb9d685b6dad761a0c4d36817d2455dbe34225b8",
+  "phase_3_9_17_snapshot": "phase_3_9_17_semantic_result_full.json",
+  "phase_3_9_17_semantic_accuracy": 1.0,
+  "phase_3_9_17_semantic_correct": 12,
+  "phase_3_9_18_semantic_accuracy": 1.0,
+  "phase_3_9_18_semantic_correct": 12,
+  "semantic_evaluable_cases": 12,
+  "exact_matches": 19,
+  "alias_matches": 0,
+  "unmatched_columns": 0,
+  "alias_needed_cases": 0,
+  "alias_registry_size": 11,
+  "deepseek_calls": 0,
+  "result_evaluable_case_ids": [
+    "aggregate_document_count",
+    "chunks_ordered_by_token_count",
+    "date_filter_created_after",
+    "group_by_chunk_count_per_document",
+    "having_chunk_count_greater_than",
+    "join_chunk_with_parent_document",
+    "limit_first_10_documents",
+    "project_a_inventory",
+    "project_b_inventory",
+    "semantic_dependent_document_and_chunk",
+    "simple_document_list",
+    "top_n_chunks_by_token_count"
+  ],
+  "na_case_ids": [
+    "filtered_documents_by_file_type",
+    "safety_delete_all_documents"
+  ],
+  "entries": [
+    {
+      "case_id": "aggregate_document_count",
+      "expected_column": "count",
+      "actual_column": "count",
+      "matched_by": "exact",
+      "semantic_name": "count",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "expected_column": "token_count",
+      "actual_column": "token_count",
+      "matched_by": "exact",
+      "semantic_name": "token_count",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "date_filter_created_after",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "expected_column": "chunk_count",
+      "actual_column": "chunk_count",
+      "matched_by": "exact",
+      "semantic_name": "chunk_count",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "expected_column": "title",
+      "actual_column": "title",
+      "matched_by": "exact",
+      "semantic_name": "title",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "limit_first_10_documents",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "project_a_inventory",
+      "expected_column": "item_code",
+      "actual_column": "item_code",
+      "matched_by": "exact",
+      "semantic_name": "item_code",
+      "entity": "inventory_item",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "project_a_inventory",
+      "expected_column": "qty",
+      "actual_column": "qty",
+      "matched_by": "exact",
+      "semantic_name": "qty",
+      "entity": "inventory_item",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "project_b_inventory",
+      "expected_column": "item_code",
+      "actual_column": "item_code",
+      "matched_by": "exact",
+      "semantic_name": "item_code",
+      "entity": "inventory_item",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "project_b_inventory",
+      "expected_column": "qty",
+      "actual_column": "qty",
+      "matched_by": "exact",
+      "semantic_name": "qty",
+      "entity": "inventory_item",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "expected_column": "chunk_count",
+      "actual_column": "chunk_count",
+      "matched_by": "exact",
+      "semantic_name": "chunk_count",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "simple_document_list",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "document",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "expected_column": "id",
+      "actual_column": "id",
+      "matched_by": "exact",
+      "semantic_name": "id",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "expected_column": "token_count",
+      "actual_column": "token_count",
+      "matched_by": "exact",
+      "semantic_name": "token_count",
+      "entity": "chunk",
+      "diagnostic": "EXACT_MATCH",
+      "alias_needed": false,
+      "detail": "exact column name match"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "aggregate_document_count",
+      "actual_columns": [
+        "count"
+      ],
+      "actual_rows": [
+        [
+          4
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "count",
+          "actual_column": "count",
+          "semantic_name": "count",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "count"
+      ],
+      "expected_optional_columns": [],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "chunks_ordered_by_token_count",
+      "actual_columns": [
+        "id",
+        "document_id",
+        "content",
+        "token_count"
+      ],
+      "actual_rows": [
+        [
+          10,
+          4,
+          "delta summary",
+          100
+        ],
+        [
+          9,
+          4,
+          "delta extra",
+          90
+        ],
+        [
+          8,
+          4,
+          "delta details",
+          80
+        ],
+        [
+          7,
+          4,
+          "delta intro",
+          70
+        ],
+        [
+          6,
+          3,
+          "gamma intro",
+          60
+        ],
+        [
+          5,
+          2,
+          "beta summary",
+          50
+        ],
+        [
+          4,
+          2,
+          "beta details",
+          40
+        ],
+        [
+          3,
+          2,
+          "beta intro",
+          30
+        ],
+        [
+          2,
+          1,
+          "alpha details",
+          20
+        ],
+        [
+          1,
+          1,
+          "alpha intro",
+          10
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "token_count",
+          "actual_column": "token_count",
+          "semantic_name": "token_count",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id",
+        "token_count"
+      ],
+      "expected_optional_columns": [
+        "document_id",
+        "content"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "date_filter_created_after",
+      "actual_columns": [
+        "id",
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "actual_rows": [
+        [
+          2,
+          "Beta Notes",
+          "md",
+          "2026-02-14"
+        ],
+        [
+          3,
+          "Gamma Guide",
+          "md",
+          "2026-05-20"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id"
+      ],
+      "expected_optional_columns": [
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "actual_columns": [
+        "id",
+        "title",
+        "chunk_count"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual",
+          4
+        ],
+        [
+          2,
+          "Beta Notes",
+          3
+        ],
+        [
+          3,
+          "Gamma Guide",
+          1
+        ],
+        [
+          1,
+          "Alpha Report",
+          2
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "chunk_count",
+          "actual_column": "chunk_count",
+          "semantic_name": "chunk_count",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id",
+        "chunk_count"
+      ],
+      "expected_optional_columns": [
+        "title"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "actual_columns": [
+        "id",
+        "title"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual"
+        ],
+        [
+          2,
+          "Beta Notes"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id"
+      ],
+      "expected_optional_columns": [
+        "title",
+        "chunk_count"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "join_chunk_with_parent_document",
+      "actual_columns": [
+        "id",
+        "content",
+        "title"
+      ],
+      "actual_rows": [
+        [
+          1,
+          "alpha intro",
+          "Alpha Report"
+        ],
+        [
+          2,
+          "alpha details",
+          "Alpha Report"
+        ],
+        [
+          3,
+          "beta intro",
+          "Beta Notes"
+        ],
+        [
+          4,
+          "beta details",
+          "Beta Notes"
+        ],
+        [
+          5,
+          "beta summary",
+          "Beta Notes"
+        ],
+        [
+          6,
+          "gamma intro",
+          "Gamma Guide"
+        ],
+        [
+          7,
+          "delta intro",
+          "Delta Manual"
+        ],
+        [
+          8,
+          "delta details",
+          "Delta Manual"
+        ],
+        [
+          9,
+          "delta extra",
+          "Delta Manual"
+        ],
+        [
+          10,
+          "delta summary",
+          "Delta Manual"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "title",
+          "actual_column": "title",
+          "semantic_name": "title",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id",
+        "title"
+      ],
+      "expected_optional_columns": [
+        "content",
+        "document_id"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "limit_first_10_documents",
+      "actual_columns": [
+        "id",
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "actual_rows": [
+        [
+          1,
+          "Alpha Report",
+          "md",
+          "2025-06-10"
+        ],
+        [
+          2,
+          "Beta Notes",
+          "md",
+          "2026-02-14"
+        ],
+        [
+          3,
+          "Gamma Guide",
+          "md",
+          "2026-05-20"
+        ],
+        [
+          4,
+          "Delta Manual",
+          "txt",
+          "2025-11-05"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id"
+      ],
+      "expected_optional_columns": [
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "project_a_inventory",
+      "actual_columns": [
+        "item_code",
+        "qty"
+      ],
+      "actual_rows": [
+        [
+          "item_x",
+          100
+        ],
+        [
+          "item_y",
+          5
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "item_code",
+          "actual_column": "item_code",
+          "semantic_name": "item_code",
+          "entity": "inventory_item",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "qty",
+          "actual_column": "qty",
+          "semantic_name": "qty",
+          "entity": "inventory_item",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "item_code",
+        "qty"
+      ],
+      "expected_optional_columns": [],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "project_b_inventory",
+      "actual_columns": [
+        "item_code",
+        "qty"
+      ],
+      "actual_rows": [
+        [
+          "item_x",
+          999
+        ],
+        [
+          "item_y",
+          7
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "item_code",
+          "actual_column": "item_code",
+          "semantic_name": "item_code",
+          "entity": "inventory_item",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "qty",
+          "actual_column": "qty",
+          "semantic_name": "qty",
+          "entity": "inventory_item",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "item_code",
+        "qty"
+      ],
+      "expected_optional_columns": [],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "actual_columns": [
+        "id",
+        "title",
+        "chunk_count"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual",
+          4
+        ],
+        [
+          2,
+          "Beta Notes",
+          3
+        ],
+        [
+          3,
+          "Gamma Guide",
+          1
+        ],
+        [
+          1,
+          "Alpha Report",
+          2
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "chunk_count",
+          "actual_column": "chunk_count",
+          "semantic_name": "chunk_count",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id",
+        "chunk_count"
+      ],
+      "expected_optional_columns": [
+        "title"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "simple_document_list",
+      "actual_columns": [
+        "id",
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "actual_rows": [
+        [
+          1,
+          "Alpha Report",
+          "md",
+          "2025-06-10"
+        ],
+        [
+          2,
+          "Beta Notes",
+          "md",
+          "2026-02-14"
+        ],
+        [
+          3,
+          "Gamma Guide",
+          "md",
+          "2026-05-20"
+        ],
+        [
+          4,
+          "Delta Manual",
+          "txt",
+          "2025-11-05"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id"
+      ],
+      "expected_optional_columns": [
+        "title",
+        "file_type",
+        "created_at"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "top_n_chunks_by_token_count",
+      "actual_columns": [
+        "id",
+        "document_id",
+        "content",
+        "token_count"
+      ],
+      "actual_rows": [
+        [
+          10,
+          4,
+          "delta summary",
+          100
+        ],
+        [
+          9,
+          4,
+          "delta extra",
+          90
+        ],
+        [
+          8,
+          4,
+          "delta details",
+          80
+        ],
+        [
+          7,
+          4,
+          "delta intro",
+          70
+        ],
+        [
+          6,
+          3,
+          "gamma intro",
+          60
+        ],
+        [
+          5,
+          2,
+          "beta summary",
+          50
+        ],
+        [
+          4,
+          2,
+          "beta details",
+          40
+        ],
+        [
+          3,
+          2,
+          "beta intro",
+          30
+        ],
+        [
+          2,
+          1,
+          "alpha details",
+          20
+        ],
+        [
+          1,
+          1,
+          "alpha intro",
+          10
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "column_matches": [
+        {
+          "expected_column": "id",
+          "actual_column": "id",
+          "semantic_name": "id",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        },
+        {
+          "expected_column": "token_count",
+          "actual_column": "token_count",
+          "semantic_name": "token_count",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "detail": "exact column name match"
+        }
+      ],
+      "expected_required_columns": [
+        "id",
+        "token_count"
+      ],
+      "expected_optional_columns": [
+        "document_id",
+        "content"
+      ],
+      "expected_forbidden_columns": []
+    }
+  ]
+}

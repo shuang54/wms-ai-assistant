@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from backend.app.services.text_to_sql_column_alias_evaluation_service import (
+    MATCH_ALIAS,
+    MATCH_EXACT,
+    MATCH_NONE,
+    ColumnAliasResolution,
+)
 from backend.app.services.text_to_sql_result_evaluation_service import (
     SEMANTIC_CATEGORY_DUPLICATE_ROW,
     SEMANTIC_CATEGORY_FORBIDDEN,
@@ -62,11 +68,19 @@ __all__ = [
     "analyze_phase_3_9_14_for_full_semantic",
     "compute_semantic_summary",
     "validate_semantic_consistency",
+    # Phase 3.9.18 — alias-aware re-analysis of the same 3.9.14 snapshot.
+    "PHASE_3_9_18",
+    "SNAPSHOT_3_9_18_PATH",
+    "REPORT_3_9_18_PATH",
+    "AliasAuditEntry",
+    "AliasAuditSummary",
+    "analyze_phase_3_9_14_for_alias_audit",
 ]
 
 
 PHASE_3_9_16: Final[str] = "3.9.16"
 PHASE_3_9_17: Final[str] = "3.9.17"
+PHASE_3_9_18: Final[str] = "3.9.18"
 
 SNAPSHOT_3_9_16_PATH: Final[Path] = (
     _REPO_ROOT / "tests" / "fixtures" / "text_to_sql" / "baselines"
@@ -83,6 +97,15 @@ SNAPSHOT_3_9_17_PATH: Final[Path] = (
 REPORT_3_9_17_PATH: Final[Path] = (
     _REPO_ROOT / "docs" / "evaluation"
     / "text-to-sql-semantic-result-full-3.9.17.md"
+)
+#: Phase 3.9.18 — alias audit snapshot (NEW file; 3.9.17 is never overwritten).
+SNAPSHOT_3_9_18_PATH: Final[Path] = (
+    _REPO_ROOT / "tests" / "fixtures" / "text_to_sql" / "baselines"
+    / "phase_3_9_18_alias_evaluation.json"
+)
+REPORT_3_9_18_PATH: Final[Path] = (
+    _REPO_ROOT / "docs" / "evaluation"
+    / "text-to-sql-semantic-column-alias-3.9.18.md"
 )
 
 #: Result-evaluable case IDs (Phase 3.9.17; excludes 2 N/A cases).
@@ -118,6 +141,8 @@ class SemanticResultCaseOutcome:
     expected_required_columns: tuple[str, ...]
     expected_optional_columns: tuple[str, ...]
     expected_forbidden_columns: tuple[str, ...]
+    #: Phase 3.9.18 — per required-column alias diagnostics.
+    column_matches: tuple[ColumnAliasResolution, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +152,9 @@ class SemanticResultCaseOutcome:
             "semantic_passed": self.semantic_passed,
             "semantic_reason": self.semantic_reason,
             "semantic_categories": list(self.semantic_categories),
+            "column_matches": [
+                item.to_dict() for item in self.column_matches
+            ],
             "expected_required_columns": list(
                 self.expected_required_columns
             ),
@@ -187,7 +215,7 @@ def analyze_phase_3_9_14_for_semantic() -> SemanticResultSummary:
             continue
         actual_columns = tuple(case_data.get("actual_columns", ()))
         actual_rows = tuple(tuple(r) for r in case_data.get("actual_rows", ()))
-        passed, reason, categories = _check_semantic_result(
+        passed, reason, categories, matches = _check_semantic_result(
             ResultCheckInput(
                 case_id=case_id,
                 columns=actual_columns,
@@ -208,6 +236,7 @@ def analyze_phase_3_9_14_for_semantic() -> SemanticResultSummary:
                 expected_required_columns=semantic.required_columns,
                 expected_optional_columns=semantic.optional_columns,
                 expected_forbidden_columns=semantic.forbidden_columns,
+                column_matches=matches,
             )
         )
 
@@ -354,7 +383,7 @@ def analyze_phase_3_9_14_for_full_semantic() -> SemanticResultFullSummary:
             continue
         actual_columns = tuple(actual.get("actual_columns", ()))
         actual_rows = tuple(tuple(r) for r in actual.get("actual_rows", ()))
-        passed, reason, categories = _check_semantic_result(
+        passed, reason, categories, matches = _check_semantic_result(
             ResultCheckInput(
                 case_id=case_id,
                 columns=actual_columns,
@@ -375,6 +404,7 @@ def analyze_phase_3_9_14_for_full_semantic() -> SemanticResultFullSummary:
                 expected_required_columns=semantic.required_columns,
                 expected_optional_columns=semantic.optional_columns,
                 expected_forbidden_columns=semantic.forbidden_columns,
+                column_matches=matches,
             )
         )
 
@@ -444,3 +474,140 @@ def validate_semantic_consistency(
                 f"(Rule 6 violation)"
             )
     return tuple(problems)
+
+
+# ============================================================
+# Phase 3.9.18 — Semantic Column Alias Audit
+# ============================================================
+
+
+@dataclass(frozen=True)
+class AliasAuditEntry:
+    """One (case, required column) alias audit row (section §十一)."""
+    case_id: str
+    expected_column: str
+    actual_column: str | None
+    matched_by: str
+    semantic_name: str | None
+    entity: str | None
+    diagnostic: str
+    alias_needed: bool
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "expected_column": self.expected_column,
+            "actual_column": self.actual_column,
+            "matched_by": self.matched_by,
+            "semantic_name": self.semantic_name,
+            "entity": self.entity,
+            "diagnostic": self.diagnostic,
+            "alias_needed": self.alias_needed,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class AliasAuditSummary:
+    """Phase 3.9.18 — alias audit over the 12 result-evaluable cases."""
+    phase: str
+    source_snapshot: str
+    phase_3_9_17_semantic_accuracy: float | None
+    phase_3_9_18_semantic_accuracy: float | None
+    phase_3_9_17_semantic_correct: int
+    phase_3_9_18_semantic_correct: int
+    semantic_evaluable_cases: int
+    exact_matches: int
+    alias_matches: int
+    unmatched_columns: int
+    alias_needed_cases: int
+    entries: tuple[AliasAuditEntry, ...] = ()
+    cases: tuple[SemanticResultCaseOutcome, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "source_snapshot": self.source_snapshot,
+            "phase_3_9_17_semantic_accuracy":
+                self.phase_3_9_17_semantic_accuracy,
+            "phase_3_9_18_semantic_accuracy":
+                self.phase_3_9_18_semantic_accuracy,
+            "phase_3_9_17_semantic_correct":
+                self.phase_3_9_17_semantic_correct,
+            "phase_3_9_18_semantic_correct":
+                self.phase_3_9_18_semantic_correct,
+            "semantic_evaluable_cases": self.semantic_evaluable_cases,
+            "exact_matches": self.exact_matches,
+            "alias_matches": self.alias_matches,
+            "unmatched_columns": self.unmatched_columns,
+            "alias_needed_cases": self.alias_needed_cases,
+            "entries": [item.to_dict() for item in self.entries],
+            "cases": [item.to_dict() for item in self.cases],
+        }
+
+
+def _load_phase_3_9_17_accuracy() -> tuple[float | None, int]:
+    """Read the FROZEN 3.9.17 snapshot (never recomputed, never written)."""
+    import json
+
+    if not SNAPSHOT_3_9_17_PATH.exists():
+        return None, 0
+    raw = json.loads(SNAPSHOT_3_9_17_PATH.read_text(encoding="utf-8"))
+    return raw.get("semantic_result_correctness"), int(
+        raw.get("semantic_correct_cases", 0)
+    )
+
+
+def analyze_phase_3_9_14_for_alias_audit() -> AliasAuditSummary:
+    """Phase 3.9.18 — offline alias audit of the 12 result-evaluable cases.
+
+    Re-evaluates the SAVED Phase 3.9.14 actual results with the alias-aware
+    semantic checker and compares the outcome with the frozen 3.9.17
+    snapshot. No DeepSeek call, no DB, no mutation of any 3.9.14 / 3.9.17
+    artifact, and no ground-truth change (sections §十二 / §十六).
+    """
+    summary = analyze_phase_3_9_14_for_full_semantic()
+
+    entries: list[AliasAuditEntry] = []
+    alias_needed_cases: set[str] = set()
+    for outcome in summary.cases:
+        for match in outcome.column_matches:
+            alias_needed = match.match_kind == MATCH_ALIAS
+            if alias_needed:
+                alias_needed_cases.add(outcome.case_id)
+            entries.append(
+                AliasAuditEntry(
+                    case_id=outcome.case_id,
+                    expected_column=match.expected_column,
+                    actual_column=match.actual_column,
+                    matched_by=match.match_kind,
+                    semantic_name=match.semantic_name,
+                    entity=match.entity,
+                    diagnostic=match.diagnostic,
+                    alias_needed=alias_needed,
+                    detail=match.detail,
+                )
+            )
+
+    exact = sum(1 for e in entries if e.matched_by == MATCH_EXACT)
+    alias = sum(1 for e in entries if e.matched_by == MATCH_ALIAS)
+    unmatched = sum(1 for e in entries if e.matched_by == MATCH_NONE)
+
+    accuracy_3_9_17, correct_3_9_17 = _load_phase_3_9_17_accuracy()
+
+    return AliasAuditSummary(
+        phase=PHASE_3_9_18,
+        source_snapshot=summary.source_snapshot,
+        phase_3_9_17_semantic_accuracy=accuracy_3_9_17,
+        phase_3_9_18_semantic_accuracy=summary.semantic_result_correctness,
+        phase_3_9_17_semantic_correct=correct_3_9_17,
+        phase_3_9_18_semantic_correct=summary.semantic_correct_cases,
+        semantic_evaluable_cases=summary.semantic_evaluable_cases,
+        exact_matches=exact,
+        alias_matches=alias,
+        unmatched_columns=unmatched,
+        alias_needed_cases=len(alias_needed_cases),
+        entries=tuple(entries),
+        cases=summary.cases,
+    )
