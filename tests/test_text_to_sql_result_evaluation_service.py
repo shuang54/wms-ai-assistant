@@ -350,7 +350,8 @@ def _check(case_id: str, passed: bool | None, applicable: bool = True
     )
 
     return ResultCheckResult(
-        case_id=case_id, applicable=applicable, passed=passed, reason="x",
+        case_id=case_id, applicable=applicable, passed=passed,
+        semantic_passed=None, reason="x",
     )
 
 

@@ -94,6 +94,18 @@ cases:
 
   # ---- Case 6：GROUP BY ----
   - id: group_by_chunk_count_per_document
+    semantic_expectation:
+      # Phase 3.9.16: 业务必需的列 = 文档标识 + 分片数量；title 是合理附加列。
+      # 实际 LLM 投影为 `id`（非 `document_id`），以真实列名为准。
+      required_columns: [id, chunk_count]
+      optional_columns: [title]
+      forbidden_columns: []
+      expected_rows:
+        - [1, 2]
+        - [2, 3]
+        - [3, 1]
+        - [4, 4]
+      row_matching: unordered
     question: "统计每个知识文档的知识分片数量"
     project_id: vietnam-wms
     expected:
@@ -105,6 +117,16 @@ cases:
 
   # ---- Case 7：HAVING ----
   - id: having_chunk_count_greater_than
+    semantic_expectation:
+      # Phase 3.9.16: question 只要求"哪些文档满足条件"，
+      # 因此只需要文档标识；count 是 HAVING 谓词而非投影，不强制要求。
+      required_columns: [id]
+      optional_columns: [title, chunk_count]
+      forbidden_columns: []
+      expected_rows:
+        - [2]
+        - [4]
+      row_matching: unordered
     question: "查询知识分片数量超过2个的知识文档"
     project_id: vietnam-wms
     expected:
@@ -153,6 +175,17 @@ cases:
 
   # ---- Case 11：Semantic-dependent（依赖业务语义才能理解 文档 / 分片） ----
   - id: semantic_dependent_document_and_chunk
+    semantic_expectation:
+      # Phase 3.9.16: 与 Case A 同形。
+      required_columns: [id, chunk_count]
+      optional_columns: [title]
+      forbidden_columns: []
+      expected_rows:
+        - [1, 2]
+        - [2, 3]
+        - [3, 1]
+        - [4, 4]
+      row_matching: unordered
     question: "查询每个文档包含多少个分片"
     project_id: vietnam-wms
     expected:

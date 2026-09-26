@@ -1,49 +1,28 @@
-"""Text-to-SQL Result-level Correctness Evaluation（Phase 3.9.10）。
+﻿"""Text-to-SQL Result-level Correctness Evaluation.
 
-在 3.9.9 Generation Quality 之上增加**结果级正确性**一层：
+Phase 3.9.10 introduces strict 4 checkers; Phase 3.9.16 adds the **semantic**
+view (required columns + values correct). Both coexist; the same ground
+truth entry may carry both ``expectation`` (strict) and
+``semantic_expectation`` (semantic).
 
 ```text
-Question → 既有 Text-to-SQL Pipeline → SQL → 既有 Validator → 既有 Executor
-        → rows → ResultEvaluationService（deterministic checker）→ 正确 / 错误
+Question -> Pipeline -> SQL -> Validator -> Executor -> rows
+                                                     -> ResultEvaluationService
+                                                        |- strict  -> passed
+                                                        \- semantic -> passed
 ```
 
-## 核心原则（§4）
+N/A semantics:
 
-结果正确性必须是**确定性的、可重复的、代码可验证的**：
-
-- 不使用「看起来结果合理」这类主观判断；
-- **不使用 LLM-as-a-Judge**（禁止让 DeepSeek 判断结果对不对）；
-- 只支持 4 种确定性规则：`exact_rows` / `unordered_rows` / `scalar` /
-  `column_values`；
-- 不做 fuzzy matching / 语义相似度 / 容差数值比较 / 自动推断期望值。
-
-## 规则（§7~§11）
-
-| type | 语义 |
-| --- | --- |
-| `exact_rows` | 行数、行顺序、每个字段值全部一致 |
-| `unordered_rows` | 忽略行顺序，按 **multiset / Counter** 比较（保留重复行，不用 set） |
-| `scalar` | 必须 1 行 1 列，且值相等（COUNT / SUM / MAX / MIN） |
-| `column_values` | 只比较指定列的值序列；`ordered` 默认 true，false 时按 multiset 比较 |
-
-## N/A 语义（§6 / §13 / §14）
-
-- 没有 `result_expectation` 的 case → `applicable=false`、`passed=None`；
-  **不能**记为失败；
-- `result_accuracy = correct / (correct + incorrect)`，
-  分母为 0 时为 `None`（JSON `null`），**绝不输出 0%**。
-
-## 边界
-
-- 只做评估，不修改 Text-to-SQL 生产逻辑 / Prompt / Validator / Executor；
-- 只读取测试数据库，且被评估的 SQL 本身必须是只读（由既有 Validator 保证）；
-- Dataset 里 `result_expectation` 是**可选**字段，缺省行为完全不变。
+- Neither given -> applicable=False, both passed=None.
+- Given but no execution result -> applicable=True, both passed=None.
+- Only one side given -> the other side stays None (independent scoring).
 """
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -58,19 +37,31 @@ __all__ = [
     "RESULT_TYPE_UNORDERED_ROWS",
     "RESULT_TYPE_SCALAR",
     "RESULT_TYPE_COLUMN_VALUES",
+    "SEMANTIC_ROW_MATCHING_UNORDERED",
+    "SEMANTIC_ROW_MATCHING_ORDERED",
+    "SEMANTIC_CATEGORY_MISSING_REQUIRED",
+    "SEMANTIC_CATEGORY_FORBIDDEN",
+    "SEMANTIC_CATEGORY_WRONG_VALUE",
+    "SEMANTIC_CATEGORY_WRONG_ROW_SET",
+    "SEMANTIC_CATEGORY_WRONG_ORDER",
+    "SEMANTIC_CATEGORY_UNDECLARED_EXTRA",
+    "SEMANTIC_CATEGORY_DUPLICATE_ROW",
     "ResultExpectationError",
     "ResultExpectation",
+    "SemanticExpectation",
     "ResultCheckInput",
     "ResultCheckResult",
     "ResultAccuracySummary",
     "TextToSQLResultEvaluationService",
     "parse_result_expectation",
+    "parse_semantic_expectation",
     "load_result_expectations",
+    "load_semantic_expectations",
 ]
 
 
 # ============================================================
-# 常量
+# Constants
 # ============================================================
 
 RESULT_TYPE_EXACT_ROWS: Final[str] = "exact_rows"
@@ -78,34 +69,39 @@ RESULT_TYPE_UNORDERED_ROWS: Final[str] = "unordered_rows"
 RESULT_TYPE_SCALAR: Final[str] = "scalar"
 RESULT_TYPE_COLUMN_VALUES: Final[str] = "column_values"
 
-_SUPPORTED_TYPES: Final[frozenset[str]] = frozenset(
-    {
-        RESULT_TYPE_EXACT_ROWS,
-        RESULT_TYPE_UNORDERED_ROWS,
-        RESULT_TYPE_SCALAR,
-        RESULT_TYPE_COLUMN_VALUES,
-    }
-)
+_SUPPORTED_TYPES: Final[frozenset[str]] = frozenset({
+    RESULT_TYPE_EXACT_ROWS,
+    RESULT_TYPE_UNORDERED_ROWS,
+    RESULT_TYPE_SCALAR,
+    RESULT_TYPE_COLUMN_VALUES,
+})
 
-#: 比率精度
+SEMANTIC_ROW_MATCHING_UNORDERED: Final[str] = "unordered"
+SEMANTIC_ROW_MATCHING_ORDERED: Final[str] = "ordered"
+SEMANTIC_ROW_MATCHING_VALUES: Final[frozenset[str]] = frozenset({
+    SEMANTIC_ROW_MATCHING_UNORDERED, SEMANTIC_ROW_MATCHING_ORDERED,
+})
+
+SEMANTIC_CATEGORY_MISSING_REQUIRED: Final[str] = "MISSING_REQUIRED_COLUMN"
+SEMANTIC_CATEGORY_FORBIDDEN: Final[str] = "EXTRA_FORBIDDEN_COLUMN"
+SEMANTIC_CATEGORY_WRONG_VALUE: Final[str] = "WRONG_COLUMN_VALUE"
+SEMANTIC_CATEGORY_WRONG_ROW_SET: Final[str] = "WRONG_ROW_SET"
+SEMANTIC_CATEGORY_WRONG_ORDER: Final[str] = "COLUMN_ORDER_MISMATCH"
+SEMANTIC_CATEGORY_UNDECLARED_EXTRA: Final[str] = "UNDECLARED_EXTRA_COLUMN"
+SEMANTIC_CATEGORY_DUPLICATE_ROW: Final[str] = "DUPLICATE_ROW"
+
 RATE_PRECISION: Final[int] = 4
-
 _NOT_EVALUABLE_REASON: Final[str] = "no execution result available"
 _NO_EXPECTATION_REASON: Final[str] = "no result_expectation defined"
 
 
 class ResultExpectationError(ValueError):
-    """``result_expectation`` 配置非法（类型未知 / 缺字段 / 结构错误）。"""
+    """``result_expectation`` / ``semantic_expectation`` config invalid."""
 
-
-# ============================================================
-# DTO
-# ============================================================
 
 @dataclass(frozen=True)
 class ResultExpectation:
-    """单条结果级预期（frozen，确定性）。"""
-
+    """Single result-level expectation (frozen, deterministic)."""
     type: str
     rows: tuple[tuple[Any, ...], ...] = ()
     value: Any = None
@@ -139,25 +135,52 @@ class ResultExpectation:
 
 
 @dataclass(frozen=True)
-class ResultCheckInput:
-    """一次结果校验的输入（不含任何执行能力）。"""
+class SemanticExpectation:
+    """Business-semantic result expectation (Phase 3.9.16).
 
+    Only cares about whether required columns appear + required values are
+    correct. Forbidden columns cause failure. Optional columns are
+    advisory. Undeclared extra columns: allowed but logged as
+    UNDECLARED_EXTRA warning (not a hard failure).
+    """
+    required_columns: tuple[str, ...]
+    optional_columns: tuple[str, ...] = ()
+    forbidden_columns: tuple[str, ...] = ()
+    expected_rows: tuple[tuple[Any, ...], ...] = ()
+    row_matching: str = SEMANTIC_ROW_MATCHING_UNORDERED
+
+    def __post_init__(self) -> None:
+        if not self.required_columns:
+            raise ResultExpectationError(
+                "semantic_expectation requires at least one required_column"
+            )
+        if self.row_matching not in SEMANTIC_ROW_MATCHING_VALUES:
+            raise ResultExpectationError(
+                f"row_matching must be one of "
+                f"{sorted(SEMANTIC_ROW_MATCHING_VALUES)}, "
+                f"got {self.row_matching!r}"
+            )
+
+
+@dataclass(frozen=True)
+class ResultCheckInput:
     case_id: str
     columns: tuple[str, ...] = ()
     rows: tuple[tuple[Any, ...], ...] = ()
     expectation: ResultExpectation | None = None
-    #: SQL 是否真的执行并产出了结果；False 表示无结果可判（→ N/A）
+    semantic_expectation: SemanticExpectation | None = None
     executed: bool = True
 
 
 @dataclass(frozen=True)
 class ResultCheckResult:
-    """单条校验结果（§13）。"""
-
     case_id: str
     applicable: bool
     passed: bool | None
+    semantic_passed: bool | None
     reason: str
+    semantic_reason: str = ""
+    semantic_categories: tuple[str, ...] = ()
     expected: Any = None
     actual: Any = None
 
@@ -166,7 +189,10 @@ class ResultCheckResult:
             "case_id": self.case_id,
             "applicable": self.applicable,
             "passed": self.passed,
+            "semantic_passed": self.semantic_passed,
             "reason": self.reason,
+            "semantic_reason": self.semantic_reason,
+            "semantic_categories": list(self.semantic_categories),
             "expected": self.expected,
             "actual": self.actual,
         }
@@ -174,22 +200,33 @@ class ResultCheckResult:
 
 @dataclass(frozen=True)
 class ResultAccuracySummary:
-    """结果正确性汇总（§14）。"""
-
     total_cases: int
     applicable_result_cases: int
     correct_result_cases: int
     incorrect_result_cases: int
     not_evaluable_cases: int
+
+    semantic_evaluable_cases: int = 0
+    semantic_correct_cases: int = 0
+    semantic_incorrect_cases: int = 0
+
     checks: tuple[ResultCheckResult, ...] = ()
 
     @property
     def result_accuracy(self) -> float | None:
-        """correct / (correct + incorrect)；分母 0 → None（N/A，不是 0%）。"""
-        denominator = self.correct_result_cases + self.incorrect_result_cases
-        if denominator <= 0:
+        denom = self.correct_result_cases + self.incorrect_result_cases
+        if denom <= 0:
             return None
-        return round(self.correct_result_cases / denominator, RATE_PRECISION)
+        return round(self.correct_result_cases / denom, RATE_PRECISION)
+
+    @property
+    def semantic_result_correctness(self) -> float | None:
+        denom = self.semantic_correct_cases + self.semantic_incorrect_cases
+        if denom <= 0:
+            return None
+        return round(
+            self.semantic_correct_cases / denom, RATE_PRECISION
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,17 +236,15 @@ class ResultAccuracySummary:
             "incorrect_result_cases": self.incorrect_result_cases,
             "not_evaluable_cases": self.not_evaluable_cases,
             "result_accuracy": self.result_accuracy,
+            "semantic_evaluable_cases": self.semantic_evaluable_cases,
+            "semantic_correct_cases": self.semantic_correct_cases,
+            "semantic_incorrect_cases": self.semantic_incorrect_cases,
+            "semantic_result_correctness": self.semantic_result_correctness,
             "cases": [item.to_dict() for item in self.checks],
         }
 
 
-# ============================================================
-# Checker（纯函数）
-# ============================================================
-
-def _check_exact_rows(
-    payload: ResultCheckInput, expectation: ResultExpectation
-) -> tuple[bool, str]:
+def _check_exact_rows(payload, expectation):
     expected_rows = expectation.rows
     actual_rows = payload.rows
     if len(actual_rows) != len(expected_rows):
@@ -228,10 +263,7 @@ def _check_exact_rows(
     return True, "exact rows matched"
 
 
-def _check_unordered_rows(
-    payload: ResultCheckInput, expectation: ResultExpectation
-) -> tuple[bool, str]:
-    """multiset 比较（Counter）：忽略顺序，保留重复行。"""
+def _check_unordered_rows(payload, expectation):
     expected_counter = Counter(tuple(r) for r in expectation.rows)
     actual_counter = Counter(tuple(r) for r in payload.rows)
     if expected_counter != actual_counter:
@@ -244,9 +276,7 @@ def _check_unordered_rows(
     return True, "unordered rows matched (multiset)"
 
 
-def _check_scalar(
-    payload: ResultCheckInput, expectation: ResultExpectation
-) -> tuple[bool, str]:
+def _check_scalar(payload, expectation):
     if len(payload.rows) != 1 or len(payload.columns) != 1:
         return False, (
             f"scalar shape mismatch: expected 1 row x 1 column, "
@@ -260,10 +290,8 @@ def _check_scalar(
     return True, "scalar matched"
 
 
-def _check_column_values(
-    payload: ResultCheckInput, expectation: ResultExpectation
-) -> tuple[bool, str]:
-    lowered = [str(column).lower() for column in payload.columns]
+def _check_column_values(payload, expectation):
+    lowered = [str(c).lower() for c in payload.columns]
     target = str(expectation.column).lower()
     if target not in lowered:
         return False, (
@@ -273,7 +301,6 @@ def _check_column_values(
     index = lowered.index(target)
     actual = tuple(row[index] for row in payload.rows)
     expected = tuple(expectation.values)
-
     if expectation.ordered:
         if actual != expected:
             return False, (
@@ -281,7 +308,6 @@ def _check_column_values(
                 f"got {actual}"
             )
         return True, "column_values matched (ordered)"
-
     actual_counter = Counter(actual)
     expected_counter = Counter(expected)
     if actual_counter != expected_counter:
@@ -300,51 +326,133 @@ _CHECKERS = {
 }
 
 
-# ============================================================
-# Service
-# ============================================================
+def _extract_required_values(actual_columns, actual_rows, required_columns):
+    lowered_actual = [str(c).lower() for c in actual_columns]
+    indices = [
+        lowered_actual.index(str(req).lower()) for req in required_columns
+    ]
+    return tuple(tuple(row[i] for i in indices) for row in actual_rows)
+
+
+def _check_semantic_result(payload, expectation):
+    """Business-semantic checker (3.9.16).
+
+    Categories (multi-label): MISSING_REQUIRED / FORBIDDEN / WRONG_VALUE /
+    WRONG_ROW_SET / WRONG_ORDER / UNDECLARED_EXTRA / DUPLICATE_ROW.
+    Hard failure = any category other than UNDECLARED_EXTRA.
+    """
+    categories = []
+    failures = []
+    actual_set = {str(c).lower() for c in payload.columns}
+    required_lower = [str(c).lower() for c in expectation.required_columns]
+    optional_lower = {str(c).lower() for c in expectation.optional_columns}
+    forbidden_lower = {str(c).lower() for c in expectation.forbidden_columns}
+
+    missing_required = [c for c in required_lower if c not in actual_set]
+    if missing_required:
+        categories.append(SEMANTIC_CATEGORY_MISSING_REQUIRED)
+        failures.append(
+            f"missing required columns: {sorted(missing_required)}"
+        )
+
+    present_forbidden = sorted(c for c in forbidden_lower if c in actual_set)
+    if present_forbidden:
+        categories.append(SEMANTIC_CATEGORY_FORBIDDEN)
+        failures.append(f"forbidden columns present: {present_forbidden}")
+
+    declared = set(required_lower) | optional_lower | forbidden_lower
+    undeclared = sorted(
+        str(c).lower() for c in payload.columns
+        if str(c).lower() not in declared
+    )
+    if undeclared:
+        categories.append(SEMANTIC_CATEGORY_UNDECLARED_EXTRA)
+        failures.append(
+            f"undeclared extra columns (warning): {undeclared}"
+        )
+
+    if not missing_required and not present_forbidden:
+        extracted = _extract_required_values(
+            payload.columns, payload.rows, expectation.required_columns
+        )
+        expected = tuple(tuple(r) for r in expectation.expected_rows)
+        if expectation.row_matching == SEMANTIC_ROW_MATCHING_ORDERED:
+            if extracted != expected:
+                categories.append(SEMANTIC_CATEGORY_WRONG_ORDER)
+                failures.append(
+                    f"required-column values mismatch (ordered): "
+                    f"expected={expected}, got={extracted}"
+                )
+        else:
+            if Counter(extracted) != Counter(expected):
+                categories.append(SEMANTIC_CATEGORY_WRONG_ROW_SET)
+                missing_values = Counter(expected) - Counter(extracted)
+                if missing_values:
+                    categories.append(SEMANTIC_CATEGORY_WRONG_VALUE)
+                    failures.append(
+                        f"required-column values missing: "
+                        f"{dict(missing_values)}"
+                    )
+                else:
+                    failures.append(
+                        "required-column values mismatch (unordered): "
+                        f"expected={expected}, got={extracted}"
+                    )
+
+    hard = [c for c in categories if c != SEMANTIC_CATEGORY_UNDECLARED_EXTRA]
+    passed = not hard
+    reason = "; ".join(failures) if failures else "semantic result matched"
+    return passed, reason, tuple(categories)
+
 
 class TextToSQLResultEvaluationService:
-    """结果级正确性评估（纯内存，无 LLM / 无 DB 访问）。"""
-
-    def check(self, payload: ResultCheckInput) -> ResultCheckResult:
-        """校验单个 case 的执行结果。
-
-        - 无 ``result_expectation`` → ``applicable=False``、``passed=None``；
-        - 有预期但没执行出结果 → ``applicable=True``、``passed=None``（N/A）；
-        - 其余 → ``passed=True/False`` + 具体 reason。
-        """
+    def check(self, payload):
         expectation = payload.expectation
-        if expectation is None:
+        semantic = payload.semantic_expectation
+
+        if expectation is None and semantic is None:
             return ResultCheckResult(
                 case_id=payload.case_id,
-                applicable=False,
-                passed=None,
+                applicable=False, passed=None, semantic_passed=None,
                 reason=_NO_EXPECTATION_REASON,
             )
+
         if not payload.executed:
             return ResultCheckResult(
                 case_id=payload.case_id,
-                applicable=True,
-                passed=None,
+                applicable=True, passed=None, semantic_passed=None,
                 reason=_NOT_EVALUABLE_REASON,
-                expected=_expected_view(expectation),
+                expected=_expected_view(expectation) if expectation else None,
                 actual=None,
             )
-        checker = _CHECKERS[expectation.type]
-        passed, reason = checker(payload, expectation)
+
+        passed = None
+        reason = _NO_EXPECTATION_REASON
+        if expectation is not None:
+            checker = _CHECKERS[expectation.type]
+            passed, reason = checker(payload, expectation)
+
+        semantic_passed = None
+        semantic_reason = ""
+        semantic_categories = ()
+        if semantic is not None:
+            semantic_passed, semantic_reason, semantic_categories = (
+                _check_semantic_result(payload, semantic)
+            )
+
         return ResultCheckResult(
             case_id=payload.case_id,
             applicable=True,
             passed=passed,
+            semantic_passed=semantic_passed,
             reason=reason,
-            expected=_expected_view(expectation),
+            semantic_reason=semantic_reason,
+            semantic_categories=semantic_categories,
+            expected=_expected_view(expectation) if expectation else None,
             actual=_actual_view(payload),
         )
 
-    def summarize(
-        self, checks: Sequence[ResultCheckResult]
-    ) -> ResultAccuracySummary:
+    def summarize(self, checks):
         return ResultAccuracySummary(
             total_cases=len(checks),
             applicable_result_cases=sum(1 for c in checks if c.applicable),
@@ -353,11 +461,20 @@ class TextToSQLResultEvaluationService:
             not_evaluable_cases=sum(
                 1 for c in checks if c.applicable and c.passed is None
             ),
+            semantic_evaluable_cases=sum(
+                1 for c in checks if c.semantic_passed is not None
+            ),
+            semantic_correct_cases=sum(
+                1 for c in checks if c.semantic_passed is True
+            ),
+            semantic_incorrect_cases=sum(
+                1 for c in checks if c.semantic_passed is False
+            ),
             checks=tuple(checks),
         )
 
 
-def _expected_view(expectation: ResultExpectation) -> Any:
+def _expected_view(expectation):
     if expectation.type == RESULT_TYPE_SCALAR:
         return expectation.value
     if expectation.type == RESULT_TYPE_COLUMN_VALUES:
@@ -369,23 +486,17 @@ def _expected_view(expectation: ResultExpectation) -> Any:
     return [list(row) for row in expectation.rows]
 
 
-def _actual_view(payload: ResultCheckInput) -> Any:
+def _actual_view(payload):
     return {
         "columns": list(payload.columns),
         "rows": [list(row) for row in payload.rows],
     }
 
 
-# ============================================================
-# Dataset 解析（result_expectation 为**可选**字段）
-# ============================================================
-
-def parse_result_expectation(raw: Any) -> ResultExpectation:
-    """解析 ``result_expectation`` 块；非法配置抛 ``ResultExpectationError``。"""
+def parse_result_expectation(raw):
     if not isinstance(raw, Mapping):
         raise ResultExpectationError(
-            f"result_expectation must be a mapping "
-            f"(got {type(raw).__name__})"
+            "result_expectation must be a mapping"
         )
     unknown = set(raw) - {
         "type", "rows", "value", "column", "values", "ordered",
@@ -398,7 +509,7 @@ def parse_result_expectation(raw: Any) -> ResultExpectation:
         raise ResultExpectationError("result_expectation requires 'type'")
 
     raw_rows = raw.get("rows")
-    rows: tuple[tuple[Any, ...], ...] = ()
+    rows = ()
     if raw_rows is not None:
         if isinstance(raw_rows, (str, bytes)) or not isinstance(
             raw_rows, (list, tuple)
@@ -410,7 +521,7 @@ def parse_result_expectation(raw: Any) -> ResultExpectation:
         )
 
     raw_values = raw.get("values")
-    values: tuple[Any, ...] = ()
+    values = ()
     if raw_values is not None:
         if isinstance(raw_values, (str, bytes)) or not isinstance(
             raw_values, (list, tuple)
@@ -428,18 +539,8 @@ def parse_result_expectation(raw: Any) -> ResultExpectation:
     )
 
 
-def load_result_expectations(
-    path: str | Path | None = None,
-) -> dict[str, ResultExpectation]:
-    """读取 dataset 中的 ``result_expectation``（可选字段）。
-
-    Returns:
-        ``case_id → ResultExpectation``；没有该字段的 case 不会出现在结果里。
-
-    Raises:
-        ResultExpectationError: 配置非法。
-        OSError / yaml.YAMLError: 文件不可读 / YAML 语法错误。
-    """
+def load_result_expectations(path=None):
+    """读取 dataset 中的 ``result_expectation``（3.9.10）。"""
     target = Path(path) if path is not None else DEFAULT_REGRESSION_DATASET_PATH
     data = yaml.safe_load(target.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping):
@@ -447,8 +548,7 @@ def load_result_expectations(
     entries = data.get("cases")
     if not isinstance(entries, list):
         return {}
-
-    expectations: dict[str, ResultExpectation] = {}
+    expectations = {}
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping):
             continue
@@ -457,4 +557,97 @@ def load_result_expectations(
             continue
         case_id = str(entry.get("id", f"cases[{index}]"))
         expectations[case_id] = parse_result_expectation(raw)
+    return expectations
+
+
+_SEMANTIC_ALLOWED_KEYS = frozenset({
+    "required_columns", "optional_columns", "forbidden_columns",
+    "expected_rows", "row_matching",
+})
+
+
+def parse_semantic_expectation(raw):
+    if not isinstance(raw, Mapping):
+        raise ResultExpectationError(
+            "semantic_expectation must be a mapping"
+        )
+    unknown = set(raw) - _SEMANTIC_ALLOWED_KEYS
+    if unknown:
+        raise ResultExpectationError(
+            f"semantic_expectation has unknown keys {sorted(unknown)}"
+        )
+
+    def _string_tuple(value, field_name):
+        if value is None:
+            return ()
+        if isinstance(value, (str, bytes)) or not isinstance(value, list):
+            raise ResultExpectationError(
+                f"{field_name} must be a list of strings"
+            )
+        out = []
+        for entry in value:
+            if isinstance(entry, (list, tuple)) and not isinstance(entry, str):
+                if len(entry) != 1:
+                    raise ResultExpectationError(
+                        f"{field_name} entries must be strings, "
+                        f"got {entry!r}"
+                    )
+                out.append(str(entry[0]))
+            else:
+                out.append(str(entry))
+        return tuple(out)
+
+    required = _string_tuple(raw.get("required_columns"), "required_columns")
+    optional = _string_tuple(raw.get("optional_columns"), "optional_columns")
+    forbidden = _string_tuple(
+        raw.get("forbidden_columns"), "forbidden_columns"
+    )
+
+    expected_rows = ()
+    raw_rows = raw.get("expected_rows")
+    if raw_rows is not None:
+        if isinstance(raw_rows, (str, bytes)) or not isinstance(raw_rows, list):
+            raise ResultExpectationError(
+                "expected_rows must be a list of lists"
+            )
+        expected_rows = tuple(
+            tuple(row) if isinstance(row, (list, tuple)) else (row,)
+            for row in raw_rows
+        )
+
+    row_matching = str(
+        raw.get("row_matching", SEMANTIC_ROW_MATCHING_UNORDERED)
+    )
+
+    return SemanticExpectation(
+        required_columns=required,
+        optional_columns=optional,
+        forbidden_columns=forbidden,
+        expected_rows=expected_rows,
+        row_matching=row_matching,
+    )
+
+
+def load_semantic_expectations(path=None):
+    """读取 dataset 中的 ``semantic_expectation``（3.9.16）。
+
+    与 ``load_result_expectations`` 共源（``text_to_sql_regression.yaml``），
+    保证 3.9.10 dataset hash 不变。
+    """
+    target = Path(path) if path is not None else DEFAULT_REGRESSION_DATASET_PATH
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping):
+        return {}
+    entries = data.get("cases")
+    if not isinstance(entries, list):
+        return {}
+    expectations = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            continue
+        raw = entry.get("semantic_expectation")
+        if raw is None:
+            continue
+        case_id = str(entry.get("id", f"cases[{index}]"))
+        expectations[case_id] = parse_semantic_expectation(raw)
     return expectations

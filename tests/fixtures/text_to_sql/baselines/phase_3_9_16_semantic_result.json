@@ -1,0 +1,122 @@
+{
+  "phase": "3.9.16",
+  "source_snapshot": "phase_3_9_14_result_llm_baseline.json",
+  "source_snapshot_sha256": "1ffe014fa050c915dd200fe6fb9d685b6dad761a0c4d36817d2455dbe34225b8",
+  "total_cases": 3,
+  "semantic_evaluable_cases": 3,
+  "semantic_correct_cases": 3,
+  "semantic_incorrect_cases": 0,
+  "semantic_result_correctness": 1.0,
+  "cases": [
+    {
+      "case_id": "group_by_chunk_count_per_document",
+      "actual_columns": [
+        "id",
+        "title",
+        "chunk_count"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual",
+          4
+        ],
+        [
+          2,
+          "Beta Notes",
+          3
+        ],
+        [
+          3,
+          "Gamma Guide",
+          1
+        ],
+        [
+          1,
+          "Alpha Report",
+          2
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "expected_required_columns": [
+        "id",
+        "chunk_count"
+      ],
+      "expected_optional_columns": [
+        "title"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "having_chunk_count_greater_than",
+      "actual_columns": [
+        "id",
+        "title"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual"
+        ],
+        [
+          2,
+          "Beta Notes"
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "expected_required_columns": [
+        "id"
+      ],
+      "expected_optional_columns": [
+        "title",
+        "chunk_count"
+      ],
+      "expected_forbidden_columns": []
+    },
+    {
+      "case_id": "semantic_dependent_document_and_chunk",
+      "actual_columns": [
+        "id",
+        "title",
+        "chunk_count"
+      ],
+      "actual_rows": [
+        [
+          4,
+          "Delta Manual",
+          4
+        ],
+        [
+          2,
+          "Beta Notes",
+          3
+        ],
+        [
+          3,
+          "Gamma Guide",
+          1
+        ],
+        [
+          1,
+          "Alpha Report",
+          2
+        ]
+      ],
+      "semantic_passed": true,
+      "semantic_reason": "semantic result matched",
+      "semantic_categories": [],
+      "expected_required_columns": [
+        "id",
+        "chunk_count"
+      ],
+      "expected_optional_columns": [
+        "title"
+      ],
+      "expected_forbidden_columns": []
+    }
+  ]
+}

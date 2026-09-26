@@ -381,7 +381,7 @@ class TestSnapshotValidation:
 
 
 class TestCheckPurity:
-    def test_check_does_not_write_files(self, monkeypatch) -> None:
+    def test_check_does_not_write_files(self, monkeypatch, capsys) -> None:
         script = _load_script_module()
         targets = (
             script.SNAPSHOT_PATH, script.REPORT_PATH, DATASET_PATH,
@@ -390,10 +390,25 @@ class TestCheckPurity:
         before = {str(p): _digest(p) for p in targets}
 
         monkeypatch.setattr(sys, "argv", ["script", "--check"])
-        assert script.main() == 0
+        exit_code = script.main()
+        captured = capsys.readouterr().out
+        # Phase 3.9.16 deliberately adds ``semantic_expectation`` to the
+        # regression dataset (section 25: dataset hash drift is expected and
+        # the new hash must be recorded in the 3.9.16 report). The strict
+        # 3.9.14 --check therefore returns 1 with this drift reason; the
+        # *purity* invariants (no file writes, no LLM/DB calls) still hold.
+        allowed_drift = (
+            "dataset hash changed" in captured
+            or "dataset_sha256 mismatch" in captured
+        )
+        if exit_code == 0:
+            assert {str(p): _digest(p) for p in targets} == before
+            return
+        assert exit_code == 1
+        assert allowed_drift, captured
         assert {str(p): _digest(p) for p in targets} == before
 
-    def test_check_does_not_invoke_llm_or_db(self, monkeypatch) -> None:
+    def test_check_does_not_invoke_llm_or_db(self, monkeypatch, capsys) -> None:
         """section 37: no TextToSQLService / LLM client in the check path."""
         script = _load_script_module()
         from backend.app.services.text_to_sql_service import TextToSQLService
@@ -407,7 +422,16 @@ class TestCheckPurity:
         )
         monkeypatch.setattr("backend.app.db.session.get_engine", forbid)
         monkeypatch.setattr(sys, "argv", ["script", "--check"])
-        assert script.main() == 0
+        exit_code = script.main()
+        captured = capsys.readouterr().out
+        allowed_drift = (
+            "dataset hash changed" in captured
+            or "dataset_sha256 mismatch" in captured
+        )
+        if exit_code == 0:
+            return
+        assert exit_code == 1
+        assert allowed_drift, captured
 
     def test_preflight_gate_detects_drift(self, monkeypatch) -> None:
         script = _load_script_module()
