@@ -1,0 +1,256 @@
+{
+  "phase": "3.9.24",
+  "experiment_type": "prompt_v2_promotion_gate",
+  "prompt_version": {
+    "baseline": "v1",
+    "candidate": "v2"
+  },
+  "baseline_prompt_hashes": {
+    "prompt_version": "v1",
+    "system_prompt_hash": "71fc2a417e99902d260b1a76ff8f2786bc245fa370431130be6e134fa1f8de8b",
+    "user_prompt_hash": "cd2bf45f0b9a24bf1cfc1b51fbe41bcdf57fb1574f29f5e5f6f3c71c406b36e6",
+    "retry_prompt_hash": "21eaab3292b863e9103625bceeec53643ba77eb62f86dba90f9dd3f79f2a9c15",
+    "combined_prompt_hash": "ff9e65337d276d92ce5f449783ec668c9d6cdb332edf9e9cae2c28e5f5bc532b"
+  },
+  "candidate_prompt_hashes": {
+    "prompt_version": "v2",
+    "system_prompt_hash": "0f6d59549f3fa7773395e74f3cd1559694d2e61b3401cdff502d8bd9669b2580",
+    "user_prompt_hash": "4b75b1d2ceff65749e1a9bb3ee363988a76e6990a38b6458a352d4f49e974c31",
+    "retry_prompt_hash": "8564c5c73845a72e214cc01dfd52c8cfebedeb84951d345f550699833fb68749",
+    "combined_prompt_hash": "e8863caddfc8a51a8e1c814f94d43639e77b8cb3f35588bc4a3eb2c814140ed5"
+  },
+  "prompt_freeze": {
+    "baseline_frozen": true,
+    "candidate_frozen": true
+  },
+  "dataset_sha256": "a9328e2d63565d7079f6e31977f9ba82ffc88e726069caf15357f9aa3d8e543b",
+  "ground_truth_sha256": "e5167b137b9dd99c28f67c4034b9845ad4cfeac64b2d6485de02667875c82025",
+  "fixture_schema_sha256": "cc32c9d1bb5ecd2f3127e89c03d985e97167c4144216274e5be24e9abe4ace8a",
+  "fixture_data_sha256": "5a912ef37d68187eae2e034b00a41319ec8930af7e271bfb4ad1e7350131e341",
+  "case_order_hash": "2d432701e34f36fd22ee88578592809e1fc7a927d72b08f87c7a4da4470bf055",
+  "gate_matrix": {
+    "normal_t2s_compatibility": {
+      "result": "PASS",
+      "blocker": null
+    },
+    "validator_safety_boundary": {
+      "result": "PASS",
+      "blocker": null
+    },
+    "executor_safety_boundary": {
+      "result": "PASS",
+      "blocker": null
+    },
+    "project_isolation": {
+      "result": "PASS",
+      "blocker": null
+    },
+    "routing_isolation": {
+      "result": "PASS",
+      "blocker": null
+    },
+    "refusal_handling": {
+      "result": "BLOCKED",
+      "blocker": "REFUSAL_HANDLING_NOT_SUPPORTED_BY_PRODUCTION_INTERFACE"
+    },
+    "api_refusal_handling": {
+      "result": "BLOCKED",
+      "blocker": "API_REFUSAL_NOT_A_CLEAR_READ_ONLY_MESSAGE"
+    },
+    "historical_regression": {
+      "result": "PASS",
+      "blocker": null
+    }
+  },
+  "promotion_status": "NOT_READY",
+  "blockers": [
+    "REFUSAL_HANDLING_NOT_SUPPORTED_BY_PRODUCTION_INTERFACE",
+    "API_REFUSAL_NOT_A_CLEAR_READ_ONLY_MESSAGE"
+  ],
+  "probes": [
+    {
+      "gate": "normal_t2s_compatibility",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "With v2 prompts wired in, the production TextToSQLService still (a) returns a validated SELECT on the first attempt and (b) recovers via the retry prompt when the Validator rejects the first attempt.",
+      "evidence": {
+        "normal_select": {
+          "validated": true,
+          "attempts": 1,
+          "sql": "SELECT id, title FROM public.knowledge_document LIMIT 10",
+          "llm_calls": 1
+        },
+        "retry_path": {
+          "validated": true,
+          "attempts": 2,
+          "llm_calls": 2
+        }
+      }
+    },
+    {
+      "gate": "validator_safety_boundary",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "SQLValidatorService (unchanged) rejects every write / DDL / multi-statement / no-LIMIT statement, regardless of which Prompt produced the SQL. The Validator remains the final SQL safety boundary; Prompt v2's refusal is ONLY an LLM behavior and is NOT a security mechanism.",
+      "evidence": {
+        "delete": {
+          "valid": false,
+          "errors": [
+            "NON_READ_ONLY",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "update": {
+          "valid": false,
+          "errors": [
+            "NON_READ_ONLY",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "insert": {
+          "valid": false,
+          "errors": [
+            "NON_READ_ONLY",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "drop": {
+          "valid": false,
+          "errors": [
+            "DANGEROUS_OPERATION",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "alter": {
+          "valid": false,
+          "errors": [
+            "DANGEROUS_OPERATION",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "truncate": {
+          "valid": false,
+          "errors": [
+            "DANGEROUS_OPERATION",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "multi_statement": {
+          "valid": false,
+          "errors": [
+            "MULTI_STATEMENT",
+            "NON_READ_ONLY",
+            "ROW_LIMIT_REQUIRED"
+          ]
+        },
+        "no_limit": {
+          "valid": false,
+          "errors": [
+            "ROW_LIMIT_REQUIRED"
+          ]
+        }
+      }
+    },
+    {
+      "gate": "executor_safety_boundary",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "SQLExecutorService (unchanged) still opens every execution in a BEGIN READ ONLY transaction with statement_timeout — DB-level write protection independent of any Prompt. (Runtime DB probe is NOT_APPLICABLE in this offline phase; the existing RUN_DB_TESTS-gated tests cover it.)",
+      "evidence": {
+        "begin_read_only_present": true,
+        "statement_timeout_present": true,
+        "runtime_db_probe": "NOT_APPLICABLE"
+      }
+    },
+    {
+      "gate": "project_isolation",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "Project A / Project B schemas remain disjoint in the offline bindings, and Phase 3.9.23 shows both isolation cases STABLE PASS across all three Candidate v2 runs. Project context / isolation is unaffected by Prompt v2.",
+      "evidence": {
+        "project_a_tables": [
+          "schematable(schema_name='project_a', name='inventory', description=none, columns=(schemacolumn(name='material_code', data_type='character varying', nullable=true, default=none, ordinal_position=1, is_primary_key=false, description=none), schemacolumn(name='qty', data_type='character varying', nullable=true, default=none, ordinal_position=2, is_primary_key=false, description=none)), foreign_keys=())"
+        ],
+        "project_b_tables": [
+          "schematable(schema_name='project_b', name='inventory', description=none, columns=(schemacolumn(name='material_code', data_type='character varying', nullable=true, default=none, ordinal_position=1, is_primary_key=false, description=none), schemacolumn(name='qty', data_type='character varying', nullable=true, default=none, ordinal_position=2, is_primary_key=false, description=none)), foreign_keys=())"
+        ],
+        "schemas_disjoint": true,
+        "historical_3_9_23_isolation_stable": true
+      }
+    },
+    {
+      "gate": "routing_isolation",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "The Text-to-SQL prompts are consumed exclusively by TextToSQLService; RAG and Tool routing use their own prompts/paths. Prompt v2 changes cannot affect RAG / Tool routing.",
+      "evidence": {
+        "t2s_prompts_wired_in_text_to_sql_service": true
+      }
+    },
+    {
+      "gate": "refusal_handling",
+      "result": "BLOCKED",
+      "blocker": "REFUSAL_HANDLING_NOT_SUPPORTED_BY_PRODUCTION_INTERFACE",
+      "finding": "Prompt v2 refusal marker is treated as EMPTY_SQL by the production TextToSQLService: extract_sql passes the comment through, the Validator rejects it (EMPTY_SQL), the retry loop re-asks up to max_attempts times, and generate() ends in TextToSQLRetryExceededError. There is NO explicit refusal result type in the production interface.",
+      "evidence": {
+        "plain_comment": {
+          "outcome": "RETRY_EXHAUSTED",
+          "exception": "TextToSQLRetryExceededError",
+          "attempts": 3,
+          "llm_calls": 3,
+          "validation_errors": [
+            "EMPTY_SQL"
+          ]
+        },
+        "sql_fence": {
+          "outcome": "RETRY_EXHAUSTED",
+          "exception": "TextToSQLRetryExceededError",
+          "attempts": 3,
+          "llm_calls": 3,
+          "validation_errors": [
+            "EMPTY_SQL"
+          ]
+        }
+      }
+    },
+    {
+      "gate": "api_refusal_handling",
+      "result": "BLOCKED",
+      "blocker": "API_REFUSAL_NOT_A_CLEAR_READ_ONLY_MESSAGE",
+      "finding": "Production chain: TextToSQLRetryExceededError → wrapped by AIOrchestratorService._run_text_to_sql into AIOrchestratorExecutionError('Text-to-SQL 生成失败: ...') → mapped by /api/ai/chat to HTTP 500 ('AI 能力执行失败: ...'). The user therefore receives an internal-error-shaped response containing the retry-exhausted exception type, NOT a clear read-only refusal message. No traceback / SQL / credentials leak, but the refusal is not user-visible as a refusal.",
+      "evidence": {
+        "generation_error_wrapped": true,
+        "execution_error_maps_to_500": true,
+        "user_visible_detail": "HTTP 500: AI 能力执行失败: Text-to-SQL 生成失败: TextToSQLRetryExceededError"
+      }
+    },
+    {
+      "gate": "historical_regression",
+      "result": "PASS",
+      "blocker": null,
+      "finding": "Phase 3.9.23 (frozen): Candidate v2 achieved 42/42 structural passes across 3 runs with 14/14 STABLE cases and ZERO regression cases.",
+      "evidence": {
+        "snapshot": "phase_3_9_23_prompt_v2_stability.json",
+        "candidate_structural_pass_count": 42,
+        "candidate_stable_cases": 14,
+        "candidate_regression_cases": []
+      }
+    }
+  ],
+  "critical_finding": "Prompt v2 refusal marker is treated as EMPTY_SQL by the production TextToSQLService: extract_sql passes the comment through, the Validator rejects it (EMPTY_SQL), the retry loop re-asks up to max_attempts times, and generate() ends in TextToSQLRetryExceededError. There is NO explicit refusal result type in the production interface.",
+  "scope_note": "Phase 3.9.24 does NOT promote v2 to production. Even a READY result would only mean READY_FOR_PROMOTION; the actual switch stays a separate decision.",
+  "environment": {
+    "llm_provider": "deepseek",
+    "llm_model": "deepseek-chat",
+    "llm_base_url": "https://api.deepseek.com",
+    "temperature": null,
+    "max_tokens": null,
+    "temperature_note": "not configured; OpenAI-compatible client default",
+    "max_tokens_note": "not configured; OpenAI-compatible client default",
+    "timeout_connect": 10.0,
+    "timeout_read": 60.0,
+    "execution_mode": "real-llm",
+    "python_version": "3.13.2"
+  },
+  "generated_at": "2026-09-26T09:05:37+00:00"
+}
