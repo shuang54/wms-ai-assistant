@@ -564,6 +564,41 @@ LLM request 产生 2 个 Observation，而非一个"整个 T2S 操作"
 
 ---
 
+## 8.9 LLM Token & Cost Accounting Contract（Phase 3.10.9）
+
+两个不同层次（务必区分）：
+
+```text
+层次 1（provider 事实）：
+    LLMResponse → LLMUsage
+    （LLMUsage 不知道价格；LLMResponse / LLMObservation
+      均不携带 cost / price / currency）
+
+层次 2（显式输入 Pricing，llm/accounting.py）：
+    LLMUsage + LLMPricing → calculate_llm_cost → LLMCost
+```
+
+* **Token Accounting 复用 `LLMUsage`**（frozen、`int | None`、
+  total 一致性构造校验已满足 Contract——不新增重复 DTO）；
+  Accounting 不重新解析 provider response（SDK isolation
+  仍由 Client 负责），不推断 / 不补全 partial usage；
+* **LLMPricing**：`input_price_per_1m_tokens` /
+  `output_price_per_1m_tokens`（Decimal，>= 0，拒绝 NaN / Inf /
+  bool / string / float 隐式转换）+ 显式 `currency`（无默认币种，
+  不做货币转换）；**本阶段不含任何真实 Provider 价格**
+  （禁止 model → price 硬编码；测试仅用 synthetic pricing）；
+* **`calculate_llm_cost` 是纯函数**（无网络 / 无 DB / 无全局状态 /
+  deterministic）；公式按 input / output 分别计价
+  （绝不用 total_tokens 乘统一价）；partial usage：缺失侧成本为
+  `None`（缺失 ≠ 0）；`usage=None → cost=None`（不估算 token）；
+* **Decimal 计算（标准库），不自动 rounding**——本阶段 Cost 是
+  计算 Contract，不定义账单展示 / 结算精度；
+* **Observation ≠ Cost**：同一 request 可套用多套 Pricing，
+  因此 LLMObservation / LLMResponse 契约保持不变；
+* **不持久化、不结算账单、不做汇率转换**、无新依赖。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
