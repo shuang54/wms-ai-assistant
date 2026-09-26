@@ -630,6 +630,41 @@ LLMPricing + LLMUsage → calculate_llm_cost → LLMCost
 
 ---
 
+## 8.11 LLM Accounting Lifecycle（Phase 3.10.11）
+
+```text
+LLM Request
+    ↓
+LLMResponse / str
+    ↓
+LLMObservation
+    ├──→ ObservationSink（runtime facts；默认 No-op）
+    └──→ AccountingSink（token facts；默认 No-op）
+              ↓  token_accounting_from_usage(observation.usage)
+              ↓  LLMUsage | None（request-level accounting）
+```
+
+* **独立 Sink Contract**：`LLMAccountingSink.record(observation)`
+  与 `LLMObservationSink` 相互独立、互不影响；实现只读取
+  `observation.usage` 并通过 `token_accounting_from_usage()` 派生
+  （usage=None → accounting=None，不估算 / 不生成 0 tokens /
+  不伪造）；
+* **每次实际 Provider 请求恰好一个 accounting event**（成功与
+  失败都会 emit；失败 observation usage=None → accounting=None）；
+  semantic retry / Tool Calling 每轮独立，**不做合并 / aggregation**；
+* **默认行为不变**：`accounting_sink=None` → `NoopAccountingSink`
+  ——与 Phase 3.10.10 行为完全一致（`create_llm_client` 新增
+  optional 参数，旧调用不失效）；
+* **Sink failure isolation**：任一 sink（Observation / Accounting）
+  抛异常只记 warning，绝不影响 LLM 调用结果与原始异常传播；
+* **request-scoped**：无共享 last_accounting 状态；并发请求
+  Observation A ↔ Accounting A 一一对应；
+* Accounting = request-level；Cost = explicit calculation
+  （lifecycle 不自动调用 `calculate_llm_cost`）；Aggregation /
+  Persistence / Billing = not implemented。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

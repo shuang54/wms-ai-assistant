@@ -64,7 +64,9 @@ import httpx
 from backend.app.config import LLMSettings, settings
 from backend.app.llm.deepseek_provider import DeepSeekProvider
 from backend.app.llm.observability import (
+    LLMAccountingSink,
     LLMObservationSink,
+    NoopAccountingSink,
     NoopObservationSink,
     build_llm_observation_safe,
 )
@@ -344,6 +346,7 @@ class OpenAICompatibleClient:
         timeout_pool: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
         observation_sink: LLMObservationSink | None = None,
+        accounting_sink: LLMAccountingSink | None = None,
     ) -> None:
         # 配置校验：缺失即抛 LLMConfigError，由 API 层捕获 → 503
         if not api_key:
@@ -371,6 +374,14 @@ class OpenAICompatibleClient:
         self._observation_sink: LLMObservationSink = (
             observation_sink if observation_sink is not None
             else NoopObservationSink()
+        )
+        # Phase 3.10.11：Accounting sink（与 Observation sink 相互独立；
+        # 每次实际请求 emit 恰好一次，实现方从 observation.usage 派生
+        # accounting——usage=None → accounting=None，不估算 / 不虚构）；
+        # 默认 No-op → 默认行为与 Phase 3.10.10 完全一致。
+        self._accounting_sink: LLMAccountingSink = (
+            accounting_sink if accounting_sink is not None
+            else NoopAccountingSink()
         )
 
     # ---------- internal helpers ----------
@@ -693,6 +704,28 @@ class OpenAICompatibleClient:
             )
             return
         self._emit_observation(observation)
+        self._emit_accounting(observation)
+
+    def _emit_accounting(self, observation: LLMObservation) -> None:
+        """把 Observation 交给 accounting sink（Phase 3.10.11）。
+
+        每次实际 Provider 请求（成功或失败）emit 恰好一次；
+        sink 实现内部从 ``observation.usage`` 派生 accounting
+        （``token_accounting_from_usage``）——usage=None →
+        accounting=None（不估算 / 不虚构 / 不生成 0 tokens）。
+
+        与 Observation sink 相互独立；纵深防御同 _emit_observation：
+        sink 异常记 warning 并吞掉，绝不影响 LLM 调用结果与
+        原始异常传播。默认 No-op → 不持久化、不外发、无 aggregation。
+        """
+        try:
+            self._accounting_sink.record(observation)
+        except Exception:  # noqa: BLE001 —— accounting 失败绝不穿透为业务失败
+            logger.warning(
+                "LLM accounting sink 失败（不影响业务结果）",
+                exc_info=True,
+                extra={"llm_provider": self._provider},
+            )
 
     async def _chat_impl(
         self,
@@ -828,6 +861,7 @@ class OpenAICompatibleClient:
 def create_llm_client(
     llm_settings: LLMSettings | None = None,
     observation_sink: LLMObservationSink | None = None,
+    accounting_sink: LLMAccountingSink | None = None,
 ) -> LLMProvider:
     """根据配置创建 LLM Provider（composition/root 工厂）。
 
@@ -839,6 +873,8 @@ def create_llm_client(
 
     Phase 3.10.7：``observation_sink`` 仅对真实 Client 生效
     （Mock 不产生真实调用 Observation）；None → 默认 No-op sink。
+    Phase 3.10.11：``accounting_sink`` 同理（与 observation_sink
+    相互独立）；None → 默认 No-op（行为与 3.10.10 完全一致）。
 
     业务代码应调用本工厂，而不是直接 new 具体实现，
     便于未来切换不同 Provider / 协议。
@@ -862,6 +898,7 @@ def create_llm_client(
             timeout_write=s.timeout_write,
             timeout_pool=s.timeout_pool,
             observation_sink=observation_sink,
+            accounting_sink=accounting_sink,
         )
     )
 

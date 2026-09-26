@@ -74,6 +74,8 @@ __all__ = [
     "LLMObservation",
     "LLMObservationSink",
     "NoopObservationSink",
+    "LLMAccountingSink",
+    "NoopAccountingSink",
     "build_llm_observation",
     "build_llm_observation_safe",
 ]
@@ -154,6 +156,43 @@ class LLMObservationSink(Protocol):
 
 class NoopObservationSink:
     """默认 No-op sink：接收但什么都不做（不持久化、不外发、不记日志）。"""
+
+    def record(self, observation: LLMObservation) -> None:
+        return None
+
+
+# ============================================================
+# Accounting Sink（Phase 3.10.11：request-level token facts）
+# ============================================================
+
+class LLMAccountingSink(Protocol):
+    """接收 Observation 并派生 request-level Accounting 的最小接口
+    （Phase 3.10.11）。
+
+    契约：
+
+        * Client 对每次实际 Provider 请求调用 ``record()``
+          恰好一次（成功与失败都会调用——失败 Observation 的
+          usage 为 None）；
+        * 实现内部通过 ``token_accounting_from_usage(observation.usage)``
+          派生 accounting：usage=None → accounting=None
+          （不估算 token、不生成 0 tokens、不伪造 usage）；
+        * **只读取** ``observation.usage``——不得读取 messages /
+          prompt / SQL / RAG chunks / tool arguments / raw response /
+          API key / headers；
+        * 抛出任何异常都会被 Client 吞掉（warning）——
+          绝不影响 LLM 调用结果与原始异常传播；
+        * 不持久化、不外发、不做 aggregation / billing。
+    """
+
+    def record(self, observation: LLMObservation) -> None:
+        """接收一条 Observation（实现方派生 accounting；不得抛出）。"""
+        ...
+
+
+class NoopAccountingSink:
+    """默认 No-op accounting sink：接收但什么都不做
+    （accounting_sink=None 等价语义；不持久化、不外发）。"""
 
     def record(self, observation: LLMObservation) -> None:
         return None
