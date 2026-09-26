@@ -93,7 +93,24 @@ class LLMConfigError(LLMError):
 
 
 class LLMRequestError(LLMError):
-    """LLM 请求失败（连接失败、超时、HTTP 非 2xx 等）。"""
+    """LLM 请求失败（连接失败、超时、HTTP 非 2xx 等）。
+
+    Phase 3.10.2：增加结构化 ``status_code``（retry 分类的依据，
+    见 ``llm.retry.is_retryable_llm_error``）。
+
+    Attributes:
+        status_code: HTTP 状态码；网络级失败（连接失败 / 超时 /
+                     其它 httpx 错误）为 ``None``。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class LLMResponseError(LLMError):
@@ -508,7 +525,8 @@ class OpenAICompatibleClient:
                 },
             )
             raise LLMRequestError(
-                f"LLM API 返回 HTTP {response.status_code}: {body_preview[:200]}"
+                f"LLM API 返回 HTTP {response.status_code}: {body_preview[:200]}",
+                status_code=response.status_code,
             )
 
         # ---- 响应解析 ----

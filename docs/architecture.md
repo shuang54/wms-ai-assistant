@@ -368,6 +368,32 @@ OpenAICompatibleClient（backend/app/llm/client.py，
 
 ---
 
+## 8.3 LLM Reliability Boundary（Phase 3.10.2）
+
+```text
+Transport reliability（HTTP timeout / 网络错误 / 状态码分类）
+    ↓ 由 LLM Client / Provider 层负责
+
+Business semantic retry（如 Validator 拒绝后重新生成 SQL）
+    ↓ 由 TextToSQLService / 未来业务服务负责
+```
+
+* **Timeout**：由 `OpenAICompatibleClient` 统一负责
+  （httpx.Timeout；`LLM_TIMEOUT_CONNECT / READ / WRITE / POOL`
+  可配置，默认 10 / 60 / 10 / 10 秒）。业务服务不各自实现
+  HTTP timeout。
+* **Retry 分类**（只分类，不自动重试）：
+  `llm.retry.is_retryable_llm_error()` 纯函数——
+  网络级失败（连接失败 / 超时）、HTTP 429、HTTP 5xx 为可重试；
+  其它 4xx、配置错误（`LLMConfigError`）、响应结构错误
+  （`LLMResponseError`）不可重试。
+* **Provider 不负责业务语义 Retry**；**业务层不负责
+  HTTP transport retry**。两者不得叠加（避免多层重试放大）。
+* **Refusal**（Phase 3.9.25）是业务层语义结果，
+  不是 transport failure，不触发任何 retry。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
