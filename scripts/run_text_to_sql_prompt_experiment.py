@@ -41,6 +41,9 @@ from backend.app.services.text_to_sql_prompt_experiment_service import (  # noqa
 from backend.app.services.text_to_sql_baseline_stability_service import (  # noqa: E402
     SNAPSHOT_3_9_21_PATH,
 )
+from backend.app.services.text_to_sql_prompt_candidate_v2_service import (  # noqa: E402
+    SNAPSHOT_3_9_22_PATH,
+)
 from backend.app.config import settings  # noqa: E402
 
 _VARIANT_RESULT_PATHS = {
@@ -224,7 +227,96 @@ def _run_check() -> int:
             print(f"    deepseek/db/network = "
                   f"{calls.get('deepseek_calls')}/{calls.get('db_calls')}/"
                   f"{calls.get('network_calls')}")
+
+    # ---- Phase 3.9.22 ----
+    if not SNAPSHOT_3_9_22_PATH.exists():
+        print("SKIP: 3.9.22 candidate v2 snapshot not generated yet")
+    else:
+        from backend.app.services.text_to_sql_prompt_candidate_v2_service import (
+            validate_candidate_v2_snapshot,
+        )
+        snapshot = json.loads(
+            SNAPSHOT_3_9_22_PATH.read_text(encoding="utf-8")
+        )
+        problems = validate_candidate_v2_snapshot(snapshot)
+        if problems:
+            print("FAIL: 3.9.22 candidate v2 snapshot check failed")
+            for problem in problems:
+                print(f"  - {problem}")
+            exit_code = 1
+        else:
+            s = snapshot.get("summary") or {}
+            calls = s.get("calls") or {}
+            print("OK: 3.9.22 candidate v2 snapshot consistent "
+                  "(baseline v1 frozen, candidate v2 hashes aligned)")
+            print(f"    regression_cases = {snapshot.get('regression_cases') or 'none'}")
+            print(f"    improvement_cases = {snapshot.get('improvement_cases') or 'none'}")
+            print(f"    structural: baseline {s.get('baseline', {}).get('structural_match')}/14"
+                  f" -> candidate {s.get('candidate', {}).get('structural_match')}/14")
+            print(f"    deepseek/db/network = "
+                  f"{calls.get('deepseek_calls')}/{calls.get('db_calls')}/"
+                  f"{calls.get('network_calls')}")
     return exit_code
+
+
+def _run_candidate_v2() -> int:
+    """Phase 3.9.22: Baseline v1 vs Candidate v2 A/B (28 DeepSeek calls)."""
+    from backend.app.services.text_to_sql_prompt_candidate_v2_service import (
+        SNAPSHOT_3_9_22_PATH,
+        REPORT_3_9_22_PATH,
+        build_v2_runner,
+        build_v2_snapshot,
+        check_baseline_frozen,
+        render_v2_report,
+    )
+    from backend.app.services.sql_validator_service import SQLValidatorService
+    from backend.app.services.text_to_sql_evaluation_service import (
+        StaticEvaluationContextResolver,
+    )
+    from scripts._text_to_sql_offline_bindings import (
+        build_offline_project_bindings,
+    )
+
+    problems = check_baseline_frozen()
+    if problems:
+        print("EXPERIMENT INVALID: Baseline v1 prompt is not frozen")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
+
+    _verify_environment()
+    runner = build_v2_runner(
+        context_resolver=StaticEvaluationContextResolver(
+            bindings=build_offline_project_bindings()
+        ),
+        validator=SQLValidatorService(),
+        executor=None,
+    )
+    summary = asyncio.run(runner.compare())
+    snapshot = build_v2_snapshot(summary)
+
+    SNAPSHOT_3_9_22_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_3_9_22_PATH.write_text(
+        json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    REPORT_3_9_22_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_3_9_22_PATH.write_text(render_v2_report(snapshot), encoding="utf-8")
+
+    s = snapshot["summary"]
+    print(f"Phase {snapshot['phase']} A/B complete "
+          f"({snapshot['baseline_prompt_version']} vs "
+          f"{snapshot['candidate_prompt_version']})")
+    print(f"  baseline  structural: {s['baseline']['structural_match']}/14")
+    print(f"  candidate structural: {s['candidate']['structural_match']}/14")
+    print(f"  regression_cases: {snapshot['regression_cases'] or 'none'}")
+    print(f"  improvement_cases: {snapshot['improvement_cases'] or 'none'}")
+    print(f"  calls: deepseek={s['calls']['deepseek_calls']} "
+          f"db={s['calls']['db_calls']} "
+          f"network={s['calls']['network_calls']}")
+    print(f"Snapshot written: {SNAPSHOT_3_9_22_PATH}")
+    print(f"Report written:   {REPORT_3_9_22_PATH}")
+    return 0
 
 
 def _run_stability(repeat: int) -> int:
@@ -281,13 +373,21 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="offline snapshot integrity for 3.9.20 + 3.9.21 "
+        help="offline snapshot integrity for 3.9.20 + 3.9.21 + 3.9.22 "
              "(no LLM/DB/network)",
+    )
+    parser.add_argument(
+        "--candidate-v2",
+        action="store_true",
+        help="Phase 3.9.22: run Baseline v1 vs Candidate v2 A/B "
+             "(28 DeepSeek calls)",
     )
     args = parser.parse_args()
 
     if args.check:
         return _run_check()
+    if args.candidate_v2:
+        return _run_candidate_v2()
     if args.repeat is not None:
         if args.variant == "candidate":
             print("ERROR: --repeat is baseline-only (no Candidate in 3.9.21)")

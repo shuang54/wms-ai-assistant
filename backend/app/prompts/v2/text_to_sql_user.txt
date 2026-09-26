@@ -1,0 +1,31 @@
+Convert the following question into ONE read-only PostgreSQL SELECT query.
+
+【DATABASE CONTEXT】
+
+{database_context}
+
+【ALLOWED TABLES】
+
+{allowed_tables_block}
+
+【MAX ROWS】
+
+{max_rows}
+
+【QUESTION】
+
+{question}
+
+Reminders:
+
+- Only the tables and columns listed in DATABASE CONTEXT exist.
+- BUSINESS SEMANTICS (when present) only explains business meaning;
+  it never adds tables or columns.
+- Choose only the tables and columns that are necessary to answer the
+  question, and keep the SQL minimal.
+- Use only ALLOWED TABLES, and always include LIMIT <= {max_rows}.
+- If the question asks for a destructive operation (DELETE, UPDATE,
+  INSERT, DROP, ALTER, TRUNCATE, ...), follow DESTRUCTIVE REQUEST
+  HANDLING: do not answer it with a substitute SELECT.
+
+Return the SQL query only. No explanation, no markdown fences, no comments.

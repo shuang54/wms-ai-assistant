@@ -736,12 +736,20 @@ class PromptExperimentRunner:
                                                   "eval-project-b"),
         force_execution: bool = False,
         candidate_generator: TextToSQLGenerator | None = None,
+        candidate_prompt_fingerprint: "PromptFingerprint | None" = None,
     ) -> None:
         self._generator = generator
         # 本阶段 Candidate == Baseline 内容（同一份真实 Prompt），因此默认
         # 复用同一个 generator。未来真正做 Prompt Optimization 时，可传入
         # 一个不同的 generator 而无需修改本文件以外的任何生产代码。
         self._candidate_generator = candidate_generator or generator
+        # Phase 3.9.22：Candidate 使用不同 Prompt 文件时，其指纹由调用方
+        # 提供（默认仍为 Baseline 指纹，保持 3.9.20/3.9.21 行为不变）。
+        self._candidate_fingerprint = (
+            candidate_prompt_fingerprint
+            if candidate_prompt_fingerprint is not None
+            else load_prompt_fingerprint(prompt_version)
+        )
         self._resolver = context_resolver
         self._validator = validator
         self._executor = executor
@@ -755,8 +763,13 @@ class PromptExperimentRunner:
         self._force_execution = force_execution
         self._prompt_fingerprint = load_prompt_fingerprint(prompt_version)
 
-    async def run_variant(self, variant: str) -> PromptExperimentVariantResult:
+    async def run_variant(
+        self,
+        variant: str,
+        fingerprint: "PromptFingerprint | None" = None,
+    ) -> PromptExperimentVariantResult:
         """运行单个 variant（Baseline 或 Candidate A）。"""
+        fp = fingerprint or self._prompt_fingerprint
         gen = _CallCountingGenerator(self._generator)
         exec_wrapper = (
             _CallCountingExecutor(self._executor) if self._executor else None
@@ -784,9 +797,9 @@ class PromptExperimentRunner:
         db_calls = exec_wrapper.calls if exec_wrapper is not None else 0
         return PromptExperimentVariantResult(
             variant=variant,
-            prompt_version=self._prompt_fingerprint.prompt_version,
-            prompt_hash=self._prompt_fingerprint.combined_prompt_hash,
-            prompt_fingerprint=self._prompt_fingerprint,
+            prompt_version=fp.prompt_version,
+            prompt_hash=fp.combined_prompt_hash,
+            prompt_fingerprint=fp,
             results=results,
             metrics=baseline.metrics,
             total_cases=len(cases),
@@ -799,12 +812,15 @@ class PromptExperimentRunner:
         return await self.run_variant("baseline")
 
     async def run_candidate(self) -> PromptExperimentVariantResult:
-        # 本阶段 Candidate == Baseline 内容（同一份真实 Prompt）。
-        # 通过临时替换底层 generator 支持未来真正不同的 Candidate。
+        # 3.9.20/3.9.21：Candidate == Baseline 内容（同一份真实 Prompt）。
+        # 3.9.22 起：candidate_generator / candidate_prompt_fingerprint 可
+        # 指向不同 Prompt 版本（实验层装配，不改生产代码）。
         saved = self._generator
         self._generator = self._candidate_generator
         try:
-            return await self.run_variant("candidate")
+            return await self.run_variant(
+                "candidate", fingerprint=self._candidate_fingerprint
+            )
         finally:
             self._generator = saved
 

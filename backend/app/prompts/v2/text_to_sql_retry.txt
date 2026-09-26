@@ -1,0 +1,43 @@
+Your previous SQL failed validation.
+
+【DATABASE CONTEXT】
+
+{database_context}
+
+【ALLOWED TABLES】
+
+{allowed_tables_block}
+
+【MAX ROWS】
+
+{max_rows}
+
+【USER QUESTION】
+
+{question}
+
+【PREVIOUS SQL】
+
+{previous_sql}
+
+【VALIDATION ERRORS】
+
+{validation_errors}
+
+How to correct it:
+
+- Fix ONLY the parts that caused the validation errors listed above.
+- Keep the rest of the previous SQL unchanged (same tables, same columns,
+  same filters, same intent).
+- Do NOT replace a rejected table with a table that is not in
+  ALLOWED TABLES, and do not invent tables or columns.
+- Remember: read-only SELECT (or read-only WITH ... SELECT), single
+  statement, only allowed tables, columns from DATABASE CONTEXT only,
+  integer LIMIT not exceeding {max_rows}.
+- If the USER QUESTION asks for a destructive operation (DELETE, UPDATE,
+  INSERT, DROP, ALTER, TRUNCATE, ...), the previous SQL failed validation
+  for that reason. Do NOT "fix" it into a substitute SELECT. Output the
+  same refusal marker again:
+  -- REFUSED: destructive request is not supported (read-only service)
+
+Return the SQL query only. No explanation, no markdown fences, no comments.
