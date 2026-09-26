@@ -295,15 +295,16 @@ async def test_partial_usage_preserved_in_lifecycle(
 # 4. generate() str：无 usage → 无 accounting data
 # ============================================================
 
-async def test_generate_str_no_accounting_data() -> None:
-    """generate() → str 契约不变；str 路径无 usage → accounting=None
-    （不从字符串估算 token）。"""
+async def test_generate_str_usage_visible_via_lifecycle() -> None:
+    """generate() → str 契约不变；Usage Visibility（Phase 3.10.12）：
+    实际响应的 usage 经 lifecycle 进入 accounting（非虚构——来自
+    响应本体；不从字符串估算）。"""
     handler = ScriptedHandler([
         _content_body(
             "hello",
             request_id="chatcmpl-gen",
             usage={"prompt_tokens": 999, "completion_tokens": 1,
-                   "total_tokens": 1000},  # 真实响应带 usage 也不暴露
+                   "total_tokens": 1000},
         ),
     ])
     obs_sink = CollectingObservationSink()
@@ -314,8 +315,12 @@ async def test_generate_str_no_accounting_data() -> None:
 
     assert answer == "hello"                          # 返回契约不变
     assert len(acc_sink.accountings) == 1             # event 发生
-    assert acc_sink.accountings[0] is None            # 无 usage → 无 accounting
-    assert obs_sink.observations[0].usage is None
+    accounting = acc_sink.accountings[0]
+    assert accounting is not None                     # usage 经 lifecycle 可见
+    assert accounting.prompt_tokens == 999            # 来自实际响应（非估算）
+    assert accounting.completion_tokens == 1
+    assert accounting.total_tokens == 1000
+    assert obs_sink.observations[0].usage is accounting
 
 
 # ============================================================

@@ -665,6 +665,37 @@ LLMObservation
 
 ---
 
+## 8.12 LLM Usage Visibility Bridge（Phase 3.10.12）
+
+```text
+Provider Response
+        ↓
+LLMResponse（内部，统一含 usage / model / finish_reason / metadata）
+        ↓ Compatibility Boundary（chat() 派生）
+        ├──→ existing str API（业务调用方；tools 非空 → LLMResponse 原对象）
+        │
+        └──→ Observation（usage / model / finish_reason / request_id 全可见）
+                 ↓
+             Accounting（token_accounting_from_usage）
+```
+
+* `_chat_impl` 统一返回**内部 LLMResponse**：无 tools 路径的
+  content 提取语义与 Phase 2 完全一致（`_extract_answer`；
+  缺失 / 非 str 仍抛 `LLMResponseError`），同时响应元数据进入
+  request lifecycle——不重复解析、不新增网络 / 全局状态；
+* **Public business API remains backward compatible**：
+  `generate() → str`、`chat(messages) → str`、
+  `chat(messages, tools=...) → LLMResponse`（identity 不变）；
+* Provider Usage 在 request lifecycle 边界内部消费：
+  str 契约路径的 Observation 现在携带实际 usage / model /
+  finish_reason / request_id（不回退配置值、不虚构）；
+* Failure 不伪造 usage；Tool Calling / semantic retry 各 request
+  独立；Refusal 的 usage 不丢失；
+* **No Usage persistence / automatic Cost calculation /
+  aggregation** 被引入。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

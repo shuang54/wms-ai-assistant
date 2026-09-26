@@ -441,9 +441,10 @@ async def test_failure_request_no_accounting() -> None:
 # Test 8 — Generate：str 契约不虚构 usage / accounting
 # ============================================================
 
-async def test_generate_contract_no_fabricated_usage() -> None:
-    """generate() → str 不变；str 契约无 usage → accounting=None
-    （不凭空产生 usage / model / finish_reason）。"""
+async def test_generate_contract_usage_visible_not_fabricated() -> None:
+    """generate() → str 不变；Usage Visibility（Phase 3.10.12）：
+    usage 经 lifecycle 可见且来自实际响应（非虚构——响应里的
+    数值原样透传；仍不从字符串估算）。"""
     handler = ScriptedHandler([
         _content_body(
             "hello",
@@ -461,10 +462,13 @@ async def test_generate_contract_no_fabricated_usage() -> None:
     assert len(sink.observations) == 1
     observation = sink.observations[0]
     assert observation.success is True
-    # str 契约：即使真实响应带 usage，str 路径也不暴露 → 不虚构
-    assert observation.usage is None
-    assert observation.model is None
-    assert token_accounting_from_usage(observation.usage) is None
+    # Usage Visibility：实际响应的 usage 原样可见（非虚构、非估算）
+    assert observation.usage is not None
+    assert observation.usage.prompt_tokens == 999
+    assert observation.usage.total_tokens == 1000
+    assert observation.model == "deepseek-chat"
+    accounting = token_accounting_from_usage(observation.usage)
+    assert accounting is observation.usage
 
 
 # ============================================================

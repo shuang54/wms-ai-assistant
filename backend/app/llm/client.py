@@ -658,12 +658,23 @@ class OpenAICompatibleClient:
             （经构造时注入的 sink 接收；默认 No-op——不持久化、不外发）：
 
                 started_at = perf_counter()
-                → _chat_impl（原有调用逻辑，零改动）
-                → 成功：emit(build(response=result)) → return result（原样）
+                → _chat_impl（返回内部 LLMResponse）
+                → 成功：emit(build(response=result)) → compatibility boundary
                 → 失败：emit(build(error=exc)) → raise（原始异常原样传播）
 
-            Observation 失败绝不影响业务；返回值 identity / 异常行为
-            与 Phase 2 / 3.6.2 完全一致。
+            Observation 失败绝不影响业务；异常行为与 Phase 2 / 3.6.2
+            完全一致。
+
+        Phase 3.10.12（Usage Visibility Bridge / compatibility boundary）：
+
+            _chat_impl 统一返回内部 LLMResponse（无 tools 路径的
+            usage / model / finish_reason / metadata 由此进入
+            Observation / Accounting）；本方法在返回前派生 public 契约：
+
+                tools 非空 → 返回该 LLMResponse（原对象，identity 不变）
+                tools 为空 → 返回 content（str，Phase 2 契约不变）
+
+            业务调用方仍只看到 str；不新增网络 / 解析 / 全局状态。
         """
         started_at = time.perf_counter()
         try:
@@ -672,9 +683,15 @@ class OpenAICompatibleClient:
             # ---- failure observation：不吞、不替换原始异常（§十）----
             self._observe_call(started_at, error=exc)
             raise
-        # ---- success observation（result 为 LLMResponse 或 Phase 2 str）----
+        # ---- success observation（internal LLMResponse：usage 全可见）----
         self._observe_call(started_at, response=result)
-        return result
+        # ---- compatibility boundary（Phase 3.10.12）----
+        if tools:
+            return result
+        content = result.content
+        if content is None:  # 理论不可达：无 tools 路径 _extract_answer 保证 str
+            return ""
+        return content
 
     def _observe_call(
         self,
@@ -731,8 +748,16 @@ class OpenAICompatibleClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-    ) -> str | LLMResponse:
-        """实际调用逻辑（Phase 3.10.7 起由 chat() 包裹观测；本方法零改动）。"""
+    ) -> LLMResponse:
+        """实际调用逻辑（Phase 3.10.7 起由 chat() 包裹观测）。
+
+        Phase 3.10.12：统一返回**内部 LLMResponse**——
+        无 tools 路径的 content 提取语义与 Phase 2 完全一致
+        （_extract_answer；缺失 / 非str 仍抛 LLMResponseError），
+        同时 usage / model / finish_reason / metadata 进入
+        request lifecycle。public str 返回由 chat() 的
+        compatibility boundary 派生（业务调用方契约不变）。
+        """
         url = self._endpoint_url()
         headers = self._headers()
         payload = self._build_payload(messages, tools)
@@ -826,11 +851,24 @@ class OpenAICompatibleClient:
             raise LLMResponseError(f"LLM 响应不是合法 JSON: {exc}") from exc
 
         if tools:
-            result: str | LLMResponse = self._extract_llm_response(data)
+            result: LLMResponse = self._extract_llm_response(data)
             answer_length = len(result.content or "")
         else:
-            result = self._extract_answer(data)
-            answer_length = len(result)
+            # Phase 3.10.12（Usage Visibility Bridge）：
+            # content 提取沿用 _extract_answer（错误语义与 Phase 2 完全
+            # 一致——content 缺失 / 非 str 仍抛 LLMResponseError）；
+            # 同时组装内部 LLMResponse，让 usage / model / finish_reason /
+            # metadata 进入 request lifecycle（Observation / Accounting）。
+            # 公共返回仍为 str（由 chat() 的 compatibility boundary 派生）。
+            answer = self._extract_answer(data)
+            result = LLMResponse(
+                content=answer,
+                model=self._extract_response_model(data),
+                finish_reason=self._extract_finish_reason(data),
+                usage=self._extract_usage(data),
+                metadata=self._build_response_metadata(data),
+            )
+            answer_length = len(answer)
 
         logger.info(
             "LLM request success: elapsed=%.1fms answer_len=%d",

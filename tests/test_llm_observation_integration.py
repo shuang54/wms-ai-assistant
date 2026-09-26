@@ -252,12 +252,12 @@ async def test_rag_single_request_single_observation() -> None:
     assert len(sink.observations) == 1         # observation == request
     observation = sink.observations[0]
     assert_observation_valid(observation, success=True)
-    # str 契约路径：provider 来自 client 标识；无 response 契约字段
+    # Usage Visibility（3.10.12）：str 路径 observation 携带实际响应元数据
     assert observation.provider == "deepseek-test"
-    assert observation.model is None
-    assert observation.usage is None
-    assert observation.finish_reason is None
-    assert observation.request_id is None
+    assert observation.model == "deepseek-chat"      # 实际响应（非配置值）
+    assert observation.finish_reason == "stop"
+    assert observation.request_id == "chatcmpl-obs-1"
+    assert observation.usage is None                 # 响应未带 usage → None
     assert observation.error_type is None
 
 
@@ -335,10 +335,10 @@ async def test_t2s_normal_single_observation() -> None:
     assert handler.request_count == 1
     assert len(sink.observations) == 1
     assert_observation_valid(sink.observations[0], success=True)
-    # str 契约路径（无 tools）：provider 来自 client 标识，
-    # model / usage / finish_reason / request_id 无契约依据 → None
+    # Usage Visibility（3.10.12）：str 路径携带实际响应元数据
     assert sink.observations[0].provider == "deepseek-test"
-    assert sink.observations[0].request_id is None
+    assert sink.observations[0].request_id == "chatcmpl-t2s-1"
+    assert sink.observations[0].usage is None        # 响应未带 usage
 
 
 # ============================================================
@@ -366,9 +366,11 @@ async def test_t2s_semantic_retry_two_observations() -> None:
     assert len(sink.observations) == 2              # 每个实际 request 一个
     obs1, obs2 = sink.observations
     assert obs1 is not obs2                         # 两个独立 Observation（非复用）
-    # str 契约路径不提供 request_id（任务书豁免：不强行伪造）——
-    # request-level 区分依据：独立对象身份 + 各自独立 latency
-    assert obs1.request_id is None and obs2.request_id is None
+    # Usage Visibility（3.10.12）：request_id 现在可见且互异
+    # （request-level 区分更强：独立对象 + 独立 request_id）
+    assert obs1.request_id == "chatcmpl-t2s-try-1"
+    assert obs2.request_id == "chatcmpl-t2s-try-2"
+    assert obs1.request_id != obs2.request_id
     assert obs1.latency_ms is not None and obs2.latency_ms is not None
     assert_observation_valid(obs1, success=True)
     assert_observation_valid(obs2, success=True)
@@ -557,9 +559,14 @@ async def test_orchestrator_request_count_equals_observation_count() -> None:
     result2 = await orchestrator.execute("asdfghjkl12345")
     assert result2.route == RouteType.RAG  # LLM fallback → rag
     assert len(sink.observations) == 3     # router 1 + rag 1（累计 1+2）
-    # str 契约路径（RAG / Router 均无 tools）：request_id 均 None；
-    # request/observation 对应关系用数量 + 独立对象身份验证
-    assert all(obs.request_id is None for obs in sink.observations)
+    # Usage Visibility（3.10.12）：request_id 可见且互异
+    # （request/observation 对应关系：数量 + 独立 request_id + 独立对象）
+    request_ids = [obs.request_id for obs in sink.observations]
+    assert request_ids == [
+        "chatcmpl-rag-1",        # 路径 1 的 RAG
+        "chatcmpl-router-fb",    # 路径 2 的 router fallback
+        "chatcmpl-rag-2",        # 路径 2 的 RAG
+    ]
     assert len({id(obs) for obs in sink.observations}) == 3
     assert all(obs.success for obs in sink.observations)
     assert all(obs.provider == "deepseek-test" for obs in sink.observations)
@@ -732,11 +739,12 @@ async def test_parallel_t2s_requests_no_observation_cross_talk() -> None:
     )
 
     assert len(sink.observations) == 5
-    # str 契约路径无 request_id：互异性用独立对象身份证明（无共享覆盖），
-    # 响应唯一性由 SQL 集合证明（每个请求拿到各自响应）
-    assert len({id(obs) for obs in sink.observations}) == 5
+    # Usage Visibility（3.10.12）：request_id 可见 → 互异性直接断言
+    request_ids = [obs.request_id for obs in sink.observations]
+    assert len(set(request_ids)) == 5                    # 无交叉
+    assert request_ids == [f"chatcmpl-parallel-{n}" for n in range(1, 6)]
     assert all(obs.success for obs in sink.observations)  # 状态无交叉
-    assert all(obs.model is None for obs in sink.observations)
+    assert all(obs.model == "deepseek-chat" for obs in sink.observations)
     assert all(r.validated for r in results)
     assert {r.sql for r in results} == {
         f"SELECT {n} LIMIT 1" for n in range(1, 6)

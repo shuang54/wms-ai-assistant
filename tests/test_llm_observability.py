@@ -512,9 +512,10 @@ async def test_success_observation_via_sink() -> None:
 
 
 async def test_str_path_observation_via_sink() -> None:
-    """无 tools 路径（Phase 2 str 契约）同样产生 Observation：
-    success=True、provider=client 标识；model/usage/finish_reason/
-    request_id 无契约依据 → None（不回退配置值）。"""
+    """无 tools 路径（Phase 2 str 契约）：public 返回仍是 str，
+    且 lifecycle 可见 Provider 实际 usage / model / finish_reason /
+    request_id（Phase 3.10.12 Usage Visibility Bridge——不回退配置值，
+    不虚构，全部来自实际响应）。"""
     sink = CollectingSink()
     client = _obs_client(
         lambda request: httpx.Response(200, json=_ok_body()), sink,
@@ -522,15 +523,18 @@ async def test_str_path_observation_via_sink() -> None:
 
     result = await client.chat([{"role": "user", "content": "hi"}])
 
-    assert result == "hello"
+    assert result == "hello"                          # public str 契约不变
     assert len(sink.observations) == 1
     observation = sink.observations[0]
     assert observation.success is True
     assert observation.provider == "test"
-    assert observation.model is None
-    assert observation.usage is None
-    assert observation.finish_reason is None
-    assert observation.request_id is None
+    # Usage Visibility：来自实际响应（非配置值、非虚构）
+    assert observation.model == "deepseek-chat"
+    assert observation.usage == LLMUsage(
+        prompt_tokens=100, completion_tokens=20, total_tokens=120,
+    )
+    assert observation.finish_reason == "stop"
+    assert observation.request_id == "chatcmpl-obs-1"
     assert observation.latency_ms is not None and observation.latency_ms >= 0
 
 
@@ -680,7 +684,8 @@ async def test_tool_calling_observation_unchanged() -> None:
 
 async def test_generate_single_observation() -> None:
     """Test 10：generate() → str 仍然成立；内部经 chat() 复用，
-    一次实际 Provider request 恰好一个 Observation（不重复记录）。"""
+    一次实际 Provider request 恰好一个 Observation（不重复记录）；
+    Usage Visibility：observation 携带实际响应的 model。"""
     sink = CollectingSink()
     client = _obs_client(
         lambda request: httpx.Response(200, json=_ok_body()), sink,
@@ -690,7 +695,9 @@ async def test_generate_single_observation() -> None:
     assert answer == "hello"
     assert len(sink.observations) == 1
     assert sink.observations[0].success is True
-    assert sink.observations[0].model is None  # str 契约：无 model 依据
+    assert sink.observations[0].model == "deepseek-chat"  # 实际响应 model
+    assert sink.observations[0].usage is not None
+    assert sink.observations[0].usage.total_tokens == 120
 
 
 async def test_chat_return_contract_unchanged() -> None:
