@@ -38,7 +38,8 @@ from string import Template
 from typing import Any, Protocol
 
 from backend.app.config import settings
-from backend.app.llm.client import LLMClient, LLMError
+from backend.app.llm.client import LLMError
+from backend.app.llm.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +329,7 @@ def _read_template(path: Path) -> Template:
 
 
 def _extract_text(response: Any) -> str:
-    """从 LLMClient 返回中提取纯文本（兼容 str / LLMResponse）。"""
+    """从 LLM Provider 返回中提取纯文本（兼容 str / LLMResponse）。"""
     if isinstance(response, str):
         return response.strip()
     content = getattr(response, "content", None)
@@ -361,7 +362,7 @@ class AIRouterService:
     def __init__(
         self,
         *,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMProvider | None = None,
         tool_capabilities: ToolCapabilityRegistry | None = None,
         llm_fallback_enabled: bool | None = None,
         knowledge_enabled: bool = True,
@@ -372,7 +373,8 @@ class AIRouterService:
         """构造 Router（全部依赖可注入，测试用 Fake）。
 
         Args:
-            llm_client:           LLM 客户端（fallback 使用）。
+            llm_client:           LLM Provider（Phase 3.10.1 抽象，
+                                  fallback 使用）。
             tool_capabilities:    Tool 能力元数据；None 时为空。
                                   **调用方负责注入"当前项目允许的"
                                   Tool 元数据**（Phase 3.8.2 §七：
@@ -592,7 +594,7 @@ class AIRouterService:
 
 def get_default_router(
     *,
-    llm_client: LLMClient | None = None,
+    llm_client: LLMProvider | None = None,
     tool_capabilities: ToolCapabilityRegistry | None = None,
 ) -> AIRouterService:
     """工厂：按需接入项目全局 LLM 客户端与 ToolRegistry。

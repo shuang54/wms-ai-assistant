@@ -55,7 +55,8 @@ from pathlib import Path
 from typing import Final
 
 from backend.app.config import settings
-from backend.app.llm.client import LLMClient, get_default_llm_client
+from backend.app.llm.client import get_default_llm_client
+from backend.app.llm.provider import LLMProvider
 from backend.app.projects.knowledge_provider import ProjectKnowledgeScope
 from backend.app.reranker.client import (
     RerankerClient,
@@ -154,7 +155,8 @@ class RagService:
         - VectorSearchService（Phase 3.5.3）—— 默认通过懒加载构造
         - RerankerClient（Phase 3.5.12 抽象）—— 仅 RERANKER_ENABLED=true 时参与；
           默认通过 get_default_reranker_client() 懒加载（进程内单例）
-        - LLMClient（Phase 2+）—— 默认通过 get_default_llm_client() 懒加载
+        - LLMProvider（Phase 3.10.1 抽象；Phase 2+ 语义不变）
+          —— 默认通过 get_default_llm_client() 懒加载
         - ContextBuilder（Phase 3.5.4 本模块）—— 默认 max_context_chars 来自 settings.rag
 
     可注入项（用于测试）：
@@ -174,7 +176,7 @@ class RagService:
         *,
         vector_search_service: VectorSearchService | None = None,
         reranker_client: RerankerClient | None = None,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMProvider | None = None,
         context_builder: ContextBuilder | None = None,
         system_prompt: str | None = None,
         user_prompt_template: str | None = None,
@@ -213,7 +215,7 @@ class RagService:
         # 进程内单例（BGERerankerClient 内部线程锁保证只加载一次模型）
         return get_default_reranker_client()
 
-    def _get_llm_client(self) -> LLMClient:
+    def _get_llm_client(self) -> LLMProvider:
         if self._llm_client is None:
             self._llm_client = get_default_llm_client()
         return self._llm_client

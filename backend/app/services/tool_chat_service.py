@@ -58,11 +58,11 @@ from typing import Any
 
 from backend.app.config import settings
 from backend.app.llm.client import (
-    LLMClient,
     LLMResponse,
     ToolCall,
     get_default_llm_client,
 )
+from backend.app.llm.provider import LLMProvider
 from backend.app.llm.tool_schema import definitions_to_openai_tools
 from backend.app.tools.base import ToolResult
 from backend.app.tools.registry import ToolRegistry
@@ -214,15 +214,15 @@ class ToolChatService:
 
     def __init__(
         self,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMProvider | None = None,
         *,
         max_tool_rounds: int | None = None,
     ) -> None:
         """构造 ToolChatService。
 
         Args:
-            llm_client:      LLM Client；为 None 时使用模块默认实例
-                             （主要用于测试注入 Scripted Fake）。
+            llm_client:      LLM Provider（Phase 3.10.1 抽象）；为 None 时
+                             使用模块默认实例（主要用于测试注入 Scripted Fake）。
             max_tool_rounds: 最大 Tool Calling 轮数（>=1）；
                              为 None 时读取 settings.tool.max_rounds
                              （环境变量 TOOL_MAX_ROUNDS，默认 5）。

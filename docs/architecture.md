@@ -338,6 +338,36 @@ API_KEY = "xxxxx"
 
 ---
 
+## 8.2 LLM Provider 抽象（Phase 3.10.1）
+
+AI Core 不直接依赖具体 LLM 实现，依赖抽象 `LLMProvider`：
+
+```text
+AI Core
+  ↓
+LLMProvider         （backend/app/llm/provider.py，Protocol）
+  ↓
+DeepSeekProvider    （backend/app/llm/deepseek_provider.py，delegation）
+  ↓
+OpenAICompatibleClient（backend/app/llm/client.py，
+                       现有 DeepSeek OpenAI-compatible Client）
+```
+
+要求：
+
+* DeepSeek 只是具体的 Provider 实现，通过
+  `LLM_BASE_URL / LLM_MODEL / LLM_API_KEY` 配置；
+* Provider 接口不暴露 DeepSeek 专属概念、不泄漏 HTTP /
+  OpenAI SDK 类型、不包含 API Key / Project Context /
+  RAG / Tool / Text-to-SQL 逻辑；
+* 核心服务（`RagService` / `TextToSQLService` / `ToolChatService` /
+  `AIRouterService`）通过依赖注入接收 `LLMProvider`；
+* `client.LLMClient` 保留为 `LLMProvider` 的向后兼容别名；
+* 实例由 composition/root 层决定（`create_llm_client()`）；
+  未来再增加 Provider Factory / Registry，本阶段不实现。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

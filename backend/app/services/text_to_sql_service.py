@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from backend.app.llm.client import LLMClient
+from backend.app.llm.provider import LLMProvider
 from backend.app.services.schema_explorer_service import DatabaseSchema
 from backend.app.services.sql_validator_service import (
     DEFAULT_MAX_ROWS,
@@ -295,7 +295,7 @@ def extract_sql(output: str) -> str:
 # ============================================================
 
 class TextToSQLService:
-    """Text-to-SQL Generator 默认实现（复用 LLMClient + SQLValidator）。
+    """Text-to-SQL Generator 默认实现（复用 LLMProvider + SQLValidator）。
 
     职责边界：
         生成 SQL + 提取 + 交给 Validator + 预算内重试。
@@ -305,7 +305,7 @@ class TextToSQLService:
     def __init__(
         self,
         *,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMProvider | None = None,
         validator: SQLValidator | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         max_rows: int = DEFAULT_MAX_ROWS,
@@ -313,8 +313,8 @@ class TextToSQLService:
         """构造 Generator。
 
         Args:
-            llm_client:  LLM 客户端；None 时懒加载全局默认
-                         ``get_default_llm_client()``。测试注入 Fake。
+            llm_client:  LLM Provider（Phase 3.10.1 抽象）；None 时懒加载
+                         全局默认 ``get_default_llm_client()``。测试注入 Fake。
             validator:   SQL 校验器；None 时使用 SQLValidatorService()。
             max_attempts: LLM 生成次数上限（含首次），[1, 10]。
             max_rows:   LIMIT 上限，与 Validator 一致。
@@ -343,7 +343,7 @@ class TextToSQLService:
 
     # ---------- 依赖解析（懒加载） ----------
 
-    def _get_llm_client(self) -> LLMClient:
+    def _get_llm_client(self) -> LLMProvider:
         if self._llm_client is not None:
             return self._llm_client
         from backend.app.llm.client import get_default_llm_client

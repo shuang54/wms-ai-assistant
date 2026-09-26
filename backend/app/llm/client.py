@@ -1,22 +1,27 @@
-"""LLM Client 抽象层与实现（Phase 2；Phase 3.6.2 扩展 Tool Calling）。
+"""LLM Client 实现层（Phase 2；Phase 3.6.2 扩展 Tool Calling；
+Phase 3.10.1 引入 LLMProvider 抽象 + DeepSeekProvider）。
 
-抽象边界：
+抽象边界（Phase 3.10.1 起）：
 
-    ChatService
+    AI Core
         ↓
-    LLMClient（Protocol）
+    LLMProvider（provider.py，Protocol —— AI Core 依赖的抽象）
         ↓
-    ┌─────────────────────┐
-    │                     │
-    MockLLMClient       OpenAICompatibleClient
-    （无 Key 回退）            │
+    DeepSeekProvider（deepseek_provider.py，delegation）
+        ↓
+    ┌─────────────────────────┐
+    │ MockLLMClient           │ （无 Key 回退）
+    │ OpenAICompatibleClient  │ （本模块，httpx HTTP）
+    └─────────────────────────┘
                                ↓
-                            httpx (HTTP)
-                               ↓
-                       OpenAI Chat Completions API
+                        OpenAI Chat Completions API
                           （OpenAI / DeepSeek /
                             Qwen (compatible-mode) /
                             Ollama / 自部署）
+
+向后兼容：本模块 ``LLMClient`` 现为 ``provider.LLMProvider`` 的
+别名（同一对象）。Phase 2 ~ 3.9 的 ``from backend.app.llm.client
+import LLMClient`` 继续有效。
 
 异常层级：
 
@@ -45,11 +50,13 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import httpx
 
 from backend.app.config import LLMSettings, settings
+from backend.app.llm.deepseek_provider import DeepSeekProvider
+from backend.app.llm.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -146,45 +153,21 @@ class LLMResponse:
 
 
 # ============================================================
-# 抽象接口
+# 抽象接口（Phase 3.10.1：定义移至 provider.py，此处保留别名）
 # ============================================================
 
-class LLMClient(Protocol):
-    """LLM Client 抽象接口。
+LLMClient = LLMProvider
+"""LLM 抽象接口（向后兼容别名）。
 
-    ChatService 仅依赖此接口，不直接引用具体实现。
+Phase 3.10.1 起抽象正式定义于 ``backend/app.llm.provider.LLMProvider``；
+本名字保留为同一对象的别名，Phase 2 ~ 3.9 的旧 import 路径
+``from backend.app.llm.client import LLMClient`` 继续有效。
 
-    Phase 3.6.2 起支持 Tool Calling：
+语义（Phase 3.6.2 起支持 Tool Calling）：
 
-        chat(messages)              → str          （向后兼容，Phase 2 行为）
-        chat(messages, tools=...)   → LLMResponse  （content + tool_calls）
-    """
-
-    async def generate(self, prompt: str) -> str:
-        """单轮文本生成（无 system prompt）。"""
-        ...
-
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None = None,
-    ) -> str | LLMResponse:
-        """多轮对话生成。
-
-        messages 每项形如 {"role": "system|user|assistant|tool", ...}；
-        Tool Calling 链路中 content 可能为 None、arguments 为 JSON 字符串。
-
-        Args:
-            messages: 对话消息列表。
-            tools:    OpenAI-compatible tool schema 列表
-                      （由 ``llm.tool_schema.definitions_to_openai_tools`` 转换）。
-
-        Returns:
-            tools 为空 / None 时：assistant 的 content（str，Phase 2 行为不变）。
-            tools 非空时：``LLMResponse``（content + tool_calls）。
-        """
-        ...
+    chat(messages)              → str          （向后兼容，Phase 2 行为）
+    chat(messages, tools=...)   → LLMResponse  （content + tool_calls）
+"""
 
 
 # ============================================================
@@ -571,15 +554,17 @@ class OpenAICompatibleClient:
 # 工厂 + 单例
 # ============================================================
 
-def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMClient:
-    """根据配置创建 LLM Client。
+def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMProvider:
+    """根据配置创建 LLM Provider（composition/root 工厂）。
 
-    规则：
-        - api_key 非空  → OpenAICompatibleClient
+    规则（Phase 3.10.1 起）：
+        - api_key 非空  → DeepSeekProvider(OpenAICompatibleClient)
+                          （现有 OpenAI-compatible Client 原样保留在
+                           delegation 内层，生产行为不变）
         - api_key 为空  → MockLLMClient（带 warning 日志）
 
     业务代码应调用本工厂，而不是直接 new 具体实现，
-    便于未来切换不同协议。
+    便于未来切换不同 Provider / 协议。
     """
     s = llm_settings if llm_settings is not None else settings.llm
     if not s.api_key:
@@ -589,15 +574,17 @@ def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMClient:
         )
         return MockLLMClient(system_prompt=load_system_prompt())
 
-    return OpenAICompatibleClient(
-        api_key=s.api_key,
-        base_url=s.base_url,
-        model=s.model,
-        provider=s.provider,
-        timeout_connect=s.timeout_connect,
-        timeout_read=s.timeout_read,
-        timeout_write=s.timeout_write,
-        timeout_pool=s.timeout_pool,
+    return DeepSeekProvider(
+        OpenAICompatibleClient(
+            api_key=s.api_key,
+            base_url=s.base_url,
+            model=s.model,
+            provider=s.provider,
+            timeout_connect=s.timeout_connect,
+            timeout_read=s.timeout_read,
+            timeout_write=s.timeout_write,
+            timeout_pool=s.timeout_pool,
+        )
     )
 
 
@@ -623,6 +610,7 @@ def reset_default_llm_client() -> None:
 
 __all__ = [
     "LLMClient",
+    "LLMProvider",
     "LLMError",
     "LLMConfigError",
     "LLMRequestError",
