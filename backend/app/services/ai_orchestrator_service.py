@@ -36,7 +36,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.context import DataSource, ProjectContext
@@ -69,8 +69,15 @@ from backend.app.services.semantic_schema_filter import SemanticSchemaFilter
 from backend.app.services.sql_validator_service import DEFAULT_MAX_ROWS
 from backend.app.services.text_to_sql_context import TextToSQLContext
 from backend.app.services.text_to_sql_service import (
+    RESULT_STATUS_REFUSAL,
+    RESULT_STATUS_SQL,
     TextToSQLGenerator,
     TextToSQLService,
+)
+
+#: Phase 3.9.25 — refusal 时用户可见的只读拒绝信息（不暴露内部 reason）
+TEXT_TO_SQL_REFUSAL_MESSAGE: Final[str] = (
+    "当前 AI 数据查询服务仅支持只读查询，不支持删除、修改等操作。"
 )
 from backend.app.tools.base import ToolDefinition
 from backend.app.tools.errors import ToolError
@@ -652,6 +659,25 @@ class AIOrchestratorService:
             raise AIOrchestratorExecutionError(
                 f"Text-to-SQL 生成失败: {type(exc).__name__}"
             ) from exc
+
+        # d2) Phase 3.9.25：First-Class Refusal —— LLM 明确拒绝
+        #     （destructive request 等）时直接形成 Chat 层拒绝结果，
+        #     **绝不进入 Executor**，也不走 Exception → 500 路径。
+        #     refusal_reason 属内部语义，不放入 metadata（metadata 会
+        #     透出给客户端），仅标记 refused=True。
+        if getattr(
+            sql_result, "status", RESULT_STATUS_SQL
+        ) == RESULT_STATUS_REFUSAL:
+            return AIOrchestrationResult(
+                route=RouteType.TEXT_TO_SQL,
+                content=TEXT_TO_SQL_REFUSAL_MESSAGE,
+                data=None,
+                metadata={
+                    "decision_source": decision.source,
+                    "route_reason": decision.reason,
+                    "refused": True,
+                },
+            )
 
         # e) 安全执行（重新验证 + READ ONLY 事务 + limits）
         try:

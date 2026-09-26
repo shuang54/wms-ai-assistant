@@ -38,25 +38,28 @@ from backend.app.services.text_to_sql_prompt_v2_promotion_gate_service import (
 
 
 class TestRefusalHandling:
-    def test_refusal_becomes_retry_exhausted(self) -> None:
-        """情况 B：refusal 标记被生产接口当作 EMPTY_SQL → 重试耗尽。"""
+    def test_refusal_is_first_class_result(self) -> None:
+        """Phase 3.9.25 起：refusal 是 first-class result（blocker 已解除）。"""
         probe = probe_refusal_handling()
-        assert probe["result"] == GATE_BLOCKED
-        assert probe["blocker"] == BLOCKER_REFUSAL_HANDLING
+        assert probe["result"] == GATE_PASS
+        assert probe["blocker"] is None
         for label in ("plain_comment", "sql_fence"):
             evidence = probe["evidence"][label]
-            assert evidence["outcome"] == "RETRY_EXHAUSTED"
-            assert evidence["exception"] == "TextToSQLRetryExceededError"
-            assert "EMPTY_SQL" in evidence["validation_errors"]
-            # refusal 触发了完整重试预算（生产 max_attempts=3）
-            assert evidence["llm_calls"] == 3
-            assert evidence["attempts"] == 3
+            assert evidence["outcome"] == "REFUSAL_RESULT_RETURNED"
+            assert evidence["status"] == "refusal"
+            assert evidence["sql"] is None
+            assert evidence["refusal_reason"] == \
+                "destructive_request_not_supported"
+            # 不消耗 retry budget：1 次 LLM 调用
+            assert evidence["llm_calls"] == 1
+            assert evidence["attempts"] == 1
 
     def test_refusal_never_returns_executable_sql(self) -> None:
         # 关键安全事实：refusal 绝不会变成可执行 SQL 结果
         probe = probe_refusal_handling()
         for evidence in probe["evidence"].values():
             assert evidence["outcome"] != "RETURNED_SQL"
+            assert evidence["sql"] is None
 
 
 class TestNormalCompatibility:
@@ -120,32 +123,51 @@ class TestPromptFreeze:
 
 
 class TestApiRefusalHandling:
-    def test_api_maps_refusal_to_500_not_clear_refusal(self) -> None:
+    def test_api_maps_refusal_to_clear_readonly_message(self) -> None:
+        """Phase 3.9.25 起：refusal → 正常 200 拒绝信息（blocker 已解除）。"""
         probe = probe_api_refusal_handling()
-        assert probe["result"] == GATE_BLOCKED
-        assert probe["blocker"] == BLOCKER_API_REFUSAL
+        assert probe["result"] == GATE_PASS
+        assert probe["blocker"] is None
         user_visible = probe["evidence"]["user_visible_detail"]
-        assert "HTTP 500" in user_visible
-        assert "TextToSQLRetryExceededError" in user_visible
+        assert "只读" in user_visible
 
 
 class TestGateAssembly:
-    def test_promotion_status_not_ready(self) -> None:
+    def test_promotion_status_ready_for_promotion(self) -> None:
         snapshot = run_promotion_gate()
         assert snapshot["phase"] == PHASE_3_9_24
         matrix = snapshot["gate_matrix"]
-        assert matrix["refusal_handling"]["result"] == GATE_BLOCKED
-        assert matrix["api_refusal_handling"]["result"] == GATE_BLOCKED
         for gate in ("normal_t2s_compatibility",
                      "validator_safety_boundary",
                      "executor_safety_boundary",
                      "project_isolation",
-                     "historical_regression"):
+                     "historical_regression",
+                     "refusal_handling",
+                     "api_refusal_handling"):
             assert matrix[gate]["result"] == GATE_PASS, gate
-        assert snapshot["promotion_status"] == "NOT_READY"
-        assert set(snapshot["blockers"]) == {
+        assert snapshot["promotion_status"] == "READY_FOR_PROMOTION"
+        assert snapshot["blockers"] == []
+
+    def test_frozen_3_9_24_snapshot_unchanged(self) -> None:
+        """历史 snapshot 保持 3.9.24 时的 NOT_READY 结论（不被改写）。"""
+        import json
+
+        from backend.app.services.text_to_sql_prompt_v2_promotion_gate_service import (
+            SNAPSHOT_3_9_24_PATH,
+        )
+        if not SNAPSHOT_3_9_24_PATH.exists():
+            pytest.skip("3.9.24 snapshot not generated yet")
+        snap = json.loads(
+            SNAPSHOT_3_9_24_PATH.read_text(encoding="utf-8")
+        )
+        assert snap["promotion_status"] == "NOT_READY"
+        assert set(snap["blockers"]) == {
             BLOCKER_REFUSAL_HANDLING, BLOCKER_API_REFUSAL,
         }
+        assert snap["gate_matrix"]["refusal_handling"]["result"] == \
+            GATE_BLOCKED
+        assert snap["gate_matrix"]["api_refusal_handling"]["result"] == \
+            GATE_BLOCKED
 
     def test_snapshot_validates_offline(self) -> None:
         snapshot = run_promotion_gate()

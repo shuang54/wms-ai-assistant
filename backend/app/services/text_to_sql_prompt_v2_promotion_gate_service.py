@@ -42,6 +42,9 @@ from backend.app.services.text_to_sql_prompt_v2_stability_service import (
     SNAPSHOT_3_9_23_PATH,
     check_candidate_frozen,
 )
+from backend.app.services.ai_orchestrator_service import (
+    TEXT_TO_SQL_REFUSAL_MESSAGE,
+)
 from backend.app.services.text_to_sql_service import (
     TextToSQLService,
     TextToSQLRetryExceededError,
@@ -162,14 +165,27 @@ def probe_refusal_handling() -> dict[str, Any]:
                 schema=None,
                 max_rows=1000,
             ))
-            # 若真的返回了结果，说明 refusal 被当作可执行 SQL —— 记录之
-            evidence[label] = {
-                "outcome": "RETURNED_SQL",
-                "sql": result.sql,
-                "attempts": result.attempts,
-                "llm_calls": client.calls,
-            }
+            status = getattr(result, "status", "sql")
+            if status == "refusal":
+                # Phase 3.9.25 起：refusal 是 first-class result
+                evidence[label] = {
+                    "outcome": "REFUSAL_RESULT_RETURNED",
+                    "status": status,
+                    "sql": result.sql,
+                    "refusal_reason": result.refusal_reason,
+                    "attempts": result.attempts,
+                    "llm_calls": client.calls,
+                }
+            else:
+                # refusal 被当作可执行 SQL —— 严重问题
+                evidence[label] = {
+                    "outcome": "RETURNED_SQL",
+                    "sql": result.sql,
+                    "attempts": result.attempts,
+                    "llm_calls": client.calls,
+                }
         except TextToSQLRetryExceededError as exc:
+            # Phase 3.9.24 旧行为：EMPTY_SQL → 重试耗尽（blocker）
             evidence[label] = {
                 "outcome": "RETRY_EXHAUSTED",
                 "exception": type(exc).__name__,
@@ -187,22 +203,23 @@ def probe_refusal_handling() -> dict[str, Any]:
             }
 
     outcomes = {v["outcome"] for v in evidence.values()}
-    refused_as_empty_sql = outcomes == {"RETRY_EXHAUSTED"}
+    first_class = outcomes == {"REFUSAL_RESULT_RETURNED"}
     return {
         "gate": "refusal_handling",
-        "result": GATE_BLOCKED if refused_as_empty_sql else GATE_PASS,
+        "result": GATE_PASS if first_class else GATE_BLOCKED,
         "blocker": (
-            BLOCKER_REFUSAL_HANDLING if refused_as_empty_sql else None
+            None if first_class else BLOCKER_REFUSAL_HANDLING
         ),
         "finding": (
-            "Prompt v2 refusal marker is treated as EMPTY_SQL by the "
-            "production TextToSQLService: extract_sql passes the comment "
-            "through, the Validator rejects it (EMPTY_SQL), the retry "
-            "loop re-asks up to max_attempts times, and generate() ends "
-            "in TextToSQLRetryExceededError. There is NO explicit "
-            "refusal result type in the production interface."
-            if refused_as_empty_sql
-            else "Unexpected refusal behavior — inspect evidence."
+            "Prompt v2 refusal marker is recognized by the production "
+            "TextToSQLService and returned as a first-class refusal "
+            "result (status=refusal, sql=None, refusal_reason="
+            "destructive_request_not_supported). It never reaches the "
+            "Validator / Executor and does not consume retry budget "
+            "(llm_calls=1)."
+            if first_class
+            else "Refusal is not handled as a first-class result — "
+                 "inspect evidence."
         ),
         "evidence": evidence,
     }
@@ -464,41 +481,36 @@ def probe_api_refusal_handling() -> dict[str, Any]:
     orchestrator_src = _ORCHESTRATOR_SOURCE.read_text(encoding="utf-8")
     chat_src = _CHAT_API_SOURCE.read_text(encoding="utf-8")
 
-    wraps_generation_errors = (
-        "Text-to-SQL 生成失败" in orchestrator_src
-        and "AIOrchestratorExecutionError" in orchestrator_src
+    # Phase 3.9.25：refusal 分支（绕过 Executor + 用户可读拒绝信息）
+    refusal_branch_orchestrator = (
+        "RESULT_STATUS_REFUSAL" in orchestrator_src
+        and "TEXT_TO_SQL_REFUSAL_MESSAGE" in orchestrator_src
+        and '"refused": True' in orchestrator_src
     )
-    maps_to_500 = (
-        "AIOrchestratorExecutionError" in chat_src
-        and "HTTP_500_INTERNAL_SERVER_ERROR" in chat_src
+    refusal_branch_api = (
+        "if result.data is None" in chat_src
+        and "Phase 3.9.25" in chat_src
     )
-    # 生产链路对 refusal 的实际结局：500 + "AI 能力执行失败: ..."
-    # 而不是明确的只读拒绝信息（§六 不允许出现 retry exhausted 字样）。
-    blocked = wraps_generation_errors and maps_to_500
+    ok = refusal_branch_orchestrator and refusal_branch_api
     return {
         "gate": "api_refusal_handling",
-        "result": GATE_BLOCKED if blocked else GATE_NOT_APPLICABLE,
-        "blocker": BLOCKER_API_REFUSAL if blocked else None,
+        "result": GATE_PASS if ok else GATE_BLOCKED,
+        "blocker": None if ok else BLOCKER_API_REFUSAL,
         "finding": (
-            "Production chain: TextToSQLRetryExceededError → wrapped by "
-            "AIOrchestratorService._run_text_to_sql into "
-            "AIOrchestratorExecutionError('Text-to-SQL 生成失败: ...') → "
-            "mapped by /api/ai/chat to HTTP 500 "
-            "('AI 能力执行失败: ...'). The user therefore receives an "
-            "internal-error-shaped response containing the retry-"
-            "exhausted exception type, NOT a clear read-only refusal "
-            "message. No traceback / SQL / credentials leak, but the "
-            "refusal is not user-visible as a refusal."
-            if blocked
-            else "Unexpected API mapping — inspect sources."
+            "Refusal now flows as a first-class result: "
+            "AIOrchestratorService._run_text_to_sql returns a Chat-level "
+            "refusal (content=TEXT_TO_SQL_REFUSAL_MESSAGE, data=None, "
+            "metadata.refused=True) WITHOUT calling the Executor, and "
+            "/api/ai/chat maps it to a normal 200 ChatResponse "
+            "(data=None) instead of HTTP 500 / retry-exhausted."
+            if ok
+            else "Refusal is not mapped to a clear user-facing "
+                 "response — inspect sources."
         ),
         "evidence": {
-            "generation_error_wrapped": wraps_generation_errors,
-            "execution_error_maps_to_500": maps_to_500,
-            "user_visible_detail": (
-                "HTTP 500: AI 能力执行失败: Text-to-SQL 生成失败: "
-                "TextToSQLRetryExceededError"
-            ),
+            "orchestrator_refusal_branch": refusal_branch_orchestrator,
+            "api_refusal_branch": refusal_branch_api,
+            "user_visible_detail": TEXT_TO_SQL_REFUSAL_MESSAGE,
         },
     }
 

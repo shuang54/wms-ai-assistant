@@ -60,6 +60,11 @@ __all__ = [
     "TextToSQLGenerator",
     "TextToSQLService",
     "extract_sql",
+    "is_refusal_output",
+    "RESULT_STATUS_SQL",
+    "RESULT_STATUS_REFUSAL",
+    "REFUSAL_REASON_DESTRUCTIVE",
+    "REFUSAL_MARKER",
     "DEFAULT_MAX_ATTEMPTS",
 ]
 
@@ -70,6 +75,18 @@ __all__ = [
 
 #: 默认最大 LLM 生成次数（含首次）
 DEFAULT_MAX_ATTEMPTS: Final[int] = 3
+
+#: Phase 3.9.25 — Result 状态：正常已校验 SELECT
+RESULT_STATUS_SQL: Final[str] = "sql"
+#: Phase 3.9.25 — Result 状态：LLM 明确拒绝（destructive request 等）
+RESULT_STATUS_REFUSAL: Final[str] = "refusal"
+#: Refusal 原因（内部语义；不得原样暴露给终端用户）
+REFUSAL_REASON_DESTRUCTIVE: Final[str] = "destructive_request_not_supported"
+
+#: Prompt v2 约定的 refusal marker（逐字）
+REFUSAL_MARKER: Final[str] = (
+    "-- REFUSED: destructive request is not supported (read-only service)"
+)
 
 _PROMPTS_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "prompts"
 _SYSTEM_PROMPT_FILE: Final[Path] = _PROMPTS_DIR / "text_to_sql_system.txt"
@@ -85,6 +102,11 @@ _SQL_FENCE_RE: Final[re.Pattern[str]] = re.compile(
 _SQL_START_RE: Final[re.Pattern[str]] = re.compile(
     r"^\s*(SELECT|WITH)\b", re.IGNORECASE
 )
+
+#: 归一化后的 refusal marker（大小写 / 内部空白不敏感）
+_REFUSAL_MARKER_NORMALIZED: Final[str] = " ".join(
+    REFUSAL_MARKER.split()
+).lower()
 
 
 # ============================================================
@@ -143,21 +165,38 @@ class TextToSQLRetryExceededError(TextToSQLError):
 
 @dataclass(frozen=True)
 class TextToSQLResult:
-    """生成结果（只有 validated=True 才会以本 DTO 返回）。
+    """生成结果（Phase 3.9.25：支持 First-Class Refusal）。
+
+    两种互斥状态：
+
+    - ``status == "sql"``（默认，向后兼容既有构造点）：
+      ``sql`` 是通过 Validator 的只读 SELECT，``validated=True``。
+    - ``status == "refusal"``：
+      LLM 输出了完整、明确的 refusal marker（见 :func:`is_refusal_output`）。
+      此时 ``sql=None``、``validated=False``、``refusal_reason`` 非空。
+      Refusal **不是** generation failure：不进入 Validator、不进入
+      Executor、不消耗 retry budget（首次识别即返回，``attempts`` 记录
+      实际发生的 LLM 次数）。
 
     Attributes:
         question:           原始问题（未修改）。
-        sql:                通过 Validator 的 SQL。
+        sql:                status="sql" 时为通过 Validator 的 SQL；
+                            status="refusal" 时为 None。
         attempts:           实际 LLM 生成次数（1 起）。
-        validated:          恒为 True（失败走异常，不返回假 SQL）。
-        referenced_tables:  Validator 提取的规范化引用表。
+        validated:          status="sql" 时为 True（失败走异常，不返回
+                            假 SQL）；status="refusal" 时恒为 False。
+        referenced_tables:  Validator 提取的规范化引用表（refusal 为空）。
+        status:             "sql" | "refusal"。
+        refusal_reason:     仅 refusal 非空（内部语义，勿直接暴露给用户）。
     """
 
     question: str
-    sql: str
+    sql: str | None
     attempts: int
     validated: bool
     referenced_tables: tuple[str, ...]
+    status: str = RESULT_STATUS_SQL
+    refusal_reason: str | None = None
 
 
 # ============================================================
@@ -178,6 +217,10 @@ class TextToSQLGenerator(Protocol):
     ) -> TextToSQLResult:
         """把自然语言问题转换成**通过 Validator 校验的**只读 SQL。
 
+        Phase 3.9.25：若 LLM 输出完整明确的 refusal marker，则返回
+        ``status="refusal"`` 的 Result（``sql=None``）——这不是异常，
+        不进入 Validator / Executor，也不消耗重试预算。
+
         Raises:
             TextToSQLInputError:        输入非法。
             TextToSQLGenerationError:   LLM 连续无法产出 SQL。
@@ -185,6 +228,38 @@ class TextToSQLGenerator(Protocol):
             LLMError:                   LLM 网络 / 响应错误（透传）。
         """
         ...
+
+
+# ============================================================
+# Refusal 识别（Phase 3.9.25：只识别约定好的完整 refusal marker）
+# ============================================================
+
+def is_refusal_output(raw: str | None) -> bool:
+    """判断 LLM 原始输出是否为**完整且明确**的 refusal。
+
+    规则（Phase 3.9.25 §四）：
+
+    - 去除前后空白；若整个输出恰好是一个 markdown sql fence，取 fence 内文；
+    - 归一化（折叠连续空白、忽略大小写）后必须**整体等于**约定 marker；
+    - 不做"包含 REFUSED 就算"的模糊匹配：
+
+        ``-- REFUSED: destructive request is not supported (read-only
+        service)``                                        → REFUSAL
+
+        ``SELECT '-- REFUSED: ...' AS message LIMIT 1``   → 正常 SQL
+        （含 refusal 字符串字面量，交给 Validator 判定）
+
+        fence 前后附带其它文字                              → 非 refusal
+        （按既有 extract_sql → Validator 路径处理）
+    """
+    text = (raw or "").strip()
+    if not text:
+        return False
+    fence = _SQL_FENCE_RE.fullmatch(text)
+    if fence:
+        text = fence.group(1).strip()
+    normalized = " ".join(text.split()).lower()
+    return normalized == _REFUSAL_MARKER_NORMALIZED
 
 
 # ============================================================
@@ -313,6 +388,26 @@ class TextToSQLService:
             )
 
             raw = await self._call_llm(llm, messages)
+
+            # ---- Phase 3.9.25: First-Class Refusal ----
+            # 明确 refusal 不是 generation failure：立即返回 Refusal
+            # Result，不进入 Validator / Executor，不消耗 retry budget
+            # （首次识别即返回 → llm_calls=1, retry_count=0）。
+            if is_refusal_output(raw):
+                logger.info(
+                    "text-to-sql refusal detected",
+                    extra={"question_chars": len(question)},
+                )
+                return TextToSQLResult(
+                    question=question,
+                    sql=None,
+                    attempts=attempt,
+                    validated=False,
+                    referenced_tables=(),
+                    status=RESULT_STATUS_REFUSAL,
+                    refusal_reason=REFUSAL_REASON_DESTRUCTIVE,
+                )
+
             sql = extract_sql(raw)
             if not sql.strip():
                 # 生成失败（空输出）——预算内继续重试

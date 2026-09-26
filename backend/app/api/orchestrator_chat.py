@@ -312,7 +312,14 @@ def _to_chat_response(result: AIOrchestrationResult) -> ChatResponse:
     elif route == "tool":
         data = _tool_data(result).model_dump() if result.data is not None else None
     elif route == "text_to_sql":
-        data = _sql_data(result).model_dump()
+        if result.data is None:
+            # Phase 3.9.25：Text-to-SQL refusal（first-class result）。
+            # 复用现有 ChatResponse envelope：content 承载用户可读的
+            # 只读拒绝信息，data=None，metadata 带 refused=True。
+            # 不进入 500 / retry-exhausted 错误路径。
+            data = None
+        else:
+            data = _sql_data(result).model_dump()
     else:
         data = None
 
