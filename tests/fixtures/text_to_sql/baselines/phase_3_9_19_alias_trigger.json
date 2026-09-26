@@ -1,0 +1,581 @@
+{
+  "phase": "3.9.19",
+  "parent_baseline": "3.9.18",
+  "source_snapshot": "phase_3_9_14_result_llm_baseline.json",
+  "llm_calls": 0,
+  "db_calls": 0,
+  "network_calls": 0,
+  "real_historical_result_count": 12,
+  "phase_3_9_17_semantic_accuracy": 1.0,
+  "phase_3_9_18_semantic_accuracy": 1.0,
+  "phase_3_9_18_semantic_correct": 12,
+  "exact_matches": 19,
+  "alias_matches": 0,
+  "unknown_matches": 0,
+  "variant_count": 16,
+  "variants_expecting_pass": 6,
+  "variants_pass_expected": 16,
+  "variants_expectation_met": 16,
+  "required_matched_by": {
+    "alias": 6,
+    "exact": 1,
+    "none": 10
+  },
+  "optional_matched_by": {
+    "exact": 2,
+    "alias": 1
+  },
+  "forbidden_matched_by": {
+    "alias": 1
+  },
+  "undeclared_extra_variants": [
+    "case_h_unknown_extra"
+  ],
+  "variants": [
+    {
+      "variant_id": "case_a_document_id_alias",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "semantic result matched",
+      "categories": [],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": "id",
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'document_id' -> 'id' (semantic_name='document_id', entity='document')"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_b_chunk_id_alias",
+      "base_case": "top_n_chunks_by_token_count",
+      "kind": "projection_variant",
+      "columns": [
+        "id",
+        "token_count"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "semantic result matched",
+      "categories": [],
+      "required_matches": [
+        {
+          "expected_column": "chunk_id",
+          "actual_column": "id",
+          "semantic_name": "chunk_id",
+          "entity": "chunk",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'chunk_id' -> 'id' (semantic_name='chunk_id', entity='chunk')"
+        },
+        {
+          "expected_column": "token_count",
+          "actual_column": "token_count",
+          "semantic_name": "token_count",
+          "entity": "chunk",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "role": "required",
+          "detail": "exact column name match"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_c_aggregate_alias",
+      "base_case": "aggregate_document_count",
+      "kind": "projection_variant",
+      "columns": [
+        "total_documents"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "semantic result matched",
+      "categories": [],
+      "required_matches": [
+        {
+          "expected_column": "document_count",
+          "actual_column": "total_documents",
+          "semantic_name": "document_count",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'document_count' -> 'total_documents' (semantic_name='document_count', entity='document')"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_f_optional_alias",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id",
+        "title"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "semantic result matched",
+      "categories": [],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": "id",
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'document_id' -> 'id' (semantic_name='document_id', entity='document')"
+        }
+      ],
+      "optional_matches": [
+        {
+          "expected_column": "title",
+          "actual_column": "title",
+          "semantic_name": "title",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "role": "optional",
+          "detail": "exact column name match"
+        }
+      ],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_g_optional_alias_no_extra",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id",
+        "file_type"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "semantic result matched",
+      "categories": [],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": "id",
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'document_id' -> 'id' (semantic_name='document_id', entity='document')"
+        }
+      ],
+      "optional_matches": [
+        {
+          "expected_column": "document_file_type",
+          "actual_column": "file_type",
+          "semantic_name": "document_file_type",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "optional",
+          "detail": "explicit semantic alias: 'document_file_type' -> 'file_type' (semantic_name='document_file_type', entity='document')"
+        }
+      ],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_h_unknown_extra",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id",
+        "title",
+        "foo"
+      ],
+      "semantic_passed": true,
+      "expected_passed": true,
+      "semantic_reason": "undeclared extra columns (warning): ['foo']",
+      "categories": [
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": "id",
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "required",
+          "detail": "explicit semantic alias: 'document_id' -> 'id' (semantic_name='document_id', entity='document')"
+        }
+      ],
+      "optional_matches": [
+        {
+          "expected_column": "title",
+          "actual_column": "title",
+          "semantic_name": "title",
+          "entity": "document",
+          "matched_by": "exact",
+          "diagnostic": "EXACT_MATCH",
+          "role": "optional",
+          "detail": "exact column name match"
+        }
+      ],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_d_wrong_entity",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['id']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "actual column 'id' is a cross-entity alias; an explicit entity context matching entity='document' is required to bind it to 'document_id' (deterministic, no guessing)"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_e_ambiguous_bare_id",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['id']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "actual column 'id' is a cross-entity alias; an explicit entity context matching entity='document' is required to bind it to 'document_id' (deterministic, no guessing)"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_i_forbidden_alias",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; forbidden columns present: ['chunk_id<-id']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "EXTRA_FORBIDDEN_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "actual column 'id' is a cross-entity alias; an explicit entity context matching entity='document' is required to bind it to 'document_id' (deterministic, no guessing)"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [
+        {
+          "expected_column": "chunk_id",
+          "actual_column": "id",
+          "semantic_name": "chunk_id",
+          "entity": "chunk",
+          "matched_by": "alias",
+          "diagnostic": "ALIAS_MATCH",
+          "role": "forbidden",
+          "detail": "explicit semantic alias: 'chunk_id' -> 'id' (semantic_name='chunk_id', entity='chunk')"
+        }
+      ],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_j_bare_count_no_context",
+      "base_case": "aggregate_document_count",
+      "kind": "projection_variant",
+      "columns": [
+        "count"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_count']; undeclared extra columns (warning): ['count']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_count",
+          "actual_column": null,
+          "semantic_name": "document_count",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "actual column 'count' is a cross-entity alias; an explicit entity context matching entity='document' is required to bind it to 'document_count' (deterministic, no guessing)"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_k_wrong_aggregate_entity",
+      "base_case": "aggregate_document_count",
+      "kind": "projection_variant",
+      "columns": [
+        "count"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_count']; undeclared extra columns (warning): ['count']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_count",
+          "actual_column": null,
+          "semantic_name": "document_count",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "actual column 'count' is a cross-entity alias; an explicit entity context matching entity='document' is required to bind it to 'document_count' (deterministic, no guessing)"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_l_unknown_column",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "id"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_code']; undeclared extra columns (warning): ['id']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_code",
+          "actual_column": null,
+          "semantic_name": null,
+          "entity": null,
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "no alias concept declares 'document_code'; unknown alias"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_m_fuzzy_doc_id",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "doc_id"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['doc_id']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "canonical semantic column 'document_id' declared, but no actual column matches its alias set ['document_id', 'id']"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_n_fuzzy_documentid",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "documentid"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['documentid']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "canonical semantic column 'document_id' declared, but no actual column matches its alias set ['document_id', 'id']"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_o_fuzzy_document_ids",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "document_ids"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['document_ids']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "canonical semantic column 'document_id' declared, but no actual column matches its alias set ['document_id', 'id']"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    },
+    {
+      "variant_id": "case_p_fuzzy_doc",
+      "base_case": "simple_document_list",
+      "kind": "projection_variant",
+      "columns": [
+        "doc"
+      ],
+      "semantic_passed": false,
+      "expected_passed": false,
+      "semantic_reason": "missing required columns: ['document_id']; undeclared extra columns (warning): ['doc']",
+      "categories": [
+        "MISSING_REQUIRED_COLUMN",
+        "UNDECLARED_EXTRA_COLUMN"
+      ],
+      "required_matches": [
+        {
+          "expected_column": "document_id",
+          "actual_column": null,
+          "semantic_name": "document_id",
+          "entity": "document",
+          "matched_by": "none",
+          "diagnostic": "UNKNOWN_COLUMN",
+          "role": "required",
+          "detail": "canonical semantic column 'document_id' declared, but no actual column matches its alias set ['document_id', 'id']"
+        }
+      ],
+      "optional_matches": [],
+      "forbidden_matches": [],
+      "expectation_met": true,
+      "problems": []
+    }
+  ],
+  "source_snapshot_sha256": "1ffe014fa050c915dd200fe6fb9d685b6dad761a0c4d36817d2455dbe34225b8",
+  "phase_3_9_17_snapshot": "phase_3_9_17_semantic_result_full.json",
+  "parent_baseline_snapshot": "phase_3_9_18_alias_evaluation.json",
+  "projection_variant_file": "projection_variants_3_9_19.yaml",
+  "alias_registry_size": 11,
+  "kind_note": "variant_count entries are OFFLINE projection variants derived from the saved Phase 3.9.14 results; they are NOT real LLM outputs and must never be reported as such (section §十三)."
+}

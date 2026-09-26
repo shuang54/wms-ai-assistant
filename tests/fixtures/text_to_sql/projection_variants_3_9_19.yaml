@@ -1,0 +1,294 @@
+# Phase 3.9.19 - Offline projection variants (NOT real LLM outputs)
+#
+# Every variant is derived in-memory from the SAVED Phase 3.9.14 actual
+# results (see `source_snapshot`). The runner loads `base_case`'s real
+# columns/rows, then applies an OPTIONAL subset selection (`columns`),
+# an OPTIONAL rename (`column_renames`), and an OPTIONAL `extra_columns`
+# injection. `expected_rows` is auto-derived from the resolved required
+# columns, so a variant only ever changes the *projection name surface*
+# (and/or the declared entity context), never the underlying data.
+#
+# These are projection variants, not new ground truth. They must never be
+# reported as real LLM results (section §十三).
+version: "1.0"
+phase: "3.9.19"
+source_snapshot: phase_3_9_14_result_llm_baseline.json
+kind: projection_variant
+description: >
+  Offline-constructed projection variants used to truly trigger the alias
+  evaluation path. Derived from saved 3.9.14 actual results; zero DeepSeek,
+  zero DB, zero network calls.
+
+variants:
+  # ---------- Positive: alias is correctly accepted ----------
+
+  - id: case_a_document_id_alias
+    description: "documents.id projected as id -> document_id (entity=document)"
+    base_case: simple_document_list
+    columns: [id]
+    alias_context:
+      document_id: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { document_id: alias }
+      categories_exclude: [MISSING_REQUIRED_COLUMN, UNDECLARED_EXTRA_COLUMN]
+
+  - id: case_b_chunk_id_alias
+    description: "chunks.id projected as id -> chunk_id (entity=chunk)"
+    base_case: top_n_chunks_by_token_count
+    columns: [id, token_count]
+    alias_context:
+      chunk_id: { entity: chunk }
+      token_count: { entity: chunk }
+    expectation:
+      required_columns: [chunk_id, token_count]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: ordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { chunk_id: alias, token_count: exact }
+      categories_exclude: [MISSING_REQUIRED_COLUMN, UNDECLARED_EXTRA_COLUMN]
+
+  - id: case_c_aggregate_alias
+    description: "COUNT(documents) projected as total_documents -> document_count"
+    base_case: aggregate_document_count
+    columns: [count]
+    column_renames: { count: total_documents }
+    alias_context:
+      document_count: { entity: document, aggregate: count }
+    expectation:
+      required_columns: [document_count]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { document_count: alias }
+      categories_exclude: [MISSING_REQUIRED_COLUMN, UNDECLARED_EXTRA_COLUMN]
+
+  - id: case_f_optional_alias
+    description: "required document_id (alias) + optional title (exact)"
+    base_case: simple_document_list
+    columns: [id, title]
+    alias_context:
+      document_id: { entity: document }
+      title: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: [title]
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { document_id: alias }
+      optional_matched_by: { title: exact }
+      categories_exclude: [MISSING_REQUIRED_COLUMN, UNDECLARED_EXTRA_COLUMN]
+
+  - id: case_g_optional_alias_no_extra
+    description: "optional column resolved by alias must NOT become undeclared extra"
+    base_case: simple_document_list
+    columns: [id, file_type]
+    alias_context:
+      document_id: { entity: document }
+      document_file_type: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: [document_file_type]
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { document_id: alias }
+      optional_matched_by: { document_file_type: alias }
+      categories_exclude: [UNDECLARED_EXTRA_COLUMN]
+
+  - id: case_h_unknown_extra
+    description: "alias-matched + extra unknown column -> UNDECLARED_EXTRA (warning only)"
+    base_case: simple_document_list
+    columns: [id, title]
+    extra_columns: [foo]
+    alias_context:
+      document_id: { entity: document }
+      title: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: [title]
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: true
+      required_matched_by: { document_id: alias }
+      optional_matched_by: { title: exact }
+      categories_include: [UNDECLARED_EXTRA_COLUMN]
+
+  # ---------- Negative: alias must NOT be wrongly applied ----------
+
+  - id: case_d_wrong_entity
+    description: "documents.id must NOT match chunk context (entity=chunk)"
+    base_case: simple_document_list
+    columns: [id]
+    alias_context:
+      document_id: { entity: chunk }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_e_ambiguous_bare_id
+    description: "bare id without entity context cannot be auto-bound"
+    base_case: simple_document_list
+    columns: [id]
+    alias_context: {}
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_i_forbidden_alias
+    description: "forbidden chunk_id via alias (id under chunk context) IS detected"
+    base_case: simple_document_list
+    columns: [id]
+    alias_context:
+      document_id: { entity: chunk }
+      chunk_id: { entity: chunk }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: [chunk_id]
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      forbidden_matched_by: { chunk_id: alias }
+      categories_include: [EXTRA_FORBIDDEN_COLUMN, MISSING_REQUIRED_COLUMN]
+
+  - id: case_j_bare_count_no_context
+    description: "bare count without entity context cannot bind to document_count"
+    base_case: aggregate_document_count
+    columns: [count]
+    alias_context: {}
+    expectation:
+      required_columns: [document_count]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_count: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_k_wrong_aggregate_entity
+    description: "document_count under chunk context must NOT bind to count"
+    base_case: aggregate_document_count
+    columns: [count]
+    alias_context:
+      document_count: { entity: chunk, aggregate: count }
+    expectation:
+      required_columns: [document_count]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_count: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_l_unknown_column
+    description: "document_code is not a declared alias of document_id"
+    base_case: simple_document_list
+    columns: [id]
+    alias_context:
+      document_code: { entity: document }
+    expectation:
+      required_columns: [document_code]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_code: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_m_fuzzy_doc_id
+    description: "doc_id must NOT fuzzy-match document_id"
+    base_case: simple_document_list
+    columns: [id]
+    column_renames: { id: doc_id }
+    alias_context:
+      document_id: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_n_fuzzy_documentid
+    description: "documentid must NOT fuzzy-match document_id"
+    base_case: simple_document_list
+    columns: [id]
+    column_renames: { id: documentid }
+    alias_context:
+      document_id: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_o_fuzzy_document_ids
+    description: "document_ids must NOT fuzzy-match document_id"
+    base_case: simple_document_list
+    columns: [id]
+    column_renames: { id: document_ids }
+    alias_context:
+      document_id: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]
+
+  - id: case_p_fuzzy_doc
+    description: "doc must NOT fuzzy-match document_id"
+    base_case: simple_document_list
+    columns: [id]
+    column_renames: { id: doc }
+    alias_context:
+      document_id: { entity: document }
+    expectation:
+      required_columns: [document_id]
+      optional_columns: []
+      forbidden_columns: []
+      row_matching: unordered
+    expect:
+      semantic_passed: false
+      required_matched_by: { document_id: none }
+      categories_include: [MISSING_REQUIRED_COLUMN]

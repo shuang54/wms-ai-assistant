@@ -39,10 +39,13 @@ from backend.app.services.text_to_sql_column_alias_evaluation_service import (
     MATCH_ALIAS,
     MATCH_EXACT,
     MATCH_NONE,
+    ROLE_FORBIDDEN,
+    ROLE_OPTIONAL,
+    ROLE_REQUIRED,
     ColumnAliasContext,
     ColumnAliasResolution,
     alias_context_for_case,
-    resolve_required_columns,
+    resolve_declared_columns,
 )
 from backend.app.services.text_to_sql_evaluation_service import (
     DEFAULT_REGRESSION_DATASET_PATH,
@@ -225,6 +228,12 @@ class ResultCheckInput:
     expectation: ResultExpectation | None = None
     semantic_expectation: SemanticExpectation | None = None
     executed: bool = True
+    #: Phase 3.9.19 — explicit per-column alias context. When provided it
+    #: takes precedence over ``alias_context_for_case(case_id)``; when None
+    #: the case-level evaluation metadata is used. Permits projection
+    #: variants (synthetic semantic expectations) to carry their own
+    #: entity context without mutating the registry.
+    alias_context: Mapping[str, ColumnAliasContext] | None = None
 
 
 @dataclass(frozen=True)
@@ -419,28 +428,38 @@ def _check_semantic_result(payload, expectation):
     Hard failure = any category other than UNDECLARED_EXTRA.
 
     Returns ``(passed, reason, categories, resolutions)`` where
-    ``resolutions`` carries the per required-column alias diagnostic
-    (``matched_by`` = exact / alias / none). Alias matches are recorded as
-    diagnostics only — they never change the hard-failure rule, and they
+    ``resolutions`` carries every per-column alias diagnostic, tagged by
+    ``role`` (required / optional / forbidden). Alias matches are recorded
+    as diagnostics only — they never change the hard-failure rule, and they
     are never applied to the strict projection checkers (section §八).
+
+    Phase 3.9.19: ONE resolver and ONE context map are applied to the
+    required + optional + forbidden columns so that a column can never be
+    both an alias of a declared concept and an undeclared extra column.
     """
     categories = []
     failures = []
-    actual_set = {str(c).lower() for c in payload.columns}
     required_lower = [str(c).lower() for c in expectation.required_columns]
     optional_lower = {str(c).lower() for c in expectation.optional_columns}
     forbidden_lower = {str(c).lower() for c in expectation.forbidden_columns}
 
-    # Phase 3.9.18: alias resolution applies to REQUIRED columns only and
-    # only inside semantic mode.
-    resolutions = resolve_required_columns(
+    # Phase 3.9.19: unified resolution across required/optional/forbidden.
+    contexts = payload.alias_context
+    if contexts is None:
+        contexts = alias_context_for_case(payload.case_id)
+    resolutions = resolve_declared_columns(
         expectation.required_columns,
+        expectation.optional_columns,
+        expectation.forbidden_columns,
         payload.columns,
-        alias_context_for_case(payload.case_id),
+        contexts,
     )
+    required_matches = [r for r in resolutions if r.role == ROLE_REQUIRED]
+    optional_matches = [r for r in resolutions if r.role == ROLE_OPTIONAL]
+    forbidden_matches = [r for r in resolutions if r.role == ROLE_FORBIDDEN]
 
     missing_required = [
-        item.expected_column for item in resolutions
+        item.expected_column for item in required_matches
         if item.match_kind == MATCH_NONE
     ]
     if missing_required:
@@ -449,14 +468,21 @@ def _check_semantic_result(payload, expectation):
             f"missing required columns: {sorted(missing_required)}"
         )
 
-    present_forbidden = sorted(c for c in forbidden_lower if c in actual_set)
-    if present_forbidden:
+    # Forbidden is alias-aware (section §八): a forbidden expected column
+    # that resolves to an actual column is treated as present. An
+    # unresolvable forbidden column stays unmatched -> not flagged (the
+    # safe "context cannot disambiguate" policy).
+    forbidden_present = sorted(
+        f"{item.expected_column}<-{item.actual_column}"
+        for item in forbidden_matches if item.actual_column is not None
+    )
+    if forbidden_present:
         categories.append(SEMANTIC_CATEGORY_FORBIDDEN)
-        failures.append(f"forbidden columns present: {present_forbidden}")
+        failures.append(f"forbidden columns present: {forbidden_present}")
 
     declared = set(required_lower) | optional_lower | forbidden_lower
-    # An alias-matched actual column is "declared" by construction: it is
-    # the same business concept, not an undeclared extra.
+    # Every alias-matched actual column is "declared" by construction: it
+    # is the same business concept, never an undeclared extra (section §七).
     for item in resolutions:
         if item.actual_column is not None:
             declared.add(str(item.actual_column).lower())
@@ -470,12 +496,12 @@ def _check_semantic_result(payload, expectation):
             f"undeclared extra columns (warning): {undeclared}"
         )
 
-    if not missing_required and not present_forbidden:
+    if not missing_required and not forbidden_present:
         extracted = _extract_required_values(
             payload.columns,
             payload.rows,
             expectation.required_columns,
-            resolutions,
+            required_matches,
         )
         expected = tuple(tuple(r) for r in expectation.expected_rows)
         if expectation.row_matching == SEMANTIC_ROW_MATCHING_ORDERED:
@@ -504,7 +530,7 @@ def _check_semantic_result(payload, expectation):
     hard = [c for c in categories if c != SEMANTIC_CATEGORY_UNDECLARED_EXTRA]
     passed = not hard
     reason = "; ".join(failures) if failures else "semantic result matched"
-    return passed, reason, tuple(categories), resolutions
+    return passed, reason, tuple(categories), tuple(resolutions)
 
 
 class TextToSQLResultEvaluationService:

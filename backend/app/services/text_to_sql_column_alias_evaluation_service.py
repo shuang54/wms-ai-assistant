@@ -49,6 +49,16 @@ Matching priority (section §七)
 4. otherwise                  -> UNKNOWN_COLUMN
 ```
 
+Cross-entity guard (Phase 3.9.19, sections §五 / §十): an actual column
+name claimed by concepts of more than one entity (``id``, ``count``) is
+intrinsically ambiguous. It only matches when the entity context is
+explicit AND equals the chosen concept's entity. Bound to the wrong
+entity, or with no context at all, it resolves to ``UNKNOWN_COLUMN``
+instead of being guessed — so ``documents.id`` never bleeds into
+``chunk_id``. The same resolver, with the same roles (required /
+optional / forbidden), is reused everywhere, so a column can never be
+both an alias and an undeclared extra.
+
 Forbidden by design (sections §五 / §七):
 
 ```text
@@ -80,6 +90,10 @@ __all__ = [
     "MATCH_ALIAS",
     "MATCH_NONE",
     "MATCH_KINDS",
+    "ROLE_REQUIRED",
+    "ROLE_OPTIONAL",
+    "ROLE_FORBIDDEN",
+    "ROLE_VALUES",
     "DIAGNOSTIC_EXACT_MATCH",
     "DIAGNOSTIC_ALIAS_MATCH",
     "DIAGNOSTIC_UNKNOWN_COLUMN",
@@ -98,6 +112,9 @@ __all__ = [
     "alias_context_for_case",
     "resolve_semantic_column",
     "resolve_required_columns",
+    "resolve_column_group",
+    "resolve_declared_columns",
+    "is_cross_entity_alias",
     "validate_alias_registry",
 ]
 
@@ -115,6 +132,17 @@ MATCH_NONE: Final[str] = "none"
 
 MATCH_KINDS: Final[frozenset[str]] = frozenset({
     MATCH_EXACT, MATCH_ALIAS, MATCH_NONE,
+})
+
+#: Phase 3.9.19 — which part of ``semantic_expectation`` a resolution
+#: belongs to. The SAME resolver is used for all three roles, so
+#: ``required`` / ``optional`` / ``forbidden`` can never disagree about
+#: whether two column names denote the same business concept.
+ROLE_REQUIRED: Final[str] = "required"
+ROLE_OPTIONAL: Final[str] = "optional"
+ROLE_FORBIDDEN: Final[str] = "forbidden"
+ROLE_VALUES: Final[frozenset[str]] = frozenset({
+    ROLE_REQUIRED, ROLE_OPTIONAL, ROLE_FORBIDDEN,
 })
 
 #: Diagnostic recorded when a required column matched by exact name.
@@ -190,7 +218,13 @@ class ColumnSemanticAlias:
 
 @dataclass(frozen=True)
 class ColumnAliasResolution:
-    """Outcome of resolving one expected semantic column."""
+    """Outcome of resolving one expected semantic column.
+
+    Phase 3.9.19: ``role`` records whether the column came from
+    ``required_columns`` / ``optional_columns`` / ``forbidden_columns``.
+    All three roles share the same resolver, so the classification is
+    consistent across the whole expectation.
+    """
     expected_column: str
     actual_column: str | None = None
     semantic_name: str | None = None
@@ -198,6 +232,7 @@ class ColumnAliasResolution:
     match_kind: str = MATCH_NONE
     diagnostic: str = DIAGNOSTIC_UNKNOWN_COLUMN
     detail: str = ""
+    role: str = ROLE_REQUIRED
 
     @property
     def matched(self) -> bool:
@@ -211,6 +246,7 @@ class ColumnAliasResolution:
             "entity": self.entity,
             "matched_by": self.match_kind,
             "diagnostic": self.diagnostic,
+            "role": self.role,
             "detail": self.detail,
         }
 
@@ -417,6 +453,7 @@ def _unknown(
     semantic_name: str | None = None,
     entity: str | None = None,
     detail: str,
+    role: str = ROLE_REQUIRED,
 ) -> ColumnAliasResolution:
     return ColumnAliasResolution(
         expected_column=expected,
@@ -426,7 +463,20 @@ def _unknown(
         match_kind=MATCH_NONE,
         diagnostic=DIAGNOSTIC_UNKNOWN_COLUMN,
         detail=detail,
+        role=role,
     )
+
+
+def is_cross_entity_alias(column_name: str) -> bool:
+    """True if the projection name is claimed by concepts of >1 entity.
+
+    Such a name (e.g. ``id``, ``count``) is intrinsically ambiguous: it can
+    only be bound to a concept when the entity context is explicit and
+    matches that concept (Phase 3.9.19, sections §五 / §十). Without the
+    context it resolves to ``UNKNOWN_COLUMN`` — never a guess.
+    """
+    concepts = _ALIAS_INDEX.get(str(column_name).strip().lower(), ())
+    return len({concept.entity for concept in concepts}) > 1
 
 
 def resolve_semantic_column(
@@ -434,11 +484,18 @@ def resolve_semantic_column(
     expected_column: str,
     actual_columns: Sequence[str],
     context: ColumnAliasContext | None = None,
+    role: str = ROLE_REQUIRED,
 ) -> ColumnAliasResolution:
     """Resolve one expected semantic column against the actual projection.
 
     Pure, deterministic, offline. See the module docstring for the
     4-level priority and the aggregate rule.
+
+    Phase 3.9.19: ``role`` tags the resolution with the part of the
+    expectation it came from (required / optional / forbidden). The
+    cross-entity guard (below) additionally requires an entity context
+    before binding an ambiguous actual column name (``id`` / ``count``)
+    to any concept.
     """
     expected = str(expected_column)
     expected_lower = expected.strip().lower()
@@ -454,16 +511,35 @@ def resolve_semantic_column(
             entity=None if context is None else context.entity,
             match_kind=MATCH_EXACT,
             diagnostic=DIAGNOSTIC_EXACT_MATCH,
+            role=role,
             detail="exact column name match",
         )
 
     # ---- Level 2: explicit semantic alias ----------------------------
     # The expected column IS the canonical semantic_name of a concept, so
-    # the concept is unambiguous without any context.
+    # the concept is unambiguous without any context — but the actual
+    # column it binds to may itself be a cross-entity alias (e.g. ``id``),
+    # in which case the entity context is authoritative (Case D / Case E).
     canonical = SEMANTIC_COLUMN_ALIAS_BY_NAME.get(expected_lower)
     if canonical is not None:
         hit = _first_actual_in_alias_set(actual, lowered_actual, canonical.aliases)
         if hit is not None:
+            if is_cross_entity_alias(hit) and not (
+                context is not None and context.entity == canonical.entity
+            ):
+                return _unknown(
+                    expected,
+                    semantic_name=canonical.semantic_name,
+                    entity=canonical.entity,
+                    role=role,
+                    detail=(
+                        f"actual column {hit!r} is a cross-entity alias; an "
+                        f"explicit entity context matching "
+                        f"entity={canonical.entity!r} is required to bind it "
+                        f"to {canonical.semantic_name!r} (deterministic, no "
+                        f"guessing)"
+                    ),
+                )
             return ColumnAliasResolution(
                 expected_column=expected,
                 actual_column=hit,
@@ -471,6 +547,7 @@ def resolve_semantic_column(
                 entity=canonical.entity,
                 match_kind=MATCH_ALIAS,
                 diagnostic=DIAGNOSTIC_ALIAS_MATCH,
+                role=role,
                 detail=(
                     f"explicit semantic alias: {expected!r} -> {hit!r} "
                     f"(semantic_name={canonical.semantic_name!r}, "
@@ -481,6 +558,7 @@ def resolve_semantic_column(
             expected,
             semantic_name=canonical.semantic_name,
             entity=canonical.entity,
+            role=role,
             detail=(
                 f"canonical semantic column {expected!r} declared, but no "
                 f"actual column matches its alias set "
@@ -493,11 +571,13 @@ def resolve_semantic_column(
     if not candidates:
         return _unknown(
             expected,
+            role=role,
             detail=f"no alias concept declares {expected!r}; unknown alias",
         )
     if context is None or not context.entity:
         return _unknown(
             expected,
+            role=role,
             detail=(
                 f"{expected!r} is a bare alias shared by "
                 f"{len(candidates)} concept(s); an explicit entity context "
@@ -513,6 +593,7 @@ def resolve_semantic_column(
         return _unknown(
             expected,
             entity=context.entity,
+            role=role,
             detail=(
                 f"ambiguous alias: {len(scoped)} concept(s) match "
                 f"{expected!r} under entity={context.entity!r}; "
@@ -526,11 +607,27 @@ def resolve_semantic_column(
             expected,
             semantic_name=concept.semantic_name,
             entity=concept.entity,
+            role=role,
             detail=(
                 f"concept {concept.semantic_name!r} "
                 f"(entity={concept.entity!r}) selected by context, but no "
                 f"actual column matches its alias set "
                 f"{sorted(concept.aliases)}"
+            ),
+        )
+    # Cross-entity guard: a bare actual column (``count``) must agree with
+    # the context entity. At this level ``scoped`` was already filtered by
+    # ``context.entity``, so this only rejects a residual mismatch.
+    if is_cross_entity_alias(hit) and concept.entity != context.entity:
+        return _unknown(
+            expected,
+            semantic_name=concept.semantic_name,
+            entity=concept.entity,
+            role=role,
+            detail=(
+                f"actual column {hit!r} is a cross-entity alias; entity "
+                f"context required to bind it to "
+                f"{concept.semantic_name!r} (entity={concept.entity!r})"
             ),
         )
     return ColumnAliasResolution(
@@ -540,6 +637,7 @@ def resolve_semantic_column(
         entity=concept.entity,
         match_kind=MATCH_ALIAS,
         diagnostic=DIAGNOSTIC_ALIAS_MATCH,
+        role=role,
         detail=(
             f"context-aware alias: {expected!r} -> {hit!r} "
             f"(semantic_name={concept.semantic_name!r}, "
@@ -554,7 +652,28 @@ def resolve_required_columns(
     actual_columns: Sequence[str],
     contexts: Mapping[str, ColumnAliasContext] | None = None,
 ) -> tuple[ColumnAliasResolution, ...]:
-    """Resolve every required column of one semantic expectation."""
+    """Resolve every required column of one semantic expectation.
+
+    Thin wrapper over :func:`resolve_column_group` with ``role=required``.
+    """
+    return resolve_column_group(
+        required_columns, actual_columns, contexts, ROLE_REQUIRED
+    )
+
+
+def resolve_column_group(
+    columns: Sequence[str],
+    actual_columns: Sequence[str],
+    contexts: Mapping[str, ColumnAliasContext] | None,
+    role: str,
+) -> tuple[ColumnAliasResolution, ...]:
+    """Resolve one group (required/optional/forbidden) of expected columns.
+
+    ``role`` tags every returned resolution so the semantic checker can
+    attribute it to the right part of the expectation (Phase 3.9.19).
+    """
+    if role not in ROLE_VALUES:
+        raise ValueError(f"unknown alias role: {role!r}")
     lookup: Mapping[str, ColumnAliasContext] = contexts or {}
     normalized = {
         str(key).strip().lower(): value for key, value in lookup.items()
@@ -564,8 +683,38 @@ def resolve_required_columns(
             expected_column=column,
             actual_columns=actual_columns,
             context=normalized.get(str(column).strip().lower()),
+            role=role,
         )
-        for column in required_columns
+        for column in columns
+    )
+
+
+def resolve_declared_columns(
+    required_columns: Sequence[str],
+    optional_columns: Sequence[str],
+    forbidden_columns: Sequence[str],
+    actual_columns: Sequence[str],
+    contexts: Mapping[str, ColumnAliasContext] | None = None,
+) -> tuple[ColumnAliasResolution, ...]:
+    """Resolve required + optional + forbidden columns in one pass.
+
+    Phase 3.9.19 (sections §四 / §六 / §七): the SAME resolver, with the
+    SAME entity context, is applied to all three groups, so a column can
+    never be simultaneously an alias for a required/optional concept AND
+    an undeclared extra column. The caller partitions the result by
+    ``ColumnAliasResolution.role``. Unmatched entries are kept so the
+    caller can report ``MISSING_REQUIRED`` / ``UNDECLARED_EXTRA`` etc.
+    """
+    return (
+        resolve_column_group(
+            required_columns, actual_columns, contexts, ROLE_REQUIRED
+        )
+        + resolve_column_group(
+            optional_columns, actual_columns, contexts, ROLE_OPTIONAL
+        )
+        + resolve_column_group(
+            forbidden_columns, actual_columns, contexts, ROLE_FORBIDDEN
+        )
     )
 
 

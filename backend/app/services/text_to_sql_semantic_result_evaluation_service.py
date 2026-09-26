@@ -13,7 +13,10 @@ Pipeline:
 """
 from __future__ import annotations
 
+import json
+import yaml
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -22,7 +25,12 @@ from backend.app.services.text_to_sql_column_alias_evaluation_service import (
     MATCH_ALIAS,
     MATCH_EXACT,
     MATCH_NONE,
+    ROLE_FORBIDDEN,
+    ROLE_OPTIONAL,
+    ROLE_REQUIRED,
+    ColumnAliasContext,
     ColumnAliasResolution,
+    resolve_column_group,
 )
 from backend.app.services.text_to_sql_result_evaluation_service import (
     SEMANTIC_CATEGORY_DUPLICATE_ROW,
@@ -75,12 +83,23 @@ __all__ = [
     "AliasAuditEntry",
     "AliasAuditSummary",
     "analyze_phase_3_9_14_for_alias_audit",
+    # Phase 3.9.19 — offline projection variants that truly trigger alias.
+    "PHASE_3_9_19",
+    "PROJECTION_VARIANT_PATH",
+    "SNAPSHOT_3_9_19_PATH",
+    "REPORT_3_9_19_PATH",
+    "ProjectionVariant",
+    "ProjectionVariantOutcome",
+    "ProjectionVariantSummary",
+    "load_projection_variants",
+    "run_projection_variants",
 ]
 
 
 PHASE_3_9_16: Final[str] = "3.9.16"
 PHASE_3_9_17: Final[str] = "3.9.17"
 PHASE_3_9_18: Final[str] = "3.9.18"
+PHASE_3_9_19: Final[str] = "3.9.19"
 
 SNAPSHOT_3_9_16_PATH: Final[Path] = (
     _REPO_ROOT / "tests" / "fixtures" / "text_to_sql" / "baselines"
@@ -106,6 +125,21 @@ SNAPSHOT_3_9_18_PATH: Final[Path] = (
 REPORT_3_9_18_PATH: Final[Path] = (
     _REPO_ROOT / "docs" / "evaluation"
     / "text-to-sql-semantic-column-alias-3.9.18.md"
+)
+
+#: Phase 3.9.19 — offline projection variants (derived from 3.9.14, NOT
+#: fresh LLM output).
+PROJECTION_VARIANT_PATH: Final[Path] = (
+    _REPO_ROOT / "tests" / "fixtures" / "text_to_sql"
+    / "projection_variants_3_9_19.yaml"
+)
+SNAPSHOT_3_9_19_PATH: Final[Path] = (
+    _REPO_ROOT / "tests" / "fixtures" / "text_to_sql" / "baselines"
+    / "phase_3_9_19_alias_trigger.json"
+)
+REPORT_3_9_19_PATH: Final[Path] = (
+    _REPO_ROOT / "docs" / "evaluation"
+    / "text-to-sql-alias-trigger-3.9.19.md"
 )
 
 #: Result-evaluable case IDs (Phase 3.9.17; excludes 2 N/A cases).
@@ -572,7 +606,12 @@ def analyze_phase_3_9_14_for_alias_audit() -> AliasAuditSummary:
     entries: list[AliasAuditEntry] = []
     alias_needed_cases: set[str] = set()
     for outcome in summary.cases:
+        # Phase 3.9.19: column_matches now covers required + optional +
+        # forbidden. The 3.9.18 audit is defined over REQUIRED columns only,
+        # so we filter by role to keep the frozen 3.9.18 snapshot stable.
         for match in outcome.column_matches:
+            if match.role != ROLE_REQUIRED:
+                continue
             alias_needed = match.match_kind == MATCH_ALIAS
             if alias_needed:
                 alias_needed_cases.add(outcome.case_id)
@@ -610,4 +649,377 @@ def analyze_phase_3_9_14_for_alias_audit() -> AliasAuditSummary:
         alias_needed_cases=len(alias_needed_cases),
         entries=tuple(entries),
         cases=summary.cases,
+    )
+
+
+# ============================================================
+# Phase 3.9.19 — Offline projection variants (alias path trigger)
+# ============================================================
+
+def _load_phase_3_9_14_actual_by_case() -> dict[str, dict[str, Any]]:
+    """case_id -> {actual_columns, actual_rows} from the SAVED 3.9.14
+    baseline. These are real historical results; they are never re-run."""
+    raw = json.loads(REAL_LLM_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    out: dict[str, dict[str, Any]] = {}
+    for case in raw.get("cases", ()):
+        out[str(case["case_id"])] = {
+            "actual_columns": tuple(case.get("actual_columns", ())),
+            "actual_rows": tuple(tuple(r) for r in case.get("actual_rows", ())),
+        }
+    return out
+
+
+@dataclass(frozen=True)
+class ProjectionVariant:
+    """One offline projection variant (derived from 3.9.14, NOT an LLM run)."""
+    variant_id: str
+    description: str
+    base_case: str
+    columns: tuple[str, ...]
+    column_renames: Mapping[str, str]
+    extra_columns: tuple[str, ...]
+    alias_context: Mapping[str, ColumnAliasContext]
+    required_columns: tuple[str, ...]
+    optional_columns: tuple[str, ...]
+    forbidden_columns: tuple[str, ...]
+    row_matching: str
+    expect: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ProjectionVariantOutcome:
+    variant_id: str
+    base_case: str
+    kind: str
+    columns: tuple[str, ...]
+    semantic_passed: bool
+    expected_passed: bool | None
+    semantic_reason: str
+    categories: tuple[str, ...]
+    required_matches: tuple[ColumnAliasResolution, ...]
+    optional_matches: tuple[ColumnAliasResolution, ...]
+    forbidden_matches: tuple[ColumnAliasResolution, ...]
+    expectation_met: bool
+    problems: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "variant_id": self.variant_id,
+            "base_case": self.base_case,
+            "kind": self.kind,
+            "columns": list(self.columns),
+            "semantic_passed": self.semantic_passed,
+            "expected_passed": self.expected_passed,
+            "semantic_reason": self.semantic_reason,
+            "categories": list(self.categories),
+            "required_matches": [m.to_dict() for m in self.required_matches],
+            "optional_matches": [m.to_dict() for m in self.optional_matches],
+            "forbidden_matches": [
+                m.to_dict() for m in self.forbidden_matches
+            ],
+            "expectation_met": self.expectation_met,
+            "problems": list(self.problems),
+        }
+
+
+@dataclass(frozen=True)
+class ProjectionVariantSummary:
+    """Phase 3.9.19 — alias-trigger audit over offline projection variants.
+
+    `real_historical_result_count` / accuracy fields come from the frozen
+    3.9.18 audit (the REAL 3.9.14 results). The `variants` list is what
+    this phase ADDS: synthetic projections that genuinely exercise the
+    alias path. They are labelled `kind="projection_variant"` and must
+    never be reported as real LLM outputs (section §十三).
+    """
+    phase: str
+    parent_baseline: str
+    source_snapshot: str
+    llm_calls: int
+    db_calls: int
+    network_calls: int
+    real_historical_result_count: int
+    phase_3_9_17_semantic_accuracy: float | None
+    phase_3_9_18_semantic_accuracy: float | None
+    phase_3_9_18_semantic_correct: int
+    exact_matches: int
+    alias_matches: int
+    unknown_matches: int
+    variant_count: int
+    variants_expecting_pass: int
+    variants_pass_expected: int
+    variants_expectation_met: int
+    required_matched_by: Mapping[str, int]
+    optional_matched_by: Mapping[str, int]
+    forbidden_matched_by: Mapping[str, int]
+    undeclared_extra_variants: tuple[str, ...]
+    variants: tuple[ProjectionVariantOutcome, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "parent_baseline": self.parent_baseline,
+            "source_snapshot": self.source_snapshot,
+            "llm_calls": self.llm_calls,
+            "db_calls": self.db_calls,
+            "network_calls": self.network_calls,
+            "real_historical_result_count": self.real_historical_result_count,
+            "phase_3_9_17_semantic_accuracy": self.phase_3_9_17_semantic_accuracy,
+            "phase_3_9_18_semantic_accuracy": self.phase_3_9_18_semantic_accuracy,
+            "phase_3_9_18_semantic_correct": self.phase_3_9_18_semantic_correct,
+            "exact_matches": self.exact_matches,
+            "alias_matches": self.alias_matches,
+            "unknown_matches": self.unknown_matches,
+            "variant_count": self.variant_count,
+            "variants_expecting_pass": self.variants_expecting_pass,
+            "variants_pass_expected": self.variants_pass_expected,
+            "variants_expectation_met": self.variants_expectation_met,
+            "required_matched_by": dict(self.required_matched_by),
+            "optional_matched_by": dict(self.optional_matched_by),
+            "forbidden_matched_by": dict(self.forbidden_matched_by),
+            "undeclared_extra_variants": list(self.undeclared_extra_variants),
+            "variants": [v.to_dict() for v in self.variants],
+        }
+
+
+def _parse_variant(raw: Mapping[str, Any]) -> ProjectionVariant:
+    ctx_raw = raw.get("alias_context") or {}
+    alias_context = {
+        str(k): ColumnAliasContext(
+            entity=str(v["entity"]),
+            aggregate=str(v["aggregate"]) if v.get("aggregate") else None,
+        )
+        for k, v in ctx_raw.items()
+    }
+    exp = raw["expectation"]
+    expect = raw.get("expect") or {}
+    return ProjectionVariant(
+        variant_id=str(raw["id"]),
+        description=str(raw.get("description", "")),
+        base_case=str(raw["base_case"]),
+        columns=tuple(raw.get("columns", ()) or ()),
+        column_renames=dict(raw.get("column_renames", {}) or {}),
+        extra_columns=tuple(raw.get("extra_columns", ()) or ()),
+        alias_context=alias_context,
+        required_columns=tuple(exp.get("required_columns", ()) or ()),
+        optional_columns=tuple(exp.get("optional_columns", ()) or ()),
+        forbidden_columns=tuple(exp.get("forbidden_columns", ()) or ()),
+        row_matching=str(exp.get("row_matching", SEMANTIC_ROW_MATCHING_UNORDERED)),
+        expect=expect,
+    )
+
+
+def load_projection_variants(
+    path: Path | None = None,
+) -> tuple[ProjectionVariant, ...]:
+    """Load the offline projection-variant definitions (section §十)."""
+    target = Path(path) if path is not None else PROJECTION_VARIANT_PATH
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    if not isinstance(data, Mapping):
+        return ()
+    variants = data.get("variants")
+    if not isinstance(variants, list):
+        return ()
+    return tuple(_parse_variant(v) for v in variants)
+
+
+def _apply_variant(
+    base: Mapping[str, Any], variant: ProjectionVariant
+) -> tuple[tuple[str, ...], tuple[tuple[Any, ...], ...]]:
+    """Return (final_columns, final_rows) after selection/rename/extra."""
+    base_cols = list(base["actual_columns"])
+    base_rows = [list(r) for r in base["actual_rows"]]
+
+    # 1. selection (subset / reorder), default = all.
+    if variant.columns:
+        keep = [c for c in variant.columns if c in base_cols]
+        idx = [base_cols.index(c) for c in keep]
+        cols = list(keep)
+        rows = [[row[i] for i in idx] for row in base_rows]
+    else:
+        cols = list(base_cols)
+        rows = [list(row) for row in base_rows]
+
+    # 2. rename (old -> new).
+    rename = variant.column_renames or {}
+    if rename:
+        cols = [rename.get(c, c) for c in cols]
+
+    # 3. extra columns (appended, value None).
+    for extra in variant.extra_columns:
+        cols.append(extra)
+        for row in rows:
+            row.append(None)
+    return tuple(cols), tuple(tuple(r) for r in rows)
+
+
+def run_projection_variants(
+    path: Path | None = None,
+) -> ProjectionVariantSummary:
+    """Phase 3.9.19 — truly trigger the alias evaluation path.
+
+    Builds offline projection variants from the SAVED 3.9.14 results,
+    evaluates each with the unified alias resolver, and checks every
+    variant against its declared expectation. No DeepSeek, no DB, no
+    network (section §十二).
+    """
+    actual_by_case = _load_phase_3_9_14_actual_by_case()
+    variants = load_projection_variants(path)
+
+    service = TextToSQLResultEvaluationService()
+    outcomes: list[ProjectionVariantOutcome] = []
+
+    required_dist: Counter = Counter()
+    optional_dist: Counter = Counter()
+    forbidden_dist: Counter = Counter()
+    undeclared_extra: list[str] = []
+
+    for variant in variants:
+        base = actual_by_case[variant.base_case]
+        final_columns, final_rows = _apply_variant(base, variant)
+
+        # Derive expected_rows from the finalized (renamed) rows.
+        required_res = resolve_column_group(
+            variant.required_columns, final_columns,
+            variant.alias_context, ROLE_REQUIRED,
+        )
+        if all(r.actual_column is not None for r in required_res):
+            lowered = [str(c).lower() for c in final_columns]
+            indices = [
+                lowered.index(r.actual_column.lower()) for r in required_res
+            ]
+            expected_rows = tuple(
+                tuple(row[i] for i in indices) for row in final_rows
+            )
+        else:
+            expected_rows = ()
+
+        sem = SemanticExpectation(
+            required_columns=variant.required_columns,
+            optional_columns=variant.optional_columns,
+            forbidden_columns=variant.forbidden_columns,
+            expected_rows=expected_rows,
+            row_matching=variant.row_matching,
+        )
+        result = service.check(
+            ResultCheckInput(
+                case_id=variant.variant_id,
+                columns=final_columns,
+                rows=final_rows,
+                semantic_expectation=sem,
+                alias_context=variant.alias_context,
+            )
+        )
+
+        required_matches = tuple(
+            m for m in result.semantic_column_matches
+            if m.role == ROLE_REQUIRED
+        )
+        optional_matches = tuple(
+            m for m in result.semantic_column_matches
+            if m.role == ROLE_OPTIONAL
+        )
+        forbidden_matches = tuple(
+            m for m in result.semantic_column_matches
+            if m.role == ROLE_FORBIDDEN
+        )
+
+        for m in required_matches:
+            required_dist[m.match_kind] += 1
+        for m in optional_matches:
+            optional_dist[m.match_kind] += 1
+        for m in forbidden_matches:
+            forbidden_dist[m.match_kind] += 1
+
+        # ---- expectation check ----
+        problems: list[str] = []
+        expect = variant.expect
+        exp_passed = expect.get("semantic_passed")
+        if exp_passed is not None and result.semantic_passed != exp_passed:
+            problems.append(
+                f"semantic_passed expected {exp_passed!r}, "
+                f"got {result.semantic_passed!r}"
+            )
+        for role, matches, key in (
+            (ROLE_REQUIRED, required_matches, "required_matched_by"),
+            (ROLE_OPTIONAL, optional_matches, "optional_matched_by"),
+            (ROLE_FORBIDDEN, forbidden_matches, "forbidden_matched_by"),
+        ):
+            want = expect.get(key)
+            if not want:
+                continue
+            got = {m.expected_column: m.match_kind for m in matches}
+            for col, kind in want.items():
+                if got.get(col) != kind:
+                    problems.append(
+                        f"{key}[{col}] expected {kind!r}, got {got.get(col)!r}"
+                    )
+        for cat in expect.get("categories_include", ()) or ():
+            if cat not in result.semantic_categories:
+                problems.append(f"expected category {cat!r} missing")
+        for cat in expect.get("categories_exclude", ()) or ():
+            if cat in result.semantic_categories:
+                problems.append(f"unexpected category {cat!r} present")
+
+        if (
+            SEMANTIC_CATEGORY_UNDECLARED_EXTRA in result.semantic_categories
+            and result.semantic_passed
+        ):
+            undeclared_extra.append(variant.variant_id)
+
+        outcomes.append(
+            ProjectionVariantOutcome(
+                variant_id=variant.variant_id,
+                base_case=variant.base_case,
+                kind="projection_variant",
+                columns=final_columns,
+                semantic_passed=bool(result.semantic_passed),
+                expected_passed=exp_passed,
+                semantic_reason=result.semantic_reason,
+                categories=tuple(result.semantic_categories),
+                required_matches=required_matches,
+                optional_matches=optional_matches,
+                forbidden_matches=forbidden_matches,
+                expectation_met=not problems,
+                problems=tuple(problems),
+            )
+        )
+
+    audit = analyze_phase_3_9_14_for_alias_audit()
+    alias_total = (
+        sum(required_dist.values())
+        + sum(optional_dist.values())
+        + sum(forbidden_dist.values())
+    )
+    return ProjectionVariantSummary(
+        phase=PHASE_3_9_19,
+        parent_baseline=PHASE_3_9_18,
+        source_snapshot=audit.source_snapshot,
+        llm_calls=0,
+        db_calls=0,
+        network_calls=0,
+        real_historical_result_count=audit.semantic_evaluable_cases,
+        phase_3_9_17_semantic_accuracy=audit.phase_3_9_17_semantic_accuracy,
+        phase_3_9_18_semantic_accuracy=audit.phase_3_9_18_semantic_accuracy,
+        phase_3_9_18_semantic_correct=audit.phase_3_9_18_semantic_correct,
+        exact_matches=audit.exact_matches,
+        alias_matches=audit.alias_matches,
+        unknown_matches=audit.unmatched_columns,
+        variant_count=len(variants),
+        variants_expecting_pass=sum(
+            1 for v in variants
+            if v.expect.get("semantic_passed") is True
+        ),
+        variants_pass_expected=sum(
+            1 for o in outcomes
+            if o.semantic_passed == (o.expected_passed is True)
+        ),
+        variants_expectation_met=sum(
+            1 for o in outcomes if o.expectation_met
+        ),
+        required_matched_by=dict(required_dist),
+        optional_matched_by=dict(optional_dist),
+        forbidden_matched_by=dict(forbidden_dist),
+        undeclared_extra_variants=tuple(undeclared_extra),
+        variants=tuple(outcomes),
     )

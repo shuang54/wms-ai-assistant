@@ -31,6 +31,8 @@ from backend.app.services.text_to_sql_column_alias_evaluation_service import (
     MATCH_ALIAS,
     MATCH_EXACT,
     MATCH_NONE,
+    ROLE_FORBIDDEN,
+    ROLE_REQUIRED,
     CASE_ALIAS_CONTEXTS,
     NA_CASE_ALIAS_CONTEXTS,
     ColumnAliasContext,
@@ -357,6 +359,11 @@ class TestSemanticAcceptsProvableAlias:
             rows=((1,), (2,)),
             semantic_expectation=_sem(required=("document_id",),
                                       rows=[(1,), (2,)]),
+            # Phase 3.9.19: a cross-entity actual column (``id``) only
+            # matches when the entity context is explicit (section §十).
+            alias_context={
+                "document_id": ColumnAliasContext(entity=ENTITY_DOCUMENT),
+            },
         ))
         assert r.semantic_passed is True
         assert len(r.semantic_column_matches) == 1
@@ -373,6 +380,9 @@ class TestSemanticAcceptsProvableAlias:
             rows=((1,), (2,)),
             semantic_expectation=_sem(required=("document_id",),
                                       rows=[(1,), (2,)]),
+            alias_context={
+                "document_id": ColumnAliasContext(entity=ENTITY_DOCUMENT),
+            },
         ))
         assert r.semantic_categories == ()
 
@@ -404,6 +414,9 @@ class TestSemanticAcceptsProvableAlias:
             rows=((1,), (2,)),
             semantic_expectation=_sem(required=("document_id",),
                                       rows=[(1,), (2,)]),
+            alias_context={
+                "document_id": ColumnAliasContext(entity=ENTITY_DOCUMENT),
+            },
         ))
         assert "UNDECLARED_EXTRA_COLUMN" not in r.semantic_categories
 
@@ -506,10 +519,14 @@ class TestAliasAudit:
 
     def test_every_required_column_is_resolved(self) -> None:
         for outcome in analyze_phase_3_9_14_for_full_semantic().cases:
-            assert len(outcome.column_matches) == len(
+            required_matches = [
+                m for m in outcome.column_matches
+                if m.role == ROLE_REQUIRED
+            ]
+            assert len(required_matches) == len(
                 outcome.expected_required_columns
             )
-            for item in outcome.column_matches:
+            for item in required_matches:
                 assert item.match_kind in (MATCH_EXACT, MATCH_ALIAS)
 
 
@@ -529,6 +546,154 @@ class Test3918Snapshot:
         assert payload["alias_matches"] == 0
         assert payload["unmatched_columns"] == 0
         assert payload["exact_matches"] > 0
+        blob = json.dumps(payload, ensure_ascii=False).lower()
+        for fragment in ("sk-", "postgres://", "postgresql://", "bearer "):
+            assert fragment not in blob
+
+
+class TestProjectionVariant3919:
+    """Phase 3.9.19 — offline projection variants that truly trigger the
+    alias path (section §十). Derived from saved 3.9.14 results, never an
+    LLM re-run."""
+
+    @staticmethod
+    def _summary():
+        from backend.app.services.text_to_sql_semantic_result_evaluation_service import (
+            run_projection_variants,
+        )
+        return run_projection_variants()
+
+    def test_all_variants_meet_expectation(self) -> None:
+        s = self._summary()
+        assert s.variants_expectation_met == s.variant_count
+        assert s.variant_count >= 16
+
+    def test_real_historical_accuracy_unchanged(self) -> None:
+        s = self._summary()
+        assert s.real_historical_result_count == 12
+        assert s.phase_3_9_17_semantic_accuracy == 1.0
+        assert s.phase_3_9_18_semantic_accuracy == 1.0
+        assert s.phase_3_9_18_semantic_correct == 12
+
+    def test_positive_variants_pass(self) -> None:
+        passing = {
+            "case_a_document_id_alias",
+            "case_b_chunk_id_alias",
+            "case_c_aggregate_alias",
+            "case_f_optional_alias",
+            "case_g_optional_alias_no_extra",
+        }
+        for v in self._summary().variants:
+            if v.variant_id in passing:
+                assert v.semantic_passed is True, v.variant_id
+                assert v.expectation_met, v.variant_id
+
+    def test_negative_variants_fail(self) -> None:
+        failing = {
+            "case_d_wrong_entity",
+            "case_e_ambiguous_bare_id",
+            "case_i_forbidden_alias",
+            "case_j_bare_count_no_context",
+            "case_k_wrong_aggregate_entity",
+            "case_l_unknown_column",
+            "case_m_fuzzy_doc_id",
+            "case_n_fuzzy_documentid",
+            "case_o_fuzzy_document_ids",
+            "case_p_fuzzy_doc",
+        }
+        for v in self._summary().variants:
+            if v.variant_id in failing:
+                assert v.semantic_passed is False, v.variant_id
+                assert v.expectation_met, v.variant_id
+
+    def test_alias_path_is_genuinely_triggered(self) -> None:
+        """At least one required/optional/forbidden column must resolve via
+        ALIAS (otherwise the variant did not exercise the alias path)."""
+        s = self._summary()
+        alias_total = (
+            s.required_matched_by.get("alias", 0)
+            + s.optional_matched_by.get("alias", 0)
+            + s.forbidden_matched_by.get("alias", 0)
+        )
+        assert alias_total >= 8
+
+    def test_required_optional_forbidden_all_unified(self) -> None:
+        s = self._summary()
+        # required + optional have real matches (alias or exact).
+        assert (
+            s.required_matched_by.get("alias", 0)
+            + s.required_matched_by.get("exact", 0)
+        ) > 0
+        assert (
+            s.optional_matched_by.get("alias", 0)
+            + s.optional_matched_by.get("exact", 0)
+        ) > 0
+        # forbidden alias detected (Case I).
+        assert s.forbidden_matched_by.get("alias", 0) == 1
+
+    def test_optional_alias_is_not_undeclared_extra(self) -> None:
+        """Case F & G: an alias-matched optional column must NOT surface as
+        UNDECLARED_EXTRA_COLUMN (section §七 / §十一)."""
+        for v in self._summary().variants:
+            if v.variant_id in (
+                "case_f_optional_alias", "case_g_optional_alias_no_extra"
+            ):
+                assert "UNDECLARED_EXTRA_COLUMN" not in v.categories, v.variant_id
+
+    def test_undeclared_extra_only_when_passing(self) -> None:
+        s = self._summary()
+        # Only case_h_unknown_extra legitimately reports UNDECLARED_EXTRA,
+        # and it still passes semantically.
+        assert s.undeclared_extra_variants == ("case_h_unknown_extra",)
+        h = next(
+            v for v in s.variants
+            if v.variant_id == "case_h_unknown_extra"
+        )
+        assert h.semantic_passed is True
+        assert "UNDECLARED_EXTRA_COLUMN" in h.categories
+
+    def test_forbidden_alias_detected(self) -> None:
+        i = next(
+            v for v in self._summary().variants
+            if v.variant_id == "case_i_forbidden_alias"
+        )
+        assert "EXTRA_FORBIDDEN_COLUMN" in i.categories
+        forbidden_match = i.forbidden_matches[0]
+        assert forbidden_match.match_kind == MATCH_ALIAS
+        assert forbidden_match.role == ROLE_FORBIDDEN
+
+    def test_no_false_positive_fuzzy(self) -> None:
+        """Fuzzy-looking aliases must never bind (section §十一)."""
+        for v in self._summary().variants:
+            if v.variant_id in (
+                "case_m_fuzzy_doc_id", "case_n_fuzzy_documentid",
+                "case_o_fuzzy_document_ids", "case_p_fuzzy_doc",
+            ):
+                req = {m.expected_column: m.match_kind for m in v.required_matches}
+                assert req.get("document_id") == MATCH_NONE, v.variant_id
+
+
+class Test3919Snapshot:
+    def test_snapshot_exists_and_valid(self) -> None:
+        from backend.app.services.text_to_sql_semantic_result_evaluation_service import (
+            PHASE_3_9_19,
+            SNAPSHOT_3_9_19_PATH,
+        )
+        if not SNAPSHOT_3_9_19_PATH.exists():
+            pytest.skip("snapshot not yet generated")
+        payload = json.loads(SNAPSHOT_3_9_19_PATH.read_text(encoding="utf-8"))
+        assert payload["phase"] == PHASE_3_9_19
+        assert payload["parent_baseline"] == "3.9.18"
+        assert payload["real_historical_result_count"] == 12
+        assert payload["phase_3_9_18_semantic_accuracy"] == 1.0
+        assert payload["variant_count"] == len(payload["variants"])
+        assert payload["variants_expectation_met"] == payload["variant_count"]
+        assert payload["llm_calls"] == 0
+        assert payload["db_calls"] == 0
+        assert payload["network_calls"] == 0
+        # Real vs synthetic must be distinguishable (section §十三).
+        for v in payload["variants"]:
+            assert v["kind"] == "projection_variant"
         blob = json.dumps(payload, ensure_ascii=False).lower()
         for fragment in ("sk-", "postgres://", "postgresql://", "bearer "):
             assert fragment not in blob
