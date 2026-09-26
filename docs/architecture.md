@@ -529,6 +529,41 @@ LLMObservationSink.record(observation)（默认 No-op）
 
 ---
 
+## 8.8 LLM Observation Evaluation（Phase 3.10.8）
+
+Observation 是 **request-level** telemetry DTO：
+
+```text
+1 actual LLM request  →  1 Observation
+```
+
+（不是 business-operation level：T2S semantic retry 的两次
+LLM request 产生 2 个 Observation，而非一个"整个 T2S 操作"
+的 Observation。）
+
+业务链路验证原则（`tests/test_llm_observation_integration.py`）：
+
+* **RAG**：规则内 1 次 LLM request → 1 Observation（success=True）；
+  空检索 0 request → 0 Observation；
+* **Tool Calling**：每轮 LLM 各 1 个 Observation
+  （`finish_reason="tool_calls"` 与最终 `"stop"` 各自对应）；
+* **Text-to-SQL**：正常生成 1 个；semantic retry 每个实际
+  request 各 1 个（`LLMError` 直接透传，不进入语义 retry）；
+* **Refusal**：LLM 调用 1 次 → 1 个 Observation 且 `success=True`
+  （refusal 是业务结果，不是 LLM 调用失败），Validator=0；
+* **Router**：规则命中 0 request → 0 Observation；
+  LLM fallback 1 request → 1 Observation；分类结果不因 sink 改变；
+* **Orchestrator**：`observation_count == actual_llm_request_count`；
+* 失败链路：原始业务异常原样传播 + failure Observation；
+  builder / sink 故障不影响业务结果与异常；
+* 无 sink（No-op 默认）与 collecting sink 的业务结果完全一致；
+* 并发请求无 Observation 交叉；Observation 不含 prompt / SQL /
+  RAG chunks / tool arguments / secrets。
+
+当前 Observation 仍然**不持久化、不外发、不做 cost calculation**。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
