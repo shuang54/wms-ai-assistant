@@ -33,16 +33,27 @@
       OpenTelemetry / Prometheus / Langfuse / Sentry 等系统，
       不新增任何依赖；Observation 最终写到哪里留待后续阶段。
 
-接入说明（当前架构决策，Phase 3.10.6）：
+接入说明（Phase 3.10.7）：
 
-    ``OpenAICompatibleClient.chat()`` 的对外契约是
-    ``str | LLMResponse``（Phase 2 / 3.6.2 语义，不可破坏）；
-    ``LLMResponse.metadata`` 是白名单契约（provider / request_id）。
-    因此本阶段**不**把 Observation 塞入返回值或 metadata，
-    也不使用有并发缺陷的"实例最后状态"。生命周期边界为：
-    调用方在 Provider 调用前后用 ``time.perf_counter()`` 记录起点，
-    结束后调用 :func:`build_llm_observation_safe`（response 或
-    exception）得到 Observation。业务服务本阶段不接入。
+    ``OpenAICompatibleClient`` 在构造时通过 ``observation_sink``
+    注入 :class:`LLMObservationSink`（默认 :class:`NoopObservationSink`
+    ——接收但不持久化、不外发）。每次实际 Provider 请求在 ``chat()``
+    内部产生**恰好一个** Observation：
+
+        t0 = perf_counter()
+        try:
+            result = impl(...)          # 原有调用逻辑（零改动）
+        except BaseException as exc:
+            emit(build_llm_observation_safe(error=exc, ...))
+            raise                        # 原始异常原样继续传播
+        emit(build_llm_observation_safe(response=result, ...))
+        return result                    # 原样返回（identity 不变）
+
+    暴露方式为 per-client sink（request-scoped record，无共享
+    last_observation 状态 → 并发安全）；``generate()`` 内部复用
+    ``chat()``，同一请求不会重复产生 Observation。
+    ``LLMResponse.metadata`` 白名单契约（provider / request_id）
+    不受影响。
 """
 from __future__ import annotations
 
@@ -50,14 +61,19 @@ import logging
 import math
 import time
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
-from backend.app.llm.client import LLMResponse, LLMUsage
+if TYPE_CHECKING:
+    # 仅类型检查期引用（本模块运行时零依赖 client，
+    # 使 client.py 可正向 import 本模块而无循环）。
+    from backend.app.llm.client import LLMResponse, LLMUsage
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "LLMObservation",
+    "LLMObservationSink",
+    "NoopObservationSink",
     "build_llm_observation",
     "build_llm_observation_safe",
 ]
@@ -121,6 +137,29 @@ class LLMObservation:
 
 
 # ============================================================
+# Observation Sink（Phase 3.10.7：最小暴露接口）
+# ============================================================
+
+class LLMObservationSink(Protocol):
+    """接收 LLMObservation 的最小接口（Phase 3.10.7）。
+
+    Client 在每次实际 Provider 请求结束后调用 ``record()`` 恰好一次；
+    sink 实现自行决定并发安全与去向（本阶段：不持久化、不外发）。
+    """
+
+    def record(self, observation: LLMObservation) -> None:
+        """接收一条 Observation（不得抛出——Client 侧另有防御）。"""
+        ...
+
+
+class NoopObservationSink:
+    """默认 No-op sink：接收但什么都不做（不持久化、不外发、不记日志）。"""
+
+    def record(self, observation: LLMObservation) -> None:
+        return None
+
+
+# ============================================================
 # 内部 helpers（防御性提取：契约字段缺失 / 类型异常 → None）
 # ============================================================
 
@@ -144,7 +183,7 @@ def _metadata_str(response: LLMResponse, key: str) -> str | None:
 def build_llm_observation(
     *,
     started_at: float | None = None,
-    response: LLMResponse | None = None,
+    response: LLMResponse | str | None = None,
     error: BaseException | None = None,
     provider: str | None = None,
 ) -> LLMObservation:
@@ -156,7 +195,10 @@ def build_llm_observation(
     Args:
         started_at: ``time.perf_counter()`` 起点；None → latency=None
                     （不伪造测量值）。
-        response:   成功时 Provider 返回的 LLMResponse。
+        response:   成功时的调用结果：``LLMResponse``（Tool Calling
+                    契约）或 ``str``（Phase 2 契约——此时 model /
+                    finish_reason / usage / request_id 无契约依据，
+                    一律 None，provider 取显式传入值）。
         error:      失败时捕获的异常（只取类名，不取 message）。
         provider:   调用方已确定的 provider 标识（仅当 response 缺失
                     或其 metadata 无 provider 时使用；不猜测）。
@@ -191,7 +233,23 @@ def build_llm_observation(
         )
 
     assert response is not None  # noqa: S101 —— 上方已互斥校验
-    # ---- success observation ----
+
+    if isinstance(response, str):
+        # ---- Phase 2 契约结果（str）：只有 provider / latency / success ----
+        # model / usage / finish_reason / request_id 无契约依据 → None
+        # （不回退配置值，不虚构）。
+        return LLMObservation(
+            provider=provider,
+            model=None,
+            latency_ms=latency_ms,
+            success=True,
+            finish_reason=None,
+            usage=None,
+            request_id=None,
+            error_type=None,
+        )
+
+    # ---- success observation（LLMResponse 契约）----
     # provider：优先 contract 来源（metadata），缺失时用显式传入值。
     resolved_provider = _metadata_str(response, "provider") or provider
     return LLMObservation(
@@ -209,7 +267,7 @@ def build_llm_observation(
 def build_llm_observation_safe(
     *,
     started_at: float | None = None,
-    response: LLMResponse | None = None,
+    response: LLMResponse | str | None = None,
     error: BaseException | None = None,
     provider: str | None = None,
 ) -> LLMObservation | None:

@@ -63,6 +63,11 @@ import httpx
 
 from backend.app.config import LLMSettings, settings
 from backend.app.llm.deepseek_provider import DeepSeekProvider
+from backend.app.llm.observability import (
+    LLMObservationSink,
+    NoopObservationSink,
+    build_llm_observation_safe,
+)
 from backend.app.llm.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -338,6 +343,7 @@ class OpenAICompatibleClient:
         timeout_write: float = 10.0,
         timeout_pool: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        observation_sink: LLMObservationSink | None = None,
     ) -> None:
         # 配置校验：缺失即抛 LLMConfigError，由 API 层捕获 → 503
         if not api_key:
@@ -359,6 +365,13 @@ class OpenAICompatibleClient:
         )
         # 仅测试使用：传入 httpx.MockTransport 以避免真实网络
         self._transport = transport
+        # Phase 3.10.7：Observation sink（per-client 注入，request-scoped
+        # record，无共享 last_observation 状态 → 并发安全）；默认 No-op
+        # （接收但不持久化、不外发）。
+        self._observation_sink: LLMObservationSink = (
+            observation_sink if observation_sink is not None
+            else NoopObservationSink()
+        )
 
     # ---------- internal helpers ----------
 
@@ -591,6 +604,24 @@ class OpenAICompatibleClient:
             "llm_model": self._model,
         }
 
+    def _emit_observation(self, observation: object | None) -> None:
+        """把 Observation 交给 sink（Phase 3.10.7）。
+
+        Observability failure must never become business failure：
+        sink.record() 抛出任何异常时记 warning 并吞掉，
+        绝不影响 LLM 调用结果 / 原始异常传播。
+        """
+        if observation is None:
+            return
+        try:
+            self._observation_sink.record(observation)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 —— 观测失败绝不穿透为业务失败
+            logger.warning(
+                "LLM observation sink 失败（不影响业务结果）",
+                exc_info=True,
+                extra={"llm_provider": self._provider},
+            )
+
     # ---------- public API ----------
 
     async def chat(
@@ -609,7 +640,66 @@ class OpenAICompatibleClient:
         Returns:
             tools 为空时：str（assistant content，与 Phase 2 完全一致）。
             tools 非空时：LLMResponse（content 可能为 None + tool_calls）。
+
+        Phase 3.10.7（Observation 生命周期边界）：
+
+            本方法每次实际 Provider 请求产生**恰好一个** Observation
+            （经构造时注入的 sink 接收；默认 No-op——不持久化、不外发）：
+
+                started_at = perf_counter()
+                → _chat_impl（原有调用逻辑，零改动）
+                → 成功：emit(build(response=result)) → return result（原样）
+                → 失败：emit(build(error=exc)) → raise（原始异常原样传播）
+
+            Observation 失败绝不影响业务；返回值 identity / 异常行为
+            与 Phase 2 / 3.6.2 完全一致。
         """
+        started_at = time.perf_counter()
+        try:
+            result = await self._chat_impl(messages, tools)
+        except BaseException as exc:
+            # ---- failure observation：不吞、不替换原始异常（§十）----
+            self._observe_call(started_at, error=exc)
+            raise
+        # ---- success observation（result 为 LLMResponse 或 Phase 2 str）----
+        self._observe_call(started_at, response=result)
+        return result
+
+    def _observe_call(
+        self,
+        started_at: float,
+        *,
+        response: str | LLMResponse | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """构造并发射本次调用的 Observation（Phase 3.10.7）。
+
+        纵深防御：builder（build_llm_observation_safe）与 sink
+        （_emit_observation）任何一层失败都被吞掉——
+        Observability failure must never become business failure。
+        """
+        try:
+            observation = build_llm_observation_safe(
+                started_at=started_at,
+                response=response,
+                error=error,
+                provider=self._provider,
+            )
+        except Exception:  # noqa: BLE001 —— 观测失败绝不穿透为业务失败
+            logger.warning(
+                "LLM observation 构造失败（不影响业务结果）",
+                exc_info=True,
+                extra={"llm_provider": self._provider},
+            )
+            return
+        self._emit_observation(observation)
+
+    async def _chat_impl(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> str | LLMResponse:
+        """实际调用逻辑（Phase 3.10.7 起由 chat() 包裹观测；本方法零改动）。"""
         url = self._endpoint_url()
         headers = self._headers()
         payload = self._build_payload(messages, tools)
@@ -735,7 +825,10 @@ class OpenAICompatibleClient:
 # 工厂 + 单例
 # ============================================================
 
-def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMProvider:
+def create_llm_client(
+    llm_settings: LLMSettings | None = None,
+    observation_sink: LLMObservationSink | None = None,
+) -> LLMProvider:
     """根据配置创建 LLM Provider（composition/root 工厂）。
 
     规则（Phase 3.10.1 起）：
@@ -743,6 +836,9 @@ def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMProvider:
                           （现有 OpenAI-compatible Client 原样保留在
                            delegation 内层，生产行为不变）
         - api_key 为空  → MockLLMClient（带 warning 日志）
+
+    Phase 3.10.7：``observation_sink`` 仅对真实 Client 生效
+    （Mock 不产生真实调用 Observation）；None → 默认 No-op sink。
 
     业务代码应调用本工厂，而不是直接 new 具体实现，
     便于未来切换不同 Provider / 协议。
@@ -765,6 +861,7 @@ def create_llm_client(llm_settings: LLMSettings | None = None) -> LLMProvider:
             timeout_read=s.timeout_read,
             timeout_write=s.timeout_write,
             timeout_pool=s.timeout_pool,
+            observation_sink=observation_sink,
         )
     )
 

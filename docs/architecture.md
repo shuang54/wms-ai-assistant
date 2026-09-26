@@ -498,6 +498,37 @@ finish_reason / usage / request_id / error_type`。
 
 ---
 
+## 8.7 LLM Observation Integration（Phase 3.10.7）
+
+```text
+LLM call（OpenAICompatibleClient.chat）
+    ↓ started_at = perf_counter()
+    ↓ _chat_impl（原有调用逻辑，零改动）
+    ├── success → build_llm_observation_safe(response=result)
+    └── failure → build_llm_observation_safe(error=exc) → raise（原样）
+    ↓
+LLMObservationSink.record(observation)（默认 No-op）
+```
+
+* **一次实际 Provider request 最多一个 Observation**：
+  `chat()` 是唯一观测边界；`generate()` 内部复用 `chat()`，
+  不重复记录；
+* **success / failure 都产生 Observation**：失败时
+  `success=False + error_type=类名`，原始异常**原样继续抛出**
+  （不被 Observation 替换 / 吞掉）；
+* **Observation failure 不影响业务**：builder 与 sink 双层防御，
+  任何观测层故障只记 warning（返回值 identity / 异常行为与
+  Phase 2 / 3.6.2 完全一致）；
+* **暴露方式**：per-client 注入 `LLMObservationSink`（构造参数，
+  默认 `NoopObservationSink`）——request-scoped `record()`，
+  无共享 last_observation 状态 → 并发安全；
+  返回契约（`generate()→str` / `chat()→str|LLMResponse`）与
+  `LLMResponse.metadata` 白名单均不变；
+* **不持久化、不外发**、不做 cost calculation、不做 tracing
+  （Observation ≠ Logging / Metrics / Tracing System）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

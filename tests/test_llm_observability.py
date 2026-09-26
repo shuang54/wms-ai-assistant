@@ -397,3 +397,436 @@ def test_safe_wrapper_swallows_build_validation_error() -> None:
         assert observation is None  # 观测失败 → None，不抛出
     finally:
         mod._elapsed_ms = original
+
+
+# ============================================================
+# Phase 3.10.7 — Observation Integration（接入真实 Client 生命周期）
+# ============================================================
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+
+import httpx  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
+
+from backend.app.llm.client import (  # noqa: E402
+    LLMResponse,
+    LLMToolCallFormatError,
+    MockLLMClient,
+    NoopObservationSink,
+    OpenAICompatibleClient,
+    create_llm_client,
+)
+from backend.app.config import LLMSettings  # noqa: E402
+from backend.app.llm.observability import (  # noqa: E402
+    LLMObservationSink,
+    build_llm_observation as _build_for_str_contract,
+)
+from backend.app.llm.structured import parse_structured_response  # noqa: E402
+
+
+class CollectingSink:
+    """测试用 sink：内存收集全部 Observation。"""
+
+    def __init__(self) -> None:
+        self.observations: list[LLMObservation] = []
+
+    def record(self, observation: LLMObservation) -> None:
+        self.observations.append(observation)
+
+
+class FailingSink:
+    """故意失败的 sink（模拟观测层故障）。"""
+
+    def record(self, observation: LLMObservation) -> None:
+        raise RuntimeError("observation sink failure")
+
+
+_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_inventory",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+]
+
+
+def _obs_client(handler, sink=None) -> OpenAICompatibleClient:
+    return OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://api.example.com/v1",
+        model="configured-model",
+        provider="test",
+        transport=httpx.MockTransport(handler),
+        observation_sink=sink,
+    )
+
+
+def _ok_body(content: str = "hello", **overrides) -> dict:
+    body = {
+        "id": "chatcmpl-obs-1",
+        "model": "deepseek-chat",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+        },
+    }
+    body.update(overrides)
+    return body
+
+
+# ---- Test 1-5：成功调用经 sink 暴露 ----
+
+async def test_success_observation_via_sink() -> None:
+    """Test 1-5：一次真实调用（MockTransport）产生一个 Observation：
+    success / model / usage identity / metadata / latency 全部正确。"""
+    sink = CollectingSink()
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()), sink,
+    )
+
+    response = await client.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+
+    assert len(sink.observations) == 1  # 恰好一个 Observation
+    observation = sink.observations[0]
+    assert observation.success is True
+    assert observation.latency_ms is not None and observation.latency_ms >= 0
+    assert observation.model == "deepseek-chat"       # 实际响应，非配置值
+    assert observation.provider == "test"             # metadata contract
+    assert observation.request_id == "chatcmpl-obs-1"  # metadata contract
+    assert observation.finish_reason == "stop"
+    assert observation.usage is response.usage        # 复用同一 LLMUsage
+    assert observation.error_type is None
+
+
+async def test_str_path_observation_via_sink() -> None:
+    """无 tools 路径（Phase 2 str 契约）同样产生 Observation：
+    success=True、provider=client 标识；model/usage/finish_reason/
+    request_id 无契约依据 → None（不回退配置值）。"""
+    sink = CollectingSink()
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()), sink,
+    )
+
+    result = await client.chat([{"role": "user", "content": "hi"}])
+
+    assert result == "hello"
+    assert len(sink.observations) == 1
+    observation = sink.observations[0]
+    assert observation.success is True
+    assert observation.provider == "test"
+    assert observation.model is None
+    assert observation.usage is None
+    assert observation.finish_reason is None
+    assert observation.request_id is None
+    assert observation.latency_ms is not None and observation.latency_ms >= 0
+
+
+def test_build_supports_str_contract_result() -> None:
+    """build helper 直接接受 str 结果（Phase 2 契约分支）。"""
+    observation = _build_for_str_contract(response="plain", provider="p")
+    assert observation.success is True
+    assert observation.provider == "p"
+    assert observation.model is None
+    assert observation.usage is None
+    assert observation.finish_reason is None
+    assert observation.request_id is None
+
+
+# ---- Test 6 / 7：失败 observation 与原始异常传播 ----
+
+async def test_failure_observation_and_reraise() -> None:
+    """Test 6：失败调用 → sink 收到 success=False 的 Observation，
+    同时 LLMRequestError 继续向上抛出（不被吞掉）。"""
+    sink = CollectingSink()
+    client = _obs_client(
+        lambda request: httpx.Response(503, json={"error": "unavailable"}), sink,
+    )
+
+    with pytest.raises(LLMRequestError):
+        await client.chat([{"role": "user", "content": "hi"}], tools=_TOOLS)
+
+    assert len(sink.observations) == 1
+    observation = sink.observations[0]
+    assert observation.success is False
+    assert observation.error_type == "LLMRequestError"
+    assert observation.model is None
+    assert observation.usage is None
+    assert observation.request_id is None
+    assert observation.finish_reason is None
+    assert observation.provider == "test"
+    assert observation.latency_ms is not None and observation.latency_ms >= 0
+
+
+async def test_original_exception_preserved() -> None:
+    """Test 7：原始异常原样继续传播——类型不变、__cause__ 链保留
+    （Observation 接入不替换 / 不包装原始异常）。"""
+
+    def handler(request):
+        raise httpx.ConnectError("boom")
+
+    client = _obs_client(handler, CollectingSink())
+    with pytest.raises(LLMRequestError) as exc_info:
+        await client.chat([{"role": "user", "content": "hi"}], tools=_TOOLS)
+
+    assert isinstance(exc_info.value, LLMRequestError)
+    assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+
+
+# ---- Test 8：Observation failure isolation ----
+
+async def test_failing_sink_does_not_affect_success() -> None:
+    """Test 8a：sink 故意失败 → 成功调用仍然成功（结果原样）。"""
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body("ok-answer")),
+        FailingSink(),
+    )
+    result = await client.chat([{"role": "user", "content": "hi"}])
+    assert result == "ok-answer"
+
+
+async def test_failing_sink_does_not_affect_failure() -> None:
+    """Test 8b：sink 故意失败 → 失败调用仍抛原始 LLMRequestError
+    （不被 sink 异常替换）。"""
+    client = _obs_client(
+        lambda request: httpx.Response(503, json={"error": "x"}), FailingSink(),
+    )
+    with pytest.raises(LLMRequestError):
+        await client.chat([{"role": "user", "content": "hi"}])
+
+
+async def test_builder_failure_does_not_affect_business(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test 8c：Observation builder 故障 → 成功仍成功、失败仍抛
+    原始异常（Observability failure must never become business failure）。"""
+    import backend.app.llm.client as client_mod
+
+    def boom(**kwargs):
+        raise RuntimeError("builder failure")
+
+    monkeypatch.setattr(client_mod, "build_llm_observation_safe", boom)
+
+    success_client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body("fine")),
+        CollectingSink(),
+    )
+    assert await success_client.chat([{"role": "user", "content": "hi"}]) == "fine"
+
+    failure_client = _obs_client(
+        lambda request: httpx.Response(500, json={"error": "e"}),
+        CollectingSink(),
+    )
+    with pytest.raises(LLMRequestError):
+        await failure_client.chat([{"role": "user", "content": "hi"}])
+
+
+# ---- Test 9 / 10 / 11：Tool Calling / generate() / chat() 契约 ----
+
+async def test_tool_calling_observation_unchanged() -> None:
+    """Test 9：Tool Calling 路径——observation 正确记录
+    finish_reason="tool_calls"，tool_calls 本身不发生改变。"""
+    sink = CollectingSink()
+    body = _ok_body(
+        content=None,
+        finish_reason="tool_calls",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_inventory",
+                                "arguments": '{"material_code": "MAT001"}',
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=body), sink,
+    )
+    response = await client.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert response.tool_calls[0].name == "get_inventory"  # tool_calls 不变
+    assert response.tool_calls[0].arguments == {"material_code": "MAT001"}
+    assert len(sink.observations) == 1
+    assert sink.observations[0].finish_reason == "tool_calls"
+    assert sink.observations[0].success is True
+
+
+async def test_generate_single_observation() -> None:
+    """Test 10：generate() → str 仍然成立；内部经 chat() 复用，
+    一次实际 Provider request 恰好一个 Observation（不重复记录）。"""
+    sink = CollectingSink()
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()), sink,
+    )
+    answer = await client.generate("ping")
+
+    assert answer == "hello"
+    assert len(sink.observations) == 1
+    assert sink.observations[0].success is True
+    assert sink.observations[0].model is None  # str 契约：无 model 依据
+
+
+async def test_chat_return_contract_unchanged() -> None:
+    """Test 11：chat(messages) → str；chat(messages, tools=...) → LLMResponse
+    （接入 Observation 后返回契约完全不变）。"""
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()), CollectingSink(),
+    )
+    plain = await client.chat([{"role": "user", "content": "hi"}])
+    assert isinstance(plain, str)
+
+    with_tools = await client.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+    assert isinstance(with_tools, LLMResponse)
+
+
+# ---- Test 12：Structured Response 兼容 ----
+
+class _DemoAnswer(BaseModel):
+    answer: str
+
+
+async def test_structured_response_still_works() -> None:
+    """Test 12：LLMResponse.content → parse_structured_response 正常
+    （Observation 记录 LLM request，不包含 parser 延迟/职责）。"""
+    sink = CollectingSink()
+    body = _ok_body(content='{"answer":"structured-ok"}')
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=body), sink,
+    )
+    response = await client.chat(
+        [{"role": "user", "content": "hi"}], tools=_TOOLS,
+    )
+    assert isinstance(response, LLMResponse) and response.content
+
+    typed = parse_structured_response(response.content, _DemoAnswer)
+    assert typed.answer == "structured-ok"
+    assert len(sink.observations) == 1  # 不因 parser 产生额外 Observation
+
+
+# ---- Test 14：并发安全 ----
+
+async def test_concurrent_requests_no_cross_talk() -> None:
+    """Test 14：同一 client 并发 5 个请求 → 5 个 Observation，
+    request_id 互不相同（无共享 last_observation 状态导致交叉覆盖）。"""
+    sink = CollectingSink()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        tag = body["messages"][0]["content"]  # req-0 .. req-4
+        return httpx.Response(
+            200,
+            json={
+                "id": f"chatcmpl-{tag}",
+                "model": "deepseek-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant",
+                                    "content": f"answer-{tag}"},
+                    }
+                ],
+            },
+        )
+
+    client = _obs_client(handler, sink)
+    results = await asyncio.gather(
+        *[
+            client.chat([{"role": "user", "content": f"req-{i}"}],
+                        tools=_TOOLS)
+            for i in range(5)
+        ]
+    )
+
+    assert all(r.content == f"answer-req-{i}" for i, r in enumerate(results))
+    assert len(sink.observations) == 5  # 每个请求恰好一个 Observation
+    request_ids = {obs.request_id for obs in sink.observations}
+    assert request_ids == {f"chatcmpl-req-{i}" for i in range(5)}  # 无交叉
+    assert all(obs.success for obs in sink.observations)
+
+
+# ---- 默认行为 / 工厂透传 / No-op ----
+
+async def test_noop_sink_is_default_and_harmless() -> None:
+    """默认（不传 sink）= No-op：调用行为完全不变、无异常。"""
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()),
+        None,
+    )
+    assert isinstance(client._observation_sink, NoopObservationSink)
+    assert await client.generate("hi") == "hello"
+
+    NoopObservationSink().record(
+        build_llm_observation(response=_full_response())
+    )  # no-op，不抛出
+
+
+def test_create_llm_client_passes_sink_to_real_client() -> None:
+    """工厂把 sink 透传给真实 Client（Mock 分支不产生 Observation）。"""
+    sink = CollectingSink()
+    llm_settings = LLMSettings(
+        api_key="k", base_url="https://api.example.com/v1", model="m",
+    )
+    provider = create_llm_client(llm_settings, observation_sink=sink)
+    assert provider._client._observation_sink is sink  # type: ignore[attr-defined]
+
+
+def test_sink_protocol_structural() -> None:
+    """CollectingSink / FailingSink / NoopObservationSink 均满足
+    LLMObservationSink Protocol（structural typing）。"""
+    def _accept(sink: LLMObservationSink) -> LLMObservationSink:
+        return sink
+
+    assert _accept(CollectingSink()) is not None
+    assert _accept(FailingSink()) is not None
+    assert _accept(NoopObservationSink()) is not None
+
+
+async def test_observations_never_contain_prompt_content() -> None:
+    """§二十一：Observation 不携带请求内容（messages / prompt），
+    接入后字段白名单未扩大。"""
+    import dataclasses
+
+    sink = CollectingSink()
+    client = _obs_client(
+        lambda request: httpx.Response(200, json=_ok_body()), sink,
+    )
+    secret_prompt = "SECRET-PROMPT-CONTENT-XYZ"
+    await client.chat([{"role": "user", "content": secret_prompt}],
+                      tools=_TOOLS)
+
+    as_dict = dataclasses.asdict(sink.observations[0])
+    assert set(as_dict) <= {
+        "provider", "model", "latency_ms", "success",
+        "finish_reason", "usage", "request_id", "error_type",
+    }
+    assert secret_prompt not in str(as_dict)
