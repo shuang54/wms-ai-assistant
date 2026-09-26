@@ -44,6 +44,9 @@ from backend.app.services.text_to_sql_baseline_stability_service import (  # noq
 from backend.app.services.text_to_sql_prompt_candidate_v2_service import (  # noqa: E402
     SNAPSHOT_3_9_22_PATH,
 )
+from backend.app.services.text_to_sql_prompt_v2_stability_service import (  # noqa: E402
+    SNAPSHOT_3_9_23_PATH,
+)
 from backend.app.config import settings  # noqa: E402
 
 _VARIANT_RESULT_PATHS = {
@@ -256,7 +259,93 @@ def _run_check() -> int:
             print(f"    deepseek/db/network = "
                   f"{calls.get('deepseek_calls')}/{calls.get('db_calls')}/"
                   f"{calls.get('network_calls')}")
+
+    # ---- Phase 3.9.23 ----
+    if not SNAPSHOT_3_9_23_PATH.exists():
+        print("SKIP: 3.9.23 v2 stability snapshot not generated yet")
+    else:
+        from backend.app.services.text_to_sql_prompt_v2_stability_service import (
+            validate_v2_stability_snapshot,
+        )
+        snapshot = json.loads(
+            SNAPSHOT_3_9_23_PATH.read_text(encoding="utf-8")
+        )
+        problems = validate_v2_stability_snapshot(snapshot)
+        if problems:
+            print("FAIL: 3.9.23 v2 stability snapshot check failed")
+            for problem in problems:
+                print(f"  - {problem}")
+            exit_code = 1
+        else:
+            s = snapshot.get("summary") or {}
+            calls = s.get("calls") or {}
+            bs = snapshot.get("baseline_stability") or {}
+            cs = snapshot.get("candidate_stability") or {}
+            print("OK: 3.9.23 v2 stability snapshot consistent "
+                  "(6 runs, hashes frozen, all recomputations aligned)")
+            print(f"    baseline stable/non-det = "
+                  f"{bs.get('stable_cases')}/{bs.get('non_deterministic_cases')}")
+            print(f"    candidate stable/non-det = "
+                  f"{cs.get('stable_cases')}/{cs.get('non_deterministic_cases')}")
+            print(f"    regression_cases = {len(snapshot.get('regression_cases') or [])}"
+                  f" | improvement_cases = {len(snapshot.get('improvement_cases') or [])}")
+            print(f"    deepseek/db/network = "
+                  f"{calls.get('deepseek_calls')}/{calls.get('db_calls')}/"
+                  f"{calls.get('network_calls')}")
     return exit_code
+
+
+def _run_v2_stability() -> int:
+    """Phase 3.9.23: Baseline v1 x3 + Candidate v2 x3 (84 generate calls)."""
+    from backend.app.services.text_to_sql_prompt_v2_stability_service import (
+        SNAPSHOT_3_9_23_PATH,
+        REPORT_3_9_23_PATH,
+        V2StabilityRunner,
+        check_experiment_frozen,
+    )
+    from backend.app.services.text_to_sql_prompt_candidate_v2_service import (
+        build_v2_runner,
+    )
+    from backend.app.services.sql_validator_service import SQLValidatorService
+    from backend.app.services.text_to_sql_evaluation_service import (
+        StaticEvaluationContextResolver,
+    )
+    from scripts._text_to_sql_offline_bindings import (
+        build_offline_project_bindings,
+    )
+
+    problems = check_experiment_frozen()
+    if problems:
+        print("EXPERIMENT INVALID: prompts / data are not frozen")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
+
+    _verify_environment()
+    runner = build_v2_runner(
+        context_resolver=StaticEvaluationContextResolver(
+            bindings=build_offline_project_bindings()
+        ),
+        validator=SQLValidatorService(),
+        executor=None,
+    )
+    stability = V2StabilityRunner(runner=runner)
+    summary = asyncio.run(stability.run())
+
+    snapshot = summary.to_snapshot_dict()
+    SNAPSHOT_3_9_23_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_3_9_23_PATH.write_text(
+        json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    REPORT_3_9_23_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REPORT_3_9_23_PATH.write_text(summary.render_report(), encoding="utf-8")
+
+    print(summary.render_summary())
+    print()
+    print(f"Snapshot written: {SNAPSHOT_3_9_23_PATH}")
+    print(f"Report written:   {REPORT_3_9_23_PATH}")
+    return 0
 
 
 def _run_candidate_v2() -> int:
@@ -374,7 +463,7 @@ def main() -> int:
         "--check",
         action="store_true",
         help="offline snapshot integrity for 3.9.20 + 3.9.21 + 3.9.22 "
-             "(no LLM/DB/network)",
+             "+ 3.9.23 (no LLM/DB/network)",
     )
     parser.add_argument(
         "--candidate-v2",
@@ -382,10 +471,18 @@ def main() -> int:
         help="Phase 3.9.22: run Baseline v1 vs Candidate v2 A/B "
              "(28 DeepSeek calls)",
     )
+    parser.add_argument(
+        "--v2-stability",
+        action="store_true",
+        help="Phase 3.9.23: Baseline v1 x3 + Candidate v2 x3 repeated "
+             "stability validation (84 generate calls)",
+    )
     args = parser.parse_args()
 
     if args.check:
         return _run_check()
+    if args.v2_stability:
+        return _run_v2_stability()
     if args.candidate_v2:
         return _run_candidate_v2()
     if args.repeat is not None:
