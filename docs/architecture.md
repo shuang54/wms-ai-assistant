@@ -467,6 +467,37 @@ Contract 不变量（Phase 3.10.5 加固）：
 
 ---
 
+## 8.6 LLM Observability Contract（Phase 3.10.6）
+
+```text
+LLM Request → LLMProvider → LLMResponse / Exception
+                                   ↓
+                     build_llm_observation_safe（llm/observability.py）
+                                   ↓
+                          LLMObservation（内部 DTO）
+```
+
+`LLMObservation` 字段：`provider / model / latency_ms / success /
+finish_reason / usage / request_id / error_type`。
+
+* **内部 DTO**：Observation 是结构化数据对象，只记录**调用元数据**，
+  不是 Logging / Metrics / Tracing System；
+* **不记录调用内容**：无 messages / system_prompt / tool definitions /
+  SQL / RAG chunks；
+* **不记录 secrets**：无 API Key / Authorization / password / headers /
+  raw response；失败只记 `error_type = type(exc).__name__`
+  （不含 exception message / stack trace）；
+* **usage 与 cost 分离**：usage 复用 `LLMUsage`，
+  无 cost / price / currency 字段；
+* **Observation failure 不影响业务**：`build_llm_observation_safe`
+  构造失败返回 `None` + warning，绝不抛出；
+* **当前不持久化**（无 DB / Redis / 文件写入），不接
+  OpenTelemetry / Prometheus / Langfuse；无新增依赖；
+* latency 由调用方以 `time.perf_counter()` 起点传入（无法测量时
+  `None`，不伪造）；`request_id` 只来自 `LLMResponse.metadata`。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
