@@ -1363,6 +1363,57 @@ Facade 不吞异常、不包装、不转换成 None。
   boundary，数据仍是 §8.19 的 Usage 白名单字段；
 * 无缓存 / 无全局状态 / 无 fire-and-forget（调用方必须 `await`）。
 
+## 8.22 Usage Analytics HTTP Read API（Phase 3.10.22，已设计 / 待实现）
+
+在 Usage Analytics Read Facade 之上增加**只读 HTTP Application API**：
+
+```text
+HTTP GET /api/usage/analytics
+  ↓
+Usage Analytics API（只读 Router，仅 HTTP / Schema / 异常映射）
+  ↓
+LLMUsageAnalyticsReadFacade（§8.21 Application Read Boundary）
+  ↓
+LLMUsageQueryRuntimeBridge（async → sync DB boundary）
+  ↓
+LLMUsageQueryService → LLMUsageRepository
+  ↓
+LLMUsageAnalyticsService（Snapshot 唯一实现）
+  ↓
+PostgreSQL
+```
+
+### 契约要点
+
+* 端点：`GET /api/usage/analytics`（沿用统一 `/api` prefix，
+  `include_router(usage.router, prefix="/api", tags=["usage"])`）；
+* HTTP Query 参数与 `LLMUsageQueryFilter` 字段一一映射
+  （request_id / provider / model / created_at_from / created_at_to /
+  limit / offset），复用 Filter 既有校验，不定义第二套 Filter
+  或分页常量；
+* 响应为 `LLMUsageAnalyticsSnapshot` 四视图的只读投影
+  （API 层 Pydantic DTO 镜像；frozen Domain DTO 不变）；
+* 分页语义保持 §8.21：Analytics = 当前 Filter 命中的本页记录集合，
+  无 global_total / COUNT(*)；
+* 错误映射沿用项目规范：Filter 输入非法 → 422；Repository
+  故障（含 DB 未配置）→ 502；Analytics / Aggregation 内部输入
+  错误 → 500；未知异常原样上抛（Starlette 兜底 500）。
+
+### 依赖与安全边界
+
+```text
+允许：HTTP API → LLMUsageAnalyticsReadFacade（唯一下游入口）
+禁止：HTTP API → Repository / Session / Engine / SQL / PostgreSQL
+禁止：HTTP API → LLM 调用 / API Key / 数据库连接串 / DB 写操作
+```
+
+详细 Contract（参数映射 / Response 结构 / 错误映射 / 依赖注入 /
+测试策略 / 非目标）：
+`docs/evaluation/Phase 3.10.22 — HTTP Read API Contract.md`。
+
+状态：**已实现**（Step 2：`backend/app/api/usage.py` +
+`tests/test_usage_analytics_api.py`；实现与 Contract 一致）。
+
 ---
 
 # 9. Prompt Architecture
