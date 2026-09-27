@@ -1044,6 +1044,73 @@ No asyncpg introduced
 
 ---
 
+## 8.19 LLM Usage Aggregation Contract（Phase 3.10.19）
+
+在**不修改数据库、不新增 API、不做 Dashboard、不引入 Billing** 的前提下，
+为 Usage 建立纯内存聚合 Contract：
+
+```text
+Persistence
+    ↓
+Idempotency
+    ↓
+PostgreSQL
+    ↓
+Query Repository
+    ↓
+Query Service
+    ↓
+Query Runtime
+    ↓
+LLMUsageRecordView
+    ↓
+Aggregation（backend/app/services/llm_usage_aggregation_service.py）
+    ↓
+LLMUsageAggregate / 分组结果
+```
+
+明确：
+
+```text
+Aggregation ≠ Billing
+Aggregation ≠ Cost Calculation
+Aggregation ≠ Dashboard
+Aggregation ≠ API
+```
+
+规则：
+
+1. **Pure / Deterministic / In-memory**：无 IO / 无网络 / 无 DB /
+   无 SQL / 无 Session / 无 Repository——Aggregation 不知道
+   PostgreSQL 的存在；不做缓存、无全局状态；
+2. **基础聚合**：`aggregate(records)` → `total_requests` +
+   `prompt_tokens` / `completion_tokens` / `total_tokens` 求和；
+3. **三个 token 列是独立观测值**：`total_tokens` 直接对 Provider
+   原值求和，**绝不重算为 `prompt + completion`**（不修改 Usage
+   Contract，§十三）；
+4. **NULL ≠ 0（§七）**：token 为 `None` = 未知 / 不可用——
+   不计入求和、也绝不当作 0；未知信息通过
+   `prompt_tokens_known` / `completion_tokens_known` /
+   `total_tokens_known` 显式保留（`False` = 至少一条记录该列未知，
+   求和只是已知部分）；空输入 → 零值合法结果（不 None、不抛异常）；
+5. **分组**：`aggregate_by_provider()` / `aggregate_by_model()` /
+   `aggregate_by_provider_model()`；`None` 维度构成独立分组
+   （原样保留，不合并成 unknown 字符串）；分组 DTO 为 frozen tuple，
+   **不对外暴露裸 dict**；
+6. **确定性排序**：分组按 key 升序，`None` 分组在该维度排在最后；
+   同一输入（任意顺序）恒得同一输出——不依赖数据库返回顺序 /
+   dict insertion order / 线程完成顺序；
+7. **不去重**：两条完全相同的记录 = 两次 Usage；
+8. **DTO frozen**：`LLMUsageAggregate` 及分组 DTO 全部 immutable；
+9. **无 Cost**：不接 `LLMPricing` / `LLMCost` /
+   `calculate_llm_cost()`，无 currency / price / cost 字段
+   （Billing 属于后续独立阶段）；
+10. **职责分离**：Query Service 保持 `list → List[View]` 不变，
+    Aggregation 独立成层；未来 Analytics 由上层组合
+    `Query → Aggregation`（Aggregation 本身永远不接触数据库）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
