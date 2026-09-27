@@ -980,6 +980,70 @@ Read Boundary
 
 ---
 
+## 8.18 LLM Usage Query Async Runtime Boundary（Phase 3.10.18）
+
+Phase 3.10.17 的 Query Read Boundary 是**同步**的；在 async 业务链路里
+直接调用会阻塞 event loop。本阶段只加一层**线程边界**（与 §8.15 的
+Persistence Runtime 同构），不改数据库体系：
+
+```text
+Synchronous DB Query Layer（保持不变）
+        ↓
+LLMUsageQueryService（仍然是 def：CLI / Test / sync code 可直接用）
+        ↓ asyncio.to_thread（唯一新增的一步）
+LLMUsageQueryRuntimeBridge（Async Runtime Boundary）
+        ↓
+async caller（必须 await，禁止 fire-and-forget）
+```
+
+```text
+event loop thread
+   ↓ asyncio.to_thread()
+worker thread
+   ↓ session_factory()        ← Session 只在 worker 线程内创建
+Repository（同步）
+   ↓
+PostgreSQL
+```
+
+明确：
+
+```text
+Repository remains synchronous
+Database driver remains unchanged
+No AsyncSession introduced
+No asyncpg introduced
+```
+
+规则：
+
+1. **Bridge 不复制 Query 逻辑**：不写 SQL、不持有 Session，只调用
+   `LLMUsageQueryService` 现有方法（Repository = DB，Service = Query
+   Contract，Bridge = Async Boundary）；
+2. **同步 Service 不变**：`query()` / `list_records()` /
+   `get_by_request_id()` 仍是同步 `def`；async 入口是
+   `query_async()` / `list_records_async()` / `get_by_request_id_async()`；
+3. **Session 不跨线程 / 跨 task 共享**：一次查询 = 一个 worker 执行 =
+   一个独立 Session（用完即关闭）；Session 绝不在 event loop 线程创建；
+4. **无 fire-and-forget**：无 `create_task` / `ensure_future` /
+   background task；调用方必须 `await`；
+5. **无进程级状态**：无 global Session / Connection / 结果缓存 /
+   LRU / dict / set（本阶段不做缓存）；
+6. **错误可观察（与 Persistence 不同）**：Persistence 是 best-effort
+   accounting（失败降级为 warning）；Query 是显式读操作——
+   `LLMUsageQueryError` / `LLMUsageRepositoryError` **原样传播**给调用方，
+   绝不吞掉、绝不返回空结果伪装成功；
+7. **Cancellation**：Query 是主动读取请求，caller cancellation **允许
+   向调用方传播**（不复制 Persistence 的 absorb 语义）；
+8. **READ ONLY**：仍然只有 SELECT（无 INSERT / UPDATE / DELETE）；
+9. **Contract 不变**：`LLMUsageQueryFilter` / `LLMUsageRecordView` 字段、
+   frozen、timezone-aware `created_at` 全部不变；
+10. **Repository SQL 不变**：`build_record_select()` / `list_records()` /
+    `get_by_request_id()`、显式 8 列、`ORDER BY created_at DESC, id DESC`、
+    request_id 唯一契约、索引全部不变。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
