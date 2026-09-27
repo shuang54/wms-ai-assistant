@@ -778,6 +778,87 @@ PostgreSQL: llm_usage_record
 
 ---
 
+## 8.15 LLM Usage Persistence Runtime Boundary（Phase 3.10.15）
+
+Phase 3.10.14 解决了"Usage 能不能正确落库"；本小节解决
+"落库**在什么线程里发生**"。
+
+```text
+Async LLM Request（event loop 线程）
+        │
+        ▼
+   LLMObservation
+        │
+        ▼
+ DatabaseLLMAccountingSink
+        │  record()   同步入口（契约不变）
+        │  arecord()  异步入口（async 请求路径选用）
+        ▼
+ LLMUsagePersistenceRuntimeBridge        ← 唯一的运行时边界
+        │  await asyncio.to_thread(service.persist, observation)
+        ▼  ── 线程边界 ────────────────────────────────
+ LLMUsagePersistenceService（同步，逻辑不变）
+        ▼
+ LLMUsageRepository.create()
+        │  with factory() as session, session.begin():
+        ▼
+ ai_ops.llm_usage_record
+```
+
+关键原则：
+
+```text
+LLM Business Result
+        │
+        ├──────────────► caller
+        │
+        └──────────────► optional persistence（失败不影响上面这条）
+```
+
+规则：
+
+1. **Persistence 不属于 LLM Business Result**：持久化成功或失败都不
+   改变 `chat()` / `generate()` 的返回值与异常行为；
+   `DatabaseLLMAccountingSink` 内部任何异常一律降级为 warning；
+2. **Repository Session 不跨线程共享**：bridge 搬运的只有
+   `LLMObservation`（frozen 数据），**不搬运** Session / Connection /
+   Transaction；worker 线程内部由既有 `session_factory()` 创建新的
+   Session（`with factory() as session, session.begin():`），
+   commit / rollback 都在该线程内完成；
+3. **只有 runtime bridge 建立线程边界**（`asyncio.to_thread`，与项目
+   `SqlExecutorService` / `get_inventory` 既有做法一致）：LLM Client /
+   Repository / Persistence Service 都不自行 `to_thread`；
+4. **不使用 fire-and-forget**：`arecord()` 必须由调用方 `await`
+   （禁止 `create_task` / `ensure_future`），避免 task 生命周期、
+   shutdown、异常逃逸、数据丢失问题；
+5. **不做 retry**：repository 调用次数恒为 1；无 backoff / sleep /
+   retry queue；
+6. **不做 queue / worker / outbox**：无 Kafka / Redis / RabbitMQ /
+   Celery 等任何基础设施；
+7. **不做 aggregation**：仍然是 request-level 一行；无 daily /
+   monthly / user / project 汇总；
+8. **不做 billing**：无 cost / price / currency 落库
+   （Cost 仍只在 `accounting.calculate_llm_cost` 计算层）；
+9. **默认仍为 `NoopAccountingSink`**：`create_llm_client()` 不传
+   `accounting_sink` 时不会连数据库、不会产生线程边界；必须显式注入
+   `DatabaseLLMAccountingSink` 才启用持久化；
+10. **同步 Contract 不变**：`sink.record(observation)` 仍然是同步调用
+    （既有测试与同步调用方零改动），`arecord()` 是 optional 增量；
+11. **不新增 Persistence DTO**：继续复用 `LLMObservation` / `LLMUsage` /
+    `LLMUsageRecord`；字段白名单与 §8.14 完全一致。
+
+已知限制（本阶段刻意不做）：
+
+* 持久化仍发生在业务返回之前被 await（与 Phase 3.10.14 的先后顺序一致），
+  改善的是"不占用 event loop 线程"，不是"从关键路径移除"——
+  后者需要 queue / worker / outbox，与 §二 禁止项冲突；
+* caller cancellation 落在持久化窗口时，由 persistence boundary
+  吸收（`CancelledError` → warning），保证**已完成的** LLM Business
+  Result 不被破坏；worker 线程内的事务自然结束
+  （独立 Session，无共享资源）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

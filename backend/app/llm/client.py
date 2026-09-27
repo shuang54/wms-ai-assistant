@@ -48,6 +48,14 @@ Phase 3.10.4 Metadata / Usage Contract：
     usage ≠ cost tracking；metadata ≠ observability system。
     SDK response 只存在于 Client / Provider 层，上层只见 LLMResponse。
 
+Phase 3.10.15 Persistence Runtime Boundary：
+
+    accounting sink 若提供可选异步入口 ``arecord()``（如
+    DatabaseLLMAccountingSink），由本 Client 在 async 请求路径
+    await；否则退回原同步 ``record()``（行为完全不变）。
+    不使用 create_task / fire-and-forget；LLM 业务结果与 Retry 行为
+    不受持久化影响。
+
 详见 docs/architecture.md §8、AGENTS.md §9。
 """
 from __future__ import annotations
@@ -681,10 +689,10 @@ class OpenAICompatibleClient:
             result = await self._chat_impl(messages, tools)
         except BaseException as exc:
             # ---- failure observation：不吞、不替换原始异常（§十）----
-            self._observe_call(started_at, error=exc)
+            await self._observe_call(started_at, error=exc)
             raise
         # ---- success observation（internal LLMResponse：usage 全可见）----
-        self._observe_call(started_at, response=result)
+        await self._observe_call(started_at, response=result)
         # ---- compatibility boundary（Phase 3.10.12）----
         if tools:
             return result
@@ -693,7 +701,7 @@ class OpenAICompatibleClient:
             return ""
         return content
 
-    def _observe_call(
+    async def _observe_call(
         self,
         started_at: float,
         *,
@@ -703,8 +711,11 @@ class OpenAICompatibleClient:
         """构造并发射本次调用的 Observation（Phase 3.10.7）。
 
         纵深防御：builder（build_llm_observation_safe）与 sink
-        （_emit_observation）任何一层失败都被吞掉——
+        （_emit_observation / _emit_accounting）任何一层失败都被吞掉——
         Observability failure must never become business failure。
+
+        Phase 3.10.15：本方法在 async 路径中被 await（accounting sink
+        可能需要线程边界），因此改为 coroutine。
         """
         try:
             observation = build_llm_observation_safe(
@@ -721,9 +732,9 @@ class OpenAICompatibleClient:
             )
             return
         self._emit_observation(observation)
-        self._emit_accounting(observation)
+        await self._emit_accounting(observation)
 
-    def _emit_accounting(self, observation: LLMObservation) -> None:
+    async def _emit_accounting(self, observation: LLMObservation) -> None:
         """把 Observation 交给 accounting sink（Phase 3.10.11）。
 
         每次实际 Provider 请求（成功或失败）emit 恰好一次；
@@ -734,9 +745,23 @@ class OpenAICompatibleClient:
         与 Observation sink 相互独立；纵深防御同 _emit_observation：
         sink 异常记 warning 并吞掉，绝不影响 LLM 调用结果与
         原始异常传播。默认 No-op → 不持久化、不外发、无 aggregation。
+
+        Phase 3.10.15 Runtime Boundary：
+
+            * sink 提供可选异步入口 ``arecord()`` 时走 await
+              （把同步 DB 写入搬出 event loop 线程）；
+            * 只提供同步 ``record()`` 的 sink 行为**完全不变**
+              （仍是同步调用；emit 位置在 client 内部，无跨线程共享）；
+            * 不引入 fire-and-forget / create_task：await 保证
+              persistence 生命周期可控、异常可收敛。
         """
+        sink = self._accounting_sink
+        arecord = getattr(sink, "arecord", None)
         try:
-            self._accounting_sink.record(observation)
+            if arecord is not None:
+                await arecord(observation)
+            else:
+                sink.record(observation)
         except Exception:  # noqa: BLE001 —— accounting 失败绝不穿透为业务失败
             logger.warning(
                 "LLM accounting sink 失败（不影响业务结果）",

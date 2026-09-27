@@ -1,4 +1,5 @@
-"""LLM Usage Persistence Boundary（Phase 3.10.14）。
+"""LLM Usage Persistence Boundary（Phase 3.10.14；
+Phase 3.10.15 增加 Runtime Boundary）。
 
 层次（任务书 §二十四）：
 
@@ -11,6 +12,19 @@
         ↓ LLMUsagePersistenceService
         ↓ LLMUsageRepository
         ↓ PostgreSQL.llm_usage_record
+
+Phase 3.10.15 Runtime Boundary（新增，但不是新的 persistence 层）：
+
+    异步请求线程（event loop）
+        ↓  await DatabaseLLMAccountingSink.arecord(observation)
+    LLMUsagePersistenceRuntimeBridge（asyncio.to_thread → worker thread）
+        ↓
+    同步 LLMUsagePersistenceService / LLMUsageRepository（逻辑不变）
+
+    * ``record()`` 同步契约保持原样（既有同步测试与调用方不变）；
+    * ``arecord()`` 是新增的 **optional** async 入口，内部走线程边界，
+      必须被 await（不使用 fire-and-forget / create_task）；
+    * 两条入口异常语义一致：收敛为 warning，绝不改变业务结果。
 
 为什么放在 services/（而不是 backend/app/llm/）：
 
@@ -36,6 +50,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from backend.app.db.llm_usage_repository import (
@@ -44,6 +59,9 @@ from backend.app.db.llm_usage_repository import (
 )
 from backend.app.llm.accounting_consumer import consume_usage
 from backend.app.llm.observability import LLMObservation
+from backend.app.services.llm_usage_persistence_runtime import (
+    LLMUsagePersistenceRuntimeBridge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +140,22 @@ class DatabaseLLMAccountingSink:
         record() 内部任何异常只记录 warning 后返回——
         LLM 业务结果不因 usage 持久化失败而改变，
         且不触发 retry / sleep / 队列。
+
+    Phase 3.10.15 Runtime Boundary：
+
+        * ``record(observation)``  —— 同步入口，契约与行为完全不变；
+        * ``arecord(observation)`` —— 异步入口（optional）：经
+          ``LLMUsagePersistenceRuntimeBridge`` 把**同一套同步持久化**
+          放进 worker 线程执行后 await，避免阻塞 event loop；
+          由 LLM Client 在 async 请求路径自动选用（getattr 探测），
+          无 bridge 需求的同步调用方不受影响。
     """
 
     def __init__(
         self,
         persistence_service: LLMUsagePersistenceService | None = None,
         repository: LLMUsageRepository | None = None,
+        runtime_bridge: LLMUsagePersistenceRuntimeBridge | None = None,
     ) -> None:
         """构造 sink。
 
@@ -135,30 +163,83 @@ class DatabaseLLMAccountingSink:
             persistence_service: 持久化服务；None 时按 repository 构造。
             repository:          Usage 仓储；None 时用默认仓储
                                  （persistence_service 为 None 时生效）。
+            runtime_bridge:      Phase 3.10.15 异步运行时边界；None 时
+                                 用默认 bridge（asyncio.to_thread →
+                                 同一 persistence_service）。
         """
         self._service = (
             persistence_service
             if persistence_service is not None
             else LLMUsagePersistenceService(repository=repository)
         )
+        self._bridge = (
+            runtime_bridge
+            if runtime_bridge is not None
+            else LLMUsagePersistenceRuntimeBridge(
+                persistence_service=self._service
+            )
+        )
 
     def record(self, observation: LLMObservation) -> None:
-        """接收 Observation 并持久化其 usage 事实。
+        """接收 Observation 并持久化其 usage 事实（**同步契约不变**）。
 
         只读取 usage / request_id / provider / model；
         不计算 cost、不聚合、不修改 observation；
         异常 → warning（绝不传播到业务链路）。
+
+        Phase 3.10.15：既有同步入口保持 100% 向后兼容
+        （仍然是同步调用、同步返回、吞掉异常）。异步请求路径请走
+        :meth:`arecord` —— 两者持久化语义完全一致。
         """
         try:
             self._service.persist(observation)
-        except LLMUsageRepositoryError as exc:
+        except Exception as exc:  # noqa: BLE001 —— 持久化失败绝不穿透为业务失败
+            self._log_persistence_failure(exc)
+
+    async def arecord(self, observation: LLMObservation) -> None:
+        """异步入口：把**同步持久化**放进 worker 线程后 await。
+
+        Runtime Boundary（Phase 3.10.15）：
+
+            event loop thread
+                ↓ await（必须由调用方 await；禁止 create_task / fire-and-forget）
+            asyncio.to_thread(service.persist, observation)
+                ↓
+            worker thread：session_factory() → 新 Session → commit/rollback
+
+        语义与 :meth:`record` 完全一致（同一 service / repository /
+        字段白名单 / usage=None 不写入）。区别只在执行的线程。
+
+        异常收敛（**不得让 persistence 影响业务结果**）：
+
+            * LLMUsageRepositoryError → warning（事务已回滚）；
+            * 其它 Exception          → warning（含 exc_info）；
+            * asyncio.CancelledError  → warning 后返回
+              —— 持久化期间的 caller cancellation 不得破坏**已经完成**
+              的 LLM Business Result（任务书 §十八）。
+        """
+        try:
+            await self._bridge.persist_async(observation)
+        except asyncio.CancelledError:
+            # 已完成的 LLM 业务结果不应被可选的持久化链路取消掉；
+            # worker 线程内的写入会在自己的事务里自然结束（独立 Session）。
+            logger.warning(
+                "LLM usage 持久化被取消（不影响已完成的业务结果）",
+                exc_info=False,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 持久化失败绝不穿透为业务失败
+            self._log_persistence_failure(exc)
+
+    def _log_persistence_failure(self, exc: BaseException) -> None:
+        """持久化故障统一降级为 warning（两条入口共用）。"""
+        if isinstance(exc, LLMUsageRepositoryError):
             logger.warning(
                 "LLM usage 持久化失败（不影响业务结果）: %s",
                 exc,
                 exc_info=False,
             )
-        except Exception:  # noqa: BLE001 —— 持久化失败绝不穿透为业务失败
-            logger.warning(
-                "LLM usage 持久化失败（不影响业务结果）",
-                exc_info=True,
-            )
+            return
+        logger.warning(
+            "LLM usage 持久化失败（不影响业务结果）",
+            exc_info=True,
+        )
