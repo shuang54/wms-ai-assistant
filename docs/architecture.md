@@ -1234,6 +1234,137 @@ Usage Analytics  ≠  Cost Calculation  ≠  Billing  ≠  Dashboard  ≠  API
 
 ---
 
+## 8.21 Usage Analytics Application Read Facade（Phase 3.10.21）
+
+在 Query / Aggregation / Analytics 之上增加**应用层只读入口**：
+
+```text
+LLM Request
+  ↓
+Observation
+  ↓
+Accounting
+  ↓
+Persistence
+  ↓
+Idempotency
+  ↓
+PostgreSQL
+  ↓
+Query Repository        （负责数据库读取）
+  ↓
+Query Service           （负责 Query Contract / Filter / Pagination）
+  ↓
+Query Runtime           （负责 async → sync DB boundary）
+  ↓
+LLMUsageRecordView
+  ↓
+Usage Aggregation       （纯内存 sum / count / grouping）
+  ↓
+Usage Analytics         （Analytics / Aggregation composition）
+  ↓
+Usage Analytics Read Facade（Application Read Boundary）
+  ↓
+Future API / Dashboard / Admin / AI Ops   ← 仅未来消费者，本阶段未实现
+```
+
+入口：`backend/app/services/llm_usage_analytics_facade.py`
+
+```text
+LLMUsageAnalyticsReadFacade(query_runtime, analytics_service=None)
+
+async query_snapshot(query_filter=None)   → LLMUsageAnalyticsSnapshot
+async query_summary(query_filter=None)    → LLMUsageAggregate
+async query_by_provider(query_filter=None)
+async query_by_model(query_filter=None)
+async query_by_provider_model(query_filter=None)
+```
+
+### 四层职责（Facade 之前已各司其职）
+
+```text
+Query Repository         → 数据库读取
+Query Service            → Query Contract / Filter / Pagination
+Query Runtime            → async → sync DB boundary
+Analytics Service        → Analytics / Aggregation composition
+Analytics Read Facade    → Application Read Boundary（只组合，不计算）
+```
+
+**Facade 不负责数据库访问。**
+
+### 依赖边界
+
+```text
+允许：Facade → LLMUsageQueryRuntime（唯一 DB 途经）
+           → LLMUsageAnalyticsService（Snapshot 唯一实现）
+
+禁止：Facade → Repository
+           → SQLAlchemy Session / Engine / Connection / SQL / PostgreSQL
+```
+
+构造校验：`query_runtime` 为 None 或缺少 `query_async()` → `TypeError`；
+`analytics_service=None` → 默认 `LLMUsageAnalyticsService()`。
+
+### Snapshot 语义（一次查询 → 完整四视图）
+
+```text
+query_snapshot(query_filter)
+    ↓ Runtime 查询 1 次（不是四次数据库查询）
+records: list[LLMUsageRecordView]
+    ↓ LLMUsageAnalyticsService.snapshot(records)
+LLMUsageAnalyticsSnapshot（frozen）
+    ├── total              （LLMUsageAggregate）
+    ├── by_provider        （tuple[ProviderUsageAggregate, ...]）
+    ├── by_model           （tuple[ModelUsageAggregate, ...]）
+    └── by_provider_model  （tuple[ProviderModelUsageAggregate, ...]）
+```
+
+Facade 不重新实现 Snapshot（无 `tuple(records)` 物化逻辑），
+Snapshot 的唯一实现仍是 `LLMUsageAnalyticsService`。
+
+### Pagination 语义
+
+```text
+Facade Analytics = 当前 Query Filter 对应记录集合的 Analytics
+```
+
+例如 `limit = 100` → Analytics 只代表查询得到的 **100 条记录**，
+**不是整个数据库的全局统计**。本阶段没有
+`COUNT(*)` / `global_total` / `total_count`。
+
+`LLMUsageQueryFilter` **原样传递**（含 limit / offset），
+Facade 不创建第二套 Filter / PageSize 常量。
+
+### 便捷方法（convenience read methods）
+
+`query_summary()` / `query_by_provider()` / `query_by_model()` /
+`query_by_provider_model()` 属于**单视图快捷方式**（各自一次
+Runtime 查询）。完整 Analytics 推荐使用 `query_snapshot()`——
+一次 Query 即可得到完整四视图。
+
+### 错误传播
+
+```text
+Runtime error   → Facade → caller（原样）
+Analytics error → Facade → caller（原样）
+```
+
+Facade 不吞异常、不包装、不转换成 None。
+
+### Immutability / Security Boundary
+
+* 返回值仍是既有 frozen DTO（`LLMUsageAnalyticsSnapshot` /
+  `LLMUsageAggregate` / `ProviderUsageAggregate` /
+  `ModelUsageAggregate` / `ProviderModelUsageAggregate`）与 tuple，
+  Facade 绝不重新包装成 dict / list；
+* Facade 返回的数据不包含：API Key / Password / Database URL /
+  Connection String / Authorization Header / SQLAlchemy Session /
+  Connection / Engine / Raw SQL——Facade 只是 application read
+  boundary，数据仍是 §8.19 的 Usage 白名单字段；
+* 无缓存 / 无全局状态 / 无 fire-and-forget（调用方必须 `await`）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
