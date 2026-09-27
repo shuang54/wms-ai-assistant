@@ -43,6 +43,10 @@ Phase 3.10.15 Runtime Boundary（新增，但不是新的 persistence 层）：
     * usage=None → 不写入：本表是 **LLM Usage Storage**，不是
       request audit log；失败请求（usage=None）与无 usage 的成功
       请求都不产生行（§十五）；
+    * Phase 3.10.16 幂等：request_id 存在时重复持久化由
+      **数据库**忽略（Repository 的 INSERT ... ON CONFLICT DO
+      NOTHING）；本层 / Runtime Bridge **不**做任何 in-memory
+      去重（无 dict / set / lock / cache）；
     * 持久化失败 → warning + 业务结果不变；无 retry / sleep /
       backoff / 队列（§二十二 / §二十三）；
     * **默认不接入 Client**：`create_llm_client()` 默认仍是
@@ -99,7 +103,10 @@ class LLMUsagePersistenceService:
 
         Returns:
             新记录 id；
-            observation 为 None / usage 为 None 时返回 None（不写入）。
+            observation 为 None / usage 为 None 时返回 None（不写入）；
+            Phase 3.10.16 起，request_id 重复时同样返回 None
+            —— 重复落库会被数据库忽略（first-write-wins），
+            **不是错误**，调用方不得当作失败处理。
 
         Raises:
             LLMUsageRepositoryError: DB 未配置或写入失败（已回滚）。

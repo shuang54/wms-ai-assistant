@@ -46,23 +46,57 @@
     因此本表与业务数据物理隔离在 `ai_ops`（`init_db()` 会
     `CREATE SCHEMA IF NOT EXISTS ai_ops`）。
 
-幂等性（§二十八）：
-    本阶段**不提供幂等保证**。同一 observation 被 record() 两次会产生
-    两条记录（at-least-once / caller-controlled）。request_id 允许 NULL，
-    不能依赖唯一约束实现幂等，因此不伪造幂等机制。
+幂等性（Phase 3.10.14 §二十八 已升级，见 Phase 3.10.16）：
+
+    Phase 3.10.14 明确"不提供幂等保证"；Phase 3.10.16 起改为
+    **数据库保证的 request_id 幂等**：
+
+        request_id IS NOT NULL → 一个 request_id 最多一行
+                                 （UNIQUE PARTIAL INDEX +
+                                   INSERT ... ON CONFLICT DO NOTHING）
+        request_id IS NULL     → **没有幂等身份**，不参与幂等，
+                                 每次持久化都允许产生新行（有意设计）
+
+    request_id 仍然允许 NULL，且**绝不**为了伪造幂等 key 而生成
+    UUID / hash / timestamp / provider+model 合成值（§五）。
+
+    为什么是 partial unique index（而不是普通 UNIQUE(request_id)）：
+    "request_id IS NULL" 的语义是"没有幂等身份"，partial index 把这个
+    Contract 直接写进数据库结构表达出来（§八）。
+
+    First-write-wins（§十 / §十七）：重复 request_id 只允许 DO NOTHING，
+    禁止 DO UPDATE ——第二次持久化既不能覆盖 provider / model / token，
+    也不能产生第二行；冲突不做 reconciliation。
 """
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Final
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.db.base import Base
 
 #: AI 内部运维 schema（与业务 schema `public` 物理隔离）。
 LLM_USAGE_SCHEMA: Final[str] = "ai_ops"
+
+#: request_id 幂等唯一索引（Phase 3.10.16）。
+#:
+#: partial index —— 只约束 `request_id IS NOT NULL`，所以
+#: request_id 为 NULL 的"无幂等身份"记录仍然可以有多行。
+LLM_USAGE_REQUEST_ID_INDEX: Final[str] = "uq_llm_usage_record_request_id"
+
+#: partial index 谓词（repository 的 ON CONFLICT target 必须一致）。
+LLM_USAGE_REQUEST_ID_PREDICATE: Final[str] = "request_id IS NOT NULL"
 
 
 class LLMUsageRecord(Base):
@@ -136,6 +170,14 @@ class LLMUsageRecord(Base):
     # ---- Table-level 索引（最小）+ 独立 schema ----
     __table_args__ = (
         Index("ix_llm_usage_record_created_at", "created_at"),
+        # Phase 3.10.16：request_id 幂等（partial unique）——
+        # request_id 为 NULL 的行不参与唯一约束。
+        Index(
+            LLM_USAGE_REQUEST_ID_INDEX,
+            "request_id",
+            unique=True,
+            postgresql_where=text(LLM_USAGE_REQUEST_ID_PREDICATE),
+        ),
         # 与业务 schema（public）隔离：避免本表被 Text-to-SQL 的
         # schema 发现当作业务表。
         {"schema": LLM_USAGE_SCHEMA},
@@ -149,4 +191,9 @@ class LLMUsageRecord(Base):
         )
 
 
-__all__ = ["LLMUsageRecord", "LLM_USAGE_SCHEMA"]
+__all__ = [
+    "LLMUsageRecord",
+    "LLM_USAGE_SCHEMA",
+    "LLM_USAGE_REQUEST_ID_INDEX",
+    "LLM_USAGE_REQUEST_ID_PREDICATE",
+]

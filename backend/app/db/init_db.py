@@ -22,13 +22,17 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Final
+from typing import Any, Final
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.db.base import Base
-from backend.app.db.models.llm_usage_record import LLM_USAGE_SCHEMA
+from backend.app.db.models.llm_usage_record import (
+    LLM_USAGE_REQUEST_ID_INDEX,
+    LLM_USAGE_REQUEST_ID_PREDICATE,
+    LLM_USAGE_SCHEMA,
+)
 from backend.app.db.session import get_engine
 
 logger = logging.getLogger(__name__)
@@ -40,18 +44,89 @@ _ENABLE_PGVECTOR_SQL: Final[str] = "CREATE EXTENSION IF NOT EXISTS vector"
 _ENABLE_AI_OPS_SCHEMA_SQL: Final[str] = (
     f"CREATE SCHEMA IF NOT EXISTS {LLM_USAGE_SCHEMA}"
 )
+# Phase 3.10.16：request_id 幂等唯一 partial index。
+#
+# 为什么需要显式 DDL（而不是只靠 Model 的 __table_args__）：
+# `Base.metadata.create_all(checkfirst=True)` 对**已存在**的表整体跳过，
+# 不会补建后来新增的索引。因此已存在的库必须通过本 DDL 显式补齐，
+# 同时对全新库仍然幂等（`IF NOT EXISTS`）。
+_USAGE_TABLE: Final[str] = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
+_CREATE_REQUEST_ID_INDEX_SQL: Final[str] = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {LLM_USAGE_REQUEST_ID_INDEX} "
+    f"ON {_USAGE_TABLE} (request_id) "
+    f"WHERE {LLM_USAGE_REQUEST_ID_PREDICATE}"
+)
+_DUPLICATE_REQUEST_ID_SQL: Final[str] = (
+    "SELECT request_id, COUNT(*) AS cnt FROM "
+    f"{_USAGE_TABLE} "
+    f"WHERE {LLM_USAGE_REQUEST_ID_PREDICATE} "
+    "GROUP BY request_id HAVING COUNT(*) > 1 "
+    "ORDER BY request_id"
+)
+
+
+def ensure_request_id_idempotency_index(conn: Any) -> bool:
+    """确保 `ai_ops.llm_usage_record.request_id` 的幂等唯一索引存在
+    （Phase 3.10.16）。
+
+    幂等行为：索引已存在 → 什么都不做（`IF NOT EXISTS`）。
+
+    已有库保护（§二十一 —— 绝不自动清理数据）：
+
+        若检测到已存在重复 request_id
+            → 明确报告（重复的 request_id / 条数）
+            → **停止**（raise RuntimeError）
+            → 不 DELETE / 不 MERGE / 不 UPDATE（由人决定如何处理）
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  索引已存在或本次成功创建。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+
+    Raises:
+        RuntimeError: 检测到重复 request_id 数据（需要人工处理）。
+    """
+    if not inspect(conn).has_table("llm_usage_record", schema=LLM_USAGE_SCHEMA):
+        # 表还不存在：create_all 会连同 Model 里的 partial index 一起创建
+        return False
+
+    duplicates = list(conn.execute(text(_DUPLICATE_REQUEST_ID_SQL)).all())
+    if duplicates:
+        detail = ", ".join(
+            f"{request_id}={count} 条" for request_id, count in duplicates[:10]
+        )
+        total = len(duplicates)
+        raise RuntimeError(
+            "无法创建 request_id 幂等唯一索引："
+            f"ai_ops.llm_usage_record 中已存在 {total} 组重复 request_id"
+            f"（示例：{detail}）。"
+            "本阶段不会自动删除 / 合并 / 更新任何数据——"
+            "请先人工确认并处理重复记录后重试。"
+        )
+
+    conn.execute(text(_CREATE_REQUEST_ID_INDEX_SQL))
+    logger.info(
+        "LLM usage request_id idempotency index ensured",
+        extra={"index": LLM_USAGE_REQUEST_ID_INDEX},
+    )
+    return True
 
 
 def init_db() -> None:
-    """启用 pgvector extension + 创建 ORM 表。
+    """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引。
 
     幂等行为：
         - pgvector extension 已存在 → 不报错
         - ORM 表已存在 → create_all 不会重复创建（只补缺失的表）
+        - request_id 幂等索引已存在 → 不报错（IF NOT EXISTS）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
         RuntimeError: DB 不可达、extension 不可用或 DDL 失败。
+        RuntimeError: llm_usage_record 中已存在重复 request_id
+                      （见 :func:`ensure_request_id_idempotency_index`）。
     """
     engine = get_engine()
     if engine is None:
@@ -72,6 +147,11 @@ def init_db() -> None:
 
             # 4. 创建所有未存在的表（幂等）
             Base.metadata.create_all(bind=conn)
+
+            # 5. Phase 3.10.16：request_id 幂等唯一 partial index
+            #    （对**已存在**的表，create_all 不会补建新增索引，
+            #     必须显式 DDL；有重复数据则不自动清理，直接停止）
+            ensure_request_id_idempotency_index(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -96,7 +176,7 @@ def main() -> int:
     return 0
 
 
-__all__ = ["init_db"]
+__all__ = ["init_db", "ensure_request_id_idempotency_index"]
 
 
 if __name__ == "__main__":

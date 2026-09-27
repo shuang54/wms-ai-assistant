@@ -859,6 +859,55 @@ LLM Business Result
 
 ---
 
+## 8.16 LLM Usage Persistence Idempotency（Phase 3.10.16）
+
+解决"同一个 `request_id` 被重复持久化"的问题；幂等由 **PostgreSQL**
+保证，不由应用内存保证。
+
+```text
+Repository.create()
+    ↓
+INSERT INTO ai_ops.llm_usage_record (...)
+ON CONFLICT (request_id) WHERE request_id IS NOT NULL
+DO NOTHING
+RETURNING id
+```
+
+```text
+Index Name : uq_llm_usage_record_request_id
+Schema     : ai_ops
+Table      : llm_usage_record
+Column     : request_id
+Predicate  : request_id IS NOT NULL
+Unique     : true
+type       : partial unique index（普通 UNIQUE 不满足本语义）
+```
+
+Contract：
+
+1. `request_id IS NOT NULL` → 一个 request_id **最多一行**；重复写入
+   `DO NOTHING`，Repository 返回 `None`（正常幂等结果，**不是错误**）；
+2. `request_id IS NULL` → **没有幂等身份**，不参与幂等，每次持久化都
+   允许产生新行（有意设计，不是 bug）；不为伪造幂等 key 生成
+   UUID / hash / timestamp / provider+model 合成值；
+3. **First-write-wins**：禁止 `DO UPDATE`，重复写入不得修改已存在的
+   provider / model / token（不做 conflict resolution / reconciliation）；
+4. 不用 `SELECT → IF NOT EXISTS → INSERT`（并发仍会重复），不用
+   `IntegrityError + rollback` 作为正常控制流；
+5. 幂等逻辑只存在于 **Repository / DB**：Runtime Bridge / Service /
+   Sink 不得做 in-memory 去重（无 dict / set / lock / cache ——
+   进程重启失效且无法解决多进程并发）；
+6. `Base.metadata.create_all()` 对**已存在**的表不会补建新增索引，因此
+   `init_db()` 会显式执行幂等 DDL
+   （`ensure_request_id_idempotency_index()`）；
+7. 已有库存在重复 `request_id` 时：`init_db()` **检测 + 明确报告 + 停止**，
+   绝不自动 DELETE / MERGE / UPDATE（不引入 Alembic，不删数据）；
+8. 写入字段与 §8.14 完全一致：`request_id / provider / model /
+   prompt_tokens / completion_tokens / total_tokens`
+   （幂等不得扩大字段集）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

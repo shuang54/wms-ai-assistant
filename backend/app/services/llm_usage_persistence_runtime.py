@@ -45,6 +45,10 @@ Phase 3.10.14 已经证明 Usage Persistence 的正确性：
       ——没有 orphan task、没有 shutdown / 数据丢失 / 异常逃逸问题；
     * **不做 retry / sleep / backoff / queue / outbox**：失败只在
       边界内收敛为 warning，不影响 LLM 业务结果；
+    * **幂等不在本层**：request_id 幂等由 Repository / PostgreSQL
+      唯一索引保证（Phase 3.10.16）；本层**不**做 in-memory 去重
+      （无 dict / set / lock / cache——进程重启即失效，且无法
+      解决多进程并发）；
     * **不新增 Persistence DTO**：继续复用 ``LLMObservation`` /
       ``LLMUsage`` / ``LLMUsageRecord``；
     * **不引入第三方依赖**：只用标准库 ``asyncio``（项目已在
@@ -130,8 +134,9 @@ class LLMUsagePersistenceRuntimeBridge:
             observation: 一次 LLM 请求的 Observation。
 
         Returns:
-            新记录 id；observation 为 None / usage 为 None → None
-            （不写入，语义由 ``LLMUsagePersistenceService`` 决定）。
+            新记录 id；observation 为 None / usage 为 None / request_id
+            重复 → ``None``（语义由 ``LLMUsagePersistenceService``
+            与 Repository 决定；重复是正常幂等结果，不是错误）。
 
         Raises:
             Exception: 底层持久化的异常原样冒泡给 awaiter

@@ -217,13 +217,35 @@ class FakeTransaction:
         return False
 
 
-class FakeSession:
-    """最小 Session 替身：只提供 Repository 用到的能力。"""
+class FakeResult:
+    """`session.execute(...)` 结果的替身。"""
 
-    def __init__(self, next_id: Callable[[], int]) -> None:
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def scalar_one_or_none(self) -> Any:
+        return self._value
+
+
+class FakeSession:
+    """最小 Session 替身：只提供 Repository 用到的能力。
+
+    Phase 3.10.16 起 Repository 用 Core `INSERT ... ON CONFLICT`
+    （`session.execute`），Session 隔离语义不变：
+    仍然是一个 Session 一次写入、用完即关。
+    """
+
+    def __init__(
+        self,
+        next_id: Callable[[], int],
+        *,
+        conflicts: bool = False,
+    ) -> None:
         self.created_in = threading.current_thread().name
         self.added: list[Any] = []
+        self.executed: list[Any] = []
         self.closed = False
+        self.conflicts = conflicts
         self._next_id = next_id
 
     # Repository 用法：with factory() as session, session.begin():
@@ -236,6 +258,14 @@ class FakeSession:
 
     def begin(self) -> FakeTransaction:
         return FakeTransaction()
+
+    def execute(self, statement: Any) -> FakeResult:
+        """执行写入语句；conflicts=True 模拟 ON CONFLICT DO NOTHING
+        （PostgreSQL 未返回 id → repository 返回 None）。"""
+        self.executed.append(statement)
+        if self.conflicts:
+            return FakeResult(None)
+        return FakeResult(self._next_id())
 
     def add(self, row: Any) -> None:
         self.added.append(row)
@@ -399,6 +429,15 @@ def _run_with_heartbeat(
 
 def _module_source(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _statement_values(statement: Any) -> dict[str, Any]:
+    """把 Repository 交给 session.execute 的 INSERT 语句还原成字段 dict
+    （Phase 3.10.16 起写入走 Core `INSERT ... ON CONFLICT`）。"""
+    from sqlalchemy.dialects import postgresql
+
+    compiled = statement.compile(dialect=postgresql.dialect())
+    return dict(compiled.params)
 
 
 # ============================================================
@@ -712,7 +751,7 @@ class TestSessionIsolation:
         # 5 个互不相同的 Session 对象（无共享 / 无复用）
         assert len({id(s) for s in factory.sessions}) == 5
         for session in factory.sessions:
-            assert len(session.added) == 1        # 一个 Session 一行
+            assert len(session.executed) == 1     # 一个 Session 一次写入
             assert session.closed is True         # 已关闭（无泄漏）
             assert session.created_in != threading.main_thread().name
 
@@ -774,15 +813,17 @@ class TestSessionIsolation:
 
         written = [
             (
-                row.request_id,
-                row.provider,
-                row.model,
-                row.prompt_tokens,
-                row.completion_tokens,
-                row.total_tokens,
+                values["request_id"],
+                values["provider"],
+                values["model"],
+                values["prompt_tokens"],
+                values["completion_tokens"],
+                values["total_tokens"],
             )
-            for session in factory.sessions
-            for row in session.added
+            for values in (
+                _statement_values(session.executed[0])
+                for session in factory.sessions
+            )
         ]
         expected = [
             (
