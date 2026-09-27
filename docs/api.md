@@ -153,38 +153,58 @@ ChatService → RagService → Vector Search → Context Builder → LLMClient
 
 ### 2.4 POST /api/chat/with-tools
 
-对话接口（Phase 3.6.2 引入；Phase 3.6.3 升级为 **Multi-Step Tool Calling**）。
-**不经过 RAG**，是独立的 Tool Calling 链路；`/api/chat` 行为不变。
+对话接口（Phase 3.6.2 引入；Phase 3.6.3 升级为 **Multi-Step Tool Calling**；
+Phase 3.11 Step 9 起 Tool 执行统一走 ToolExecutionService；
+Phase 3.11 Step 10 起支持可选 `project_id` 项目能力限制；
+Phase 3.11 Step 11 起注册**真实只读** `get_inventory`）。
+**不经过 RAG / Text-to-SQL**，是独立的 Tool Calling 链路；`/api/chat` 行为不变。
 
 ```text
 ToolChatService → LLM（携带 tools）
                 → 判断是否需要 Tool
-                → 需要：ToolRegistry.execute() → ToolResult → role=tool 消息
+                → 需要：ToolExecutionService（capability + project scope）
+                       → ToolRegistry.execute() → 真实 get_inventory Handler
+                       → PostgreSQL（SELECT …；READ ONLY + 绑定参数 + timeout）
+                       → ToolResult → role=tool 消息
                        （append 到完整消息历史）→ LLM（可继续请求 Tool）
                 → ... 顺序循环 ...
                 → LLM 不再请求 Tool → 最终回答
 ```
 
-当前阶段约束（Phase 3.6.3）：
+当前阶段约束（Phase 3.6.3 / 3.11）：
 
 - **顺序多步**：每轮最多 **1 个** Tool Call（LLM 单次返回多个 → 502 拒绝，不做并行）；
 - **总轮数硬上限** `TOOL_MAX_ROUNDS`（默认 5，钳制 [1, 20]）：
   最坏情况 = 5 次 Tool 执行 + 6 次 LLM 调用；预算耗尽后 LLM 仍请求 Tool → 502；
 - Tool 参数错误 / 未注册 Tool **不打断请求**：错误以 tool message 回传 LLM，
   由 LLM 生成自然语言错误说明，并允许继续下一轮；
-- 注册的 Tool 为两个 **Mock**（`get_inventory` / `get_work_order`），不接真实 WMS / ERP。
+- **能力拒绝（403）不降级**：`project_id` 指定的项目未启用该 Tool 时，
+  执行边界直接拒绝（Handler 0 次调用），**不**转成普通 Tool 失败；
+- 注册的 Tool = **真实只读** `get_inventory`（Phase 3.7.12 实现；参数仅
+  `material_code`（必填）/ `warehouse_code`（可选，当前库存表无该维度 →
+  显式拒绝，不静默全仓汇总）；只读事务 + 绑定参数 + statement_timeout；
+  不接受任意 SQL / table / where_clause）；
+- 真实 `get_work_order` 接入 = **DEFERRED**（本端点当前不注册该 Tool）；
+- Mock Tools（Phase 3.6.1）仅供单元 / characterization 测试使用，
+  **不**出现在生产 Registry（避免同名 Tool 双定义）。
 
 #### 请求
 
 ```json
 {
-  "message": "先查询 MAT001 的库存，然后查询工单 MO001 的状态"
+  "message": "查询 MAT-001 当前库存",
+  "project_id": "vietnam-wms"
 }
 ```
 
-| 字段    | 类型   | 必填 | 说明                     |
-| ------- | ------ | ---- | ------------------------ |
-| message | string | ✅   | 用户自然语言消息（非空） |
+> 未提供 `project_id` 时 `capabilities=None`（不限制 Tool 能力，不查注册表）；
+> 提供时该项目必须在 `ProjectCapabilities.tool_names` 中允许 `get_inventory`
+> （默认项目能力即包含；见 `backend/app/projects/capabilities.py`）。
+
+| 字段       | 类型   | 必填 | 说明                                                         |
+| ---------- | ------ | ---- | ------------------------------------------------------------ |
+| message    | string | ✅   | 用户自然语言消息（非空）                                     |
+| project_id | string | ❌   | 可选：项目上下文 ID（≤128 字符）。提供时由**服务器端** ProjectRegistry 解析该项目 Tool 能力白名单；省略时不限制 Tool 能力（旧行为，不查注册表） |
 
 #### 响应 200
 
@@ -211,9 +231,15 @@ ToolChatService → LLM（携带 tools）
 
 | HTTP | 触发条件                                       | detail 示例                                        |
 | ---- | ---------------------------------------------- | -------------------------------------------------- |
+| 403  | 项目能力未启用（AIOrchestratorCapabilityError；仅当提供 project_id） | `"项目能力未启用: Tool 'get_work_order' 未在该项目启用"` |
+| 404  | project_id 未注册（ProjectNotFoundError；仅当提供 project_id） | `"项目未注册: 项目 'project-x' 未注册（project_id 只能选择服务器端已注册的项目）"` |
 | 502  | LLM 返回多个 tool call（MultipleToolCallsError） | `"LLM 返回多个 Tool Call（当前不支持）"`           |
 | 502  | Tool Calling 预算耗尽（ToolCallingBudgetExceededError） | `"Tool Calling 预算耗尽（max_rounds=5）…"` |
 | 500  | ToolChatError（编排内部错误）                   | `"Tool Chat 服务内部错误: ..."`                     |
+
+> `project_id` 与 `/api/ai/chat`（§2.5）语义一致：只能选择**服务器端已注册**的项目，
+> 能力白名单由服务器端 ProjectRegistry 决定（HTTP 无法注入 / 覆盖能力字段）。
+> 未提供 `project_id` 时保持旧行为（不限制 Tool 能力）。
 
 LLM 家族异常（LLMConfigError 503 / LLMRequestError、LLMResponseError 502）
 沿用 §3.2 映射。

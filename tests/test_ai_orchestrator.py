@@ -17,7 +17,6 @@ from backend.app.services.ai_orchestrator_service import (
     AIOrchestratorUnavailableError,
     DefaultProjectContextProvider,
     ProjectContextProvider,
-    _resolve_tool_name,
 )
 from backend.app.services.ai_router_service import (
     AIRouterError,
@@ -25,7 +24,10 @@ from backend.app.services.ai_router_service import (
     AIRouterService,
     RouteDecision,
     RouteType,
+    ToolRegistryCapabilityAdapter,
 )
+from backend.app.services.tool_argument_extractor import ToolArgumentExtractor
+from backend.app.services.tool_execution_service import ToolExecutionService
 from backend.app.services.relevant_table_selector import (
     TableSelection,
     TableSelectionResult,
@@ -44,6 +46,8 @@ from backend.app.services.text_to_sql_service import (
     TextToSQLInputError,
     TextToSQLResult,
 )
+from backend.app.tools.get_inventory import GET_INVENTORY_DEFINITION
+from backend.app.tools.get_work_order import GET_WORK_ORDER_DEFINITION
 from backend.app.tools.mock_tools import register_mock_tools
 from backend.app.tools.registry import ToolRegistry, ToolResult
 
@@ -257,6 +261,7 @@ def _make_service(
     *,
     router=None, rag=None, tools=None, t2s=None, sql_executor=None,
     table_selector=None, context_composer=None, project_provider=None,
+    tool_execution_service=None, tool_argument_extractor=None,
 ) -> AIOrchestratorService:
     return AIOrchestratorService(
         router=router,
@@ -267,6 +272,8 @@ def _make_service(
         table_selector=table_selector,
         context_composer=context_composer,
         project_context_provider=project_provider,
+        tool_execution_service=tool_execution_service,
+        tool_argument_extractor=tool_argument_extractor,
     )
 
 
@@ -277,10 +284,17 @@ def _rag_decision() -> RouteDecision:
     )
 
 
-def _tool_decision() -> RouteDecision:
+def _tool_decision(tool_name: str | None = "get_inventory") -> RouteDecision:
+    """TOOL 决策（Phase 3.11 Step 3：Router 负责任何携带 tool_name）。
+
+    默认携带 get_inventory（与 register_mock_tools 注册的真实 mock
+    Tool 对齐）；``tool_name=None`` 用于验证 Orchestrator 在
+    decision 未携带名称时的拒绝行为。
+    """
     return RouteDecision(
         route=RouteType.TOOL, confidence=0.85,
         reason="matched get_inventory", source="tool_match",
+        tool_name=tool_name,
     )
 
 
@@ -384,20 +398,16 @@ class TestToolRoute:
         assert t2s.calls == []
         assert sql_exec.calls == []
 
-    async def test_tool_no_match_raises_route_error(self) -> None:
-        # 注册的工具都无关，但 Router 仍判为 TOOL（无 description 命中）
-        from backend.app.tools.base import ToolDefinition, ToolHandler
-        class _EmptyHandler:
-            async def execute(self, arguments): return ToolResult(
-                tool_name="x", success=True, data={}, error=None
-            )
+    async def test_tool_route_without_tool_name_raises_route_error(self) -> None:
+        """Router 判 TOOL 但未携带 tool_name → RouteError。
+
+        Phase 3.11 Step 3：Orchestrator 只信 Router 的 decision，
+        不猜、不二次选择、不回退其它 Tool。
+        """
         reg = ToolRegistry()
-        reg.register(ToolDefinition(
-            name="get_xyz", description="完全不相关能力",
-            parameters={"type": "object", "properties": {}},
-        ), _EmptyHandler())
+        register_mock_tools(reg)
         orch = _make_service(
-            router=FakeRouter(_tool_decision()), tools=reg,
+            router=FakeRouter(_tool_decision(None)), tools=reg,
         )
         with pytest.raises(AIOrchestratorRouteError):
             await orch.execute("请告诉天气情况")
@@ -420,7 +430,7 @@ class TestToolRoute:
             parameters={"type": "object", "properties": {}},
         ), BoomHandler())
         orch = _make_service(
-            router=FakeRouter(_tool_decision()), tools=reg,
+            router=FakeRouter(_tool_decision("boom_tool")), tools=reg,
         )
         result = await orch.execute("帮我查一下库存")
         # Orchestrator 不抛，但 metadata 透传 tool_success=False
@@ -445,7 +455,7 @@ class TestToolRoute:
             parameters={"type": "object", "properties": {}},
         ), BoomHandler())
         orch = _make_service(
-            router=FakeRouter(_tool_decision()), tools=reg,
+            router=FakeRouter(_tool_decision("boom_tool")), tools=reg,
         )
         result = await orch.execute("帮我查一下库存")
         assert result.metadata["tool_success"] is False
@@ -801,26 +811,370 @@ class TestProjectContextProvider:
 
 
 # ============================================================
-# J. _resolve_tool_name 单测
+# J. Tool Selection Contract（Phase 3.11 Step 3）
 # ============================================================
 
-class TestResolveToolName:
-    async def test_alias_match(self) -> None:
-        reg = ToolRegistry()
-        register_mock_tools(reg)
-        # get_inventory 的 parameter 有 material_code；question 含 material_code
-        assert _resolve_tool_name("query material_code 库存", reg) == "get_inventory"
+class TestToolSelectionUnification:
+    """Router 是 Tool 选择的**唯一来源**（Phase 3.11 Step 3）。
 
-    async def test_description_match(self) -> None:
-        reg = ToolRegistry()
-        register_mock_tools(reg)
-        # get_inventory description 含 "库存"
-        assert _resolve_tool_name("查 库存 数量", reg) == "get_inventory"
+    Orchestrator 只读取 ``RouteDecision.tool_name``；不做二次匹配、
+    不按问题文本重选、不 fallback、不重新调用 LLM
+    （原 ``_resolve_tool_name`` 已删除）。
+    """
 
-    async def test_no_match_returns_none(self) -> None:
+    async def test_orchestrator_uses_router_tool_name_not_question_text(
+        self,
+    ) -> None:
+        """Router 选 tool_b（问题文本会命中 get_inventory 的旧算法）
+        → 执行 tool_b：证明 Orchestrator 不再二次选择。"""
+        from backend.app.tools.base import ToolDefinition
+
+        class _RecordingHandler:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.last_arguments: dict[str, Any] | None = None
+
+            async def __call__(self, arguments):
+                self.calls += 1
+                self.last_arguments = dict(arguments)
+                return {"chosen": "handler"}
+
+        inv_handler = _RecordingHandler()
+        b_handler = _RecordingHandler()
+
+        reg = ToolRegistry()
+        # 故意放一个"问题文本会命中"的 Tool（旧算法会选它）
+        reg.register(ToolDefinition(
+            name="get_inventory",
+            description="查询物料 当前库存 数量",
+            parameters={
+                "type": "object",
+                "properties": {"material_code": {"type": "string"}},
+                "required": ["material_code"],
+            },
+        ), inv_handler)
+        reg.register(ToolDefinition(
+            name="tool_b",
+            description="完全无关的能力描述",
+            parameters={
+                "type": "object",
+                "properties": {"material_code": {"type": "string"}},
+                "required": ["material_code"],
+            },
+        ), b_handler)
+
+        orch = _make_service(
+            router=FakeRouter(_tool_decision("tool_b")), tools=reg,
+        )
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "tool_b"
+        assert b_handler.calls == 1
+        assert b_handler.last_arguments == {"material_code": "MAT-001"}
+        assert inv_handler.calls == 0  # 不再按问题文本二次匹配
+
+    async def test_unknown_tool_fails_safely_without_fallback(self) -> None:
+        """Router 返回未注册 Tool → 安全失败（ToolResult(success=False)）；
+        不 fallback、不换 Tool、不重新调用 Router / LLM。"""
         reg = ToolRegistry()
         register_mock_tools(reg)
-        assert _resolve_tool_name("完全不相关的无关问题", reg) is None
+        router = FakeRouter(_tool_decision("unknown_tool"))
+        orch = _make_service(router=router, tools=reg)
+
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "unknown_tool"
+        assert result.metadata["tool_success"] is False
+        assert result.data.success is False
+        assert result.data.error is not None
+        # Router 只被调用一次：0 次重选 / 0 次二次 LLM 调用
+        assert router.calls == ["查询物料 MAT-001 当前库存"]
+
+    async def test_real_router_selected_tool_is_executed_e2e(self) -> None:
+        """真实 Router（规则命中）→ decision.tool_name=get_inventory →
+        Orchestrator 直接执行（端到端唯一选择链，0 DB）。"""
+        from backend.app.services.ai_router_service import (
+            ToolRegistryCapabilityAdapter,
+        )
+        from backend.app.tools.base import ToolDefinition
+
+        class _EchoHandler:
+            def __init__(self) -> None:
+                self.last_arguments: dict[str, Any] | None = None
+
+            async def __call__(self, arguments):
+                self.last_arguments = dict(arguments)
+                return {"material_code": arguments.get("material_code"),
+                        "qty": 7.0}
+
+        handler = _EchoHandler()
+        reg = ToolRegistry()
+        reg.register(ToolDefinition(
+            name="get_inventory",
+            description="查询指定物料的当前库存数量（只读）",
+            aliases=("当前库存", "查库存", "库存数量"),
+            parameters={
+                "type": "object",
+                "properties": {"material_code": {"type": "string"}},
+                "required": ["material_code"],
+            },
+        ), handler)
+
+        router = AIRouterService(
+            llm_fallback_enabled=False,
+            tool_capabilities=ToolRegistryCapabilityAdapter(reg),
+        )
+        orch = _make_service(router=router, tools=reg)
+
+        # "当前库存" 别名命中 → TOOL + get_inventory（Router 唯一选择）
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "get_inventory"
+        assert result.metadata["tool_success"] is True
+        assert handler.last_arguments == {"material_code": "MAT-001"}
+
+    async def test_capability_denied_still_403_semantics(self) -> None:
+        """Router 选中 Tool → capability 拒绝 → AIOrchestratorCapabilityError
+        （不因选择重构变成其它异常）。"""
+        from backend.app.projects.capabilities import ProjectCapabilities
+        from backend.app.services.ai_orchestrator_service import (
+            AIOrchestratorCapabilityError,
+        )
+
+        reg = ToolRegistry()
+        register_mock_tools(reg)
+        orch = AIOrchestratorService(
+            router=FakeRouter(_tool_decision("get_inventory")),
+            tool_registry=reg,
+            capabilities=ProjectCapabilities(tool_names=()),
+        )
+
+        with pytest.raises(AIOrchestratorCapabilityError) as ei:
+            await orch.execute("查询物料 MAT-001 当前库存")
+        assert ei.value.capability == "get_inventory"
+
+
+# ============================================================
+# L. Tool Argument Extraction Boundary（Phase 3.11 Step 6）
+# ============================================================
+
+class _RecordingToolHandler:
+    """记录 arguments 的 Tool Handler（0 DB）。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_arguments: dict[str, Any] | None = None
+
+    async def __call__(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls += 1
+        self.last_arguments = dict(arguments)
+        return dict(arguments)
+
+
+class _CountingToolExecution(ToolExecutionService):
+    """真实执行边界 + 调用记录（验证「调用一次 + arguments 透传」）。
+
+    Phase 3.11 Step 18：Orchestrator TOOL 路径现在会传
+    ``ToolExecutionContext`` → 本替身同步接受并**原样转发**（记录形状不变）。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.contexts: list[Any] = []
+
+    async def execute(
+        self,
+        tool_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+        context: Any = None,
+    ) -> ToolResult:
+        self.calls.append((tool_name, arguments))
+        self.contexts.append(context)
+        return await super().execute(
+            tool_name, arguments=arguments, context=context
+        )
+
+
+class _CountingExtractor(ToolArgumentExtractor):
+    """真实提取器 + 调用记录（验证 Question + tool_name → arguments）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def extract(
+        self,
+        tool_name: str,
+        question: str,
+        *,
+        parameters: Any = None,
+    ) -> dict[str, Any]:
+        self.calls.append({
+            "tool_name": tool_name,
+            "question": question,
+            "parameters": parameters,
+        })
+        return super().extract(tool_name, question, parameters=parameters)
+
+
+class TestToolArgumentExtractionBoundary:
+    """Question → Router → tool_name → Extractor → arguments →
+    ToolExecutionService（Phase 3.11 Step 6 后的唯一 Tool 链路）。"""
+
+    def _orch(self, registry: ToolRegistry):
+        execution = _CountingToolExecution(registry=registry)
+        extractor = _CountingExtractor()
+        router = AIRouterService(
+            llm_fallback_enabled=False,
+            tool_capabilities=ToolRegistryCapabilityAdapter(registry),
+        )
+        orch = _make_service(
+            router=router,
+            rag=FakeRAG(),
+            tools=registry,
+            tool_execution_service=execution,
+            tool_argument_extractor=extractor,
+        )
+        return orch, execution, extractor
+
+    async def test_inventory_question_e2e(self) -> None:
+        """Inventory：Question → Router → get_inventory → Extractor →
+        ToolExecutionService（各调用一次；arguments 精确）。"""
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+        orch, execution, extractor = self._orch(registry)
+
+        question = "查询仓库 A01 中物料 MAT-001 当前库存"
+        result = await orch.execute(question)
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "get_inventory"
+        assert result.metadata["tool_success"] is True
+        expected_arguments = {
+            "warehouse_code": "A01", "material_code": "MAT-001",
+        }
+        # Extractor：调用一次，收到 Router 的 tool_name + 原始问题 + 声明字段
+        assert len(extractor.calls) == 1
+        assert extractor.calls[0]["tool_name"] == "get_inventory"
+        assert extractor.calls[0]["question"] == question
+        assert extractor.calls[0]["parameters"] == (
+            GET_INVENTORY_DEFINITION.parameters
+        )
+        # 执行边界：调用一次，arguments 原样透传
+        assert execution.calls == [("get_inventory", expected_arguments)]
+        # Handler：收到的入参与 Extractor 产出一致（Schema 校验通过）
+        assert handler.last_arguments == expected_arguments
+
+    async def test_work_order_question_e2e(self) -> None:
+        """Work Order：Question → Router → get_work_order → Extractor →
+        ToolExecutionService（各调用一次；arguments 精确）。"""
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_WORK_ORDER_DEFINITION, handler)
+        orch, execution, extractor = self._orch(registry)
+
+        question = "查询工单 WO-202609-001"
+        result = await orch.execute(question)
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "get_work_order"
+        assert result.metadata["tool_success"] is True
+        expected_arguments = {"work_order_no": "WO-202609-001"}
+        assert len(extractor.calls) == 1
+        assert extractor.calls[0]["tool_name"] == "get_work_order"
+        assert extractor.calls[0]["parameters"] == (
+            GET_WORK_ORDER_DEFINITION.parameters
+        )
+        assert execution.calls == [("get_work_order", expected_arguments)]
+        assert handler.last_arguments == expected_arguments
+
+    async def test_missing_required_argument_rejected_by_registry(self) -> None:
+        """缺失必填字段：Extractor 不补齐 → Registry 拒绝（Handler 0 次）。"""
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+        orch, execution, extractor = self._orch(registry)
+
+        result = await orch.execute("查询 A01 仓库当前库存")
+
+        assert result.metadata["tool_name"] == "get_inventory"
+        assert result.metadata["tool_success"] is False
+        # Extractor 产出只有 warehouse_code（未伪造 material_code）
+        assert execution.calls == [
+            ("get_inventory", {"warehouse_code": "A01"})
+        ]
+        assert len(extractor.calls) == 1
+        assert handler.calls == 0  # Schema 校验先于 Handler
+
+    async def test_unknown_tool_passes_empty_arguments(self) -> None:
+        """Router 选中未注册 Tool → Extractor 返回 {}（不猜）→
+        Registry 返回 "Tool 未注册"（不 fallback 其它 Tool）。"""
+        reg = ToolRegistry()
+        register_mock_tools(reg)
+        execution = _CountingToolExecution(registry=reg)
+        extractor = _CountingExtractor()
+        orch = _make_service(
+            router=FakeRouter(_tool_decision("unknown_tool")),
+            tools=reg,
+            tool_execution_service=execution,
+            tool_argument_extractor=extractor,
+        )
+
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.route == RouteType.TOOL
+        assert result.metadata["tool_name"] == "unknown_tool"
+        assert result.metadata["tool_success"] is False
+        assert execution.calls == [("unknown_tool", {})]
+        assert len(extractor.calls) == 1
+        assert extractor.calls[0]["parameters"] is None
+
+    async def test_injected_extractor_used_not_default(self) -> None:
+        """显式注入的 Extractor 生效（默认实例不被使用）。"""
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+
+        class _FixedExtractor:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def extract(self, tool_name, question, *, parameters=None):
+                self.calls += 1
+                return {"material_code": "INJECTED-001"}
+
+        fixed = _FixedExtractor()
+        orch = _make_service(
+            router=FakeRouter(_tool_decision("get_inventory")),
+            tools=registry,
+            tool_argument_extractor=fixed,  # type: ignore[arg-type]
+        )
+
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.metadata["tool_success"] is True
+        assert fixed.calls == 1
+        assert handler.last_arguments == {"material_code": "INJECTED-001"}
+
+    def test_invalid_extractor_rejected(self) -> None:
+        with pytest.raises(AIOrchestratorInputError):
+            AIOrchestratorService(tool_argument_extractor=object())  # type: ignore[arg-type]
+
+    def test_orchestrator_has_no_extraction_patterns(self) -> None:
+        """提取实现 0 处残留（正则 / 区间 / 匹配函数）。"""
+        import inspect
+        import backend.app.services.ai_orchestrator_service as mod
+        src = inspect.getsource(mod)
+        assert "_extract_tool_arguments_from_question" not in src
+        assert "_match_warehouse_code" not in src
+        assert "_match_work_order_no" not in src
+        assert "_spans_overlap" not in src
+        assert "re.compile" not in src
 
 
 # ============================================================

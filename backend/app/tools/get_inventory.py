@@ -10,9 +10,10 @@
         ↓
     AIRouterService.route            （根据 description 关键词命中 TOOL）
         ↓
-    _run_tool
+    _run_tool                        （tool_name 来自 Router decision；Step 3）
         ↓
-    _extract_tool_arguments          （最小兼容性 layer；Phase 3.7.12）
+    ToolArgumentExtractor.extract    （确定性提取；Phase 3.11 Step 6：
+                                       material_code + warehouse_code）
         ↓
     ToolRegistry.execute("get_inventory", arguments={...})
         ↓
@@ -28,16 +29,18 @@
 
 设计纪律（纵深防御）：
 
-* **不**修改 Orchestrator 核心路由逻辑：仅在 ``_run_tool`` 增加"从 question 抽取
-  material_code"的最少 patch（保留现有语义，向后兼容）
+* **不**修改 Orchestrator 核心路由逻辑："从 question 抽取参数"由独立组件
+  ``ToolArgumentExtractor`` 负责（Phase 3.11 Step 6 起；Orchestrator 只编排）
 * **不**修改 SQLValidator / SQLExecutor / TextToSQLService / AIRouterService
 * **不**修改已有 RAG 核心逻辑
 * **不**新增数据库表：Tool 引用**外部**库存表（settings.inventory_tool
   可配置 schema/table 名），生产可指向任何已有库存表
 * **不**写死 ``project_id == "vietnam-wms"``：project_id 仅通过 ProjectContextProvider
   解析；Tool 不关心具体 project_id 值
-* **不**允许 Tool 输入任意 SQL / table / where_clause：DTO 只接受
-  ``material_code`` 一个参数；其它字段被 Tool 参数 Schema 拒绝
+* **不**允许 Tool 输入任意 SQL / table / where_clause：Tool 只接受
+  ``material_code``（必填）与 ``warehouse_code``（可选，Phase 3.11
+  Step 4 契约保留；当前库存表无 warehouse 维度 → Handler 显式拒绝，
+  不静默忽略、不改 SQL）；其它字段被 Tool 参数 Schema 拒绝
 * **只读**：Handler 内使用 ``BEGIN READ ONLY`` 事务 + ``SET LOCAL statement_timeout``
   + 绑定参数；Tool 不提供 UPDATE/INSERT/DELETE 入口
 * **不**在 Tool 中创建 Engine / LLMClient / Embedding：复用 ``get_engine()``
@@ -93,7 +96,10 @@ GET_INVENTORY_DEFINITION: ToolDefinition = ToolDefinition(
     description=(
         "查询指定物料的当前库存数量（只读）。"
         "返回 material_code 与 qty（库存数量）。"
-        "仅支持 material_code 单参数；不接受 SQL / table / where_clause 等。"
+        "支持 material_code（必填）与 warehouse_code（可选）两个参数；"
+        "当前库存表未提供 warehouse 维度，携带 warehouse_code 的查询会被"
+        "显式拒绝（不静默按全仓汇总）。"
+        "不接受 SQL / table / where_clause 等。"
     ),
     # Router 规则命中所用的业务别名。**必须**是具备区分度的短语：
     # 不要放裸词 "库存"，否则 "库存最多的 10 个物料是什么？" 这类
@@ -113,6 +119,17 @@ GET_INVENTORY_DEFINITION: ToolDefinition = ToolDefinition(
                 "description": (
                     "物料编码（1-64 字符）；自动 strip；不接受空字符串 / "
                     "纯空白 / SQL 关键字。"
+                ),
+            },
+            # Phase 3.11 Step 4：多参数 Argument Contract（可选字段）。
+            # 注意：当前库存表未提供 warehouse 维度 → Handler 收到该值
+            # 时**显式拒绝**（不静默忽略，绝不假装过滤）。
+            "warehouse_code": {
+                "type": "string",
+                "description": (
+                    "仓库编码（可选，1-64 字符，与 material_code 同字符集）；"
+                    "自动 strip。当前库存表未提供 warehouse 维度，"
+                    "携带该值的查询会被显式拒绝（不静默忽略）。"
                 ),
             },
         },
@@ -211,6 +228,40 @@ def _validate_material_code(
     if not _MATERIAL_CODE_PATTERN.match(value):
         raise ValueError(
             "material_code 包含非法字符（仅允许字母/数字/点/下划线/dash）"
+        )
+    return value
+
+
+def _validate_warehouse_code(
+    raw: Any, *, max_len: int
+) -> str | None:
+    """校验可选 ``warehouse_code``；None / 缺省 → None（可选语义）。
+
+    字符集 / 长度规则与 material_code 相同（复用同一白名单正则）；
+    该字段当前为**契约保留**：库存表未提供 warehouse 维度，
+    Handler 对非 None 值会显式拒绝（见 ``GetInventoryHandler.__call__``），
+    不静默按全仓汇总。
+
+    Raises:
+        ValueError: 格式非法（不暴露原始输入）。
+                    Tool Handler 会包成 ToolValidationError。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"warehouse_code 必须为字符串（got {type(raw).__name__}）"
+        )
+    value = raw.strip()
+    if not value:
+        raise ValueError("warehouse_code 不能为空或纯空白")
+    if len(value) > max_len:
+        raise ValueError(
+            f"warehouse_code 长度不能超过 {max_len}（got {len(value)}）"
+        )
+    if not _MATERIAL_CODE_PATTERN.match(value):
+        raise ValueError(
+            "warehouse_code 包含非法字符（仅允许字母/数字/点/下划线/dash）"
         )
     return value
 
@@ -340,8 +391,11 @@ class GetInventoryHandler:
         """执行 ``get_inventory``。
 
         Args:
-            arguments: 调用方传入参数；Orchestrator 当前传 ``{}``，
-                        由 Phase 3.7.12 兼容性 layer 注入 ``material_code``。
+            arguments: 调用方传入参数；Orchestrator 传
+                       ``{"material_code": <str>}`` 或
+                       ``{"material_code": <str>, "warehouse_code": <str>}``
+                       （由参数提取层构造；本 Handler 只认这两个字段，
+                       未知字段已被 ToolRegistry Schema 校验拒绝）。
 
         Returns:
             dict: ``{"material_code": <str>, "qty": <float|int>, "project_id": <str>}``。
@@ -350,8 +404,10 @@ class GetInventoryHandler:
         Raises:
             ToolError: 参数校验 / DB 不可用 / 执行错误；归一化为
                        ``ToolResult(success=False, error=...)``。
+            ToolExecutionError: 携带 ``warehouse_code`` 时显式拒绝
+                       （当前库存表未提供 warehouse 维度；见步骤 1.2）。
         """
-        # 1. 参数校验
+        # 1.1 参数校验：material_code（必填）
         try:
             material_code = _validate_material_code(
                 arguments.get("material_code"),
@@ -364,6 +420,34 @@ class GetInventoryHandler:
                 reason=str(exc),
                 field_path="material_code",
             ) from exc
+
+        # 1.1b 参数校验：warehouse_code（可选；Phase 3.11 Step 4）
+        try:
+            warehouse_code = _validate_warehouse_code(
+                arguments.get("warehouse_code"),
+                max_len=self._settings.material_code_max_len,
+            )
+        except ValueError as exc:
+            raise ToolValidationError(
+                tool_name="get_inventory",
+                reason=str(exc),
+                field_path="warehouse_code",
+            ) from exc
+
+        # 1.2 warehouse 维度 guard（Phase 3.11 Step 4）：
+        #     当前库存表（settings.inventory_tool.schema.table）没有
+        #     warehouse 列 → 无法在 SQL 层做仓库过滤。**显式拒绝**，
+        #     绝不静默忽略参数后按全仓汇总返回（那会给出错误的业务答案）。
+        #     未来库存表提供 warehouse 维度时，在此处改为把 warehouse_code
+        #     作为可选绑定参数传入 _run_inventory_query 即可（独立阶段）。
+        if warehouse_code is not None:
+            raise ToolExecutionError(
+                tool_name="get_inventory",
+                reason=(
+                    "库存表未提供 warehouse 维度，warehouse_code 过滤"
+                    "当前不受支持（显式拒绝而非静默忽略参数）"
+                ),
+            )
 
         # 2. Engine 解析
         engine = self._engine or get_engine()
@@ -438,8 +522,15 @@ def register_get_inventory_tool(
 def build_default_tool_registry(
     *,
     handler: GetInventoryHandler | None = None,
+    work_order_handler: Any | None = None,
 ) -> ToolRegistry:
-    """构造一个预注册真实 ``get_inventory`` 的 ToolRegistry。
+    """构造预注册**全部真实 Tool** 的 ToolRegistry。
+
+    Phase 3.11 Step 5：注册两个真实只读 Tool —— 二者共用同一
+    ToolExecutionService / ToolRegistry 执行边界：
+
+        * ``get_inventory``   （Phase 3.7.12）
+        * ``get_work_order``  （Phase 3.11 Step 5）
 
     用于在 ``AIOrchestratorService`` 构造时注入；
     Phase 3.7.9 默认 Orchestrator 工厂 ``get_default_orchestrator()``
@@ -447,11 +538,21 @@ def build_default_tool_registry(
     以使 TOOL 路由可达。
 
     Args:
-        handler: 可选自定义 Handler；None 时使用默认 Handler。
+        handler: 可选自定义 get_inventory Handler；None 时使用默认 Handler。
+        work_order_handler: 可选自定义 get_work_order Handler；
+                            None 时使用默认 Handler（懒加载 engine）。
 
     Returns:
-        ``ToolRegistry``，包含真实 ``get_inventory``。
+        ``ToolRegistry``，含两个真实只读 Tool
+        （注册顺序：get_inventory → get_work_order）。
     """
+    # 延迟 import：避免 tools 包内模块级互相引用
+    # （get_work_order 不依赖本模块，此处延迟仅为保持 import 图稳定）
+    from backend.app.tools.get_work_order import (
+        register_get_work_order_tool,
+    )
+
     registry = ToolRegistry()
     register_get_inventory_tool(registry, handler=handler)
+    register_get_work_order_tool(registry, handler=work_order_handler)
     return registry

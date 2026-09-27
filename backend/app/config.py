@@ -367,6 +367,62 @@ class InventoryToolSettings:
 
 
 # ============================================================
+# Work Order Tool 配置（Phase 3.11 Step 5）
+# ============================================================
+
+WORK_ORDER_TOOL_NO_MAX_LEN = 64
+WORK_ORDER_TOOL_QUERY_TIMEOUT_SECONDS_MIN = 1
+WORK_ORDER_TOOL_QUERY_TIMEOUT_SECONDS_MAX = 60
+
+
+@dataclass(frozen=True)
+class WorkOrderToolSettings:
+    """真实 ``get_work_order`` Tool 配置（Phase 3.11 Step 5 引入）。
+
+    字段：
+        schema_name:      工单表所在 schema。环境变量 ``WMS_WORK_ORDER_SCHEMA``，
+                          默认 ``public``。必须是 SQL 安全标识符
+                          （字母/数字/下划线/点；不接受引号）。
+        table_name:       工单表名。环境变量 ``WMS_WORK_ORDER_TABLE``，
+                          默认 ``work_order``。同 schema_name 约束。
+                          **当前部署环境未提供该业务表**（Step 5 勘察结论：
+                          真实 DB 无 work_order 表）；生产接入时由部署环境
+                          提供，Tool 代码不建表、不改任何数据库结构。
+        work_order_no_max_len:
+                          ``work_order_no`` 长度上限。环境变量
+                          ``WMS_WORK_ORDER_NO_MAX_LEN``，默认 64，
+                          钳制到 [1, 256]。
+        query_timeout_seconds:
+                          PostgreSQL ``statement_timeout``（秒）。
+                          环境变量 ``WMS_WORK_ORDER_QUERY_TIMEOUT_SECONDS``，
+                          默认 10，钳制到 [1, 60]。
+    """
+
+    schema_name: str = field(
+        default_factory=lambda: _get_str("WMS_WORK_ORDER_SCHEMA", "public")
+    )
+    table_name: str = field(
+        default_factory=lambda: _get_str(
+            "WMS_WORK_ORDER_TABLE", "work_order"
+        )
+    )
+    work_order_no_max_len: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_WORK_ORDER_NO_MAX_LEN",
+            WORK_ORDER_TOOL_NO_MAX_LEN,
+            1, 256,
+        )
+    )
+    query_timeout_seconds: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_WORK_ORDER_QUERY_TIMEOUT_SECONDS", 10,
+            WORK_ORDER_TOOL_QUERY_TIMEOUT_SECONDS_MIN,
+            WORK_ORDER_TOOL_QUERY_TIMEOUT_SECONDS_MAX,
+        )
+    )
+
+
+# ============================================================
 # Text-to-SQL 配置（Phase 3.7.6）
 # ============================================================
 
@@ -495,6 +551,9 @@ class Settings:
     inventory_tool: InventoryToolSettings = field(
         default_factory=InventoryToolSettings
     )
+    work_order_tool: WorkOrderToolSettings = field(
+        default_factory=WorkOrderToolSettings
+    )
     project: ProjectSettings = field(default_factory=ProjectSettings)
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
@@ -512,6 +571,7 @@ __all__ = [
     "RerankerSettings",
     "ToolSettings",
     "InventoryToolSettings",
+    "WorkOrderToolSettings",
     "ProjectSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",

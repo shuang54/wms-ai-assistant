@@ -4,7 +4,9 @@
     根据用户问题 + 能力元数据，决定问题应进入哪一种 AI 能力：
 
         RAG          知识 / 流程 / 操作说明 / 业务规则 / 配置 / 故障
-        TOOL         已注册的固定业务能力（仅元数据匹配，不调用）
+        TOOL         已注册的固定业务能力（仅元数据匹配，不调用；
+                     并选择具体 Tool 写入 RouteDecision.tool_name ——
+                     Phase 3.11 Step 3：Tool 选择的唯一来源）
         TEXT_TO_SQL  数据分析 / 统计 / 聚合 / 排序 / 过滤
 
 策略：
@@ -78,15 +80,22 @@ class RouteDecision:
     Attributes:
         route:       路由目标。
         confidence:  规则命中时的固定高置信度；LLM 路径为 None
-                     （LLM 不提供稳定数值置信度，避免误导上层）。
+                    （LLM 不提供稳定数值置信度，避免误导上层）。
         reason:      可解释依据（<= 30 词；不含敏感信息）。
         source:      "rule" / "tool_match" / "llm" / "fallback"。
+        tool_name:   Phase 3.11 Step 3 —— **Tool 选择的唯一来源**：
+                     route=TOOL 且规则命中（``tool_match``）时携带被
+                     选中的 Tool 名称（来自 capability 元数据 ——
+                     name / description / aliases，**不含 handler**）；
+                     其它 route（RAG / TEXT_TO_SQL）、LLM fallback 与
+                     兜底路径均为 None（不猜测具体 Tool）。
     """
 
     route: RouteType
     confidence: float | None
     reason: str | None
     source: str = "rule"
+    tool_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -271,7 +280,10 @@ def _match_tool(
 ) -> RouteDecision | None:
     """基于 capability description / aliases 的轻量匹配。
 
-    不执行 Tool，不拼参数；只描述"是否明确匹配某个已注册 Tool"。
+    不执行 Tool，不拼参数；只描述"是否明确匹配某个已注册 Tool"，
+    并把命中的 Tool 名称写入 ``RouteDecision.tool_name``
+    （Phase 3.11 Step 3：**Tool 选择的唯一来源** —— 上层调用方
+    直接使用该名称，不做二次选择）。
     """
     q = question.lower()
     for cap in capabilities:
@@ -284,6 +296,7 @@ def _match_tool(
                 confidence=0.85,
                 reason=f"规则命中：匹配已注册 Tool '{cap.name}'",
                 source="tool_match",
+                tool_name=cap.name,
             )
         if alias_hits:
             return RouteDecision(
@@ -294,6 +307,7 @@ def _match_tool(
                     f"{alias_hits[:2]}"
                 ),
                 source="tool_match",
+                tool_name=cap.name,
             )
     return None
 

@@ -11,8 +11,12 @@
       ToolCallingBudgetExceededError（502） / ToolChatError / 未知异常
     - 安全：错误响应不泄露敏感信息
     - OpenAPI 注册
-    - 接线：真实 ToolChatService + Scripted LLM + Mock Tools 端到端
+    - 接线：真实 ToolChatService + Scripted LLM + Mock Registry 端到端
       （含多步链路 + 预算耗尽 → 502）
+
+Phase 3.11 Step 11：生产 Registry 已改为真实只读 get_inventory
+（会访问 PostgreSQL）→ 本文件在需要执行 Tool 的用例中显式 monkeypatch
+`_tool_registry` 注入 Mock Registry（不触发 DB）。
 
 全部 Mock，不发起真实 DB / LLM 调用。
 """
@@ -43,6 +47,18 @@ from backend.app.services.tool_chat_service import (
 )
 from backend.app.tools.mock_tools import register_mock_tools
 from backend.app.tools.registry import ToolRegistry
+
+
+def _mock_registry() -> ToolRegistry:
+    """Mock Tool Registry（Phase 3.6.1；Phase 3.11 Step 11 后仅供测试注入）。
+
+    生产 Registry 已改为真实只读 get_inventory（会访问 PostgreSQL）；
+    Mock Registry 继续承担 Function Calling / Multi-Step / Budget 等
+    行为测试（不触发 DB）。
+    """
+    registry = ToolRegistry()
+    register_mock_tools(registry)
+    return registry
 
 
 # ============================================================
@@ -170,10 +186,9 @@ class TestNormalRequest:
         with client() as (c, fake):
             c.post("/api/chat/with-tools", json={"message": "q"})
         assert len(fake.registries) == 1
-        # 注入的是模块级 registry（含两个 Mock Tool）
+        # 注入的是模块级 registry（Phase 3.11 Step 11：真实只读 get_inventory）
         assert {d.name for d in fake.registries[0].list_definitions()} == {
             "get_inventory",
-            "get_work_order",
         }
 
     def test_openapi_contains_endpoint(self, client) -> None:
@@ -349,8 +364,18 @@ class _InfiniteToolLLM:
 
 class TestRealServiceWiring:
     def test_end_to_end_through_endpoint(self, monkeypatch) -> None:
-        """真实 Service + Scripted LLM：完整两轮链路通过 HTTP 暴露。"""
+        """真实 Service + Scripted LLM：完整两轮链路通过 HTTP 暴露。
+
+        Phase 3.11 Step 11：生产 Registry 已改为真实只读 get_inventory
+        （会访问 PostgreSQL），本测试关注 Function Calling / Multi-Step
+        行为本身 → 显式注入 Mock Registry（与 Step 10 之前等价）。
+        """
         llm = _ScriptedLLM()
+        monkeypatch.setattr(
+            tool_chat_module,
+            "_tool_registry",
+            _mock_registry(),
+        )
         monkeypatch.setattr(
             tool_chat_module,
             "_tool_chat_service",

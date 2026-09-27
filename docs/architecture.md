@@ -1363,7 +1363,7 @@ Facade 不吞异常、不包装、不转换成 None。
   boundary，数据仍是 §8.19 的 Usage 白名单字段；
 * 无缓存 / 无全局状态 / 无 fire-and-forget（调用方必须 `await`）。
 
-## 8.22 Usage Analytics HTTP Read API（Phase 3.10.22，已设计 / 待实现）
+## 8.22 Usage Analytics HTTP Read API（Phase 3.10.22，已实现）
 
 在 Usage Analytics Read Facade 之上增加**只读 HTTP Application API**：
 
@@ -1413,6 +1413,1157 @@ PostgreSQL
 
 状态：**已实现**（Step 2：`backend/app/api/usage.py` +
 `tests/test_usage_analytics_api.py`；实现与 Contract 一致）。
+
+## 8.23 Tool Execution Boundary + Tool Selection Unification（Phase 3.11）
+
+> Step 1（现状勘察）：`docs/evaluation/Phase 3.11 — Tool Execution Boundary.md`
+> Step 2（执行边界）：`docs/evaluation/Phase 3.11 Step 2 — Tool Execution Boundary.md`
+> Step 3（选择统一）：`docs/evaluation/Phase 3.11 Step 3 — Tool Selection Unification.md`
+> Step 4（多参数契约）：`docs/evaluation/Phase 3.11 Step 4 — Multi-Parameter Tool Argument Contract.md`
+> Step 5（第二个真实 Tool）：`docs/evaluation/Phase 3.11 Step 5 — Multiple Real Tools.md`
+> Step 6（参数提取边界）：`docs/evaluation/Phase 3.11 Step 6 — Tool Argument Extraction Boundary.md`
+> Step 7（契约清理 + 边界锁定）：`docs/evaluation/Phase 3.11 Step 7 — Tool Boundary Contract.md`
+>   → 职责矩阵 / Contract C1–C12 见 §8.25
+
+### 当前真实 Tool 执行链（链路 A = Orchestrator，Step 3 之后）
+
+```text
+Question
+  ↓
+AIOrchestratorService.execute
+  ↓
+AIRouterService.route（Rule-first：TOOL capability 匹配；LLM fallback；兜底 RAG）
+  ↓
+RouteDecision
+  ├── RAG
+  ├── TOOL + tool_name          ← Phase 3.11 Step 3：Tool 选择的唯一来源
+  │       ↓
+  │   AIOrchestratorService._run_tool
+  │       ├── tool_name = decision.tool_name（未携带 → RouteError，不猜）
+  │       ├── ToolArgumentExtractor.extract（Phase 3.11 Step 6：参数提取边界；
+  │       │      参数 = tool_name + question + Tool 声明字段）
+  │       ↓
+  │   ToolExecutionService.execute（Phase 3.11 Step 2：应用层执行边界）
+  │       ├── capability 校验（工具白名单；被拒 → Handler 0 次调用）
+  │       ↓
+  │   ToolRegistry.execute（唯一执行权威，不变）
+  │       ├── validate_arguments（Argument Validation）
+  │       ├── Handler
+  │       └── 异常归一化
+  │       ↓
+  │   ToolResult（原样返回）→ AIOrchestrationResult → ChatResponse
+  │
+  └── TEXT_TO_SQL
+```
+
+链路 B（`POST /api/chat/with-tools`，ToolChatService，LLM function calling
+多步循环）：Phase 3.11 Step 9 起执行点已改经
+`ToolExecutionService`（**执行边界统一**），Step 10 起项目级 capability /
+project_id 也在该边界生效（提供可选 `project_id`；未提供则不限制），
+Step 11 起注册**真实只读** `get_inventory`（Mock Tools 仅供测试）。
+**Orchestration 仍未合并**（不经过 Router / Extractor）；真实
+`get_work_order` 接入仍 Deferred。
+勘察与决策：§8.26；迁移：§8.27；项目能力：§8.28；真实 Tool：§8.29；
+失败契约：§8.30；执行上下文：§8.31；执行记录：§8.32；观测出口：§8.33；
+内存收集器：§8.34。
+
+### 真实 Tool 清单
+
+```text
+get_inventory（真实，Phase 3.7.12）  —— 只读 PostgreSQL SELECT（READ ONLY 事务 + 绑定参数）
+get_work_order（真实，Phase 3.11.5） —— 只读 PostgreSQL SELECT（READ ONLY 事务 + 绑定参数）
+get_inventory（Mock，Phase 3.6.1）   —— 硬编码 quantity=1000，无 IO（**仅测试**注入；生产 Registry 已换真实版，Step 11）
+get_work_order（Mock，Phase 3.6.1）  —— 硬编码 status=RELEASED，无 IO（**仅测试**注入；真实版接入 = Deferred）
+```
+
+### 已确立的边界（保持不变）
+
+```text
+ToolRegistry.execute = 全项目唯一 Tool 执行入口
+    （Schema 校验 → Handler → 异常归一化 → ToolResult）
+ToolExecutionService（backend/app/services/tool_execution_service.py）
+    = 应用层执行边界（capability 校验 + 委派 Registry；无 Handler / DB / LLM 依赖）
+Router 暴露的 Tool 元数据仅 name / description / aliases（不含 handler）
+Tool 无写操作 / 无任意 SQL / 无任意 HTTP / 无 shell / 无文件访问
+Tool 不调用 LLM；Tool 不调用其它 Tool
+```
+
+### RouteDecision（Phase 3.11 Step 3）
+
+```text
+RouteDecision(route, confidence, reason, source, tool_name=None)
+
+TOOL          → tool_name = 被选中的 Tool 名称（tool_match 规则命中）
+RAG           → tool_name = None
+TEXT_TO_SQL   → tool_name = None
+LLM fallback 判 TOOL → tool_name = None（不猜；由上层显式拒绝执行）
+```
+
+### Argument Contract（Phase 3.11 Step 4：多参数）
+
+```text
+Question
+  ↓ AI Router
+RouteDecision(tool_name="get_inventory")
+  ↓ AIOrchestrator._run_tool
+ToolArgumentExtractor.extract（Phase 3.11 Step 6 迁出；确定性规则；
+                              非 NLP / 非 LLM）
+  ├── warehouse_code：显式仓库表达（"A01 仓库" / "仓库 A01" /
+  │                   "warehouse A01" / "warehouse_code=A01"）
+  └── material_code：第一个不落在仓库表达区间内的合法字面量
+  ↓ arguments（仅含匹配到的字段）
+ToolExecutionService（capability；arguments 原样透传）
+  ↓
+ToolRegistry.validate_arguments（唯一 Schema 权威：
+    required / 类型 / 未知字段拒绝；缺失必填 → ToolResult(False)）
+  ↓
+get_inventory Handler
+    material_code（必填）+ warehouse_code（可选，契约保留）
+    warehouse_code 非 None → 显式拒绝（ToolExecutionError，0 DB）
+    （当前库存表无 warehouse 维度 → database-level warehouse
+      filtering = NOT SUPPORTED；绝不静默忽略参数）
+  ↓
+ToolResult
+```
+
+### 多 Tool 统一执行边界（Phase 3.11 Step 5）
+
+```text
+                    Question
+                       │
+                       ▼
+                AIOrchestrator
+                       │
+                       ▼
+                    Router                （selection：tool_name 唯一来源）
+                       │
+                  RouteDecision
+                  tool_name
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+       get_inventory       get_work_order
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+             ToolExecutionService        （execution boundary：capability + 委派）
+                       │
+                       ▼
+                 ToolRegistry             （schema / execution authority）
+                       │
+                 Schema Validation        （validate_arguments）
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+          Tool A               Tool B      （business implementation；只读）
+             │                   │
+             └─────────┬─────────┘
+                       ▼
+                   ToolResult             （统一契约）
+```
+
+* `ToolExecutionService` 是两个真实 Tool 的**共同执行边界**
+  （Step 5 零修改即接入第二个 Tool）；
+* `ToolArgumentExtractor` 是两个真实 Tool 的**共同参数提取边界**
+  （Phase 3.11 Step 6：提取实现从 Orchestrator 迁出，0 处残留，见 §8.24）；
+* Tool-to-Tool 隔离：Handler 无 Registry / ExecutionService / Orchestrator
+  依赖；Tool 不调用其它 Tool（Question → Router → ONE Tool）；
+* `get_work_order` 真实化：ToolChatService 链路仍使用 mock 版（未迁移）。
+
+### 已引入 / 未引入（如实记录）
+
+```text
+Tool Execution Boundary（最小抽取）        = introduced（Phase 3.11 Step 2）
+Tool Selection Unification               = IMPLEMENTED（Phase 3.11 Step 3）
+（Router 是 Tool 选择唯一来源；Orchestrator 的 _resolve_tool_name 已删除）
+Multi-Parameter Tool Argument Contract   = IMPLEMENTED（Phase 3.11 Step 4）
+（get_inventory：material_code 必填 + warehouse_code 可选）
+第二个真实只读 Tool                        = IMPLEMENTED（Phase 3.11 Step 5）
+（get_work_order 真实化；与 get_inventory 共用同一执行边界）
+Deterministic Argument Extraction        = IMPLEMENTED（最小表达集合）
+Tool Argument Extraction Boundary        = IMPLEMENTED（Phase 3.11 Step 6）
+（ToolArgumentExtractor：提取职责已从 Orchestrator 迁出，Orchestrator 0 处残留）
+LLM Argument Extraction                  = NOT IMPLEMENTED
+Generic NLP Argument Parsing             = NOT IMPLEMENTED
+Database-level warehouse filtering        = NOT SUPPORTED（库存表无 warehouse 维度）
+Database-level get_work_order             = NOT SUPPORTED（真实 DB 无该业务表；
+                                            非 DB 边界测试完整覆盖）
+ToolChatService Migration                = NOT IMPLEMENTED
+Agent / LangGraph / MCP / Memory / Planning = NOT IMPLEMENTED
+多步 Tool Calling（Orchestrator 链路）      = NOT IMPLEMENTED
+```
+
+## 8.24 Tool Argument Extraction Boundary（Phase 3.11 Step 6）
+
+> Contract / 迁移记录：`docs/evaluation/Phase 3.11 Step 6 — Tool Argument Extraction Boundary.md`
+
+### 目的
+
+```text
+Phase 3.11 Step 1～5 已确立：
+    Tool Selection      = Router（唯一来源）
+    Execution Boundary  = ToolExecutionService
+    Argument Contract   = get_inventory（material_code + warehouse_code）
+                          get_work_order（work_order_no）
+
+Step 6 只解决一件事：
+    Tool 参数提取（Question → arguments）从 AIOrchestratorService 内部
+    独立为 ToolArgumentExtractor（唯一定义位置），行为逐字不变。
+```
+
+### 最终链路（链路 A = Orchestrator，Step 6 之后）
+
+```text
+Question
+   ↓
+Router                              （Tool Selection Authority）
+   ↓
+RouteDecision(tool_name)
+   ↓
+AIOrchestratorService._run_tool     （编排；0 处提取实现）
+   │   读取 ToolDefinition.parameters（声明字段，仅作字段门槛）
+   ↓
+ToolArgumentExtractor.extract       （Argument Extraction Boundary）
+   │   确定性：字符串匹配 / 正则 / 字符区间计算（非 NLP / 非 LLM）
+   ↓
+arguments（仅含命中的字段；缺失字段不补）
+   ↓
+ToolExecutionService.execute        （Execution Boundary：capability + 委派）
+   ↓
+ToolRegistry.execute                （Schema Validation Authority）
+   ├── validate_arguments（required / type / unknown field）
+   ├── Handler
+   └── 异常归一化
+   ↓
+Tool（Business Implementation；只读）
+   ↓
+ToolResult → AIOrchestrationResult → ChatResponse
+```
+
+链路 B（`POST /api/chat/with-tools`，ToolChatService）**未迁移**，仍走
+LLM function calling 多步循环 + mock tools（Step 6 明确不处理）。
+
+### 职责归属（Boundary）
+
+```text
+Router                  = Tool Selection Authority
+                          （decision.tool_name 是唯一选择来源）
+
+ToolArgumentExtractor   = Natural-language-to-argument candidate extraction
+                          （确定性候选值识别；不校验合法性）
+
+ToolRegistry            = Schema Validation Authority
+                          （required / 类型 / 未知字段拒绝；唯一执行权威）
+
+ToolExecutionService    = Execution Boundary
+                          （capability 校验 + 委派 Registry）
+
+Tool（Handler）          = Business Implementation
+                          （只读业务查询 + 业务级第二层校验）
+```
+
+### 组件契约
+
+```text
+位置：backend/app/services/tool_argument_extractor.py
+入口：ToolArgumentExtractor.extract(tool_name, question, *, parameters=None)
+返回：dict[str, Any]（永不为 None；未命中 / 未知 Tool → {}）
+
+支持字段（本阶段仅两个真实 Tool）：
+    get_inventory  → material_code（第一个不在锚定区间内的字面量）
+                     warehouse_code（显式仓库表达）
+    get_work_order → work_order_no（显式工单表达）
+
+字段来源优先级：
+    parameters（ToolDefinition.parameters 的声明字段）
+        > Tool 名称规则表（_TOOL_FIELD_RULES）
+        > {}（未知 Tool：不猜、不 fallback）
+
+禁止依赖（AST 静态测试锁定）：
+    ToolRegistry / ToolExecutionService / Handler / DB / SQLAlchemy /
+    Session / Engine / SQL / Router / LLM / HTTP / Socket / 文件系统 /
+    subprocess / eval / exec / open
+    （组件无任何 backend.app.* import；无状态：vars(instance) == {}）
+```
+
+### 行为不变性（Step 6 的核心约束）
+
+```text
+* warehouse / work_order 表达集合逐字保持（正则未改写，仅移动位置）；
+* 锚定区间排除（spans_overlap + material interval exclusion）行为不变：
+      "A01 仓库 MAT-001"       → warehouse=A01, material=MAT-001
+      "warehouse A01 ... 10001" → warehouse=A01, material=10001
+* 缺失字段不补齐（required 仍由 ToolRegistry 裁决）：
+      "查询 A01 仓库库存" → {"warehouse_code": "A01"} → Registry 拒绝
+* 未知 Tool → {}（不猜 Tool、不 fallback 到 get_inventory / get_work_order）
+* 未注册 Tool 的 arguments 由 None 变为 {}：
+      两者在 ToolRegistry.execute 内等价（None 归一为 {}），
+      用户可见结果完全一致（"Tool 未注册"）。
+```
+
+### 零修改清单（Step 6 验证：SHA256 前后一致）
+
+```text
+backend/app/services/tool_execution_service.py   unchanged
+backend/app/services/ai_router_service.py        unchanged（Router / RouteDecision）
+backend/app/services/tool_chat_service.py        unchanged
+backend/app/tools/registry.py                    unchanged
+backend/app/tools/get_inventory.py               unchanged
+backend/app/tools/get_work_order.py              unchanged
+```
+
+### 已引入 / 未引入（Step 6）
+
+```text
+Tool Argument Extraction Boundary    = IMPLEMENTED（Phase 3.11 Step 6；
+                                       Orchestrator 0 处提取实现）
+LLM Argument Extraction              = NOT IMPLEMENTED
+Generic NLP Argument Parsing         = NOT IMPLEMENTED
+Schema-driven NLP / Function Calling = NOT IMPLEMENTED
+第三个 Tool                          = NOT IMPLEMENTED（规则表由测试锁定，防隐式扩展）
+ToolChatService Migration            = NOT IMPLEMENTED
+Agent / LangGraph / MCP / Memory / Planning / Multi-step Tool Calling = NOT IMPLEMENTED
+```
+
+## 8.25 Tool Boundary Contracts（Phase 3.11 Step 7）
+
+> Contract Tests：`tests/test_tool_architecture_contract.py`（C1–C12）
+> 阶段记录：`docs/evaluation/Phase 3.11 Step 7 — Tool Boundary Contract.md`
+> 本阶段只做「契约清理 + 静态边界锁定」，**不**新增任何业务能力。
+
+### 职责矩阵（唯一权威）
+
+```text
+Router                  = Selection Authority
+                          （只读 Tool 元数据：name / description / aliases；
+                            不持有 handler、不执行 Tool）
+
+AIOrchestrator          = Orchestration
+                          （RouteDecision.tool_name → Extractor → ExecutionService；
+                            不绕过执行边界、不重选 Tool、无 Tool-specific 分支）
+
+ToolArgumentExtractor   = Candidate Argument Extraction
+                          （确定性候选值识别；不校验合法性、不执行、不触达
+                            Registry / DB / LLM / HTTP）
+
+ToolRegistry            = Schema Validation + Tool Dispatch Authority
+                          （validate_arguments + Handler 调用 + 异常归一化；
+                            唯一 Schema 校验入口、唯一执行权威）
+
+ToolExecutionService    = Capability + Execution Boundary
+                          （capability 校验 + 委派 Registry；不解析业务参数）
+
+Tool（Handler）          = Business Implementation
+                          （只读业务实现；不依赖任何上层模块）
+
+ToolResult              = Unified Tool Output Contract
+                          （success / data / error；frozen）
+```
+
+### 依赖方向（单向）
+
+```text
+Router                  → （无 Tool 执行依赖）
+AIOrchestrator          → Router / ToolArgumentExtractor / ToolExecutionService
+ToolArgumentExtractor   → 仅 Python 标准库（re / typing / collections.abc）
+ToolExecutionService    → ToolRegistry（+ ProjectCapabilities 纯配置 DTO）
+ToolRegistry            → Handler（执行权威；Handler 不被上层直接调用）
+Tool（Handler）          → DB 抽象 / 配置 / 项目上下文（**不**依赖上层）
+```
+
+### Contract 清单（C1–C12，全部由测试锁定）
+
+```text
+C1  Router 不执行 Tool（Selection Only；capability 元数据只读）
+C2  ToolArgumentExtractor 不执行 Tool（纯确定性；无 Registry / DB / LLM / HTTP）
+C3  ToolExecutionService 不解析业务参数（Capability + Registry Delegation）
+C4  Tool 不调用上层（无 Orchestrator / Router / Extractor / ExecutionService）
+C5  Tool 之间不互调（cross-import / Handler 引用 / 装配层唯一例外）
+C6  Orchestrator 只负责编排（不绕过 ToolExecutionService 直接执行 Tool）
+C7  ToolRegistry 是唯一 Schema Authority（missing / unknown / invalid type）
+C8  ToolExecutionService 原样透传 arguments（不 rename / filter / fill / parse）
+C9  Tool Selection 唯一来源 = RouteDecision.tool_name（Orchestrator 不重选）
+C10 Unknown Tool 不 fallback（不猜 Tool / 不落到 RAG / Text-to-SQL）
+C11 单 Tool 执行（每请求 1 次执行；无 Tool→Tool / Tool→Router→Tool 循环）
+C12 禁止 LLM 参数提取（Extractor 无 async / 无 LLM / 无 HTTP / 无 function calling）
+```
+
+### 允许的例外（如实记录，测试锁定归属）
+
+```text
+* Router 默认装配：get_default_router 内**延迟 import** ToolRegistry +
+  mock_tools → 仅用于 capability 元数据（list_definitions），仍不执行 Tool
+  （C1 锁定：模块级 import 不含 Registry；任何层级无 *.execute()）。
+* ToolExecutionService → ai_orchestrator_service：仅在 _check_capability 内
+  延迟 import 「AIOrchestratorCapabilityError」（定义在 Orchestrator 模块，
+  模块级 import 会循环依赖），保持既有 capability 拒绝语义与 HTTP 403
+  （C3 锁定：唯一延迟 import，且只取该异常类型）。
+* get_inventory.build_default_tool_registry → get_work_order：模块级不交叉
+  import；仅装配层延迟 import 注册助手 register_get_work_order_tool
+  （不是 Handler、不是 Tool→Tool 调用）（C5 锁定）。
+* AIOrchestrator 持有 ToolRegistry：仅用于构造 ToolExecutionService 与读取
+  ToolDefinition.parameters（声明字段门槛），**不**调用 registry.execute()
+  （C6 锁定：self._tools.get_definition 允许；self._tools.execute 禁止）。
+```
+
+### 边界不变量（任何后续阶段都不得破坏）
+
+```text
+1. Tool 选择只发生在 Router（decision.tool_name 是唯一来源）
+2. Tool 参数提取只发生在 ToolArgumentExtractor（确定性，无 LLM）
+3. Schema 校验只发生在 ToolRegistry（required / type / unknown field）
+4. Tool 执行只发生在 ToolRegistry.execute（经 ToolExecutionService 进入）
+5. 每个 TOOL 请求只执行 ONE Tool（无循环、无 Tool→Tool）
+6. Tool 之间互不调用；Tool 不依赖任何上层模块
+7. ToolResult 是唯一 Tool 输出契约
+```
+
+## 8.26 ToolChatService Boundary Survey（Phase 3.11 Step 8）
+
+> 勘察记录 / 边界决策：`docs/evaluation/Phase 3.11 Step 8 — ToolChatService Survey.md`
+> 契约测试：`tests/test_tool_chat_architecture_contract.py`（C1–C10）、
+> `tests/test_tool_chat_service_characterization.py`（缺口补测）
+>
+> 本阶段（Step 8）**只勘察**：当时生产代码 0 修改；不迁移 / 不删除 ToolChatService。
+> **后续变更**：Phase 3.11 Step 9 已按本节结论把链路 B 的执行点统一到
+> `ToolExecutionService`（Orchestration 仍独立）——见 §8.27。
+
+### 两条链路（**并存**，未统一 —— 不要画成已合并）
+
+```text
+【链路 A】主业务链路（Phase 3.11 Step 1–7，权威）
+Question
+  ↓
+Router                                   （Selection Authority）
+  ↓ RouteDecision(tool_name)
+AIOrchestrator                           （Orchestration）
+  ↓
+ToolArgumentExtractor                    （确定性参数提取）
+  ↓
+ToolExecutionService                     （Capability + Execution Boundary）
+  ↓
+ToolRegistry                             （Schema Validation + Dispatch Authority）
+  ↓
+真实 Tool（get_inventory / get_work_order，只读 DB）
+  ↓
+ToolResult
+入口：POST /api/ai/chat
+
+【链路 B】Function Calling 链路（Phase 3.6.2–3.6.3；执行边界 Step 9 统一；
+        真实 Tool Step 11 接入）
+POST /api/chat/with-tools
+  ↓ 模块级单例（registry = 真实只读 get_inventory；Mock 仅测试注入）
+ToolChatService                          （LLM Function Calling 多步编排）
+  ↓ while True（预算 max_rounds=TOOL_MAX_ROUNDS，默认 5，钳制 [1,20]）
+LLM（tools=registry.list_definitions() 转换的 OpenAI schema）
+  ↓ ToolCall(id, name, arguments)        （LLM 决定 Tool 与参数）
+ToolExecutionService.execute(name, arguments=...)
+                                          ← Phase 3.11 Step 9：统一执行边界
+  ↓
+ToolRegistry.execute（Schema 校验 → Handler → 异常归一化）
+  ↓
+Real get_inventory Handler → PostgreSQL（SELECT …；READ ONLY + 绑定参数）
+  ↓ ToolResult → role=tool message → 下一轮 LLM
+最终回答
+```
+
+> 两条链路的 **Orchestration 仍未合并**：链路 B 不经过 Router /
+> ToolArgumentExtractor / AIOrchestrator；共享的只有 **ToolExecutionService**
+> （单 Tool 执行边界）+ ToolRegistry + ToolResult。
+
+### 事实对照（真实代码，非目标状态）
+
+| 能力 | 链路 A（新 Tool Pipeline） | 链路 B（ToolChatService） |
+|---|---|---|
+| Tool Selection | Router（`RouteDecision.tool_name`） | LLM function calling（`ToolCall.name`） |
+| Tool Argument Extraction | `ToolArgumentExtractor`（确定性） | LLM 结构化 arguments（Client 解析 JSON） |
+| Schema Validation | ToolRegistry | ToolRegistry（相同，未绕过） |
+| Capability | `ToolExecutionService._check_capability`（项目白名单） | **同一 Enforcement Point**（Step 10：提供 project_id 时生效；省略则不限制） |
+| Tool Execution | ToolExecutionService → ToolRegistry | **ToolExecutionService → ToolRegistry（Step 9 已统一）** |
+| Tool Result | ToolResult | ToolResult（相同） |
+| Multi-step | 禁止（ONE Tool） | **允许**（sequential + 预算） |
+| Project Context | Orchestrator（capabilities / scope / schema） | **project_id → capabilities（执行上下文；Step 10）**；仍不注入 Engine / Schema / Semantic |
+| Tools | 真实只读 Tool（DB） | **真实只读 `get_inventory`（Step 11）**；`get_work_order` 仍 Deferred，Mock 仅测试注入 |
+| 入口 | `POST /api/ai/chat` | `POST /api/chat/with-tools` |
+
+共享组件（Step 9 起）：`ToolExecutionService`（单 Tool 执行边界，两条链路都经它）
++ `ToolRegistry`（同一类，两个独立实例）+ `ToolResult`（同一 DTO）。
+未共享：Orchestration / Selection / Argument 语义 / Capability / ProjectContext。
+
+### 迁移决策（Architecture Decision）
+
+```text
+Migration Option A（Deprecate）        = NOT CHOSEN（公开且已文档化接口，删除需产品决策）
+Migration Option B（Reuse Execution）  = IMPLEMENTED（Phase 3.11 Step 9：
+                                          执行点改经 ToolExecutionService）
+Migration Option C（Keep Separate）    = ADOPTED（Orchestration 仍独立：
+                                          Router/Extractor 与 Function Calling 不合并）
+```
+
+```text
+Current architecture = C（Keep Separate）+ B（共享单 Tool 执行边界）
+
+理由：Selection / Argument 语义根本不同（确定性 vs Function Calling），
+      强行合并会产生"Router + Function Calling 双选择"的混合体（Step 3 已消除）；
+      但"执行"是共同的：两条链路共享 ToolExecutionService（ONE Tool execution），
+      loop / 预算 / 消息历史仍只属于各自的编排层。
+
+仍待满足（接入真实 Tool 前，见 Step 8 evaluation §14）：
+      project scope / capabilities / 错误映射 / 审计；
+      ToolExecutionService 保持 "ONE Tool execution"（loop 留在 ToolChatService）。
+```
+
+### 未引入（Step 8 / Step 9 明确不做）
+
+```text
+ToolChatService 删除 / API 变更                = NOT DONE
+Function Calling 改造 / Mock Tools 删除        = NOT DONE（Mock 保留给测试）
+真实 get_inventory 接入链路 B                  = DONE（Phase 3.11 Step 11，见 §8.29）
+真实 get_work_order 接入链路 B                 = NOT DONE（Deferred）
+Capability / ProjectContext（链路 B）           = DONE（Phase 3.11 Step 10，见 §8.28）
+Agent / LangGraph / MCP / Memory / Planning    = NOT IMPLEMENTED
+Multi-step Tool Calling（链路 A）              = NOT IMPLEMENTED
+```
+
+## 8.27 Tool Execution Boundary Unification（Phase 3.11 Step 9）
+
+> 迁移记录：`docs/evaluation/Phase 3.11 Step 9 — ToolChatService Execution Boundary Migration.md`
+> 测试：`tests/test_tool_chat_execution_boundary.py`（迁移行为）+
+> `tests/test_tool_chat_architecture_contract.py`（C2 更新为 PASS）
+
+### Before → After
+
+```text
+Before：ToolChatService → ToolRegistry.execute                （绕过执行边界）
+After ：ToolChatService → ToolExecutionService → ToolRegistry.execute
+```
+
+```text
+ToolChatService（多步编排：while + 预算 + 消息历史）
+    ↓
+ToolExecutionService.execute(tool_name, *, arguments)         ← ONE Tool execution
+    ├── capability 校验（capabilities=None → 不限制；Deferred）
+    ↓
+ToolRegistry.execute（validate_arguments → Handler → 归一化）
+```
+
+### 装配（module-level singleton，不改 API contract）
+
+```text
+backend/app/api/tool_chat.py
+    _tool_registry            = ToolRegistry() + register_get_inventory_tool(...)   ← Step 11：真实只读
+    _tool_execution_service   = ToolExecutionService(registry=_tool_registry)
+    _tool_chat_service        = ToolChatService(execution_service=_tool_execution_service)
+
+（Step 9 / Step 10 时点为 register_mock_tools(...)；Step 11 已换为真实 Tool，
+  测试改为 monkeypatch 注入 Mock Registry。）
+```
+
+### 接口兼容（向后兼容 + 依赖注入）
+
+```text
+ToolChatService(llm_client=None, *, max_tool_rounds=None,
+                execution_service=None)          # 新增可注入执行边界
+chat(message, *, registry)                        # 签名不变
+
+注入 execution_service → 复用之（传入 registry 必须是 execution_service.registry
+                        同一实例，否则 ValueError：避免 Schema 源与执行源分裂）
+未注入               → 每次 chat 构造 ToolExecutionService(registry=registry)
+```
+
+### 保持不变（回归锁定）
+
+```text
+Function Calling / Argument forwarding / Schema Validation / Multi-Step /
+Budget / Multiple-Tool-Call 拒绝 / Tool failure continuation /
+Malformed ToolCall 传播 / API contract / Tool message 序列化 = PASS
+ToolExecutionService 仍为 ONE Tool（无 while / 无 LLM / 无 ToolChatService 依赖）
+```
+
+### Deferred（Step 9 时点未做；Step 10 已解决前两项，见 §8.28）
+
+```text
+Capability（capabilities=None 接入，**不等于**权限控制） = Deferred → DONE（Step 10）
+ProjectContext（链路 B 仍不下发 project context）        = Deferred → DONE（Step 10）
+真实 Tool 接入链路 B（Step 9 时点仍只挂 Mock Tools）      = DONE（get_inventory，Step 11，见 §8.29）
+                                                          get_work_order 仍 Deferred
+```
+
+## 8.28 ToolChatService Capability & ProjectContext（Phase 3.11 Step 10）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 10 — ToolChatService Capability & ProjectContext.md`
+> 测试：`tests/test_tool_chat_capability.py`、`tests/test_tool_chat_project_context.py`、
+> `tests/test_tool_chat_architecture_contract.py`（C11 / C12）
+
+### 授权链（两条链路共用同一 Enforcement Point）
+
+```text
+AIOrchestrator
+    ↓
+ToolExecutionService          ← 唯一 Capability Enforcement Point
+    ├── capability 校验（ProjectCapabilities.allows_tool）
+    ├── project_id（执行上下文）
+    ↓
+ToolRegistry → Tool
+
+ToolChatService（LLM Function Calling + Multi-Step Loop）
+    ↓
+ToolExecutionService          ← 同一个 Enforcement Point（Step 10 起生效）
+    ├── capability 校验 / project_id
+    ↓
+ToolRegistry → Tool（Step 11 起为真实只读 get_inventory）
+```
+
+### 项目作用域来源（服务器端，HTTP 不可注入）
+
+```text
+POST /api/chat/with-tools {message, project_id?}
+    ↓
+project_id → ProjectRegistry.get(project_id) → ProjectRegistration.capabilities
+    ↓
+ToolExecutionService(registry, capabilities, project_id)
+    ↓
+逐次传入 ToolChatService.chat(message, *, registry, execution_service=...)
+
+未注册 → ProjectNotFoundError → 404
+能力未启用 → AIOrchestratorCapabilityError → 403（Handler 0 次调用）
+未提供 project_id → capabilities=None（不限制）= 旧行为，且不查注册表
+```
+
+### 边界不变量（Step 10 新增，测试锁定）
+
+```text
+1. capability 只在 ToolExecutionService 判断（ToolChatService / API 不做授权）
+2. ToolChatService 不知道哪些 Tool 被允许（无白名单 / 无 Tool 名分支）
+3. 授权失败不降级：capability 拒绝**不**转成 ToolResult(success=False)，
+   也不让 LLM 继续下一轮（异常穿透 → HTTP 403）
+4. project scope 只作为执行上下文：不进入 LLM messages / 不进入 Handler arguments
+5. 能力字段无法由 HTTP 注入（DTO 仅 message + project_id）
+6. 未提供 project_id 时行为与 Step 9 完全一致（旧调用零改动）
+7. Multi-Step / 预算语义不变：执行边界仍是 ONE Tool execution
+```
+
+### 复用与未新增（如实记录）
+
+```text
+复用：ProjectCapabilities / ProjectRegistration / ProjectRegistry /
+      AIOrchestratorCapabilityError（无第二种 CapabilityError）/ ToolExecutionService
+未新增：ProjectContext DTO（已存在 projects.models.ProjectContext + ProjectRegistration）
+未修改：ToolExecutionService（capabilities / project_id 参数 Step 2 已具备，SHA256 未变）
+未修改：Router / AIOrchestrator / ToolArgumentExtractor / ToolRegistry / Tools / Mock Tools
+```
+
+## 8.29 Real `get_inventory` Integration（Phase 3.11 Step 11）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 11 — Real get_inventory Integration.md`
+> 测试：`tests/test_tool_chat_real_get_inventory.py`（DB-gated）+
+> `tests/test_tool_chat_architecture_contract.py`（C13）
+
+### Before → After
+
+```text
+Before：ToolChatService → ToolExecutionService → Mock get_inventory（硬编码 quantity=1000，0 DB）
+After ：ToolChatService → ToolExecutionService → Capability → ToolRegistry
+                     → Real get_inventory Handler → PostgreSQL（READ ONLY）→ ToolResult
+```
+
+```text
+POST /api/chat/with-tools
+    ↓
+ToolChatService（LLM Function Calling + Multi-Step Loop，未修改）
+    ↓
+ToolExecutionService（capability + project scope，未修改）
+    ↓
+ToolRegistry（真实 GET_INVENTORY_DEFINITION + GetInventoryHandler）
+    ↓
+PostgreSQL：SELECT COALESCE(SUM(qty),0) FROM "<schema>"."<table>"
+            WHERE material_code = :material_code
+            （BEGIN READ ONLY + SET LOCAL statement_timeout + 绑定参数 + rollback）
+    ↓
+ToolResult(success=True, data={material_code, qty, project_id})
+    ↓
+role=tool 消息 → LLM → Final Answer
+```
+
+### 生产装配（唯一修改点）
+
+```text
+backend/app/api/tool_chat.py
+    _tool_registry = ToolRegistry()
+    register_get_inventory_tool(_tool_registry)      ← Step 11（原 register_mock_tools）
+    _tool_execution_service = ToolExecutionService(registry=_tool_registry)
+    _tool_chat_service = ToolChatService(execution_service=_tool_execution_service)
+```
+
+```text
+* 生产 Registry 只有 1 个 Definition：真实 get_inventory
+  （同名 Mock Definition 无法覆盖：ToolRegistry.register 抛
+   ToolAlreadyRegisteredError —— C13 锁定）；
+* Mock Tools 保留给单元 / characterization 测试（测试自行构造 Mock Registry 注入）；
+* 真实 get_work_order 接入 = DEFERRED。
+```
+
+### 行为事实（DB-gated 测试锁定）
+
+```text
+* ToolCall(get_inventory, {material_code}) → 真实 SELECT → qty 来自 seed 数据；
+* arguments 原样转发（material_code 逐字到达 Handler；绑定参数 %(material_code)s）；
+* missing required / unknown field → Registry 拒绝（**0 条 SQL**，Handler 0 次）；
+* SQL 注入输入 → Handler 字符集校验拒绝（0 条 SQL，不回显注入值）；
+* warehouse_code（可选字段）→ 真实 Handler 显式拒绝（当前库存表无该维度，
+  不静默按全仓汇总；0 条 SQL）；
+* Multi-Step：两次 ToolCall → 两条 SELECT（每次 ONE Tool execution）；
+* DB writes = 0：public.knowledge_* 行数不变 + fixture 表行数不变 +
+  语句审计（仅 SELECT / SET / ROLLBACK）。
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：ToolChatService / ToolExecutionService / ToolRegistry / Router /
+        AIOrchestrator / ToolArgumentExtractor / get_inventory（Handler + SQL）/
+        get_work_order / mock_tools / DB schema（SHA256 与 Step 10 基线一致）
+未引入：真实 get_work_order / 第三个 Tool / Real LLM（Fake LLM）/
+        Agent / MCP / LangGraph / Memory / Planning / Retry / Cache / 并行 Tool
+```
+
+## 8.30 Tool Runtime Failure Contract（Phase 3.11 Step 12）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 12 — Tool Runtime Failure Contract.md`
+> 测试：`tests/test_tool_runtime_failure_contract.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C14）
+
+### 失败分类（唯一契约）
+
+```text
+授权失败（Capability denied）
+    → 异常穿透（ToolChatService 0 个 try/except）→ HTTP 403
+    → Handler 0 次 / DB 0 次 / 不继续下一轮 LLM
+
+Tool 失败（Schema 拒绝 / Handler 业务拒绝 / DB 失败）
+    → ToolResult(success=False) → role=tool 消息
+    → 按 Multi-Step contract 继续（不是授权失败，也不降级授权）
+
+协议失败（Malformed / Multiple ToolCall / 预算耗尽）
+    → 异常（LLMToolCallFormatError / MultipleToolCallsError /
+      ToolCallingBudgetExceededError）→ 任何 Tool 执行之前
+```
+
+### Failure Matrix（全部 PASS）
+
+```text
+A Capability denied   → AIOrchestratorCapabilityError；Handler 0 / SQL 0
+B Unknown Tool        → ToolResult(False,"Tool 未注册")；不 fallback / 不改 name
+C Missing required    → Registry reject；Handler 0 / SQL 0
+D Unknown argument    → Registry reject（不静默删除字段）
+E Invalid type        → Registry reject（无 Python coercion）
+F Handler validation  → Schema PASS → Handler REJECT；SQL 0；不回显原始输入
+G DB failure          → ToolResult(False)；仅 cause_type；connect 恰好 1 次（无 retry）
+H Failure + Multi-Step→ 失败(ToolResult) → 继续 → 成功（1 条 SELECT）
+I Budget 1 / 20       → 执行 == 预算；LLM == 预算 + 1；无 retry
+J Multiple ToolCall   → 任何执行之前拒绝
+K Malformed ToolCall  → LLMToolCallFormatError（真实 parser）；无执行
+M Real DB happy path  → SELECT only / READ ONLY / timeout / 绑定参数 / rollback
+L Error sanitization  → 无 API key / password / DATABASE_URL / 连接串 / traceback
+```
+
+### 静态锁定（C14）
+
+```text
+* ToolChatService：0 try/except（失败不被吞）、0 registry.execute(、
+  0 allows_tool、执行调用点唯一 = execution.execute；
+* 失败路径不触达 Handler（capability / schema 两类由边界与 Registry 前置拒绝）；
+* Unknown Tool 不 fallback 到已注册 Tool（同 Registry 内其它 Handler 0 次调用）。
+```
+
+### 本阶段零生产修改
+
+```text
+未修改：ToolChatService / ToolExecutionService / ToolRegistry / Router /
+        AIOrchestrator / ToolArgumentExtractor / get_inventory / API / DB schema
+未新增：Tool / 参数 / 错误类型 / audit 表 / request_id 持久化 / Retry
+```
+
+## 8.31 Tool Execution Context Boundary（Phase 3.11 Step 13）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 13 — Tool Execution Context Contract.md`
+> 测试：`tests/test_tool_execution_context.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C15）
+
+### 链路（链路 B）
+
+```text
+POST /api/chat/with-tools                     （API contract **不变**）
+    ↓
+ToolChatService                               （Context **创建者**）
+    │   request_id = new_request_id()         （一次 chat 一次；uuid4；不落库）
+    │   round / tool_call_id / project_id     （每轮新实例）
+    ↓
+ToolExecutionContext（frozen；4 字段白名单）
+    ├── request_id    str
+    ├── project_id    str | None   ← 执行边界作用域（非 LLM）
+    ├── tool_call_id  str | None   ← ToolCall.id 原值
+    └── round         int（>=1）
+    ↓
+ToolExecutionService.execute(tool_name, arguments=…, context=…)
+    ├── context 类型 / 作用域一致性校验（TypeError / ValueError）
+    ├── capability 校验（不变）
+    ↓
+ToolRegistry.execute(tool_name, arguments)    （签名**不含** context）
+    ↓
+Tool Handler(arguments)                       （只接收 arguments）
+    ↓
+ToolResult
+```
+
+### Isolation 不变量（测试锁定）
+
+```text
+* Context 不进入 Tool arguments（arguments 逐字 == LLM 原值）
+* Context 不进入 LLM messages（无 request_id / project scope / round 键）
+* Context 不进入 API contract（ToolChatRequest 仍为 {message, project_id}）
+* ToolRegistry.execute 签名 = (self, tool_name, arguments)
+* ToolHandler.__call__ 签名 = (self, arguments)
+* LLM 无法控制 project_id / round / request_id（伪造字段 → unknown field 拒绝）
+* Context 与授权作用域必须一致（伪造 scope → ValueError，Registry 0 次调用）
+* 每轮新实例；frozen DTO → 不可改写
+```
+
+### 零持久化（Step 13 明确不做）
+
+```text
+无落库 / 无 audit table / 无 tool_call_log / 无 dashboard /
+无 tracing backend / 无 request-id middleware / 无 HTTP header /
+无 API DTO 扩展 / 无 Retry / 无 Timeout 编排
+链路 A（AIOrchestrator）暂不创建 Context（context=None）= Deferred →
+      DONE（Phase 3.11 Step 18 接入，见 §8.36）
+```
+
+## 8.32 Tool Execution Record Contract（Phase 3.11 Step 14）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 14 — Tool Execution Record Contract.md`
+> 测试：`tests/test_tool_execution_record.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C16）
+
+### 组合关系
+
+```text
+ToolExecutionContext（§8.31：request_id / project_id / tool_call_id / round）
+        +
+ToolResult（§8.23/§8.30：success / data / error）
+        +
+Timing（started_at / finished_at / duration_ms）
+        ↓ ToolExecutionRecord.from_execution()（纯函数）
+ToolExecutionRecord（frozen；只描述执行事实）
+```
+
+### Contract（11 字段执行元数据）
+
+```text
+request_id / round / tool_name / started_at / finished_at / duration_ms /
+success / project_id / tool_call_id / error_code / error_type
+
+* tool_name 来自 execute() 实参（不推断）；success 来自 ToolResult.success（不推断）
+* error_code = None（不发明错误码体系）；error_type = 既有 ToolError 类名
+  allow-list（无法确定 → None，不解析 message 正文）
+* 计时：now_utc()（UTC wall clock）+ elapsed_ms()（perf_counter 差值）
+```
+
+### 安全边界（测试锁定）
+
+```text
+Record 不含 arguments / ToolResult.data / SQL / prompt / response /
+API Key / password / DATABASE_URL / connection string / Authorization /
+Traceback / 原始 error message；error_type 仅允许异常类名形态。
+```
+
+### 兼容性（Step 14 时点：零生产接线）
+
+```text
+ToolResult / ToolExecutionService.execute() 返回类型 / ToolRegistry /
+Tool Handler / ToolChatService / API = 全部不变；
+Record 在 Step 14 时点**不被生产代码创建** → Step 15 引入**可选 observer**。
+零持久化：无 DB / Repository / Migration / audit table / dashboard /
+metrics 聚合 / tracing backend。
+```
+
+## 8.33 Tool Execution Observability Boundary（Phase 3.11 Step 15）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 15 — Tool Execution Observability Boundary.md`
+> 测试：`tests/test_tool_execution_observer.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C17）
+
+### 链路（唯一生产改动 = 执行边界新增可选 observer）
+
+```text
+ToolExecutionService.execute(tool_name, arguments, context)
+    ├── context 类型 / 作用域校验（Step 13）
+    ├── capability 校验
+    ├── 若（context 存在 且 observer 存在）：
+    │       started_at = now_utc() / timer = perf_counter()
+    ├── ToolRegistry.execute(...) → ToolResult
+    ├── 若上述条件成立：
+    │       ToolExecutionRecord.from_execution(context, tool_name, result, timing)
+    │       observer.on_execution(record)        ← 唯一回调点（try/except 隔离）
+    ↓
+    return ToolResult（**契约不变**）
+```
+
+### 事件规则
+
+```text
+成功 / ToolResult(False) → 1 个事件
+capability 拒绝 / Registry 抛异常 / context=None → 0 个事件
+observer=None → 不计时 / 不建 Record（零开销，旧行为逐字不变）
+```
+
+### 隔离与安全（测试锁定）
+
+```text
+* observer 失败 → 只 warning（tool_name + error_type，无 message / traceback）→
+  ToolResult 不变、Tool 恰好 1 次执行、不 retry / 不 fallback；
+* observer 只接收 Record（AST：1 处调用、1 个位置参数、无关键字参数）；
+* observer 无 Registry / Handler / Engine / Session / DB / LLM / API 能力
+  （import 白名单：{__future__, typing, tool_execution_record}）；
+* Record 不含 arguments / ToolResult.data / SQL / secrets（C16 + C17 双向锁定）；
+* 零持久化：无 DB / 消息队列 / tracing backend / 文件日志 / EventBus。
+```
+
+### 兼容性
+
+```text
+ToolResult / execute() 返回类型 / ToolRegistry / Tool Handler /
+ToolChatService（request_id / round / tool_call_id 语义）/ API = 全部不变；
+observer 为**可选**关键字参数（旧构造形态合法）；
+AIOrchestrator 保持 context=None → 链路 A 无事件（Step 15 时点；
+Phase 3.11 Step 18 已接入，见 §8.36）。
+```
+
+## 8.34 In-Memory Tool Execution Collector（Phase 3.11 Step 16）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 16 — In-Memory Tool Execution Collector.md`
+> 测试：`tests/test_in_memory_tool_execution_collector.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C18）
+
+### 链路
+
+```text
+ToolExecutionService（Step 15：observer 可选）
+    ↓ ToolExecutionRecord
+InMemoryToolExecutionCollector.on_execution(record)      （原样 append；O(1)）
+    ↓
+records() / records_by_request_id() / records_by_project_id() /
+records_by_tool_name()
+    ↓
+tuple[ToolExecutionRecord, ...]（不可变快照；无匹配 → ()）
+```
+
+### Contract
+
+```text
+* 只保存 ToolExecutionRecord（非 Record → TypeError）
+* 全部查询返回 tuple 快照（调用方无法 append / clear / pop）
+* 顺序 = 写入顺序（不 sort / 不 deduplicate / 不 aggregate）
+* records_by_project_id(None) 只匹配 project_id is None（≠"全部"）
+* records_by_tool_name 严格相等（无大小写折叠 / 前缀 / 别名 / 模糊）
+* clear() 是唯一清空入口（无 TTL / 无后台清理 / 无定时任务）
+* 无统计 API（count / success_rate / 分位数属 Metrics，后续阶段）
+* 无索引 / LRU / cache（append O(1)；查询 O(n)）
+```
+
+### 安全与依赖
+
+```text
+import 白名单：{__future__, threading, collections.abc, tool_execution_record}
+无 sqlalchemy / db / api / llm / tools / httpx / kafka / redis / celery /
+opentelemetry / os / pathlib；无 execute / registry / handler 标识符
+（无 Tool 执行能力；无第二条执行路径，如 execute_and_collect）
+```
+
+### 生命周期与集成
+
+```text
+create（显式实例；**禁止**模块级单例 / get_default_* —— 防 test / request /
+        project 污染与内存泄漏）
+    ↓ collect → query → clear（可重复）
+线程模型：单个 threading.Lock（与 InMemoryProjectRegistry 一致）；
+          不引入 asyncio.Queue / 线程池 / event loop
+集成方式：既有构造函数注入（ToolExecutionService(observer=collector)）；
+          生产接线 = Deferred（Step 16 时点）；
+          Phase 3.11 Step 18 起 AIOrchestrator 可注入 observer（§8.36），
+          但仍**不**创建 Collector、不接 API（默认 0 事件）
+```
+
+## 8.35 Tool Execution Metrics Read Model（Phase 3.11 Step 17）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 17 — Tool Execution Metrics Read Model.md`
+> 测试：`tests/test_tool_execution_metrics_service.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C19）
+
+### 链路（只读分析层；执行链不变）
+
+```text
+ToolExecutionRecord（Step 14，frozen）
+    ↓
+InMemoryToolExecutionCollector.on_execution（Step 16：收集）
+    ↓
+collector.records()（不可变 tuple 快照）
+    ↓
+ToolExecutionMetricsService.snapshot(records)      （纯计算；Storage-agnostic）
+    ↓
+ToolExecutionMetricsSnapshot（frozen：counts / rates / durations）
+```
+
+```text
+backend/app/services/tool_execution_metrics_service.py
+
+@dataclass(frozen=True)
+class ToolExecutionMetricsSnapshot:      # 字段白名单（8 个）
+    total_count: int
+    success_count: int
+    failure_count: int
+    success_rate: float | None
+    failure_rate: float | None
+    total_duration_ms: float
+    average_duration_ms: float | None
+    max_duration_ms: float | None
+
+class ToolExecutionMetricsService:       # 无实例状态（@staticmethod snapshot）
+    @staticmethod
+    def snapshot(records: Iterable[ToolExecutionRecord]) -> ToolExecutionMetricsSnapshot
+```
+
+### Metrics 定义与空数据语义
+
+```text
+total_count         = 记录数
+success_count       = count(success is True)
+failure_count       = count(success is False)
+                      success_count + failure_count == total_count（恒成立）
+success_rate        = success_count / total_count   （total = 0 → None）
+failure_rate        = failure_count / total_count   （total = 0 → None）
+total_duration_ms   = sum(record.duration_ms)       （空 → 0.0）
+average_duration_ms = total_duration_ms / total_count（空 → None）
+max_duration_ms     = max(record.duration_ms)       （空 → None）
+
+空数据集：rates / average / max 一律 None（0 条记录 ≠ 0% 成功率）；
+          无 ZeroDivisionError / NaN / Infinity；无 round（保持原始精度）
+时长来源：只读 record.duration_ms（不 perf_counter / 不 datetime.now）
+```
+
+### Contract（C19）
+
+```text
+C19.1  Metrics 接收 Iterable[ToolExecutionRecord]（不是 Collector / Session）
+C19.2  Snapshot 是 frozen dataclass
+C19.3  不重新测量时间（Identifiers / Imports 无 time · datetime · random）
+C19.4  total_count = success_count + failure_count
+C19.5  空数据集 → rates / average / max = None
+C19.6  duration 来自 Record.duration_ms
+C19.7  无 request / project / tool 维度（无 by_* / top_slowest_* API）
+C19.8  无敏感字段（arguments / result data / error / SQL / credentials）
+C19.9  无 DB / LLM / Tool execution（import 白名单 + 无 execute / registry）
+C19.10 Deterministic（同一输入 → 同一 Snapshot；顺序无关）
+C19.11 无持久化（无 json / pathlib / os / redis / kafka / 文件写）
+C19.12 无全局单例（无模块级实例 / 无 get_default_* 工厂）
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：ToolExecutionService / ToolExecutionRecord / ToolExecutionObserver /
+        InMemoryToolExecutionCollector / ToolResult / ToolRegistry / Handler /
+        ToolChatService / AIOrchestrator / Router / API / DB schema
+未引入：Database / Repository / Migration / Redis / Kafka / Prometheus /
+        OpenTelemetry / Grafana / Dashboard / HTTP API / WebSocket /
+        Worker / Scheduler / Alert / 维度分析（by_tool / by_project）/
+        分位数（p50 / p90 / p95 / p99）/ min / stddev
+生产接线：Metrics 是 Read Model —— 执行链**不依赖**它（Metrics 计算失败
+          不可能导致 Tool 失败 / retry / fallback）
+```
+
+## 8.36 AIOrchestrator Tool Observability Integration（Phase 3.11 Step 18）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 18 — AIOrchestrator Tool Execution Observability Integration.md`
+> 测试：`tests/test_ai_orchestrator_tool_observability.py` +
+> `tests/test_tool_architecture_contract.py`（C20）
+
+### 链路（链路 A 的 TOOL 路径接入观测；执行链未变）
+
+```text
+Question
+   ↓
+AIOrchestrator.execute(question)
+   ├── request_id = new_request_id()        （一次 execute 一个；唯一调用点）
+   ↓
+AI Router                                  （未修改）
+   ↓ RouteType.TOOL → decision.tool_name
+ToolExecutionContext                       （round=1 / project_id=边界作用域 /
+                                            tool_call_id=None）
+   ↓
+ToolExecutionService.execute(..., context=Context)     （未修改）
+   ↓
+ToolRegistry → Tool → ToolResult            （未修改）
+   +
+ToolExecutionRecord                         （未修改）
+   ↓
+ToolExecutionObserver（注入；None = 旧行为）
+   ↓
+InMemoryToolExecutionCollector（调用方 / composition root 持有）
+   ↓
+ToolExecutionMetricsService.snapshot(collector.records())   （只读下游）
+```
+
+### 装配（`backend/app/services/ai_orchestrator_service.py`，唯一生产修改）
+
+```text
+AIOrchestratorService(
+    ...,
+    tool_execution_service=None,       # 显式注入优先（其 observer 由调用方装配）
+    tool_execution_observer=None,      # Step 18 新增：仅构造默认边界时注入
+)
+
+    observer=None              → 默认边界不传 observer（0 Record；旧行为逐字不变）
+    observer + 未注入边界       → ToolExecutionService(..., observer=observer)
+    observer + 已注入边界       → 必须为**同一对象**，否则 AIOrchestratorInputError
+    observer 形状非法           → AIOrchestratorInputError（无 on_execution）
+```
+
+### Context 语义（§四 ~ §六 / §十八）
+
+```text
+request_id    一次 execute() 一个（execute() 顶层创建；不落库 /
+              不进 API response / 不进 Tool arguments 或 LLM messages）
+round         恒为 1（one question → one route → one Tool）
+project_id    **唯一权威** = 执行边界授权作用域（服务器端）；
+              不来自 question / arguments / Router 决策 / LLM
+tool_call_id  恒为 None（非 Function Calling 链路；**不伪造** call id）
+```
+
+### Event 语义（Record 计数，C20 锁定）
+
+```text
+Tool Success                → 1 Record（success=True）
+Tool Failure（ToolResult False） → 1 Record（success=False；不 retry）
+RAG / Text-to-SQL           → 0 Record（不创建 Context；SQL Executor 不是 Tool）
+Capability denied           → 0 Record（拒绝先于执行；403 语义不变）
+observer=None               → 0 Record（默认兼容）
+Observer 抛异常              → ToolResult / AIOrchestrationResult 不变（Step 15 隔离）
+两次 execute()              → 两个不同 request_id；一次 execute ≤ 1 Record
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：ToolExecutionService / ToolExecutionRecord / ToolExecutionObserver /
+        InMemoryToolExecutionCollector / ToolExecutionMetricsService /
+        ToolExecutionContext / ToolRegistry / Tool / Handler / ToolResult /
+        Router / API / DB schema / ToolChatService（链路 B）
+未引入：Collector 内部创建 / Metrics API / HTTP / DB / Redis / Kafka / 持久化 /
+        Dashboard / Prometheus / OpenTelemetry / Audit / Event Bus /
+        Agent / MCP / LangGraph / Memory / Planning / Retry / Fallback
+生产接线仍 Deferred：API / 工厂不注入 observer（默认 0 事件）
+```
 
 ---
 

@@ -70,6 +70,7 @@ from backend.app.tools.get_inventory import (
     _SAFE_IDENTIFIER_PATTERN,
     _assert_safe_identifier,
     _validate_material_code,
+    _validate_warehouse_code,
     build_default_tool_registry,
     register_get_inventory_tool,
 )
@@ -223,6 +224,50 @@ class TestDefinitionAndValidation:
         with pytest.raises(ValueError):
             _validate_material_code(None, max_len=64)
 
+    # ---------- Phase 3.11 Step 4：warehouse_code（可选第二参数） ----------
+
+    def test_definition_declares_optional_warehouse_code(self) -> None:
+        """warehouse_code 为可选字段；required 仍只有 material_code。"""
+        params = GET_INVENTORY_DEFINITION.parameters
+        props = params["properties"]
+        assert props["warehouse_code"]["type"] == "string"
+        assert params["required"] == ["material_code"]
+
+    def test_validate_warehouse_code_none_is_optional(self) -> None:
+        """缺省（None）→ None（可选语义，与 material 的必填语义不同）。"""
+        assert _validate_warehouse_code(None, max_len=64) is None
+
+    def test_validate_warehouse_code_strips(self) -> None:
+        assert _validate_warehouse_code("  A01  ", max_len=64) == "A01"
+
+    @pytest.mark.parametrize("value", [
+        "", "   ", 123, 1.5,
+        "' OR '1'='1", "A01; DELETE FROM x", "a" * 65, "-A01",
+    ])
+    def test_validate_warehouse_code_rejects_invalid(self, value) -> None:
+        with pytest.raises(ValueError):
+            _validate_warehouse_code(value, max_len=64)
+
+    async def test_handler_rejects_warehouse_code_guard(self) -> None:
+        """携带 warehouse_code → 显式拒绝（ToolExecutionError）；
+        guard 位于 DB 访问之前（本测试 0 DB）。"""
+        handler = GetInventoryHandler()  # 无 engine；guard 先于 engine 解析
+        with pytest.raises(ToolExecutionError) as ei:
+            await handler(
+                {"material_code": "MAT-001", "warehouse_code": "A01"}
+            )
+        assert "warehouse" in str(ei.value)
+
+    async def test_handler_rejects_invalid_warehouse_code(self) -> None:
+        """warehouse_code 格式非法 → ToolValidationError（guard 之前拦截）。"""
+        handler = GetInventoryHandler()
+        with pytest.raises(ToolValidationError) as ei:
+            await handler(
+                {"material_code": "MAT-001",
+                 "warehouse_code": "A01' OR '1'='1"}
+            )
+        assert ei.value.field_path == "warehouse_code"
+
 
 # ============================================================
 # 2. Tool Registry（mock-free）
@@ -246,9 +291,10 @@ class TestRegistryRegistration:
             register_get_inventory_tool(r)
 
     def test_build_default_tool_registry_contains_get_inventory(self) -> None:
+        """Phase 3.11 Step 5：默认 Registry 含两个真实只读 Tool。"""
         r = build_default_tool_registry()
         names = [d.name for d in r.list_definitions()]
-        assert names == ["get_inventory"]
+        assert names == ["get_inventory", "get_work_order"]
 
     def test_definition_has_no_handler_in_list_def(self) -> None:
         """list_definitions() 不暴露 handler。"""
@@ -291,25 +337,34 @@ class TestRouterDiscovery:
         )
 
     def test_capability_metadata_exposes_aliases_only(self) -> None:
-        """能力元数据只暴露 name / description / aliases，**不**暴露 handler。"""
+        """能力元数据只暴露 name / description / aliases，**不**暴露 handler。
+
+        Phase 3.11 Step 5：默认 Registry 含两个真实 Tool
+        （get_inventory / get_work_order），元数据契约对两者一致。
+        """
         caps = ToolRegistryCapabilityAdapter(
             build_default_tool_registry()
         ).list_capabilities()
-        assert len(caps) == 1
-        cap = caps[0]
-        assert cap.name == "get_inventory"
-        assert "库存" in cap.description
-        assert "当前库存" in cap.aliases
+        assert len(caps) == 2
+        by_name = {c.name: c for c in caps}
+        inv = by_name["get_inventory"]
+        assert "库存" in inv.description
+        assert "当前库存" in inv.aliases
+        assert "get_work_order" in by_name
         # 只读元数据：不泄露 handler / 入参 Schema / SQL
-        assert not hasattr(cap, "handler")
-        assert not hasattr(cap, "parameters")
+        for cap in caps:
+            assert not hasattr(cap, "handler")
+            assert not hasattr(cap, "parameters")
 
     def test_capability_aliases_avoid_bare_subject_word(self) -> None:
         """§十九：别名不能用裸词，否则会抢占聚合类 Text-to-SQL 问题。"""
         caps = ToolRegistryCapabilityAdapter(
             build_default_tool_registry()
         ).list_capabilities()
-        assert "库存" not in caps[0].aliases
+        for cap in caps:
+            assert "库存" not in cap.aliases
+            assert "工单" not in cap.aliases
+            assert "物料" not in cap.aliases
 
     @pytest.mark.parametrize("question", [
         "查询物料 10001 当前库存",
@@ -626,6 +681,8 @@ class _OrchDeps:
                     confidence=1.0,
                     reason="test",
                     source="rule",
+                    # Phase 3.11 Step 3：Router 是 Tool 选择唯一来源
+                    tool_name="get_inventory",
                 )
             ),
             tool_registry=tools,
@@ -684,8 +741,9 @@ class TestOrchestratorIntegration:
         # Orchestrator 不抛异常，而是 ToolResult(success=False) 在 result.data
         # 流程：
         result = await orch.execute("查库存")  # 无 material_code → 校验失败
-        # _extract_tool_arguments_from_question("查库存") 提取失败 → arguments=None
-        # → ToolRegistry 校验失败 → ToolResult(success=False)
+        # ToolArgumentExtractor 对 "查库存" 提取不到候选值（arguments={}）
+        # → ToolRegistry 校验失败（missing required material_code）
+        # → ToolResult(success=False)
         # Orchestrator 不抛 → result 包含失败 ToolResult
         assert result.route == RouteType.TOOL
         assert result.metadata["tool_success"] is False
@@ -796,7 +854,7 @@ class TestApiIntegration:
                     ),
                 },
             )
-        # 注入含单引号/空格 → _extract_tool_arguments_from_question 提取到
+        # 注入含单引号/空格 → ToolArgumentExtractor 提取到
         # "10001" 或 _validate_material_code 拒绝（取决于首 token）
         # → Tool 失败 → Orchestrator 把 ToolResult(success=False) 透传为 200
         assert response.status_code == 200

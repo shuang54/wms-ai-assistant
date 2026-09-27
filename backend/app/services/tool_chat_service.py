@@ -31,22 +31,44 @@
     * messages 由 Service 内部独立构建（不接收 / 不修改调用方传入的列表），
       只 append、不改写历史消息。
 
-依赖方向（Phase 3.6.2 任务书 §二十，保持不变）：
+依赖方向（Phase 3.11 Step 9 统一执行边界；Step 10 项目级能力/项目上下文；
+Step 13 Execution Context）：
 
     ToolChatService
-        ↓
-    LLMClient
-        ↓
-    ToolRegistry
-        ↓
-    Tool
+        ├── LLMClient（Function Calling：Tool 名称 + arguments 由 LLM 给出）
+        └── ToolExecutionService（Phase 3.11 Step 2：应用层执行边界）
+                ├── ToolExecutionContext（Step 13：本 Service **创建**；
+                │      request_id 一次 / 每轮 tool_call_id + round；
+                │      project_id 来自执行边界的作用域，不由 LLM 控制）
+                ├── Capability 校验（ProjectCapabilities；拒绝 → 异常，不降级）
+                └── 项目上下文（project_id）
+                        ↓
+                    ToolRegistry（Schema 校验 + Handler 调用 + 异常归一化；
+                                  **不接收** Execution Context）
+                        ↓
+                    Tool（Handler 仍只接收 arguments；**不接收** Context）
+
+    注意：本 Service **仍然**是多步编排（while 循环 + 预算）的唯一承担者；
+    ``ToolExecutionService`` 始终只是「ONE Tool execution」，
+    **绝不**把 loop / retry / replanning 放进执行边界。
+
+    Phase 3.11 Step 10：项目级 Tool 授权（capability）**只**在执行边界判断；
+    本 Service 通过 ``execution_service`` 接收（构造期注入或逐次调用传入，
+    例如 API 层按 ``project_id`` 解析出的项目级边界），自身：
+        * 不知道哪些 Tool 被允许（无白名单 / 无 ``allows_tool`` / 无 Tool 名分支）；
+        * 不接收 project context 作为 LLM 参数或 Handler 参数；
+        * 不把 capability 拒绝降级为 ``ToolResult(success=False)``
+          （authorization failure ≠ tool failure，异常原样上抛）。
 
 不在本层做：
 
     * 并行 Tool / Tool 依赖图 / Retry / Cache / Timeout
     * 对话历史（多轮用户 session）
     * RAG 检索（RagService 保持独立）
-    * Tool 权限 / 持久化 / 审计
+    * Tool 权限判断（授权属于执行边界）
+    * Execution Context 的**持久化 / 审计 / 上报**：本层只**创建**并传递
+      ``ToolExecutionContext``（frozen DTO）；无落库 / 无 audit table /
+      无 tracing backend / 无 request-id middleware（Phase 3.11 Step 13）
 """
 from __future__ import annotations
 
@@ -64,6 +86,11 @@ from backend.app.llm.client import (
 )
 from backend.app.llm.provider import LLMProvider
 from backend.app.llm.tool_schema import definitions_to_openai_tools
+from backend.app.services.tool_execution_context import (
+    ToolExecutionContext,
+    new_request_id,
+)
+from backend.app.services.tool_execution_service import ToolExecutionService
 from backend.app.tools.base import ToolResult
 from backend.app.tools.registry import ToolRegistry
 
@@ -208,7 +235,8 @@ class ToolChatService:
     """LLM Function Calling 编排（Phase 3.6.3：Multi-Step，顺序、有限预算）。
 
     每一轮：LLM（携带 tools）→ 无 tool call 则返回最终回答；
-    有则执行单个 Tool 并 append 消息历史，进入下一轮。
+    有则经 **ToolExecutionService** 执行单个 Tool（Phase 3.11 Step 9），
+    再 append 消息历史，进入下一轮。
     不是 Agent / 不是无限循环：`max_tool_rounds` 是硬上限。
     """
 
@@ -217,6 +245,7 @@ class ToolChatService:
         llm_client: LLMProvider | None = None,
         *,
         max_tool_rounds: int | None = None,
+        execution_service: ToolExecutionService | None = None,
     ) -> None:
         """构造 ToolChatService。
 
@@ -226,9 +255,20 @@ class ToolChatService:
             max_tool_rounds: 最大 Tool Calling 轮数（>=1）；
                              为 None 时读取 settings.tool.max_rounds
                              （环境变量 TOOL_MAX_ROUNDS，默认 5）。
+            execution_service:
+                             Phase 3.11 Step 9 —— Tool 执行边界
+                             （`ToolExecutionService`，应用层唯一执行入口）。
+                             * 注入时：由本实例复用（推荐；生产装配在
+                               ``api/tool_chat.py`` 注入单例）；
+                             * 未注入（None）时：每次 ``chat()`` 按传入的
+                               registry 构造 ``ToolExecutionService(registry=registry)``
+                               （capabilities=None → 不限制，与迁移前
+                               ``registry.execute`` 行为逐字等价）。
+                             本类**只**调用其 ``execute(tool_name, arguments=...)``。
 
         Raises:
             ValueError: max_tool_rounds < 1。
+            TypeError:  execution_service 非法（缺少可调用的 ``execute``）。
         """
         if max_tool_rounds is None:
             max_tool_rounds = settings.tool.max_rounds
@@ -236,50 +276,143 @@ class ToolChatService:
             raise ValueError(
                 f"max_tool_rounds 必须 >= 1（got {max_tool_rounds}）"
             )
+        if execution_service is not None and not callable(
+            getattr(execution_service, "execute", None)
+        ):
+            raise TypeError(
+                "execution_service 必须提供可调用的 execute()"
+                f"（got {type(execution_service).__name__}）"
+            )
         self._max_tool_rounds = max_tool_rounds
         self._llm_client = (
             llm_client if llm_client is not None else get_default_llm_client()
         )
+        self._execution_service = execution_service
 
     @property
     def max_tool_rounds(self) -> int:
         """最大 Tool Calling 轮数（只读）。"""
         return self._max_tool_rounds
 
+    @property
+    def execution_service(self) -> ToolExecutionService | None:
+        """注入的 Tool 执行边界（None = 每次 chat 按 registry 构造）。"""
+        return self._execution_service
+
+    # ---------- 内部：执行边界解析 ----------
+
+    def _resolve_execution_service(
+        self,
+        registry: ToolRegistry,
+        override: ToolExecutionService | None = None,
+    ) -> ToolExecutionService:
+        """解析本次执行的 Tool 执行边界（Phase 3.11 Step 9 / Step 10）。
+
+        Args:
+            registry: 本次 ``chat()`` 传入的 Tool 注册中心。
+            override: 本次调用的执行边界（逐次覆盖；例如 API 层按
+                      ``project_id`` 解析出的项目级边界：capabilities +
+                      project_id）。None → 使用构造期注入的边界
+                      （``self._execution_service``）。
+
+        Returns:
+            用于本次执行的 ``ToolExecutionService``。
+
+        Raises:
+            TypeError:  override 非法（缺少可调用的 ``execute``）。
+            ValueError: 生效的 execution_service 的 registry 与传入
+                        registry 不是同一实例
+                        （防止 Tool Schema 源与执行源分裂 —— Step 8 §15 R3）。
+
+        Note:
+            仅本方法做「边界选择」，**不**做任何 capability 判断
+            （授权属于执行边界；本 Service 不知道哪些 Tool 被允许）。
+            两者都没有时按本次 registry 构造（capabilities=None → 不限制）；
+            不缓存 / 不做跨调用复用（ToolChatService 无状态）。
+        """
+        execution = override if override is not None else self._execution_service
+        if execution is None:
+            return ToolExecutionService(registry=registry)
+        if not callable(getattr(execution, "execute", None)):
+            raise TypeError(
+                "execution_service 必须提供可调用的 execute()"
+                f"（got {type(execution).__name__}）"
+            )
+        injected_registry = getattr(execution, "registry", None)
+        if injected_registry is not None and registry is not injected_registry:
+            raise ValueError(
+                "registry 与 execution_service.registry 必须是同一实例"
+                "（避免 Tool Schema 来源与执行来源不一致）"
+            )
+        return execution
+
     async def chat(
         self,
         message: str,
         *,
         registry: ToolRegistry,
+        execution_service: ToolExecutionService | None = None,
     ) -> ToolChatResponse:
         """处理单轮用户消息（顺序多步 Tool Calling，预算内循环）。
 
         每轮 LLM 调用都携带完整消息历史 + 全部 Tool Schema；
         LLM 不再请求 Tool 时返回最终回答。
+        Tool 执行经 ``ToolExecutionService``（Phase 3.11 Step 9 起；
+        Step 10 起该项目级 capability / project_id 由该边界承载）。
+
+        Phase 3.11 Step 13（Execution Context）：
+
+            * 本次 ``chat()`` 生成**一个** ``request_id``（多轮 Tool 执行共享）；
+            * 每轮 ToolCall 构造新的 ``ToolExecutionContext``
+              （``tool_call_id = ToolCall.id`` 原值；``round`` 从 1 递增；
+              ``project_id`` = 执行边界的作用域，**不由 LLM 决定**）；
+            * Context **不进入** Tool arguments / **不进入** LLM messages。
 
         Args:
             message:  用户自然语言消息。
-            registry: Tool 注册中心（只读取 list_definitions / execute）。
+            registry: Tool 注册中心（只读取 ``list_definitions`` 生成
+                      Tool Schema；执行经 ToolExecutionService →
+                      ToolRegistry，本方法**不**直接调用 ``registry.execute``）。
+            execution_service:
+                      本次调用的执行边界（逐次覆盖；例如 API 层按
+                      ``project_id`` 解析出的项目级边界）。
+                      None → 使用构造期注入的边界（或按 registry 构造）。
 
         Returns:
             ToolChatResponse（answer + 按执行顺序的 tool_calls 元信息）。
 
         Raises:
-            ValueError:                       message 为空或纯空白。
+            ValueError:                       message 为空或纯空白；
+                                              registry 与执行边界的 registry
+                                              不是同一实例。
+            TypeError:                        execution_service 非法。
             ToolCallingBudgetExceededError:   预算耗尽后 LLM 仍请求 Tool。
             MultipleToolCallsError:           LLM 单次返回多个 tool call。
             LLMError 家族:                    LLM 配置 / 请求 / 响应异常
                                               （原样透传，API 层映射 HTTP）。
+            执行边界异常:                     capability 拒绝等由
+                                              ``ToolExecutionService`` 抛出的
+                                              异常**原样传播**
+                                              （不转换为 ToolResult、
+                                               不继续下一轮 LLM）。
         """
         if not message or not message.strip():
             raise ValueError("message 不能为空")
 
         start_time = time.perf_counter()
+        execution = self._resolve_execution_service(registry, execution_service)
         definitions = registry.list_definitions()
         tools = definitions_to_openai_tools(definitions)
         # Service 内部独立构建消息历史：只 append，不改写历史消息，
         # 不接收调用方传入的 list（避免意外污染）。
         messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
+
+        # ---- Phase 3.11 Step 13：Execution Context（一次 chat 一个 request_id） ----
+        # request_id：本 Service 生成（不落库 / 不进入 messages / 不出现在 API）；
+        # project_id：来自**执行边界的作用域**（服务器端 ProjectRegistry 解析结果），
+        #             LLM / Tool arguments 无法影响它。
+        request_id = new_request_id()
+        context_project_id = getattr(execution, "project_id", None)
 
         executed_calls: list[ToolChatCallInfo] = []
         tool_round = 0
@@ -335,9 +468,25 @@ class ToolChatService:
                 raise MultipleToolCallsError(len(response.tool_calls))
             call = response.tool_calls[0]
 
-            # ---- 4) 执行 Tool（失败也归一为 ToolResult，允许继续下一轮） ----
+            # ---- 4) 执行 Tool（Phase 3.11 Step 9 统一边界；Step 10 项目级授权；
+            #         Step 13 Execution Context）----
+            # arguments 由 LLM 给出（ToolCall.arguments），经执行边界**原样**
+            # 传入 Registry（不 rename / 不补默认 / 不过滤）；
+            # **Execution Context 不写入 arguments**（两个不同概念：Handler
+            # 的业务参数 schema 不因观测上下文而改变）。
+            # Tool 失败归一为 ToolResult(success=False) → 允许继续下一轮。
+            # 边界异常（如 capability 拒绝）**不在此捕获**：授权失败不是
+            # Tool 失败，原样上抛并终止本次请求（绝不降级为 ToolResult）。
             tool_round += 1
-            result = await registry.execute(call.name, call.arguments)
+            context = ToolExecutionContext(
+                request_id=request_id,
+                round=tool_round,
+                project_id=context_project_id,
+                tool_call_id=call.id,
+            )
+            result = await execution.execute(
+                call.name, arguments=call.arguments, context=context
+            )
 
             # ---- 5) append 完整消息对，保留历史（任务书 §七） ----
             messages.extend(_build_tool_messages(call, result))

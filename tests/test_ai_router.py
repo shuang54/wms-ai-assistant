@@ -160,6 +160,102 @@ class TestToolRouting:
 
 
 # ============================================================
+# C2. Tool Selection Contract（Phase 3.11 Step 3）
+# ============================================================
+
+class TestToolSelectionContract:
+    """route=TOOL 时必须携带被选中的 Tool 名称（``tool_name``）。
+
+    Phase 3.11 Step 3：Router 是 Tool 选择的**唯一来源**；
+    上层 Orchestrator 直接使用 ``decision.tool_name``，不再二次选择。
+    """
+
+    async def test_alias_hit_carries_tool_name(self) -> None:
+        caps = InMemoryToolCapabilityRegistry([
+            ToolCapability(
+                name="get_inventory",
+                description="查询物料当前库存数量",
+                aliases=("当前库存", "查库存"),
+            ),
+        ])
+        decision = await AIRouterService(tool_capabilities=caps).route(
+            "查询物料 MAT-001 当前库存"
+        )
+        assert decision.route == RouteType.TOOL
+        assert decision.source == "tool_match"
+        assert decision.tool_name == "get_inventory"
+
+    async def test_description_hit_carries_tool_name(self) -> None:
+        caps = InMemoryToolCapabilityRegistry([
+            ToolCapability(
+                name="get_work_order",
+                description="工单状态查询",
+                aliases=(),
+            ),
+        ])
+        decision = await AIRouterService(tool_capabilities=caps).route(
+            "工单状态查询 IPN202609140008"
+        )
+        assert decision.route == RouteType.TOOL
+        assert decision.tool_name == "get_work_order"
+
+    async def test_properties_field_name_carries_tool_name(self) -> None:
+        """ToolRegistryCapabilityAdapter 把参数字段名作为 aliases →
+        命中时同样携带 tool_name（替代旧 Orchestrator 的字段名匹配）。"""
+        registry = ToolRegistry()
+        register_mock_tools(registry)
+        caps = ToolRegistryCapabilityAdapter(registry)
+        decision = await AIRouterService(tool_capabilities=caps).route(
+            "query material_code MAT-001"
+        )
+        assert decision.route == RouteType.TOOL
+        assert decision.tool_name == "get_inventory"
+
+    async def test_multiple_capabilities_carries_actual_hit_name(self) -> None:
+        """多 Tool 场景：命中哪个就携带哪个的名称（确定性）。"""
+        caps = InMemoryToolCapabilityRegistry([
+            ToolCapability(
+                name="get_work_order",
+                description="工单状态查询",
+                aliases=("工单",),
+            ),
+            ToolCapability(
+                name="get_inventory",
+                description="库存查询能力",
+                aliases=("库存",),
+            ),
+        ])
+        decision = await AIRouterService(tool_capabilities=caps).route(
+            "查一下物料库存"
+        )
+        assert decision.route == RouteType.TOOL
+        assert decision.tool_name == "get_inventory"
+
+    async def test_non_tool_routes_carry_no_tool_name(self) -> None:
+        """RAG / TEXT_TO_SQL / 兜底路径 tool_name 必须为 None。"""
+        router = AIRouterService(llm_fallback_enabled=False)
+        rag = await router.route("采购入库怎么操作？")
+        t2s = await router.route("本月库存有多少？")
+        fallback = await router.route("随便聊聊")
+
+        assert rag.route == RouteType.RAG
+        assert rag.tool_name is None
+        assert t2s.route == RouteType.TEXT_TO_SQL
+        assert t2s.tool_name is None
+        assert fallback.route == RouteType.RAG
+        assert fallback.tool_name is None
+
+    async def test_llm_fallback_tool_decision_has_no_tool_name(self) -> None:
+        """LLM fallback 判定 TOOL 时不猜测具体 Tool（tool_name=None）——
+        由上层 Orchestrator 显式拒绝执行（不猜 / 不重调 / 不换 Tool）。"""
+        llm = FakeLLM(responses=['{"route": "tool", "reason": "r"}'])
+        decision = await AIRouterService(llm_client=llm).route("采购入库")
+        assert decision.route == RouteType.TOOL
+        assert decision.source == "llm"
+        assert decision.tool_name is None
+
+
+# ============================================================
 # D. 歧义问题：落到 fallback 路径
 # ============================================================
 

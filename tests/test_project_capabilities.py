@@ -291,16 +291,24 @@ class _CountingExecutor:
 
 
 class _StubRouter:
-    """固定决策的 Fake Router（绕过规则，直接测 Orchestrator 硬校验）。"""
+    """固定决策的 Fake Router（绕过规则，直接测 Orchestrator 硬校验）。
 
-    def __init__(self, route: RouteType) -> None:
+    Phase 3.11 Step 3：TOOL 决策必须携带 tool_name（Router 是 Tool
+    选择的唯一来源），Orchestrator 不再二次选择。
+    """
+
+    def __init__(
+        self, route: RouteType, tool_name: str | None = None
+    ) -> None:
         self._route = route
+        self._tool_name = tool_name
 
     async def route(self, question, *, context=None):
         from backend.app.services.ai_router_service import RouteDecision
 
         return RouteDecision(
-            route=self._route, confidence=1.0, reason="stub", source="stub"
+            route=self._route, confidence=1.0, reason="stub", source="stub",
+            tool_name=self._tool_name,
         )
 
 
@@ -323,9 +331,10 @@ class TestOrchestratorHardChecks:
         t2s=None,
         executor=None,
         tools=None,
+        tool_name: str | None = None,
     ) -> AIOrchestratorService:
         return AIOrchestratorService(
-            router=_StubRouter(route),
+            router=_StubRouter(route, tool_name=tool_name),
             rag_service=rag if rag is not None else _CountingRag(),
             tool_registry=tools,
             text_to_sql=t2s if t2s is not None else _CountingT2S(),
@@ -415,6 +424,7 @@ class TestOrchestratorHardChecks:
             ProjectCapabilities(tool_names=()),  # 该项目不允许任何 Tool
             RouteType.TOOL,
             tools=registry,
+            tool_name="get_inventory",
         )
         with pytest.raises(AIOrchestratorCapabilityError) as ei:
             await orch.execute("查询物料 10001 当前库存")
@@ -448,6 +458,7 @@ class TestOrchestratorHardChecks:
             ProjectCapabilities(tool_names=("get_inventory",)),
             RouteType.TOOL,
             tools=registry,
+            tool_name="get_inventory",
         )
         result = await orch.execute("查询物料 10001 当前库存")
         assert result.route == RouteType.TOOL

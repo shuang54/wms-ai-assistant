@@ -83,6 +83,10 @@ from backend.app.tools.get_inventory import (
     build_default_tool_registry,
     register_get_inventory_tool,
 )
+from backend.app.tools.get_work_order import (
+    GetWorkOrderHandler,
+    register_get_work_order_tool,
+)
 from backend.app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -323,6 +327,12 @@ def _build_project_tool_registry(
     复用现有 ToolRegistry（不创建第二套注册中心）：全局 Tool 构建器
     映射 → 按 capabilities.tool_names 白名单注册。
 
+    Phase 3.11 Step 5：支持两个真实只读 Tool（均绑定同一项目 Engine /
+    schema / project_id，共用 ToolExecutionService 执行边界）：
+
+        * ``get_inventory``   （Phase 3.7.12）
+        * ``get_work_order``  （Phase 3.11 Step 5）
+
     - 白名单为空 → 空 Registry（该项目无任何 Tool）；
     - 白名单含未知 Tool 名（全局不存在）→ 记 warning 并跳过
       （能力配置是静态服务器端注册，运行期不中断其它能力）。
@@ -346,7 +356,20 @@ def _build_project_tool_registry(
             ),
         )
 
-    known_tools = {"get_inventory"}
+    if capabilities.allows_tool("get_work_order"):
+        wo_settings = _dc.replace(
+            settings.work_order_tool, schema_name=schema_name
+        )
+        register_get_work_order_tool(
+            registry,
+            handler=GetWorkOrderHandler(
+                engine=engine,
+                wo_settings=wo_settings,
+                project_id=project_id,
+            ),
+        )
+
+    known_tools = {"get_inventory", "get_work_order"}
     unknown = [n for n in capabilities.tool_names if n not in known_tools]
     if unknown:
         logger.warning(
