@@ -1111,6 +1111,129 @@ Aggregation ≠ API
 
 ---
 
+## 8.20 LLM Usage Analytics Contract（Phase 3.10.20）
+
+在 Query + Aggregation 之上组合出 **Usage 统计能力**，仍然纯内存：
+
+```text
+LLM Request
+    ↓
+Observation
+    ↓
+Accounting
+    ↓
+Persistence
+    ↓
+Idempotency
+    ↓
+PostgreSQL
+    ↓
+Query Repository
+    ↓
+Query Service
+    ↓
+Query Runtime
+    ↓
+LLMUsageRecordView
+    ↓
+Usage Aggregation
+    ↓
+Usage Analytics
+```
+
+职责边界（按当前真实实现）：
+
+```text
+Query       = 获取 Usage Records（LLMUsageQueryService / QueryRuntime）
+Aggregation = 纯内存 sum / count / grouping（LLMUsageAggregationService）
+Analytics   = 组合多个 Aggregation View（LLMUsageAnalyticsService）
+```
+
+入口：`backend/app/services/llm_usage_analytics_service.py`
+
+```text
+LLMUsageAnalyticsService
+    ├── snapshot(records)             → LLMUsageAnalyticsSnapshot
+    ├── summary(records)              → LLMUsageAggregate
+    ├── by_provider(records)          → tuple[ProviderUsageAggregate, ...]
+    ├── by_model(records)             → tuple[ModelUsageAggregate, ...]
+    └── by_provider_model(records)    → tuple[ProviderModelUsageAggregate, ...]
+```
+
+### 当前真实 DTO（以代码为准）
+
+```text
+LLMUsageAnalyticsSnapshot（frozen）
+    ├── total:            LLMUsageAggregate            （复用 3.10.19 DTO）
+    ├── by_provider:      tuple[ProviderUsageAggregate, ...]
+    ├── by_model:         tuple[ModelUsageAggregate, ...]
+    └── by_provider_model: tuple[ProviderModelUsageAggregate, ...]
+
+LLMUsageAggregate（frozen，3.10.19）
+    total_requests / prompt_tokens / completion_tokens / total_tokens
+    prompt_tokens_known / completion_tokens_known / total_tokens_known
+```
+
+Analytics **不重复定义** `LLMUsageAggregate` 等 DTO（summary 直接复用），
+唯一新增的 `LLMUsageAnalyticsSnapshot` 承载"一次快照 → 四个视图"的
+一致性语义。
+
+### Snapshot（§十 / §十一）
+
+```text
+Iterable[LLMUsageRecordView]
+        ↓  _materialize（generator 只消费一次）
+immutable tuple snapshot
+        ↓
+summary / provider / model / provider+model（四个视图共享同一份快照）
+```
+
+**generator 只被消费一次**——四个视图不会因 iterable 二次消费而产生
+`total_requests` 与各分组 requests 的不一致。
+
+### 规则
+
+1. **Analytics 不重复实现聚合算法**：sum / group-by / 排序 / NULL
+   处理全部复用 `LLMUsageAggregationService`（§五 / §七 ~ §九）；
+2. **Analytics 不接触数据库**：不创建 Session / 不执行 SQL /
+   不访问 Repository / 不访问 PostgreSQL（§四）；
+3. **NULL ≠ 0**（沿用 3.10.19 Contract）：token 为 `None` = 未知，
+   不计入求和、也绝不当作 0；`*_known = False` 表示"该字段存在
+   NULL / unknown，当前 sum 只是已知值之和"；
+4. **三个 token 列独立观测**：`total_tokens` 直接求和，不重算为
+   `prompt + completion`（§十三）；
+5. **确定性排序**：分组按 key 升序、`None` 分组在该维度排在最后；
+   同一输入（任意顺序）恒得同一输出，不依赖 dict insertion order /
+   输入顺序 / 线程顺序；
+6. **一致性**：对同一 snapshot，Σ provider / Σ model /
+   Σ provider+model 的 requests 与 token 都回溯到 `summary`；
+   `None` provider/model 也作为独立分组参与统计；
+7. **不去重**：两条完全相同的记录 = 两次 Usage；
+8. **无 Cost**：不接 `LLMPricing` / `LLMCost`，无 price / currency /
+   cost 字段（Usage Analytics ≠ Cost Calculation ≠ Billing）；
+9. **无时间聚合**：不做 hour / day / week / month / time_series；
+10. **错误 Contract**：Analytics 输入非法（None / 不可迭代 / 字符串）
+    → `LLMUsageAnalyticsInputError`；底层 `LLMUsageAggregationError`
+    族**原样传播**，不做无意义包装；
+11. **不可变 / 无全局状态**：Snapshot 与全部 DTO frozen，
+    分组结果为 tuple，无缓存 / 无 singleton。
+
+### Database / Test Boundary
+
+```text
+Analytics Service:  无 Session / 无 SQL / 无 Repository / 无 PostgreSQL
+测试:               DB Access = 0、DB Writes = 0、Network = 0
+                    （纯内存，直接构造 LLMUsageRecordView，无 RUN_DB_TESTS）
+```
+
+明确：
+
+```text
+Usage Analytics  ≠  Cost Calculation  ≠  Billing  ≠  Dashboard  ≠  API
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
