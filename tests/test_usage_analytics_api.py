@@ -673,3 +673,262 @@ class TestNoDirectDbAccess:
             assert not any(
                 fragment in value.lower() for value in strings
             ), fragment
+
+
+# ============================================================
+# 11. DB Integration（RUN_DB_TESTS=1，Phase 3.10.22 Step 3）
+# ============================================================
+
+# 复用 Phase 3.10.17 既有 DB 测试机制（schema ensure / seed 走正式
+# 写入路径 / cleanup TRUNCATE），不重造 PostgreSQL / Session fixture。
+# 不 monkeypatch _usage_facade——走真实
+# Facade → Runtime → Query Service → Repository → PostgreSQL。
+from tests.test_llm_usage_query import (  # noqa: E402
+    _cleanup as _cleanup_usage_table,
+    _count as _count_usage_rows,
+    _ensure_schema as _ensure_usage_schema,
+    _open_session as _open_usage_session,
+    _seed_fixture_rows as _seed_usage_rows,
+    requires_db as _requires_db,
+)
+
+#: 既有 8 行 fixture 的确定性聚合期望（见 test_llm_usage_query._FIXTURE_ROWS）：
+#: total = 8 requests / 38 prompt / 49 completion / 87 total tokens
+_FIXTURE_TOTAL_REQUESTS = 8
+_FIXTURE_TOTAL_TOKENS = (38, 49, 87)
+
+
+@_requires_db
+class TestUsageAnalyticsApiDatabase:
+    """真实 DB 集成：GET /api/usage/analytics → PostgreSQL → JSON。
+
+    复用既有 seed（正式写入路径）+ cleanup（TRUNCATE）机制；
+    每个用例记录 API 调用前后行数，证明 API 链路零写入。
+    """
+
+    def test_http_reads_real_postgres_full_chain(self) -> None:
+        """HTTP 200 + 四视图精确聚合值 + read-only。"""
+        engine = _ensure_usage_schema()
+        session = _open_usage_session()
+        try:
+            assert _seed_usage_rows(engine) == _FIXTURE_TOTAL_REQUESTS
+            count_before = _count_usage_rows(session)
+
+            with TestClient(app) as c:
+                response = c.get(_ENDPOINT, params={"limit": 100})
+
+            count_after = _count_usage_rows(session)
+            assert count_before == count_after == _FIXTURE_TOTAL_REQUESTS
+
+            assert response.status_code == 200
+            payload = response.json()
+
+            total = payload["total"]
+            prompt, completion, tokens = _FIXTURE_TOTAL_TOKENS
+            assert total["total_requests"] == _FIXTURE_TOTAL_REQUESTS
+            assert total["prompt_tokens"] == prompt
+            assert total["completion_tokens"] == completion
+            assert total["total_tokens"] == tokens
+            assert total["prompt_tokens_known"] is True
+            assert total["completion_tokens_known"] is True
+            assert total["total_tokens_known"] is True
+
+            # by_provider：provider 升序；deepseek 4 行 / openai 3 行 /
+            # anthropic 1 行
+            assert [g["provider"] for g in payload["by_provider"]] == [
+                "anthropic", "deepseek", "openai",
+            ]
+            by_provider = {
+                g["provider"]: g["aggregate"] for g in payload["by_provider"]
+            }
+            assert by_provider["deepseek"]["total_requests"] == 4
+            assert by_provider["deepseek"]["prompt_tokens"] == 25
+            assert by_provider["deepseek"]["completion_tokens"] == 35
+            assert by_provider["deepseek"]["total_tokens"] == 60
+            assert by_provider["openai"]["total_requests"] == 3
+            assert by_provider["openai"]["prompt_tokens"] == 9
+            assert by_provider["openai"]["total_tokens"] == 19
+            assert by_provider["anthropic"]["total_requests"] == 1
+            assert by_provider["anthropic"]["total_tokens"] == 8
+
+            # by_model：5 组，model 升序
+            assert [g["model"] for g in payload["by_model"]] == [
+                "claude-3", "deepseek-chat", "deepseek-reasoner",
+                "gpt-4o", "gpt-4o-mini",
+            ]
+            by_model = {
+                g["model"]: g["aggregate"] for g in payload["by_model"]
+            }
+            assert by_model["deepseek-chat"]["total_requests"] == 3
+            assert by_model["deepseek-chat"]["total_tokens"] == 46
+            assert by_model["gpt-4o"]["total_requests"] == 2
+            assert by_model["claude-3"]["total_tokens"] == 8
+
+            # by_provider_model：5 组
+            assert len(payload["by_provider_model"]) == 5
+            pairs = {
+                (g["provider"], g["model"]): g["aggregate"]["total_requests"]
+                for g in payload["by_provider_model"]
+            }
+            assert pairs[("deepseek", "deepseek-chat")] == 3
+            assert pairs[("deepseek", "deepseek-reasoner")] == 1
+            assert pairs[("openai", "gpt-4o")] == 2
+            assert pairs[("openai", "gpt-4o-mini")] == 1
+            assert pairs[("anthropic", "claude-3")] == 1
+        finally:
+            session.close()
+            assert _cleanup_usage_table(engine) == 0
+
+    def test_pagination_applies_to_real_query(self) -> None:
+        """limit / offset 作用于真实 SQL；Analytics = 本页记录。"""
+        engine = _ensure_usage_schema()
+        session = _open_usage_session()
+        try:
+            assert _seed_usage_rows(engine) == _FIXTURE_TOTAL_REQUESTS
+            count_before = _count_usage_rows(session)
+
+            with TestClient(app) as c:
+                page1 = c.get(
+                    _ENDPOINT, params={"limit": 1, "offset": 0},
+                )
+                page2 = c.get(
+                    _ENDPOINT, params={"limit": 2, "offset": 6},
+                )
+                full = c.get(_ENDPOINT, params={"limit": 100})
+
+            count_after = _count_usage_rows(session)
+            assert count_before == count_after == _FIXTURE_TOTAL_REQUESTS
+
+            assert page1.status_code == 200
+            p1 = page1.json()
+            # 本页 1 条记录 → 聚合只覆盖 1 条
+            assert p1["total"]["total_requests"] == 1
+            assert sum(
+                g["aggregate"]["total_requests"]
+                for g in p1["by_provider"]
+            ) == 1
+            assert "global_total" not in p1["total"]
+            assert "total_count" not in p1["total"]
+
+            assert page2.status_code == 200
+            p2 = page2.json()
+            assert p2["total"]["total_requests"] == 2
+
+            assert full.status_code == 200
+            assert (
+                full.json()["total"]["total_requests"]
+                == _FIXTURE_TOTAL_REQUESTS
+            )
+        finally:
+            session.close()
+            assert _cleanup_usage_table(engine) == 0
+
+    def test_provider_model_request_filters_hit_real_db(self) -> None:
+        """provider / model / request_id 过滤作用于真实 SQL。"""
+        engine = _ensure_usage_schema()
+        session = _open_usage_session()
+        try:
+            assert _seed_usage_rows(engine) == _FIXTURE_TOTAL_REQUESTS
+            count_before = _count_usage_rows(session)
+
+            with TestClient(app) as c:
+                by_provider = c.get(
+                    _ENDPOINT,
+                    params={"provider": "deepseek", "limit": 100},
+                )
+                by_model = c.get(
+                    _ENDPOINT, params={"model": "gpt-4o", "limit": 100},
+                )
+                by_pair = c.get(
+                    _ENDPOINT,
+                    params={
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "limit": 100,
+                    },
+                )
+                by_request = c.get(
+                    _ENDPOINT, params={"request_id": "req-003"},
+                )
+                unknown = c.get(
+                    _ENDPOINT,
+                    params={"provider": "__no_such_provider__"},
+                )
+
+            count_after = _count_usage_rows(session)
+            assert count_before == count_after == _FIXTURE_TOTAL_REQUESTS
+
+            assert by_provider.status_code == 200
+            p = by_provider.json()
+            assert p["total"]["total_requests"] == 4
+            assert [g["provider"] for g in p["by_provider"]] == ["deepseek"]
+
+            assert by_model.status_code == 200
+            assert by_model.json()["total"]["total_requests"] == 2
+
+            assert by_pair.status_code == 200
+            assert by_pair.json()["total"]["total_requests"] == 2
+
+            assert by_request.status_code == 200
+            rq = by_request.json()
+            assert rq["total"]["total_requests"] == 1
+            assert rq["total"]["prompt_tokens"] == 5
+
+            # 不存在的 provider → 200 + 空结果（不是错误）
+            assert unknown.status_code == 200
+            u = unknown.json()
+            assert u["total"]["total_requests"] == 0
+            assert u["by_provider"] == []
+            assert u["by_model"] == []
+            assert u["by_provider_model"] == []
+        finally:
+            session.close()
+            assert _cleanup_usage_table(engine) == 0
+
+    def test_time_range_filter_timezone_aware(self) -> None:
+        """created_at_from / to（tz-aware）→ 真实 SQL 时间过滤（含边界）。"""
+        engine = _ensure_usage_schema()
+        session = _open_usage_session()
+        try:
+            assert _seed_usage_rows(engine) == _FIXTURE_TOTAL_REQUESTS
+            count_before = _count_usage_rows(session)
+
+            with TestClient(app) as c:
+                ranged = c.get(
+                    _ENDPOINT,
+                    params={
+                        "created_at_from": "2024-01-03T00:00:00+00:00",
+                        "created_at_to": "2024-01-05T00:00:00+00:00",
+                        "limit": 100,
+                    },
+                )
+                tz_shifted = c.get(
+                    _ENDPOINT,
+                    params={
+                        "created_at_from": "2024-01-03T07:00:00+07:00",
+                        "created_at_to": "2024-01-05T07:00:00+07:00",
+                        "limit": 100,
+                    },
+                )
+                naive_rejected = c.get(
+                    _ENDPOINT,
+                    params={"created_at_from": "2024-01-03T00:00:00"},
+                )
+
+            count_after = _count_usage_rows(session)
+            assert count_before == count_after == _FIXTURE_TOTAL_REQUESTS
+
+            # 01-03（req-003 / req-004）+ 01-04（req-005）+
+            # 01-05（request_id=None，含 to 边界）= 4
+            assert ranged.status_code == 200
+            assert ranged.json()["total"]["total_requests"] == 4
+
+            # 07:00+07:00 与 00:00+00:00 同一时刻 → 结果一致
+            assert tz_shifted.status_code == 200
+            assert tz_shifted.json()["total"]["total_requests"] == 4
+
+            # naive datetime 被 Filter Contract 拒绝 → 422（无 DB 副作用）
+            assert naive_rejected.status_code == 422
+        finally:
+            session.close()
+            assert _cleanup_usage_table(engine) == 0

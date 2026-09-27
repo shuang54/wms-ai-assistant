@@ -411,3 +411,21 @@ Queue / Worker / Outbox / Kafka / Celery
 [ ] docs/api.md                     —— 端点 / 参数 / 响应 / 错误码
 [ ] docs/architecture.md            —— §8.22（本 Step 已先行添加，仅描述设计）
 ```
+
+---
+
+## Integration Verification（Phase 3.10.22 Step 3）
+
+真实 PostgreSQL 集成验证（`RUN_DB_TESTS=1`）；复用 Phase 3.10.17 既有
+schema / seed（正式写入路径）/ cleanup 机制，不重造 fixture。
+
+```text
+HTTP API          = PASS   （GET /api/usage/analytics 真实链路 200 + 四视图精确聚合值）
+Real PostgreSQL   = PASS   （Filter / Pagination / 时间范围作用于真实 SQL；时区感知 +00:00 ≡ +07:00）
+Read-only         = PASS   （每个用例 API 调用前后 count_before == count_after == 8）
+DB writes         = 0      （查询链路只有 SELECT；cleanup 后表行数恢复 0）
+```
+
+用例：`tests/test_usage_analytics_api.py::TestUsageAnalyticsApiDatabase`
+（4 个真实 DB 用例；默认 skip，`RUN_DB_TESTS=1` 启用）。
+Step 2 实现与本文档 Contract 完全一致，本 Step 未修改任何业务代码。
