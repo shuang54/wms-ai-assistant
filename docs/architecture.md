@@ -908,6 +908,78 @@ Contract：
 
 ---
 
+## 8.17 LLM Usage Query Read Boundary（Phase 3.10.17）
+
+Usage Persistence 现在有两条互不干扰的路径：
+
+```text
+LLM Usage Write:
+
+Observation
+ ↓
+Accounting
+ ↓
+Runtime Bridge
+ ↓
+Persistence
+ ↓
+PostgreSQL
+
+
+LLM Usage Read:
+
+PostgreSQL
+ ↓
+LLMUsageRepository（SQL / Session / Row）
+ ↓
+LLMUsageRecordRow（db 层内部记录，不是 ORM 对象）
+ ↓
+LLMUsageQueryService（validate → repository → DTO）
+ ↓
+LLMUsageRecordView（frozen DTO，只读边界）
+```
+
+明确：
+
+```text
+Read Boundary
+≠ Analytics
+≠ Billing
+≠ Dashboard
+```
+
+规则：
+
+1. **上层不得直接访问 ORM / Session**：不得 `session.query()` /
+   `session.execute()` / 直接持有 `LLMUsageRecord` 去读 Usage
+   Persistence；只能经 `LLMUsageQueryService`；
+2. **Query DTO 安全白名单**：`id / request_id / provider / model /
+   prompt_tokens / completion_tokens / total_tokens / created_at`
+   ——不含 prompt / messages / response / SQL / RAG / tool /
+   API key / password / authorization / database URL /
+   Session / Connection / Engine / cost / price / currency；
+3. **禁止返回 ORM 对象**：Repository 返回内部 `LLMUsageRecordRow`，
+   Service 转成 `LLMUsageRecordView`（frozen dataclass，项目 DTO 约定）；
+4. **过滤下推 PostgreSQL**：`request_id / provider / model /
+   created_at_from / created_at_to` 全部生成 `WHERE`，
+   不在 Python 里取回全表再过滤；
+5. **稳定排序**：`ORDER BY created_at DESC, id DESC`
+   （`LIMIT/OFFSET` 缺少稳定排序时返回顺序不确定）；
+6. **分页参数边界**：`limit` 1~100（默认 50），`offset >= 0`，
+   非法参数在进入数据库之前被 `LLMUsageQueryInputError` 拒绝；
+7. **时间范围**：`created_at >= from`、`created_at <= to`（含边界）；
+   `from > to` 明确 reject（不交换、不修正、不静默返回空）；
+   统一 timezone-aware（项目已有约定）；
+8. **Session 隔离**：继续"一次查询一个独立 Session"（Repository 管理，
+   Service 不创建 Session），读路径不开启写事务；
+9. **READ ONLY**：只增加 SELECT，无 INSERT / UPDATE / DELETE；
+10. **不做统计 / Cost / 权限**：无 `sum_tokens()` / `daily_usage()` /
+    `monthly_usage()` / `LLMCost` / user / role / tenant ACL；
+11. **无 HTTP / Dashboard**：本阶段不建 FastAPI Router、不做图表；
+12. **不为 provider / model 新建索引**（先观察真实 Query Pattern）。
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
