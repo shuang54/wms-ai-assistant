@@ -19,11 +19,19 @@
 **这不是 Trace System**：不新增表 / 不新增 Repository / 不写库 / 不产生 Span、
 Trace Parent、事件流；只把两个**已有**只读边界的结果按同一个 trace id 组合。
 
+数据源（Phase 3.12 Step 41：两者均为**持久化**读边界）::
+
+    LLM Usage  → ai_ops.llm_usage_record          （PostgreSQL）
+    Tool       → ai_ops.tool_execution_record     （PostgreSQL）
+
+    → 进程重启 / 多 worker / Runtime Collector 已淘汰的记录仍可查询
+    （Assistant Trace 是**历史链路**读取，不是"当前进程快照"）
+
 依赖方向（Architecture Boundary，本模块最重要的约束）::
 
     AssistantTraceQueryService
-        ├── LLMUsageQueryService                 （只读 Query Service）
-        └── ToolObservabilityQueryService        （只读 Query Service）
+        ├── LLMUsageQueryService                    （只读 Query Service）
+        └── Tool 观测读边界（Persistent；提供 list_by_request_id()）
 
     ✗ LLMUsageRepository / ToolExecutionRepository    （禁止依赖 Repository）
     ✗ SQLAlchemy Session / Engine / select            （禁止访问 DB）
@@ -38,8 +46,9 @@ Trace Parent、事件流；只把两个**已有**只读边界的结果按同一�
     * 不把下游异常降级为 ``[]``：数据库不可用时必须抛出既有异常
       （``[]`` 只表示"确实没有记录"）；
     * 不合并 Runtime Tool Records 与 Persistent Tool Records
-      （本阶段 Tool 数据源 = **Runtime** 内存读边界；Persistent History 由
-      ``/api/observability/tools/history`` 独立提供 —— 两者绝不混用以避免
+      （Tool 数据源 = **Persistent** 读边界；Runtime 内存 Collector 只服务
+      ``/api/observability/tools``，Persistent History 只服务
+      ``/api/observability/tools/history`` —— 两者绝不混用以避免
       duplicate Tool Execution）。
 
 用法（测试 / 未来装配显式构造；本阶段不接 API、不做单例）::
@@ -170,11 +179,12 @@ class AssistantTraceQueryService:
 
     Args:
         tool_observability_query_service: Tool 观测读边界（**必填**）——
-            由调用方 / Application Composition Root 注入既有实例
-            （通常是线上应用级 ``ToolObservabilityQueryService``，
-            其 Collector 由 ``api/orchestrator_chat.py`` 唯一创建）。
-            本服务**不创建 Collector**（沿用 Step 23/24 契约：
-            Collector 唯一创建点 = Composition Root），因此没有默认值。
+            必须提供 ``list_by_request_id(request_id)``。Assistant Trace 固定
+            使用 **Persistent** 读边界（``ToolExecutionPersistentQueryService``，
+            由 ``api/orchestrator_chat.py`` 装配为模块级单例）；Runtime
+            内存边界不参与 Trace。本服务**不创建 Collector**（沿用
+            Step 23/24 契约：Collector 唯一创建点 = Composition Root），
+            因此没有默认值。
         llm_usage_query_service: LLM Usage 读边界；``None`` → 构造默认
             ``LLMUsageQueryService()``（只创建 Query Service + Repository，
             不创建 Collector / 不访问 Session）。
@@ -208,11 +218,12 @@ class AssistantTraceQueryService:
             )
         self._tools = tool_observability_query_service
         if not callable(
-            getattr(self._tools, "snapshots_by_request_id", None)
+            getattr(self._tools, "list_by_request_id", None)
         ):
             raise TypeError(
                 "tool_observability_query_service 必须提供可调用的 "
-                "snapshots_by_request_id()"
+                "list_by_request_id()（Persistent Tool 读边界；"
+                "Runtime 内存边界不参与 Assistant Trace）"
                 f"（got {type(self._tools).__name__}）"
             )
 
@@ -223,7 +234,7 @@ class AssistantTraceQueryService:
 
     @property
     def tool_observability_query_service(self) -> Any:
-        """Tool 观测读边界（Runtime 内存读边界；只读引用）。"""
+        """Tool 观测读边界（**Persistent** 读边界；只读引用）。"""
         return self._tools
 
     def get_trace(self, assistant_request_id: str) -> AssistantTraceView:
@@ -234,7 +245,8 @@ class AssistantTraceQueryService:
             validate（先于任何下游调用）
                 ↓
             llm_usage  ← LLMUsageQueryService.list_by_assistant_request_id(A)
-            tools      ← ToolObservabilityQueryService.snapshots_by_request_id(A)
+            tools      ← Tool 观测读边界.list_by_request_id(A)
+                         （Persistent：ai_ops.tool_execution_record）
                 ↓
             AssistantTraceView(assistant_request_id=A,
                                llm_usage=(...), tool_executions=(...))
@@ -253,7 +265,9 @@ class AssistantTraceQueryService:
             LLMUsageQueryInputError: 透传（下游读边界输入错误）。
             LLMUsageRepositoryError: 透传（LLM Usage 数据库不可用 ——
                 **绝不**降级为 ``[]``）。
-            TypeError / Exception: Tool 读边界抛出的异常原样透传。
+            ToolExecutionRepositoryError: 透传（Tool 持久化数据库不可用 ——
+                **绝不**降级为 ``[]``）。
+            TypeError / Exception: Tool 读边界抛出的其它异常原样透传。
 
         Note:
             不在本层排序 / 去重 / 聚合 / 补全；不按 route 猜测内容；
@@ -264,7 +278,7 @@ class AssistantTraceQueryService:
             self._llm_usage.list_by_assistant_request_id(validated)
         )
         tool_executions = tuple(
-            self._tools.snapshots_by_request_id(validated)
+            self._tools.list_by_request_id(validated)
         )
         return AssistantTraceView(
             assistant_request_id=validated,

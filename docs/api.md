@@ -614,11 +614,16 @@ Side Effect:  None（不写库 / 不触发 Tool / 不调用 LLM / 不重新路�
 Persistence:  None（无 Trace 表 / 无 Repository）
 ```
 
-数据来源（**两个不同源，刻意不合并**）：
+数据来源（**两者均为持久化，且刻意不与 Runtime 合并**）：
 
 ```text
-llm_usage[]       ← LLMUsageQueryService      → PostgreSQL（ai_ops.llm_usage_record）
-tool_executions[] ← ToolObservabilityQueryService → Runtime 内存（当前进程 Collector）
+llm_usage[]       ← LLMUsageQueryService
+                    → PostgreSQL（ai_ops.llm_usage_record）
+tool_executions[] ← Tool 观测 Persistent 读边界（Step 41 起）
+                    → PostgreSQL（ai_ops.tool_execution_record）
+                    · 进程重启 / 多 worker / Runtime Collector 淘汰后仍可查询
+                    · Runtime（/api/observability/tools）与
+                      History（/api/observability/tools/history）语义不变
 ```
 
 Response 200（示例）：

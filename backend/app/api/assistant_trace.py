@@ -3,8 +3,10 @@
     HTTP GET /api/observability/assistant-trace/{assistant_request_id}
         ↓
     AssistantTraceQueryService.get_trace()          （Step 38 Read Model Composition）
-        ├── LLMUsageQueryService        → PostgreSQL（ai_ops.llm_usage_record）
-        └── ToolObservabilityQueryService → Runtime Memory（InMemory Collector）
+        ├── LLMUsageQueryService            → PostgreSQL（ai_ops.llm_usage_record）
+        └── Tool 观测 Persistent 读边界      → PostgreSQL（ai_ops.tool_execution_record）
+            （Step 41：Tool 数据源由 Runtime 内存切换为持久化；
+              进程重启 / 多 worker 仍可查询）
         ↓
     AssistantTraceView
         ↓
@@ -43,6 +45,9 @@ from backend.app.api.orchestrator_chat import (
     get_assistant_trace_query_service,
 )
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
+from backend.app.db.tool_execution_repository import (
+    ToolExecutionRepositoryError,
+)
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,
@@ -213,12 +218,19 @@ async def get_assistant_trace(
 
         400  assistant_request_id 非法（服务层校验：纯空白等）
         422  路径参数长度越界（FastAPI Path 校验）
-        502  LLM Usage 数据源不可用（LLMUsageRepositoryError）
+        502  持久化数据源不可用（LLMUsageRepositoryError /
+             ToolExecutionRepositoryError —— 两者均为 PostgreSQL 读边界）
         500  其它未预期错误（不暴露 traceback / SQL / 凭据 / 内部模块路径）
 
     安全：响应只包含 ``assistant_request_id`` / ``llm_usage[]``（9 字段）/
         ``tool_executions[]``（11 字段），不含 prompt / messages / arguments /
         ToolResult.data / SQL / DB 连接 / Session / 凭据。
+
+    数据源（Step 41）：LLM → ``ai_ops.llm_usage_record``；
+        Tool → ``ai_ops.tool_execution_record``；两者均**持久化**，
+        因此进程重启 / 多 worker / Runtime Collector 淘汰后仍可查询。
+        Runtime（``/api/observability/tools``）与 History
+        （``/api/observability/tools/history``）语义**不变**，且不与本端点合并。
     """
     try:
         service: AssistantTraceQueryService = (
@@ -231,10 +243,10 @@ async def get_assistant_trace(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"非法输入: {exc}",
         )
-    except LLMUsageRepositoryError:
+    except (LLMUsageRepositoryError, ToolExecutionRepositoryError) as exc:
         logger.error(
-            "assistant trace llm usage unavailable",
-            extra={"error_type": "LLMUsageRepositoryError"},
+            "assistant trace data source unavailable",
+            extra={"error_type": type(exc).__name__},
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

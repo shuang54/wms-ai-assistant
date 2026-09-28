@@ -2,24 +2,24 @@
 
 只在 ``RUN_DB_TESTS=1`` 时运行（默认跳过）。
 
-数据源（**刻意不同源，且不合并**）：
+数据源（Phase 3.12 Step 41：两者**均为 PostgreSQL**，且不合并）：
 
     AssistantTraceQueryService
-        ├── LLMUsageQueryService            → PostgreSQL（ai_ops.llm_usage_record）
-        └── ToolObservabilityQueryService   → Runtime 内存（InMemory Collector）
+        ├── LLMUsageQueryService            → ai_ops.llm_usage_record
+        └── ToolExecutionPersistentQueryService → ai_ops.tool_execution_record
 
 真实链路：
 
     写入 LLM usage（Step 36 correlation，真实 Repository → PostgreSQL）
         +
-    写入 Tool record（真实 InMemory Collector）
+    写入 Tool record（真实 ToolExecutionRepository.create → PostgreSQL）
         ↓
     AssistantTraceQueryService.get_trace(A)（真实两个读边界）
         ↓
     AssistantTraceView
 
 数据：synthetic（provider / request_id 前缀 ``step38-``）；未读取真实数据。
-清理（不用 TRUNCATE）：按 provider 前缀定向 ``DELETE`` 并断言归零。
+清理（不用 TRUNCATE）：按 provider / request_id 前缀定向 ``DELETE``（LLM Usage 与 Tool Execution 两张表）并断言归零。
 """
 from __future__ import annotations
 
@@ -39,16 +39,16 @@ from backend.app.services.assistant_trace import assistant_trace_scope
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
 )
-from backend.app.services.in_memory_tool_execution_collector import (
-    InMemoryToolExecutionCollector,
-)
 from backend.app.services.llm_usage_persistence_service import (
     LLMUsagePersistenceService,
 )
 from backend.app.services.llm_usage_query_service import LLMUsageQueryService
+from backend.app.db.tool_execution_repository import (
+    ToolExecutionRepository,
+)
 from backend.app.services.tool_execution_record import ToolExecutionRecord
-from backend.app.services.tool_observability_query_service import (
-    ToolObservabilityQueryService,
+from backend.app.services.tool_execution_persistent_query_service import (
+    ToolExecutionPersistentQueryService,
 )
 
 _TABLE = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
@@ -57,6 +57,16 @@ _DELETE_SQL = text(f"DELETE FROM {_TABLE} WHERE provider LIKE :prefix")
 _COUNT_SQL = text(f"SELECT COUNT(*) FROM {_TABLE} WHERE provider LIKE :prefix")
 _TOTAL_SQL = text(f"SELECT COUNT(*) FROM {_TABLE}")
 _BASE = datetime(2026, 9, 28, 17, 0, 0, tzinfo=timezone.utc)
+
+#: Phase 3.12 Step 41：Tool Execution 表（本文件同时写入该表）
+_TOOL_TABLE = "ai_ops.tool_execution_record"
+_TOOL_DELETE_SQL = text(
+    f"DELETE FROM {_TOOL_TABLE} WHERE request_id LIKE :prefix"
+)
+_TOOL_COUNT_SQL = text(
+    f"SELECT COUNT(*) FROM {_TOOL_TABLE} WHERE request_id LIKE :prefix"
+)
+_TOOL_TOTAL_SQL = text(f"SELECT COUNT(*) FROM {_TOOL_TABLE}")
 
 
 def _env_flag(name: str) -> bool:
@@ -87,6 +97,11 @@ def _persist_usage(assistant_request_id: str, provider_request_id: str) -> None:
         service.persist(_observation(provider_request_id))
 
 
+def _persist_tool(record: ToolExecutionRecord) -> None:
+    """把 Tool 执行写入 PostgreSQL（真实 Repository；Step 41）。"""
+    ToolExecutionRepository().create(record)
+
+
 def _tool_record(*, request_id: str, round_: int) -> ToolExecutionRecord:
     started = _BASE + timedelta(seconds=round_)
     return ToolExecutionRecord(
@@ -112,24 +127,28 @@ def trace_env():
     with engine.begin() as conn:
         conn.execute(_DELETE_SQL, {"prefix": _PREFIX})
         baseline = int(conn.execute(_TOTAL_SQL).scalar_one())
-    collector = InMemoryToolExecutionCollector()
-    yield engine, collector
-    collector.clear()
+        conn.execute(_TOOL_DELETE_SQL, {"prefix": _PREFIX})
+        tool_baseline = int(conn.execute(_TOOL_TOTAL_SQL).scalar_one())
+    yield engine
     with engine.begin() as conn:
         conn.execute(_DELETE_SQL, {"prefix": _PREFIX})
         assert int(conn.execute(_COUNT_SQL, {"prefix": _PREFIX}).scalar_one()) == 0
         assert int(conn.execute(_TOTAL_SQL).scalar_one()) == baseline
+        conn.execute(_TOOL_DELETE_SQL, {"prefix": _PREFIX})
+        assert int(conn.execute(_TOOL_COUNT_SQL, {"prefix": _PREFIX}).scalar_one()) == 0
+        assert int(conn.execute(_TOOL_TOTAL_SQL).scalar_one()) == tool_baseline
 
 
-def _trace_service(
-    collector: InMemoryToolExecutionCollector,
-) -> AssistantTraceQueryService:
+def _trace_service() -> AssistantTraceQueryService:
+    """两个数据源**均为 PostgreSQL**（Step 41）。"""
     return AssistantTraceQueryService(
         llm_usage_query_service=LLMUsageQueryService(
             repository=LLMUsageRepository()
         ),
-        tool_observability_query_service=ToolObservabilityQueryService(
-            collector
+        tool_observability_query_service=(
+            ToolExecutionPersistentQueryService(
+                repository=ToolExecutionRepository()
+            )
         ),
     )
 
@@ -137,13 +156,13 @@ def _trace_service(
 @requires_db
 class TestAssistantTraceQueryDb:
     def test_llm_only_trace(self, trace_env) -> None:
-        _engine, collector = trace_env
-        _persist_usage("A", "step38-P1")
-        _persist_usage("A", "step38-P2")
+        _engine = trace_env
+        _persist_usage("step38-A", "step38-P1")
+        _persist_usage("step38-A", "step38-P2")
 
-        view = _trace_service(collector).get_trace("A")
+        view = _trace_service().get_trace("step38-A")
 
-        assert view.assistant_request_id == "A"
+        assert view.assistant_request_id == "step38-A"
         assert [v.request_id for v in view.llm_usage] == [
             "step38-P1", "step38-P2",
         ]
@@ -153,61 +172,61 @@ class TestAssistantTraceQueryDb:
         assert view.tool_executions == ()             # Tool 侧 0（合法）
 
     def test_llm_and_tool_trace(self, trace_env) -> None:
-        _engine, collector = trace_env
-        _persist_usage("A", "step38-P3")
-        collector.on_execution(_tool_record(request_id="A", round_=1))
+        _engine = trace_env
+        _persist_usage("step38-A", "step38-P3")
+        _persist_tool(_tool_record(request_id="step38-A", round_=1))
 
-        view = _trace_service(collector).get_trace("A")
+        view = _trace_service().get_trace("step38-A")
 
         assert len(view.llm_usage) == 1
         assert len(view.tool_executions) == 1
-        assert view.llm_usage[0].assistant_request_id == "A"
-        assert view.tool_executions[0].request_id == "A"
+        assert view.llm_usage[0].assistant_request_id == "step38-A"
+        assert view.tool_executions[0].request_id == "step38-A"
         assert view.tool_executions[0].round == 1
         assert view.tool_executions[0].tool_call_id is None
 
     def test_tool_only_trace(self, trace_env) -> None:
-        _engine, collector = trace_env
-        collector.on_execution(_tool_record(request_id="A", round_=1))
+        _engine = trace_env
+        _persist_tool(_tool_record(request_id="step38-A", round_=1))
 
-        view = _trace_service(collector).get_trace("A")
+        view = _trace_service().get_trace("step38-A")
 
         assert view.llm_usage == ()
         assert len(view.tool_executions) == 1
 
     def test_empty_trace_is_not_an_error(self, trace_env) -> None:
-        _engine, collector = trace_env
+        _engine = trace_env
 
-        view = _trace_service(collector).get_trace("step38-not-exist")
+        view = _trace_service().get_trace("step38-not-exist")
 
         assert view.assistant_request_id == "step38-not-exist"
         assert view.llm_usage == () and view.tool_executions == ()
 
     def test_traces_do_not_mix(self, trace_env) -> None:
-        _engine, collector = trace_env
-        _persist_usage("A", "step38-P4")
-        _persist_usage("B", "step38-P5")
-        collector.on_execution(_tool_record(request_id="A", round_=1))
-        collector.on_execution(_tool_record(request_id="B", round_=2))
+        _engine = trace_env
+        _persist_usage("step38-A", "step38-P4")
+        _persist_usage("step38-B", "step38-P5")
+        _persist_tool(_tool_record(request_id="step38-A", round_=1))
+        _persist_tool(_tool_record(request_id="step38-B", round_=2))
 
-        service = _trace_service(collector)
-        view_a = service.get_trace("A")
-        view_b = service.get_trace("B")
+        service = _trace_service()
+        view_a = service.get_trace("step38-A")
+        view_b = service.get_trace("step38-B")
 
         assert [v.request_id for v in view_a.llm_usage] == ["step38-P4"]
-        assert [s.request_id for s in view_a.tool_executions] == ["A"]
+        assert [s.request_id for s in view_a.tool_executions] == ["step38-A"]
         assert [v.request_id for v in view_b.llm_usage] == ["step38-P5"]
-        assert [s.request_id for s in view_b.tool_executions] == ["B"]
+        assert [s.request_id for s in view_b.tool_executions] == ["step38-B"]
 
     def test_historical_null_usage_not_attached(self, trace_env) -> None:
         """历史 / 旧链路 usage（NULL correlation）不会被粘到任何 Trace。"""
-        _engine, collector = trace_env
+        _engine = trace_env
         LLMUsagePersistenceService(
             repository=LLMUsageRepository()
         ).persist(_observation("step38-legacy"))
-        _persist_usage("A", "step38-P6")
+        _persist_usage("step38-A", "step38-P6")
 
-        view = _trace_service(collector).get_trace("A")
+        view = _trace_service().get_trace("step38-A")
 
         assert [v.request_id for v in view.llm_usage] == ["step38-P6"]
 

@@ -299,20 +299,21 @@ _TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = (
 
 
 def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
-    """Phase 3.12 Step 39：Assistant Trace 只读 HTTP 边界的装配 accessor。
+    """Phase 3.12 Step 39/41：Assistant Trace 只读 HTTP 边界的装配 accessor。
 
-    复用**同一个**应用级 Tool 读边界（``get_tool_observability_query_service()``
-    → 本模块唯一创建的 Collector），并组合 Step 38 的
-    ``AssistantTraceQueryService``：
+    组合 Step 38 的 ``AssistantTraceQueryService``；两个数据源**均为持久化读边界**：
 
         api/assistant_trace.py
             ↓ get_assistant_trace_query_service()（本函数）
         AssistantTraceQueryService
             ├── LLMUsageQueryService（→ ai_ops.llm_usage_record）
-            └── ToolObservabilityQueryService（→ 应用级 InMemory Collector）
+            └── ToolExecutionPersistentQueryService（→ ai_ops.tool_execution_record）
 
-    * **不创建第二个 Collector**（Tool 读边界来自本模块的 accessor）；
-    * 每次调用返回新的组合服务实例，数据源始终是应用级单例；
+    * Assistant Trace 是**历史链路**读取：Tool 侧固定使用 Persistent 读边界
+      （Step 41），使 CPU 重启 / 多 worker / Collector 已淘汰的记录仍可查询；
+      与 Runtime（``/api/observability/tools``）**不合并**（避免重复）；
+    * **不创建 Collector**（Runtime Collector 仍只服务 Runtime API）；
+    * 持久历史读边界是模块级单例（``get_tool_execution_persistent_query_service()``）；
     * 本函数只装配，不查询 / 不聚合 / 不缓存。
     """
     from backend.app.services.assistant_trace_query_service import (
@@ -324,7 +325,7 @@ def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
 
     return AssistantTraceQueryService(
         tool_observability_query_service=(
-            get_tool_observability_query_service()
+            get_tool_execution_persistent_query_service()
         ),
         llm_usage_query_service=LLMUsageQueryService(),
     )

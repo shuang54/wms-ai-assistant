@@ -101,6 +101,7 @@ class FakeRepository:
         self.calls: list[tuple[int, int]] = []
         self.filters: list[dict[str, object]] = []
         self.metrics_calls: list[dict[str, object]] = []
+        self.request_id_calls: list[str] = []       # Step 41：Trace 读路径
         self._error = error
         self.metrics_row = metrics_row or ToolExecutionMetricsRow(
             total_count=0,
@@ -130,6 +131,15 @@ class FakeRepository:
         if self._error is not None:
             raise self._error
         return list(self.rows[offset: offset + limit])
+
+    def get_by_request_id(
+        self, request_id: str
+    ) -> list[ToolExecutionRecordRow]:
+        """Step 41：按 request_id 取全部行（同一 request 内的执行顺序）。"""
+        self.request_id_calls.append(request_id)
+        if self._error is not None:
+            raise self._error
+        return [row for row in self.rows if row.request_id == request_id]
 
     def get_metrics(
         self,
@@ -394,6 +404,90 @@ class TestLimitAndErrors:
 # ============================================================
 # Step 33：Persistent Metrics（SQL 聚合 + 应用层比率）
 # ============================================================
+
+class TestListByRequestId:
+    """Phase 3.12 Step 41：Assistant Trace 的 Tool 数据源（持久化读路径）。"""
+
+    @staticmethod
+    def _service(
+        rows: list[ToolExecutionRecordRow] | None = None,
+        error: Exception | None = None,
+    ) -> tuple[ToolExecutionPersistentQueryService, "FakeRepository"]:
+        repository = FakeRepository(rows=rows, error=error)
+        return (
+            ToolExecutionPersistentQueryService(repository=repository),  # type: ignore[arg-type]
+            repository,
+        )
+
+    def test_returns_snapshots_in_repository_order(self) -> None:
+        rows = [
+            _row(id=1, request_id="A", round=1),
+            _row(id=2, request_id="A", round=2),
+        ]
+        service, repository = self._service(rows)
+
+        snapshots = service.list_by_request_id("A")
+
+        assert repository.request_id_calls == ["A"]      # 精确透传
+        assert [type(s).__name__ for s in snapshots] == [
+            "ToolExecutionSnapshot", "ToolExecutionSnapshot",
+        ]
+        assert [s.round for s in snapshots] == [1, 2]     # 不重排序
+        assert all(not hasattr(s, "id") for s in snapshots)   # 主键不外泄
+
+    def test_empty_result_is_not_an_error(self) -> None:
+        service, _repository = self._service()
+
+        assert service.list_by_request_id("not-exist") == []
+
+    @pytest.mark.parametrize("bad", [None, "", "   ", 123, "x" * 129])
+    def test_invalid_request_id_rejected_before_db(self, bad) -> None:
+        service, repository = self._service()
+
+        with pytest.raises(ValueError):
+            service.list_by_request_id(bad)  # type: ignore[arg-type]
+
+        assert repository.request_id_calls == []          # 未触达 Repository
+
+    def test_repository_error_propagates(self) -> None:
+        service, _repository = self._service(
+            error=ToolExecutionRepositoryError("db down")
+        )
+
+        with pytest.raises(ToolExecutionRepositoryError):
+            service.list_by_request_id("A")
+
+    def test_does_not_use_runtime_collector(self) -> None:
+        """数据源 = 持久化仓储；代码层不依赖 Runtime Collector。
+
+        （模块文档字符串会用 Collector 做边界对照说明，因此按 import / AST
+        断言而不是原始文本断言。）
+        """
+        with open(
+            os.path.join(_REPO_ROOT, *_MODULE.split("/")), encoding="utf-8"
+        ) as handle:
+            tree = ast.parse(handle.read())
+
+        imports = {
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        } | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert not any(
+            "in_memory_tool_execution_collector" in name for name in imports
+        ), imports
+        attributes = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+        }
+        assert "snapshots_by_request_id" not in attributes, attributes
+
 
 class TestPersistentMetrics:
     @staticmethod
@@ -702,7 +796,10 @@ class TestPersistentQueryStaticBoundaries:
             for name in dir(ToolExecutionPersistentQueryService)
             if not name.startswith("_")
         }
-        assert public == {"list_recent", "metrics", "repository"}, public
+        # Step 41：+ list_by_request_id（Assistant Trace 的只读 Tool 数据源）
+        assert public == {
+            "list_recent", "list_by_request_id", "metrics", "repository",
+        }, public
         identifiers = {
             node.id.lower()
             for node in ast.walk(self._tree())

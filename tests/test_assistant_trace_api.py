@@ -3,7 +3,7 @@
     GET /api/observability/assistant-trace/{assistant_request_id}
         ↓ AssistantTraceQueryService.get_trace()（真实组合服务）
         ├── LLMUsageQueryService（测试用 Fake / 可注入异常）
-        └── ToolObservabilityQueryService（真实类 + 真实 InMemory Collector）
+        └── ToolExecutionPersistentQueryService（真实类 + Fake Repository）
         ↓ AssistantTraceResponse（显式映射）
         ↓ JSON
 
@@ -27,15 +27,12 @@ from backend.app.main import app
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
 )
-from backend.app.services.in_memory_tool_execution_collector import (
-    InMemoryToolExecutionCollector,
-)
 from backend.app.services.llm_usage_query_service import (
     LLMUsageTraceRecordView,
 )
-from backend.app.services.tool_execution_record import ToolExecutionRecord
-from backend.app.services.tool_observability_query_service import (
-    ToolObservabilityQueryService,
+from backend.app.db.tool_execution_repository import ToolExecutionRecordRow
+from backend.app.services.tool_execution_persistent_query_service import (
+    ToolExecutionPersistentQueryService,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -91,9 +88,12 @@ def _llm_view(**overrides: Any) -> LLMUsageTraceRecordView:
     return LLMUsageTraceRecordView(**values)
 
 
-def _tool_record(*, request_id: str, round_: int = 1) -> ToolExecutionRecord:
+def _tool_row(
+    *, request_id: str, round_: int = 1, row_id: int = 1
+) -> ToolExecutionRecordRow:
     started = _BASE + timedelta(seconds=round_)
-    return ToolExecutionRecord(
+    return ToolExecutionRecordRow(
+        id=row_id,
         request_id=request_id,
         round=round_,
         tool_name="get_inventory",
@@ -103,6 +103,7 @@ def _tool_record(*, request_id: str, round_: int = 1) -> ToolExecutionRecord:
         success=True,
         project_id="project-a",
         tool_call_id=None,
+        error_code=None,
         error_type=None,
     )
 
@@ -124,6 +125,20 @@ class _FakeLlmService:
         if self._error is not None:
             raise self._error
         return list(self.views)
+
+
+class _FakeToolRepository:
+    """持久化读边界背后的 Repository 替身（记录调用；0 DB）。"""
+
+    def __init__(self, rows: list[ToolExecutionRecordRow]) -> None:
+        self.rows = list(rows)
+        self.calls: list[str] = []
+
+    def get_by_request_id(
+        self, request_id: str
+    ) -> list[ToolExecutionRecordRow]:
+        self.calls.append(request_id)
+        return [row for row in self.rows if row.request_id == request_id]
 
 
 class _DuckLlmRow:
@@ -199,17 +214,17 @@ def trace_api(monkeypatch):
         *,
         views: list[LLMUsageTraceRecordView] | None = None,
         llm_error: Exception | None = None,
-        tool_records: list[ToolExecutionRecord] | None = None,
+        tool_rows: list[ToolExecutionRecordRow] | None = None,
         service: Any = None,
     ):
-        collector = InMemoryToolExecutionCollector()
-        for record in tool_records or []:
-            collector.on_execution(record)
+        repository = _FakeToolRepository(tool_rows or [])
         llm = _FakeLlmService(views or [], error=llm_error)
         installed = service or AssistantTraceQueryService(
             llm_usage_query_service=llm,
             tool_observability_query_service=(
-                ToolObservabilityQueryService(collector)
+                ToolExecutionPersistentQueryService(
+                    repository=repository  # type: ignore[arg-type]
+                )
             ),
         )
         monkeypatch.setattr(
@@ -217,7 +232,7 @@ def trace_api(monkeypatch):
             "get_assistant_trace_query_service",
             lambda: installed,
         )
-        return llm, collector
+        return llm, repository
 
     return _install
 
@@ -250,7 +265,7 @@ class TestTraceEndpoint:
         assert payload["llm_usage"][0]["created_at"].startswith("2026-09-28T18:00:00")
 
     def test_2_tool_only(self, trace_api) -> None:
-        trace_api(tool_records=[_tool_record(request_id="A")])
+        trace_api(tool_rows=[_tool_row(request_id="A")])
 
         with TestClient(app) as client:
             payload = client.get(f"{_ENDPOINT}/A").json()
@@ -263,7 +278,7 @@ class TestTraceEndpoint:
     def test_3_llm_and_tool(self, trace_api) -> None:
         trace_api(
             views=[_llm_view(id=1), _llm_view(id=2, request_id="chatcmpl-P2")],
-            tool_records=[_tool_record(request_id="A")],
+            tool_rows=[_tool_row(request_id="A")],
         )
 
         with TestClient(app) as client:
@@ -305,9 +320,9 @@ class TestTraceEndpoint:
                     created_at=_BASE + timedelta(seconds=2),
                 ),
             ],
-            tool_records=[
-                _tool_record(request_id="A", round_=1),
-                _tool_record(request_id="A", round_=2),
+            tool_rows=[
+                _tool_row(request_id="A", round_=1),
+                _tool_row(request_id="A", round_=2),
             ],
         )
 
@@ -322,9 +337,9 @@ class TestTraceEndpoint:
     def test_traces_do_not_mix(self, trace_api) -> None:
         trace_api(
             views=[_llm_view(id=1, assistant_request_id="A")],
-            tool_records=[
-                _tool_record(request_id="A"),
-                _tool_record(request_id="B", round_=2),
+            tool_rows=[
+                _tool_row(request_id="A"),
+                _tool_row(request_id="B", round_=2),
             ],
         )
 
@@ -345,7 +360,7 @@ class TestTraceErrors:
         self, trace_api, bad
     ) -> None:
         """纯空白 → 400（服务层 ValueError）；LLM 下游零调用。"""
-        llm, _collector = trace_api()
+        llm, _repository = trace_api()
 
         with TestClient(app) as client:
             response = client.get(f"{_ENDPOINT}/{bad}")
@@ -355,7 +370,7 @@ class TestTraceErrors:
         assert llm.calls == []                         # 下游未被调用
 
     def test_5_too_long_id_is_422(self, trace_api) -> None:
-        llm, _collector = trace_api()
+        llm, _repository = trace_api()
 
         with TestClient(app) as client:
             response = client.get(f"{_ENDPOINT}/{'x' * 129}")
@@ -414,7 +429,7 @@ class TestTraceSecurity:
     def test_7_no_sensitive_fields(self, trace_api) -> None:
         trace_api(
             views=[_llm_view()],
-            tool_records=[_tool_record(request_id="A")],
+            tool_rows=[_tool_row(request_id="A")],
         )
 
         with TestClient(app) as client:
@@ -456,22 +471,27 @@ class TestTraceSecurity:
         identifiers = _identifiers(_API_MODULE)
         for forbidden in (
             "vars", "asdict", "model_dump", "session", "engine", "select",
-            "execute", "collector", "repository",
+            "execute", "collector",
         ):
             assert forbidden not in identifiers, forbidden
         assert "__dict__" not in identifiers
         source = _source(_API_MODULE)
         assert "InMemoryToolExecutionCollector" not in source
+        assert "snapshots_by_request_id" not in source
 
-    def test_wiring_uses_application_collector(self, monkeypatch) -> None:
-        """HTTP accessor 复用**同一个**应用级 Collector（不创建第二个）。"""
-        monkeypatch.setattr(root, "_TOOL_EXECUTION_COLLECTOR", root._TOOL_EXECUTION_COLLECTOR)
+    def test_wiring_uses_persistent_tool_read_boundary(self) -> None:
+        """HTTP accessor（Step 41）：Tool 数据源 = 持久化读边界单例；
+        Runtime Collector 只服务 Runtime API（不参与 Trace）。"""
         service = root.get_assistant_trace_query_service()
+        tool_boundary = service.tool_observability_query_service
 
-        assert (
-            service.tool_observability_query_service.collector
-            is root._TOOL_EXECUTION_COLLECTOR
+        assert tool_boundary is (
+            root.get_tool_execution_persistent_query_service()
         )
+        assert hasattr(tool_boundary, "list_by_request_id")
+        assert not hasattr(tool_boundary, "snapshots_by_request_id")
+        # Runtime 读边界是**另一个**对象（未混用）
+        assert tool_boundary is not root.get_tool_observability_query_service()
 
 
 # ============================================================

@@ -443,6 +443,8 @@ class TestC33RepositoryBoundary:
             _MODULES["persistent_query"],
             # Step 30：API 仅导入该模块的**错误类型**用于 502 映射
             _MODULES["api"],
+            # Step 41：Assistant Trace API 同样只导入**错误类型**（502）
+            "backend/app/api/assistant_trace.py",
         }
         offenders: list[str] = []
         backend_dir = os.path.join(REPO_ROOT, "backend", "app")
@@ -1307,7 +1309,12 @@ class TestC37PersistentHistoryPaginationBoundary:
         assert {
             name for name in dir(ToolExecutionPersistentQueryService)
             if not name.startswith("_")
-        } == {"list_recent", "metrics", "repository"}
+        } == {
+            "list_recent",          # History 分页
+            "list_by_request_id",   # Step 41：Assistant Trace 的 Tool 数据源
+            "metrics",              # Step 33
+            "repository",
+        }
         # Metrics 只能经专门方法访问（不出现在 list_recent 的签名里）
         import inspect
 
@@ -1718,7 +1725,12 @@ class TestC39PersistentMetricsBoundary:
             name
             for name in dir(ToolExecutionPersistentQueryService)
             if not name.startswith("_")
-        } == {"list_recent", "metrics", "repository"}
+        } == {
+            "list_recent",          # History 分页
+            "list_by_request_id",   # Step 41：Assistant Trace 的 Tool 数据源
+            "metrics",              # Step 33
+            "repository",
+        }
 
     def test_c39_8_no_select_star_or_unrelated_columns(self) -> None:
         from backend.app.db.tool_execution_repository import (

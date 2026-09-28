@@ -4,12 +4,12 @@
 
     AssistantTraceQueryService.get_trace(A)
         ├── LLMUsageQueryService（Fake / 或真实类 + Fake Repository）
-        └── ToolObservabilityQueryService（真实类 + 真实 InMemory Collector）
+        └── ToolExecutionPersistentQueryService（真实类 + Fake Repository）
                 ↓
         AssistantTraceView（frozen；tuple）
 
-Tool 侧使用**真实** ToolObservabilityQueryService + 真实 InMemory
-Collector（内存，非 DB）：既验证排序/过滤语义，也验证"不新增 DB 查询"。
+Tool 侧使用**真实** ToolExecutionPersistentQueryService + Fake Repository
+（非 DB）：既验证排序/映射语义，也验证"Tool 数据源 = Persistent 读边界"。
 """
 from __future__ import annotations
 
@@ -23,19 +23,16 @@ from typing import Any
 import pytest
 
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
+from backend.app.db.tool_execution_repository import ToolExecutionRecordRow
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,
 )
-from backend.app.services.in_memory_tool_execution_collector import (
-    InMemoryToolExecutionCollector,
-)
 from backend.app.services.llm_usage_query_service import (
     LLMUsageTraceRecordView,
 )
-from backend.app.services.tool_execution_record import ToolExecutionRecord
-from backend.app.services.tool_observability_query_service import (
-    ToolObservabilityQueryService,
+from backend.app.services.tool_execution_persistent_query_service import (
+    ToolExecutionPersistentQueryService,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,10 +77,16 @@ def _llm_view(**overrides: Any) -> LLMUsageTraceRecordView:
     return LLMUsageTraceRecordView(**values)
 
 
-def _tool_record(
-    *, request_id: str, round_: int = 1, success: bool = True
-) -> ToolExecutionRecord:
-    return ToolExecutionRecord(
+def _tool_row(
+    *,
+    request_id: str,
+    round_: int = 1,
+    success: bool = True,
+    row_id: int = 1,
+) -> ToolExecutionRecordRow:
+    """持久化读边界的内部 Row（duck-typed DB 替身；非 ORM）。"""
+    return ToolExecutionRecordRow(
+        id=row_id,
         request_id=request_id,
         round=round_,
         tool_name="get_inventory",
@@ -93,6 +96,7 @@ def _tool_record(
         success=success,
         project_id="project-a",
         tool_call_id=None,
+        error_code=None,
         error_type=None if success else "ToolValidationError",
     )
 
@@ -125,18 +129,34 @@ class _FakeToolService:
         self.calls: list[str] = []
         self._error = error
 
-    def snapshots_by_request_id(self, request_id: str) -> tuple:
+    def list_by_request_id(self, request_id: str) -> tuple:
         self.calls.append(request_id)
         if self._error is not None:
             raise self._error
         return ()
 
 
-def _collector_with(records: list[ToolExecutionRecord]):
-    collector = InMemoryToolExecutionCollector()
-    for record in records:
-        collector.on_execution(record)
-    return collector
+class _FakeToolRepository:
+    """持久化读边界背后的 Repository 替身（记录调用；0 DB）。"""
+
+    def __init__(self, rows: list[ToolExecutionRecordRow] | None = None) -> None:
+        self.rows = rows if rows is not None else []
+        self.calls: list[str] = []
+
+    def get_by_request_id(
+        self, request_id: str
+    ) -> list[ToolExecutionRecordRow]:
+        self.calls.append(request_id)
+        return [row for row in self.rows if row.request_id == request_id]
+
+
+def _tool_boundary(
+    rows: list[ToolExecutionRecordRow] | None = None,
+) -> ToolExecutionPersistentQueryService:
+    """真实 Persistent Tool 读边界 + Fake Repository（Step 41 的 Trace 数据源）。"""
+    return ToolExecutionPersistentQueryService(
+        repository=_FakeToolRepository(rows)  # type: ignore[arg-type]
+    )
 
 
 def _service(
@@ -147,11 +167,7 @@ def _service(
     return AssistantTraceQueryService(
         llm_usage_query_service=llm if llm is not None else _FakeLlmUsageService(),
         tool_observability_query_service=(
-            tools
-            if tools is not None
-            else ToolObservabilityQueryService(
-                InMemoryToolExecutionCollector()
-            )
+            tools if tools is not None else _tool_boundary()
         ),
     )
 
@@ -177,9 +193,7 @@ class TestTraceComposition:
         assert llm.calls == ["A"]
 
     def test_2_tool_only(self) -> None:
-        tools = ToolObservabilityQueryService(
-            _collector_with([_tool_record(request_id="A")])
-        )
+        tools = _tool_boundary([_tool_row(request_id="A")])
         llm = _FakeLlmUsageService()
 
         view = _service(llm=llm, tools=tools).get_trace("A")
@@ -189,9 +203,7 @@ class TestTraceComposition:
         assert view.tool_executions[0].request_id == "A"
 
     def test_3_llm_and_tool(self) -> None:
-        tools = ToolObservabilityQueryService(
-            _collector_with([_tool_record(request_id="A")])
-        )
+        tools = _tool_boundary([_tool_row(request_id="A")])
         llm = _FakeLlmUsageService([
             _llm_view(id=1, request_id="chatcmpl-P1"),
             _llm_view(id=2, request_id="chatcmpl-P2"),
@@ -218,11 +230,11 @@ class TestTraceComposition:
         assert view.llm_usage == () and view.tool_executions == ()
 
     def test_6_traces_do_not_mix(self) -> None:
-        collector = _collector_with([
-            _tool_record(request_id="A"),
-            _tool_record(request_id="B", round_=2),
+        collector = _tool_boundary([
+            _tool_row(request_id="A"),
+            _tool_row(request_id="B", round_=2),
         ])
-        tools = ToolObservabilityQueryService(collector)
+        tools = collector
         llm = _FakeLlmUsageService([_llm_view(assistant_request_id="A")])
         service = _service(llm=llm, tools=tools)
 
@@ -257,14 +269,12 @@ class TestTraceComposition:
         )
 
     def test_8_tool_ordering_preserved(self) -> None:
-        """Tool 顺序 = Collector 写入顺序（本层不二次排序）。"""
-        tools = ToolObservabilityQueryService(
-            _collector_with([
-                _tool_record(request_id="A", round_=1),
-                _tool_record(request_id="A", round_=2),
-                _tool_record(request_id="A", round_=3),
-            ])
-        )
+        """Tool 顺序 = 持久化读边界返回顺序（本层不二次排序）。"""
+        tools = _tool_boundary([
+            _tool_row(request_id="A", round_=1, row_id=1),
+            _tool_row(request_id="A", round_=2, row_id=2),
+            _tool_row(request_id="A", round_=3, row_id=3),
+        ])
 
         view = _service(tools=tools).get_trace("A")
 
@@ -272,8 +282,10 @@ class TestTraceComposition:
         assert [s.started_at for s in view.tool_executions] == sorted(
             s.started_at for s in view.tool_executions
         )
-        # 顺序与 Collector 的直接查询一致（本层未重排）
-        assert tuple(view.tool_executions) == tools.snapshots_by_request_id("A")
+        # 顺序与下游读边界直接查询一致（本层未重排）
+        assert tuple(view.tool_executions) == tuple(
+            tools.list_by_request_id("A")
+        )
 
     def test_view_is_immutable_and_uses_tuples(self) -> None:
         view = _service().get_trace("A")
@@ -352,6 +364,25 @@ class TestValidationAndErrors:
         with pytest.raises(TypeError):
             AssistantTraceQueryService()  # type: ignore[call-arg]
 
+    def test_runtime_memory_boundary_is_rejected(self) -> None:
+        """Step 41：Runtime 内存边界（只有 snapshots_by_request_id）不被接受
+        —— Assistant Trace 固定使用 Persistent Tool 读边界。"""
+        from backend.app.services.in_memory_tool_execution_collector import (
+            InMemoryToolExecutionCollector,
+        )
+        from backend.app.services.tool_observability_query_service import (
+            ToolObservabilityQueryService,
+        )
+
+        runtime_boundary = ToolObservabilityQueryService(
+            InMemoryToolExecutionCollector()
+        )
+
+        with pytest.raises(TypeError):
+            AssistantTraceQueryService(
+                tool_observability_query_service=runtime_boundary
+            )
+
     def test_view_rejects_wrong_payload(self) -> None:
         with pytest.raises(ValueError):
             AssistantTraceView(
@@ -409,9 +440,7 @@ class TestSecurity:
         assert "model_dump" not in identifiers
 
     def test_11_no_tool_arguments_in_result(self) -> None:
-        tools = ToolObservabilityQueryService(
-            _collector_with([_tool_record(request_id="A")])
-        )
+        tools = _tool_boundary([_tool_row(request_id="A")])
 
         view = _service(tools=tools).get_trace("A")
 
@@ -429,7 +458,8 @@ class TestC43AssistantTraceReadModel:
     """C43：Assistant Trace Read Model 的组合边界。
 
         C43.1  只依赖 Query Service（LLMUsageQueryService /
-               ToolObservabilityQueryService）
+               Tool 观测 Persistent 读边界；Step 41 起用具名方法
+               ``list_by_request_id`` 断言，而不是具体类名）
         C43.2  不依赖 Repository
         C43.3  不依赖 SQLAlchemy
         C43.4  不访问 Session
@@ -444,9 +474,21 @@ class TestC43AssistantTraceReadModel:
     def test_c43_1_depends_only_on_query_services(self) -> None:
         source = _source(_SERVICE_MODULE)
         assert "LLMUsageQueryService" in source
-        assert "ToolObservabilityQueryService" in source
-        assert "list_by_assistant_request_id" in source
-        assert "snapshots_by_request_id" in source
+        assert "list_by_assistant_request_id" in source      # LLM 读边界
+        assert "list_by_request_id" in source                # Tool 持久化读边界
+        # 数据源声明：LLM / Tool 均为持久化边界（Step 41）
+        assert "llm_usage_record" in source
+        assert "tool_execution_record" in source
+        # 不使用 Runtime 内存边界：不 import Collector，也不调用其查询方法
+        # （文档字符串里可以说明"Runtime 边界不参与"，因此按 AST 断言调用点）
+        assert "in_memory_tool_execution_collector" not in source
+        assert "InMemoryToolExecutionCollector" not in source
+        attributes = {
+            node.attr
+            for node in ast.walk(_tree(_SERVICE_MODULE))
+            if isinstance(node, ast.Attribute)
+        }
+        assert "snapshots_by_request_id" not in attributes, attributes
 
     def test_c43_2_and_3_no_repository_no_sqlalchemy(self) -> None:
         identifiers = _identifiers(_SERVICE_MODULE)

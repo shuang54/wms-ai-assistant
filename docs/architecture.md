@@ -3541,8 +3541,45 @@ AssistantTraceQueryService.get_trace()        （Step 38 组合；不重新实�
 错误：400（纯空白）/ 422（长度越界）/ 502（LLM 数据源不可用）/ 500（其它）
       —— **绝不**把 DB 故障降级成 200 + 空 Trace
 顺序：HTTP 层只做 tuple → list（不重排 / 不过滤 / 不聚合 / 不去重）
-数据源：LLM 与 Tool **当前来自不同数据源**（PostgreSQL / Runtime Memory），
-        刻意不合并（避免 duplicate Tool Execution）
+数据源：**Step 41 起两者均为 PostgreSQL**（见 §8.57）；刻意不与 Runtime 合并
+```
+
+## 8.57 Persistent Tool Trace Integration（Phase 3.12 Step 41）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 41 — Persistent Tool Trace Integration.md`
+> 测试：`tests/test_assistant_trace_persistent_tool_db.py`（6，DB-gated）+
+> Step 38/39/40 测试同步
+> **No Trace DB · No Trace Repository · No OpenTelemetry · 无 migration**
+
+```text
+Assistant Request A
+       │
+       ├── LLM Usage  → ai_ops.llm_usage_record        （PostgreSQL）
+       └── Tool       → ai_ops.tool_execution_record   （PostgreSQL；Step 41 切换）
+              ↓
+        AssistantTraceQueryService
+        ├── LLMUsageQueryService                 → PostgreSQL
+        └── ToolExecutionPersistentQueryService  → PostgreSQL
+              ↓
+        GET /api/observability/assistant-trace/{A}（endpoint / response 不变）
+```
+
+```text
+新增读路径（最小扩展，复用既有 Repository 方法）
+    ToolExecutionPersistentQueryService.list_by_request_id(request_id)
+        → Repository.get_by_request_id()（既有；显式列 + WHERE + ORDER BY id ASC）
+        → [ToolExecutionSnapshot]（11 安全字段；数据库主键 id 不外泄）
+        · 空 → []；DB 失败 → ToolExecutionRepositoryError（**不降级为 []**）
+        · 不合并 Runtime Collector（避免 duplicate Tool Execution）
+
+Runtime vs Persistent（职责不变）
+    /api/observability/tools（+ /metrics）                     → Runtime 内存（未变）
+    /api/observability/tools/history（+ /metrics/persistent）  → PostgreSQL（未变）
+    /api/observability/assistant-trace/{id}                    → LLM + Tool 均 PostgreSQL
+
+Restart-like 实测：POST /api/ai/chat → Tool 落库 → Collector.clear()
+    → GET trace 仍返回 tool_executions ≥ 1；同时 /api/observability/tools
+      返回 {"records": []} ⇒ Trace ≠ Runtime Memory
 ```
 
 ---

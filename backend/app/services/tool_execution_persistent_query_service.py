@@ -83,6 +83,10 @@ DEFAULT_RECENT_LIMIT: Final[int] = 100
 #: 分页默认起始偏移（offset >= 0；无 MAX_OFFSET）。
 DEFAULT_RECENT_OFFSET: Final[int] = 0
 
+#: ``request_id`` 长度上限（与 ``ai_ops.tool_execution_record.request_id``
+#: 的 ``VARCHAR(128)`` 一致；Step 41）。
+_TOOL_EXECUTION_REQUEST_ID_MAX_LENGTH: Final[int] = 128
+
 
 def _validate_recent_limit(limit: object) -> int:
     """应用层 limit 校验（与 Repository 的硬边界一致；不触达数据库）。"""
@@ -107,6 +111,28 @@ def _validate_recent_offset(offset: object) -> int:
     if offset < 0:
         raise ValueError(f"offset 不允许负数（got {offset}）")
     return offset
+
+
+def _validate_required_request_id(value: object) -> str:
+    """**必填** request_id（Step 41：Assistant Trace 的 Tool 读路径）。
+
+    * 必须是 ``str`` 且 strip 后非空（``""`` / ``"   "`` → ValueError）；
+    * 长度上限 = ORM 列 ``VARCHAR(128)``（超长 → ValueError）；
+    * 只校验：不 truncate / 不 normalize / 不生成 / 不回填；
+      返回值与入参逐字符一致。
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"request_id 必须是 str（got {type(value).__name__}）"
+        )
+    if not value.strip():
+        raise ValueError("request_id 不能为空或纯空白")
+    if len(value) > _TOOL_EXECUTION_REQUEST_ID_MAX_LENGTH:
+        raise ValueError(
+            "request_id 超出长度上限 "
+            f"（{len(value)} > {_TOOL_EXECUTION_REQUEST_ID_MAX_LENGTH}）"
+        )
+    return value
 
 
 def _validate_optional_text_filter(name: str, value: object) -> str | None:
@@ -232,6 +258,48 @@ class ToolExecutionPersistentQueryService:
             tool_name=validated_tool,
             success=validated_success,
         )
+        return [self._to_snapshot(row) for row in rows]
+
+    def list_by_request_id(
+        self, request_id: str
+    ) -> list[ToolExecutionSnapshot]:
+        """只读：取**同一 request_id** 的全部已持久化 Tool Execution
+        （Phase 3.12 Step 41；Assistant Trace 的 Tool 数据源）。
+
+        Pipeline：
+
+            validate request_id（DB 之前）
+                ↓
+            Repository.get_by_request_id()（既有只读方法；显式列 + 精确匹配）
+                ↓
+            [ToolExecutionSnapshot]（11 安全字段；无 id / 无 arguments / 无 result）
+
+        顺序：复用 Repository 既有稳定排序 ``id ASC``（同一 request 内
+        落库顺序 = 执行顺序；**本层不重新排序**）。
+
+        边界：
+
+            * **只读**：无写入 / 无事务开启 / 不修改任何 Record；
+            * **不合并** Runtime Collector 数据（避免 duplicate Tool Execution）：
+              本方法只读 ``ai_ops.tool_execution_record``；
+            * 不做聚合 / 不做业务判断 / 不查 LLM / 不查 RAG；
+            * 无分页参数：一次 Assistant 请求内的 Tool 执行数量由
+              Tool Calling 预算约束（Repository 查询本身即 request 作用域）。
+
+        Args:
+            request_id: 必填、非空（strip 后非空）、≤128 字符
+                （通常是 Assistant request_id）。
+
+        Returns:
+            ``list[ToolExecutionSnapshot]``；无匹配 → ``[]``（**不是错误**）。
+
+        Raises:
+            ValueError:                  request_id 非法（触达 DB 之前）。
+            ToolExecutionRepositoryError: DB 未配置 / 查询失败
+                （**不降级为空列表**：DB 故障 ≠ 没有 Tool Execution）。
+        """
+        validated = _validate_required_request_id(request_id)
+        rows = self._repository.get_by_request_id(validated)
         return [self._to_snapshot(row) for row in rows]
 
     def metrics(

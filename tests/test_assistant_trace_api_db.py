@@ -5,7 +5,7 @@
 真实链路（**无 Fake 服务**）：
 
     LLM Usage ← 真实 PostgreSQL（ai_ops.llm_usage_record；Step 36 correlation）
-    Tool      ← 真实 Application Collector（api/orchestrator_chat._TOOL_EXECUTION_COLLECTOR）
+    Tool      ← 真实 PostgreSQL（ai_ops.tool_execution_record；Step 41 起）
         ↓
     GET /api/observability/assistant-trace/{assistant_request_id}
         （真实 accessor → 真实 AssistantTraceQueryService → 两个真实读边界）
@@ -13,7 +13,7 @@
     JSON
 
 数据：synthetic（provider / request_id 前缀 ``step39-``）；未读取真实数据。
-清理（不用 TRUNCATE）：按 provider 前缀定向 ``DELETE`` + 清空 Collector。
+清理（不用 TRUNCATE）：按 provider / request_id 前缀定向 ``DELETE``（LLM Usage 与 Tool Execution 两张表）。
 """
 from __future__ import annotations
 
@@ -36,11 +36,23 @@ from backend.app.services.assistant_trace import assistant_trace_scope
 from backend.app.services.llm_usage_persistence_service import (
     LLMUsagePersistenceService,
 )
+from backend.app.db.tool_execution_repository import (
+    ToolExecutionRepository,
+)
 from backend.app.services.tool_execution_record import ToolExecutionRecord
 
 _TABLE = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
 _PREFIX = "step39-%"
 _DELETE_SQL = text(f"DELETE FROM {_TABLE} WHERE provider LIKE :prefix")
+_TOOL_TABLE = "ai_ops.tool_execution_record"
+_TOOL_DELETE_SQL = text(
+    f"DELETE FROM {_TOOL_TABLE} WHERE request_id LIKE :prefix"
+)
+_TOOL_COUNT_SQL = text(
+    f"SELECT COUNT(*) FROM {_TOOL_TABLE} "
+    "WHERE request_id LIKE :prefix"
+)
+_TOOL_TOTAL_SQL = text(f"SELECT COUNT(*) FROM {_TOOL_TABLE}")
 _COUNT_SQL = text(f"SELECT COUNT(*) FROM {_TABLE} WHERE provider LIKE :prefix")
 _TOTAL_SQL = text(f"SELECT COUNT(*) FROM {_TABLE}")
 _ENDPOINT = "/api/observability/assistant-trace"
@@ -103,13 +115,16 @@ def trace_api_db():
     with engine.begin() as conn:
         conn.execute(_DELETE_SQL, {"prefix": _PREFIX})
         baseline = int(conn.execute(_TOTAL_SQL).scalar_one())
-    root._TOOL_EXECUTION_COLLECTOR.clear()
+        conn.execute(_TOOL_DELETE_SQL, {"prefix": _PREFIX})
+        tool_baseline = int(conn.execute(_TOOL_TOTAL_SQL).scalar_one())
     yield engine
-    root._TOOL_EXECUTION_COLLECTOR.clear()
     with engine.begin() as conn:
         conn.execute(_DELETE_SQL, {"prefix": _PREFIX})
         assert int(conn.execute(_COUNT_SQL, {"prefix": _PREFIX}).scalar_one()) == 0
         assert int(conn.execute(_TOTAL_SQL).scalar_one()) == baseline
+        conn.execute(_TOOL_DELETE_SQL, {"prefix": _PREFIX})
+        assert int(conn.execute(_TOOL_COUNT_SQL, {"prefix": _PREFIX}).scalar_one()) == 0
+        assert int(conn.execute(_TOOL_TOTAL_SQL).scalar_one()) == tool_baseline
 
 
 @requires_db
@@ -117,7 +132,7 @@ class TestAssistantTraceApiDb:
     def test_llm_and_tool_correlation(self, trace_api_db) -> None:
         _persist_usage("step39-A", "step39-P1")
         _persist_usage("step39-A", "step39-P2")
-        root._TOOL_EXECUTION_COLLECTOR.on_execution(
+        ToolExecutionRepository().create(
             _tool_record(request_id="step39-A", round_=1)
         )
 
@@ -147,10 +162,10 @@ class TestAssistantTraceApiDb:
     def test_cross_request_isolation(self, trace_api_db) -> None:
         _persist_usage("step39-A", "step39-P3")
         _persist_usage("step39-B", "step39-P4")
-        root._TOOL_EXECUTION_COLLECTOR.on_execution(
+        ToolExecutionRepository().create(
             _tool_record(request_id="step39-A", round_=1)
         )
-        root._TOOL_EXECUTION_COLLECTOR.on_execution(
+        ToolExecutionRepository().create(
             _tool_record(request_id="step39-B", round_=2)
         )
 
