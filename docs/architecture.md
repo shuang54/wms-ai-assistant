@@ -3582,6 +3582,42 @@ Restart-like 实测：POST /api/ai/chat → Tool 落库 → Collector.clear()
       返回 {"records": []} ⇒ Trace ≠ Runtime Memory
 ```
 
+## 8.58 RAG Trace Coverage（Phase 3.12 Step 42 — Audit Only）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 42 — RAG Trace Coverage Audit.md`
+> 测试：`tests/test_rag_trace_coverage_audit.py`（22，audit-only）
+> **Audit only**：无新表 / 无 Repository / 无 schema 变更 / 无 Trace API 变更
+
+```text
+Assistant Trace A（Step 41 现状）
+    ├── LLM Usage   → ai_ops.llm_usage_record（assistant_request_id = A）✅
+    ├── Tool        → ai_ops.tool_execution_record（request_id = A）✅
+    └── RAG         → ?     ← 本阶段审计对象
+```
+
+```text
+RAG 事实现状
+    执行期可读：current_assistant_request_id() == A（Step 36 scope 覆盖整段执行）
+                —— 关联键"读得到"，但没有记录点
+    仅日志：    query_length · top_k · result_count · used_chunks_count ·
+                context_truncated · context_chars · reranker_used ·
+                rerank_elapsed_ms · elapsed_ms（**日志无 request_id**）
+    响应：      /api/ai/chat RAG data = { sources[chunk_id·document_id·chunk_index·
+                similarity·metadata], used_chunks_count }（content 被 HTTP 层剥离）
+    持久化：    **无**（Current RAG has no persistent execution record）
+
+Gap：Assistant Trace 不能重建 RAG 执行历史（是否走向 RAG / 命中哪些 chunk /
+     检索与重排耗时）；旧链路 /api/rag/answer · /api/chat 连 trace id 也没有
+
+Recommendation：**Defer implementation**
+    Potential Boundary（仅记录）：future RAG observability could expose
+    retrieval metadata only（used_chunks_count / top_k / elapsed_ms /
+    chunk_id · document_id · similarity），不落 chunk 原文
+安全分类：Trace-safe = 计数 / 耗时 / top_k；Potentially sensitive = query 原文 ·
+    similarity 组合 · 知识库自定义 metadata；Must never expose = chunk / document
+    正文 · embedding vector · prompt / messages / raw response · 凭据 / DB 对象
+```
+
 ---
 
 # 9. Prompt Architecture
