@@ -3657,6 +3657,42 @@ RagExecutionObservation（frozen；13 字段白名单）
 隔离：observer 缺失 / 未绑定 Trace → 0 观测；观测失败绝不改变 RAG 成败
 ```
 
+## 8.60 RAG Runtime Observation 生产接线（Phase 3.12 Step 44）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 44 — RAG Runtime Wiring.md`
+> 测试：`tests/test_rag_runtime_observability_e2e.py`（16，真实装配 E2E）
+> 改动：**1 个新 Service 层 runtime 模块** + Composition Root 2 行；
+> RagService / Orchestrator / Router / Factory / DB Schema / 旧 API 全部未改。
+
+```text
+POST /api/ai/chat
+      ↓
+api/orchestrator_chat.py（Composition Root）
+      │  _default_orchestrator = AIOrchestratorService(..., rag_service=get_observed_rag_service())
+      ↓
+services/rag_observability_runtime.py（应用级装配；唯一创建点）
+      ├── _RAG_EXECUTION_COLLECTOR = InMemoryRagExecutionCollector()   ← 进程内单实例
+      └── _RAG_SERVICE = RagService(observer=_RAG_EXECUTION_COLLECTOR)
+      ↓
+AIOrchestratorService.execute() → request_id = A + assistant_trace_scope(A)
+      ↓ Router → RAG
+RagService（应用级实例）→ RagExecutionObservation.request_id = A
+      ↓
+InMemoryRagExecutionCollector → RagObservabilityQueryService（内部只读；无端点）
+
+项目级路径：build_orchestrator_for_project(..., base=_default_orchestrator)
+            → rag_service=base._rag（同一实例；Factory 未改）
+```
+
+```text
+/api/rag/answer（api/rag._rag_service）   → observer=None → 0 观测（无 trace）
+/api/chat（ChatService._rag_service）     → observer=None → 0 观测（无 trace）
+Assistant Trace                          → UNCHANGED（无 RAG 段）
+Persistence                              → NO（无表 / 无 Repository）
+Security                                 → 13 字段白名单逐字不变
+Failure isolation                        → Collector.record 抛错 → HTTP 200（实测）
+```
+
 ---
 
 # 9. Prompt Architecture

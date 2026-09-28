@@ -762,7 +762,8 @@ class TestRuntimeOnlyBoundaries:
         assert not [
             name for name in Base.metadata.tables if "rag" in name.lower()
         ]
-        # 生产装配未变：API 模块没有新增 RAG Collector（接线属后续阶段）
+        # API 模块本身**不**持有 RAG Collector（Step 44 的生产接线放在
+        # Service 层 runtime 装配模块；Composition Root 只注入已接线实例）
         assert not hasattr(root, "_RAG_EXECUTION_COLLECTOR")
 
     def test_rag_service_isolates_observer_failures_statically(self) -> None:

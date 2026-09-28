@@ -124,6 +124,9 @@ from backend.app.services.ai_router_service import (
 from backend.app.services.in_memory_tool_execution_collector import (
     InMemoryToolExecutionCollector,
 )
+from backend.app.services.rag_observability_runtime import (
+    get_observed_rag_service,
+)
 from backend.app.services.tool_execution_observer import ToolExecutionObserver
 from backend.app.services.tool_execution_persistence_adapter import (
     CompositeToolExecutionObserver,
@@ -392,6 +395,11 @@ _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     tool_registry=_TOOL_REGISTRY,
     # 观测出口（None 语义保留在 Orchestrator 层；此处显式装配 Application 级）
     tool_execution_observer=_TOOL_EXECUTION_OBSERVER,
+    # Phase 3.12 Step 44：RAG Runtime Observation 生产接线（应用级单实例；
+    # observer 在 Service 层 runtime 模块装配 —— API 层仍不 import RagService，
+    # 保持 test_api_module_does_not_import_forbidden_services 约束）。
+    # 项目级 Orchestrator 经 ``base._rag`` 复用同一实例（Factory 不改）。
+    rag_service=get_observed_rag_service(),
 )
 
 
