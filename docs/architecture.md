@@ -3510,6 +3510,41 @@ C43.7 不执行 LLM                C43.8 不新增 HTTP endpoint
 C43.9 immutable result          C43.10 不暴露 secrets
 ```
 
+## 8.56 Assistant Trace HTTP Read API（Phase 3.12 Step 39）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 39 — Assistant Trace HTTP Read API.md`
+> 接口：`docs/api.md` §2.10
+> 测试：`tests/test_assistant_trace_api.py`（21）/
+> `tests/test_assistant_trace_api_db.py`（4，DB-gated）
+> **No Trace Table · No Trace Repository · No OpenTelemetry · No Conversation · No Memory**
+
+```text
+HTTP GET /api/observability/assistant-trace/{assistant_request_id}
+        ↓
+AssistantTraceQueryService.get_trace()        （Step 38 组合；不重新实现查询）
+        ├── LLMUsageQueryService          → PostgreSQL（ai_ops.llm_usage_record）
+        └── ToolObservabilityQueryService → Runtime Memory（应用级 InMemory Collector）
+        ↓ AssistantTraceView
+        ↓ AssistantTraceResponse（显式字段映射 + response_model 过滤）
+        ↓ JSON
+```
+
+```text
+装配（Composition Root 仍是 api/orchestrator_chat.py）
+    api/assistant_trace.py → get_assistant_trace_query_service()
+        → LLMUsageQueryService()
+        → get_tool_observability_query_service() → **同一个** _TOOL_EXECUTION_COLLECTOR
+    （实测未创建第二个 Collector；Step 23/24 契约保持）
+
+响应：{assistant_request_id, llm_usage[9 字段], tool_executions[11 字段]}
+空 Trace → 200 + 两个空数组（**不是** 404）
+错误：400（纯空白）/ 422（长度越界）/ 502（LLM 数据源不可用）/ 500（其它）
+      —— **绝不**把 DB 故障降级成 200 + 空 Trace
+顺序：HTTP 层只做 tuple → list（不重排 / 不过滤 / 不聚合 / 不去重）
+数据源：LLM 与 Tool **当前来自不同数据源**（PostgreSQL / Runtime Memory），
+        刻意不合并（避免 duplicate Tool Execution）
+```
+
 ---
 
 # 9. Prompt Architecture

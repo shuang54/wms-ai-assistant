@@ -491,6 +491,8 @@ class TestC25QuerySnapshotApi:
             "/observability/tools/metrics",      # Runtime Metrics（内存）
             "/observability/tools/history",      # Persistent History（Step 30）
             "/observability/tools/metrics/persistent",   # Persistent Metrics（Step 33）
+            # Assistant Trace Read API（Phase 3.12 Step 39；只读组合，无新存储）
+            "/observability/assistant-trace/{assistant_request_id}",
         }
         api_dir = os.path.join(REPO_ROOT, "backend", "app", "api")
         routes: list[tuple[str, str]] = []

@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.app.api import (
+    assistant_trace,
     chat,
     health,
     orchestrator_chat,
@@ -44,6 +45,9 @@ def create_app() -> FastAPI:
     app.include_router(usage.router, prefix="/api", tags=["usage"])
     app.include_router(
         tool_observability.router, prefix="/api", tags=["observability"]
+    )
+    app.include_router(
+        assistant_trace.router, prefix="/api", tags=["observability"]
     )
     return app
 

@@ -567,12 +567,18 @@ class TestC41LLMUsageTraceCorrelation:
             assert forbidden not in call, forbidden
 
     def test_c41_10_no_new_endpoint_or_model_field_leak(self) -> None:
-        """不新增 HTTP 端点；analytics 响应结构未变。"""
+        """Step 36 时点：无 Trace 端点。
+
+        Step 39：新增唯一只读 Trace 端点
+        ``/api/observability/assistant-trace/{assistant_request_id}``；
+        ``/api/usage/by-request`` 仍不存在；analytics 响应结构未变。
+        """
         paths = set(app.openapi()["paths"])
         assert "/api/usage/analytics" in paths
-        assert not any(
-            "by-request" in path or "trace" in path for path in paths
-        ), sorted(paths)
+        assert not any("by-request" in path for path in paths), sorted(paths)
+        assert {
+            path for path in paths if "trace" in path
+        } == {"/api/observability/assistant-trace/{assistant_request_id}"}
         from backend.app.api.usage import UsageAnalyticsResponse
 
         fields = set(UsageAnalyticsResponse.model_fields)

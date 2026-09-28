@@ -510,25 +510,40 @@ class TestC43AssistantTraceReadModel:
             "tool_observability_query_service",
         }, public
 
-    def test_c43_8_no_new_http_endpoint(self) -> None:
+    def test_c43_8_no_unexpected_http_endpoint(self) -> None:
+        """Step 38 时点：无 Trace endpoint。
+
+        Step 39：**有意**新增唯一一个只读 Trace 端点
+        ``GET /api/observability/assistant-trace/{assistant_request_id}``
+        （HTTP 层只调用 ``get_trace()``）；其它 trace / by-request 路径仍不存在。
+        """
         from fastapi.testclient import TestClient
 
         from backend.app.main import app
 
-        paths = set(app.openapi()["paths"])
-        for forbidden in ("trace", "by-request"):
-            assert not any(forbidden in path for path in paths), forbidden
+        trace_paths = {
+            path for path in app.openapi()["paths"] if "trace" in path
+        }
+        assert trace_paths == {
+            "/api/observability/assistant-trace/{assistant_request_id}"
+        }, trace_paths
+        assert not any(
+            "by-request" in path for path in app.openapi()["paths"]
+        )
+        # 其它 API 模块仍不直接依赖本服务（只有 api/assistant_trace.py 经 accessor
+        # 调用 get_trace；orchestrator_chat 仅提供装配 accessor）
         for module in (
             "backend/app/api/usage.py",
-            "backend/app/api/orchestrator_chat.py",
             "backend/app/api/tool_observability.py",
         ):
-            source = _source(module)
-            assert "AssistantTraceQueryService" not in source, module
-            assert "assistant_trace_query_service" not in source, module
+            assert "assistant_trace_query_service" not in _source(module), module
+        root_source = _source("backend/app/api/orchestrator_chat.py")
+        assert "def get_assistant_trace_query_service" in root_source
+        assert ".get_trace(" not in root_source          # 只装配，不查询
         with TestClient(app) as client:
             assert client.get("/api/trace").status_code == 404
             assert client.get("/api/assistant/trace").status_code == 404
+            assert client.get("/api/usage/by-request").status_code == 404
 
     def test_c43_9_immutable_result(self) -> None:
         view = _service().get_trace("A")

@@ -601,6 +601,87 @@ Side Effect:  按 route：RAG 检索 + LLM / Tool 只读执行 / Text-to-SQL 只
 | 503  | `AIOrchestratorUnavailableError`（上下文不可用） | `"项目上下文不可用: ..."`     |
 | 500  | `AIOrchestratorExecutionError` / 未预期异常 | `"AI 服务内部错误"`               |
 
+### 2.10 GET /api/observability/assistant-trace/{assistant_request_id}（Phase 3.12 Step 39）
+
+Assistant Trace 只读 Read Model（组合 LLM Usage 与 Tool 执行；**只读**）。
+
+```text
+Method:       GET
+Path 参数:    assistant_request_id（1..128 字符；= POST /api/ai/chat 成功响应
+             metadata.request_id）
+Auth:         当前项目现有 API 机制（未新增认证）
+Side Effect:  None（不写库 / 不触发 Tool / 不调用 LLM / 不重新路由）
+Persistence:  None（无 Trace 表 / 无 Repository）
+```
+
+数据来源（**两个不同源，刻意不合并**）：
+
+```text
+llm_usage[]       ← LLMUsageQueryService      → PostgreSQL（ai_ops.llm_usage_record）
+tool_executions[] ← ToolObservabilityQueryService → Runtime 内存（当前进程 Collector）
+```
+
+Response 200（示例）：
+
+```json
+{
+  "assistant_request_id": "3f0b2c1e-…-9a7d",
+  "llm_usage": [
+    {
+      "id": 12,
+      "assistant_request_id": "3f0b2c1e-…-9a7d",
+      "request_id": "chatcmpl-…",
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "prompt_tokens": 120,
+      "completion_tokens": 45,
+      "total_tokens": 165,
+      "created_at": "2026-09-28T18:00:00.123456Z"
+    }
+  ],
+  "tool_executions": [
+    {
+      "request_id": "3f0b2c1e-…-9a7d",
+      "round": 1,
+      "tool_name": "get_inventory",
+      "started_at": "2026-09-28T18:00:01Z",
+      "finished_at": "2026-09-28T18:00:01.005000Z",
+      "duration_ms": 5.0,
+      "success": true,
+      "project_id": "project-a",
+      "tool_call_id": null,
+      "error_code": null,
+      "error_type": null
+    }
+  ]
+}
+```
+
+空 Trace（不存在的 Trace ID；**不是** 404）：
+
+```json
+{ "assistant_request_id": "not-exist", "llm_usage": [], "tool_executions": [] }
+```
+
+错误响应：
+
+| HTTP | 触发条件                                   | detail                        |
+| ---- | ------------------------------------------ | ----------------------------- |
+| 400  | assistant_request_id 非法（纯空白等）       | `"非法输入: …"`               |
+| 422  | 路径参数长度越界（>128）                    | FastAPI 标准校验错误          |
+| 502  | LLM Usage 数据源不可用（数据库未配置/失败） | `"助手链路观测数据不可用"`    |
+| 500  | 其它未预期错误                             | `"助手链路观测数据不可用"`    |
+
+说明：
+
+```text
+顺序      llm_usage：created_at ASC, id ASC（Step 37）
+          tool_executions：Collector 写入顺序（Step 38）
+          本端点不重排 / 不过滤 / 不聚合 / 不去重 / 无分页
+安全      仅返回上述字段；不含 prompt / messages / Tool arguments /
+          ToolResult.data / SQL / DB 连接 / 凭据 / traceback
+```
+
 ---
 
 ## 3. 错误响应

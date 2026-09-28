@@ -87,6 +87,14 @@ Phase 3.11 Step 28（Persistence Adapter Integration）：
 from __future__ import annotations
 
 import logging
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # 仅类型检查期（避免 import 期拉起组装依赖）
+    from backend.app.services.assistant_trace_query_service import (
+        AssistantTraceQueryService,
+    )
+
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -288,6 +296,38 @@ _TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = (
         _TOOL_EXECUTION_PERSISTENCE_ADAPTER,
     )
 )
+
+
+def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
+    """Phase 3.12 Step 39：Assistant Trace 只读 HTTP 边界的装配 accessor。
+
+    复用**同一个**应用级 Tool 读边界（``get_tool_observability_query_service()``
+    → 本模块唯一创建的 Collector），并组合 Step 38 的
+    ``AssistantTraceQueryService``：
+
+        api/assistant_trace.py
+            ↓ get_assistant_trace_query_service()（本函数）
+        AssistantTraceQueryService
+            ├── LLMUsageQueryService（→ ai_ops.llm_usage_record）
+            └── ToolObservabilityQueryService（→ 应用级 InMemory Collector）
+
+    * **不创建第二个 Collector**（Tool 读边界来自本模块的 accessor）；
+    * 每次调用返回新的组合服务实例，数据源始终是应用级单例；
+    * 本函数只装配，不查询 / 不聚合 / 不缓存。
+    """
+    from backend.app.services.assistant_trace_query_service import (
+        AssistantTraceQueryService,
+    )
+    from backend.app.services.llm_usage_query_service import (
+        LLMUsageQueryService,
+    )
+
+    return AssistantTraceQueryService(
+        tool_observability_query_service=(
+            get_tool_observability_query_service()
+        ),
+        llm_usage_query_service=LLMUsageQueryService(),
+    )
 
 
 def get_tool_observability_query_service() -> ToolObservabilityQueryService:

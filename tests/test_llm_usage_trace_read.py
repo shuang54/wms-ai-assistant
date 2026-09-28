@@ -373,14 +373,24 @@ class TestC42AssistantTraceReadBoundary:
         }
         assert not any("sqlalchemy" in name for name in imports), imports
 
-    def test_c42_7_no_new_http_endpoint(self) -> None:
+    def test_c42_7_no_llm_usage_by_request_endpoint(self) -> None:
+        """Step 37 时点：本读边界**没有**自己的 HTTP 入口。
+
+        Step 39：新增的唯一 Trace 端点是
+        ``/api/observability/assistant-trace/{assistant_request_id}``
+        （经 ``AssistantTraceQueryService`` 组合，而非直连 LLM 读边界）；
+        ``/api/usage/by-request`` 等仍不存在。
+        """
         from fastapi.testclient import TestClient
 
         from backend.app.main import app
 
         paths = set(app.openapi()["paths"])
-        for forbidden in ("by-request", "trace", "assistant/trace"):
-            assert not any(forbidden in path for path in paths), forbidden
+        assert not any("by-request" in path for path in paths)
+        assert {
+            path for path in paths if "trace" in path
+        } == {"/api/observability/assistant-trace/{assistant_request_id}"}
+        # LLM 读方法不被 api/** 直接调用（只经 AssistantTraceQueryService）
         for module in _API_MODULES:
             source = _source(module)
             assert "list_by_assistant_request_id" not in source, module
