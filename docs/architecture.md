@@ -3693,6 +3693,30 @@ Security                                 → 13 字段白名单逐字不变
 Failure isolation                        → Collector.record 抛错 → HTTP 200（实测）
 ```
 
+## 8.61 RAG Persistence Boundary（Phase 3.12 Step 45 — Audit / Design Only）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 45 — RAG Persistence Boundary Audit.md`
+> 测试：`tests/test_rag_persistent_observation_contract.py`（32，纯离线）
+> **Design Only**：无表 / 无 migration / 无 Repository / 无 HTTP API /
+> Assistant Trace 未改 / **0 生产运行时代码改动**。
+
+```text
+Contract（Step 46 实现时必须满足）
+    字段      13 字段 1:1（列名不变）＋ 数据库自增 `id`（沿用既有主键模式）
+              rerank_elapsed_ms NULL ≠ 0；无 query / content / similarity /
+              embedding / prompt / messages / raw response / SQL / 凭据
+    关联      request_id == Assistant Trace ID（唯一来源 current_assistant_request_id()）
+              命名沿用 Tool 侧（LLM 侧因 Provider id 占用才用 assistant_request_id）
+    写侧      RagExecutionObserver（既有端口）→ 未来 CompositeRagExecutionObserver
+              （内存 + 持久化并列；失败只 warning，绝不穿透）
+    读侧      RagExecutionPersistentQueryService.list_by_request_id()
+              → 仓储 get_by_request_id()；空 → []；DB 失败 → typed error
+    索引      request_id（第一优先级）· started_at；无投机索引；无唯一约束
+    Retention Runtime capacity ≠ persistent retention（defer）
+    Deferred  表 / migration / Repository / Assistant Trace 集成 / HTTP API /
+              retention / TTL / cleanup
+```
+
 ---
 
 # 9. Prompt Architecture
