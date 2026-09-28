@@ -3334,6 +3334,60 @@ C39.9  无 LIKE / ILIKE / regex / fuzzy C39.10 无 fallback / merge
 C39.11 响应无敏感字段                 C39.12 无 limit / offset
 ```
 
+## 8.52 Assistant Trace Contract（Phase 3.12 Step 35）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 35 — Assistant Trace Contract.md`
+> 接口：`docs/api.md` §2.9（POST /api/ai/chat）
+> 前置：Step 34 审计（`/api/ai/chat` = Canonical Assistant 入口；缺口 = 可关联性）
+> 测试：`tests/test_chat_api.py`（C40 = 16）/ `tests/test_ai_orchestrator.py`（+6）
+> **不新增 Chat API**
+
+### 链路（成功响应）
+
+```text
+POST /api/ai/chat
+      ↓
+AIOrchestratorService.execute()          ← new_request_id()（**唯一生成点**）
+      ├── RAG   ─ metadata.request_id
+      ├── TOOL  ─ metadata.request_id ──→ ToolExecutionContext(request_id)
+      │                                        ↓
+      │                                  ToolExecutionRecord.request_id
+      │                                        ↓ ai_ops.tool_execution_record
+      └── T2S   ─ metadata.request_id
+
+ChatResponse{ route, content, data, metadata }
+      ↓
+metadata.request_id = Assistant Trace ID   （API 层不生成 / 不覆盖）
+```
+
+```text
+可关联：response.metadata.request_id
+        == ToolExecutionRecord.request_id（TOOL 路径，实测）
+        → GET /api/observability/tools/history 响应项含同一 request_id
+
+不可关联（本阶段）：LLM usage（llm_usage_record.request_id 是 Provider 响应 ID、
+                    且默认 Noop sink）→ 留待统一 Error/Observability 阶段
+```
+
+### Contract（C40）
+
+```text
+C40.1  成功响应含 metadata.request_id      C40.2  唯一来源 = Orchestrator
+C40.3  API 不生成 / 不补齐 request_id      C40.4  AIOrchestrationResult 结构不变
+C40.5  RAG / TOOL / T2S 三路径均携带       C40.6  TOOL：request_id == Record.request_id
+C40.7  RAG / T2S → 0 Tool Record           C40.8  请求体不新增 request_id
+C40.9  错误 HTTP contract 不变（错误响应无 request_id）
+C40.10 metadata 无敏感信息                 C40.11 /api/chat 不变
+C40.12 /api/chat/with-tools 不变（/api/rag/answer 同）
+```
+
+```text
+metadata 只**新增** request_id 一个键；既有键（decision_source / route_reason /
+knowledge_scope / tool_name / tool_success / sql / row_count / truncated /
+execution_time_ms / selected_tables / project_id / rag_used_chunks / refused）
+语义与内容完全不变；request_id 不进入 Tool arguments / LLM messages / Prompt。
+```
+
 ---
 
 # 9. Prompt Architecture

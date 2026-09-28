@@ -363,7 +363,12 @@ class TestToolPathContext:
         assert "project-b" not in repr(execution.contexts[0])
 
     async def test_context_not_leaked_into_arguments_or_metadata(self) -> None:
-        """Context 不进入 Tool arguments / 不进入 result metadata。"""
+        """Context 不进入 Tool arguments；metadata 只带 trace id（Step 35）。
+
+        Phase 3.11 Step 18 原始契约：metadata 不含 request_id。
+        Phase 3.12 Step 35：request_id **有意**进入 metadata（Assistant
+        Trace Contract）；仍不允许出现 project_id / arguments / 执行细节。
+        """
         registry, handler = _registry_with_recording_handler()
         execution = _RecordingExecution(registry=registry, project_id="project-a")
 
@@ -376,10 +381,15 @@ class TestToolPathContext:
         assert handler.last_arguments == {"material_code": "MAT-001"}
         assert set(result.metadata) == {
             "decision_source", "route_reason", "tool_name", "tool_success",
+            "request_id",              # Step 35：Assistant Trace ID
         }
-        assert "request_id" not in result.metadata
         context = execution.contexts[0]
-        assert context.request_id not in json.dumps(result.metadata)
+        # 唯一关联字段：metadata.request_id == ToolExecutionRecord.request_id
+        assert result.metadata["request_id"] == context.request_id
+        # 作用域 / 参数 / 结果数据仍不得出现在 metadata
+        assert context.project_id not in json.dumps(result.metadata)
+        assert "MAT-001" not in json.dumps(result.metadata)
+        assert "arguments" not in result.metadata
 
 
 # ============================================================

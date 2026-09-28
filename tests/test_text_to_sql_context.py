@@ -622,7 +622,12 @@ class TestProjectContextIsolation:
         generator = _FakeGenerator(GOOD_SQL_A)
         orch = _orchestrator("project-a", generator)
         # 直接驱动 SQL 路径（Router 不是本阶段关注点）
-        asyncio.run(orch._run_text_to_sql(_decision(), "库存最多的物料有哪些"))
+        # Step 35：_run_* 需显式传入 execute() 生成的 trace request_id
+        asyncio.run(
+            orch._run_text_to_sql(
+                _decision(), "库存最多的物料有哪些", request_id="req-t2s-a"
+            )
+        )
 
         call = generator.calls[0]
         ctx = call["database_context"]
@@ -637,7 +642,11 @@ class TestProjectContextIsolation:
             "SELECT material_code, qty FROM project_b.inventory LIMIT 10"
         )
         orch = _orchestrator("project-b", generator)
-        asyncio.run(orch._run_text_to_sql(_decision(), "可用库存最多的产品有哪些"))
+        asyncio.run(
+            orch._run_text_to_sql(
+                _decision(), "可用库存最多的产品有哪些", request_id="req-t2s-b"
+            )
+        )
 
         call = generator.calls[0]
         ctx = call["database_context"]
@@ -655,12 +664,12 @@ class TestProjectContextIsolation:
         )
         asyncio.run(
             _orchestrator("project-a", gen_a)._run_text_to_sql(
-                _decision(), question
+                _decision(), question, request_id="req-t2s-a"
             )
         )
         asyncio.run(
             _orchestrator("project-b", gen_b)._run_text_to_sql(
-                _decision(), question
+                _decision(), question, request_id="req-t2s-b"
             )
         )
         assert "project_a.inventory" in gen_a.calls[0]["database_context"]

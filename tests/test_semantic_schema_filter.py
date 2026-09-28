@@ -647,7 +647,11 @@ class TestTextToSQLE2E:
             text_to_sql=generator,
             sql_executor=_FakeExecutor(),
         )
-        asyncio.run(orch._run_text_to_sql(_decision(), question))
+        asyncio.run(
+            orch._run_text_to_sql(
+                _decision(), question, request_id="req-t2s-schema"
+            )
+        )
         return generator
 
     def test_business_context_only_selected_tables(self) -> None:

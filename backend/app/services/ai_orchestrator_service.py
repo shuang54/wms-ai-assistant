@@ -518,8 +518,12 @@ class AIOrchestratorService:
             raise AIOrchestratorInputError("question 不能为空或纯空白")
 
         # Phase 3.11 Step 18：一次 execute() 一个 request_id（观测关联 ID；
-        # 复用既有 new_request_id()，不新建第二套 ID 体系；不落库 /
-        # 不进 API response / 不进 Tool arguments 或 LLM messages）。
+        # 复用既有 new_request_id()，不新建第二套 ID 体系；不进 Tool
+        # arguments / 不进 LLM messages）。
+        # Phase 3.12 Step 35：该 request_id 是**唯一** Assistant Trace ID ——
+        # 随三条成功路径的 ``metadata["request_id"]`` 透出（RAG / Tool /
+        # Text-to-SQL），使调用方可用它关联 Tool Execution Observability；
+        # 由本方法生成（API 层不生成第二个 ID）。
         request_id = new_request_id()
 
         # ---- 1) 路由决策 ----
@@ -537,13 +541,17 @@ class AIOrchestratorService:
         # ---- 2) 单次执行（无 Agent / 无 Loop / 无重规划） ----
         try:
             if decision.route == RouteType.RAG:
-                return await self._run_rag(decision, normalized)
+                return await self._run_rag(
+                    decision, normalized, request_id=request_id
+                )
             if decision.route == RouteType.TOOL:
                 return await self._run_tool(
                     decision, normalized, request_id=request_id
                 )
             if decision.route == RouteType.TEXT_TO_SQL:
-                return await self._run_text_to_sql(decision, normalized)
+                return await self._run_text_to_sql(
+                    decision, normalized, request_id=request_id
+                )
         except AIOrchestratorError:
             raise
         except Exception as exc:
@@ -595,8 +603,17 @@ class AIOrchestratorService:
     # ---------- RAG 路径 ----------
 
     async def _run_rag(
-        self, decision: RouteDecision, question: str
+        self,
+        decision: RouteDecision,
+        question: str,
+        *,
+        request_id: str,
     ) -> AIOrchestrationResult:
+        """RAG 路径（Phase 3.12 Step 35：metadata 携带本次 trace request_id）。
+
+        ``request_id`` 由 ``execute()`` 生成并透传（本方法不生成 ID ——
+        保证 API / ToolExecutionRecord / metadata 三处同一 ID）。
+        """
         # Phase 3.8.2：能力硬校验（RagService 0 次调用）
         self._check_capability("knowledge")
         if self._rag is None:
@@ -631,6 +648,8 @@ class AIOrchestratorService:
                 "rag_used_chunks": getattr(
                     rag_response, "used_chunks_count", None
                 ),
+                # Phase 3.12 Step 35：Assistant Trace ID（非敏感；仅关联用）
+                "request_id": request_id,
             },
         )
 
@@ -727,14 +746,27 @@ class AIOrchestratorService:
                 "route_reason": decision.reason,
                 "tool_name": tool_name,
                 "tool_success": tool_result.success,
+                # Phase 3.12 Step 35：Assistant Trace ID —— 与本次
+                # ToolExecutionRecord.request_id 完全一致（同一 ID，
+                # 不新建第二套）；不含 arguments / ToolResult.data。
+                "request_id": request_id,
             },
         )
 
     # ---------- Text-to-SQL 路径 ----------
 
     async def _run_text_to_sql(
-        self, decision: RouteDecision, question: str
+        self,
+        decision: RouteDecision,
+        question: str,
+        *,
+        request_id: str,
     ) -> AIOrchestrationResult:
+        """Text-to-SQL 路径（Phase 3.12 Step 35：metadata 携带 trace id）。
+
+        ``request_id`` 由 ``execute()`` 生成并透传（本方法不生成 ID）；
+        refused 结果同样携带（成功响应语义，非错误响应）。
+        """
         # Phase 3.8.2：能力硬校验 —— 在解析 ProjectContext / inspect
         # Schema / 生成 / 执行 SQL **之前**拦截（0 次数据库访问）。
         self._check_capability("text_to_sql")
@@ -822,6 +854,8 @@ class AIOrchestratorService:
                     "decision_source": decision.source,
                     "route_reason": decision.reason,
                     "refused": True,
+                    # Phase 3.12 Step 35：refusal 亦为成功响应 → 携带 trace id
+                    "request_id": request_id,
                 },
             )
 
@@ -851,6 +885,8 @@ class AIOrchestratorService:
                 "execution_time_ms": execution.execution_time_ms,
                 "selected_tables": list(allowed_tables),
                 "project_id": project.project_id,
+                # Phase 3.12 Step 35：Assistant Trace ID（非敏感；仅关联用）
+                "request_id": request_id,
             },
         )
 

@@ -237,7 +237,7 @@ ToolChatService → LLM（携带 tools）
 | 502  | Tool Calling 预算耗尽（ToolCallingBudgetExceededError） | `"Tool Calling 预算耗尽（max_rounds=5）…"` |
 | 500  | ToolChatError（编排内部错误）                   | `"Tool Chat 服务内部错误: ..."`                     |
 
-> `project_id` 与 `/api/ai/chat`（§2.5）语义一致：只能选择**服务器端已注册**的项目，
+> `project_id` 与 `/api/ai/chat`（§2.9）语义一致：只能选择**服务器端已注册**的项目，
 > 能力白名单由服务器端 ProjectRegistry 决定（HTTP 无法注入 / 覆盖能力字段）。
 > 未提供 `project_id` 时保持旧行为（不限制 Tool 能力）。
 
@@ -526,6 +526,77 @@ Response 200：
 
 > DB 失败**不会**回退到内存视图（Runtime 与 Persistent 严格并列）；
 > 响应只含 Snapshot 的 11 个字段，不含数据库主键 `id` / `created_at`。
+
+---
+
+### 2.9 POST /api/ai/chat（Phase 3.7.11；Trace Contract = Phase 3.12 Step 35）
+
+AI Assistant 统一入口（Orchestrator-backed）：一次请求经 AI Router 进入
+RAG / Tool / Text-to-SQL 之一（Phase 3.12 Step 34 审计结论：这是当前项目
+唯一的「统一入口 + 统一 Router + 三路由 + 统一 Result Envelope + 统一错误边界」）。
+
+```text
+Method:       POST
+Request:      { "question": str（必填，非空 / 非纯空白）, "project_id": str | None }
+Response:     { "route": "rag" | "tool" | "text_to_sql",
+                "content": str | None,
+                "data": object | None,
+                "metadata": object }
+Auth:         当前项目现有 API 机制（未新增认证）
+Side Effect:  按 route：RAG 检索 + LLM / Tool 只读执行 / Text-to-SQL 只读查询
+```
+
+`data` 按 route 分支：
+
+| route         | data 结构                                                        |
+| ------------- | ---------------------------------------------------------------- |
+| `rag`         | `{ "sources": [ {chunk_id, document_id, chunk_index, similarity, metadata} ], "used_chunks_count": int }` |
+| `tool`        | `{ "tool_name": str, "success": bool, "data": object\|null, "error": str\|null }` |
+| `text_to_sql` | `{ "columns": [...], "rows": [...], "row_count": int, "truncated": bool, "execution_time_ms": float, "referenced_tables": [...], "project_id": str, "sql": str\|null }`；只读拒绝时 `data = null`（`metadata.refused = true`） |
+
+#### Assistant Trace ID（Phase 3.12 Step 35）
+
+成功响应的 `metadata.request_id` 是本次请求的 **Assistant Trace ID**：
+
+```json
+{
+  "route": "tool",
+  "content": "material_code=MAT-001 qty=120",
+  "data": { "tool_name": "get_inventory", "success": true, "data": {}, "error": null },
+  "metadata": {
+    "decision_source": "tool_match",
+    "route_reason": "命中 get_inventory 别名",
+    "tool_name": "get_inventory",
+    "tool_success": true,
+    "request_id": "3f0b2c1e-...-9a7d"
+  }
+}
+```
+
+```text
+来源        Orchestrator 一次 execute() 生成一个（API 层不生成、不覆盖）
+格式        项目既有 new_request_id()（uuid4 字符串，36 字符；未重新设计 ID）
+范围        rag / tool / text_to_sql 三条成功路径 + T2S refusal 均携带
+可关联       Tool 路径下 == ai_ops.tool_execution_record.request_id
+             → 可用它查询 GET /api/observability/tools/history（响应项含 request_id）
+错误响应     4xx / 5xx **不含** request_id（错误契约本阶段未变）
+不包含       Tool arguments / ToolResult.data / SQL / prompt / LLM 响应 / 凭据 /
+             traceback / DB 连接信息（metadata 只增加 request_id 一个键）
+```
+
+请求体**不**接受 `request_id`（客户端传入会被忽略；服务端不信任客户端 trace id）。
+
+错误映射（与 Phase 3.7.11 起一致，本阶段未变）：
+
+| HTTP | 触发条件                                   | detail 示例                       |
+| ---- | ------------------------------------------ | --------------------------------- |
+| 400  | `AIOrchestratorInputError`（question 非法） | `"非法输入: ..."`                 |
+| 403  | 项目能力未启用（capability denied）         | `"项目能力未启用: ..."`           |
+| 404  | `project_id` 未注册                         | `"项目未注册: ..."`               |
+| 422  | 请求体校验失败（Pydantic）                  | 标准校验错误                      |
+| 502  | `AIOrchestratorRouteError`（路由决策失败）  | `"路由决策失败: ..."`             |
+| 503  | `AIOrchestratorUnavailableError`（上下文不可用） | `"项目上下文不可用: ..."`     |
+| 500  | `AIOrchestratorExecutionError` / 未预期异常 | `"AI 服务内部错误"`               |
 
 ---
 

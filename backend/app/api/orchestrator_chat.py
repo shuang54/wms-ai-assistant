@@ -215,6 +215,12 @@ class ChatResponse(BaseModel):
                    避免把 RagResponse / ToolResult / SQLExecutionResult 整体
                    直接 dump 到外层（响应体保持 Pydantic 兼容）。
         metadata:  路由 + 执行统计；不含敏感信息。
+                   **Phase 3.12 Step 35**：包含 ``request_id``（Assistant
+                   Trace ID）—— 由 Orchestrator 在 ``execute()`` 内生成的
+                   **唯一** ID（API 层不生成第二个）；Tool 路由下与
+                   ``ai_ops.tool_execution_record.request_id`` 完全一致，
+                   可用它关联 Tool Execution Observability
+                   （``GET /api/observability/tools/history``）。
     """
 
     route: str = Field(..., description="Orchestrator 实际执行的路由")
@@ -451,7 +457,13 @@ def _sql_data(result: AIOrchestrationResult) -> ChatSqlResponse:
 
 
 def _to_chat_response(result: AIOrchestrationResult) -> ChatResponse:
-    """Orchestrator 结果 → ChatResponse DTO（按 route 分支映射）。"""
+    """Orchestrator 结果 → ChatResponse DTO（按 route 分支映射）。
+
+    Phase 3.12 Step 35：``metadata`` 原样透传（含 Orchestrator 生成的
+    ``request_id``）；本函数**不**生成 / 改写 / 补写任何 ID
+    （避免出现第二套 trace 体系）。``data`` / ``content`` / ``route``
+    映射逻辑与本阶段前完全一致（0 变化）。
+    """
     route = result.route.value if hasattr(result.route, "value") else str(result.route)
 
     data: object | None
@@ -513,6 +525,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         * ``/api/chat``     行为不变（Phase 3.5.6，向后兼容）；
         * ``/api/ai/chat``  本端点，路由可命中三条路径。
+
+    Trace Contract（Phase 3.12 Step 35）：
+
+        成功响应 ``metadata.request_id`` = 本次请求的 Assistant Trace ID，
+        由 Orchestrator 生成（**API 层不生成 ID**，只透传）。
+        三条路由（rag / tool / text_to_sql）与 T2S refusal 均携带；
+        Tool 路径下该值与 ``ai_ops.tool_execution_record.request_id`` 一致。
+
+        错误响应（4xx / 5xx）**不含** request_id —— 错误契约本阶段不变
+        （统一 Error Contract 属未来阶段）。
 
     异常映射：
 

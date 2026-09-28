@@ -327,8 +327,12 @@ class TestComposition:
         )
 
     def test_no_second_request_id_system(self) -> None:
-        """Composition Root 不生成任何 ID（request_id 只有 Orchestrator 的
-        new_request_id() 一处来源）。"""
+        """Composition Root 不**生成**任何 ID（唯一生成点 = Orchestrator）。
+
+        Phase 3.12 Step 35：本模块的文档字符串会说明 ``metadata.request_id``
+        （Assistant Trace ID），但**不得**引入 uuid / 不得调用 ID 生成函数、
+        不得自行构造第二套 trace 体系（仅透传 Orchestrator 的 ID）。
+        """
         source = _source(_ROOT_MODULE)
         tree = _tree(_ROOT_MODULE)
         imports: set[str] = set()
@@ -338,13 +342,24 @@ class TestComposition:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imports.add(node.module)
         assert "uuid" not in imports
-        assert "new_request_id" not in source
+        # 不**调用**任何 ID 生成器（文档字符串里的说明不算）
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        } | {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        for forbidden in ("new_request_id", "uuid4", "token_hex", "token_urlsafe"):
+            assert forbidden not in called, forbidden
         identifiers = {
             node.id.lower()
             for node in ast.walk(tree)
             if isinstance(node, ast.Name)
         }
-        for forbidden in ("uuid4", "request_id", "trace_id", "correlation_id"):
+        for forbidden in ("uuid4", "trace_id", "correlation_id", "token_hex"):
             assert forbidden not in identifiers, forbidden
 
 

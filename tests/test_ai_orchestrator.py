@@ -1,6 +1,8 @@
 """AI Orchestrator 测试（Phase 3.7.9）。"""
 from __future__ import annotations
 
+import json
+
 from typing import Any
 
 import pytest
@@ -1019,6 +1021,127 @@ class _CountingExtractor(ToolArgumentExtractor):
             "parameters": parameters,
         })
         return super().extract(tool_name, question, parameters=parameters)
+
+
+class TestAssistantTraceId:
+    """Phase 3.12 Step 35：Assistant Trace Contract（service 层）。
+
+        · 三条成功路径（RAG / TOOL / T2S）metadata 均携带 request_id；
+        · 唯一来源 = execute() 的 new_request_id()（本层不生成第二套 ID）；
+        · TOOL 路径：metadata.request_id == ToolExecutionContext.request_id
+          == ToolExecutionRecord.request_id（同一 ID）；
+        · request_id 不进入 Tool arguments / 不进入下游 Prompt 上下文；
+        · AIOrchestrationResult 字段结构不变（仅 metadata 内容增加一个键）。
+    """
+
+    async def test_rag_route_carries_request_id(self) -> None:
+        orch = _make_service(
+            router=FakeRouter(_rag_decision()),
+            rag=FakeRAG(response=_FakeRagResponse("答案", used_chunks_count=1)),
+            t2s=FakeTextToSQL(),
+            sql_executor=FakeSQLExecutor(),
+            table_selector=FakeTableSelector(),
+            context_composer=FakeContextComposer(),
+            project_provider=FakeProjectProvider(),
+        )
+
+        result = await orch.execute("采购入库流程是什么")
+
+        assert result.route == RouteType.RAG
+        request_id = result.metadata["request_id"]
+        assert isinstance(request_id, str) and request_id
+        assert len(request_id) == 36              # new_request_id() = uuid4 str
+
+    async def test_tool_route_request_id_matches_execution_context(self) -> None:
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+        execution = _CountingToolExecution(registry=registry)
+        orch = _make_service(
+            router=FakeRouter(_tool_decision()),
+            tools=registry,
+            tool_execution_service=execution,
+        )
+
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+
+        assert result.route == RouteType.TOOL
+        context = execution.contexts[0]
+        assert result.metadata["request_id"] == context.request_id
+        assert context.round == 1
+        assert context.tool_call_id is None
+
+    async def test_text_to_sql_route_carries_request_id(self) -> None:
+        t2s_result = TextToSQLResult(
+            question="本月采购入库数量是多少？",
+            sql="SELECT id FROM public.inventory LIMIT 10",
+            validated=True,
+            attempts=1,
+            referenced_tables=("public.inventory",),
+        )
+        sql_result = SQLExecutionResult(
+            columns=("id",), rows=((1,),), row_count=1, truncated=False,
+            execution_time_ms=1.0,
+        )
+        orch = _make_service(
+            router=FakeRouter(_sql_decision()),
+            rag=FakeRAG(),
+            t2s=FakeTextToSQL(result=t2s_result),
+            sql_executor=FakeSQLExecutor(result=sql_result),
+            table_selector=FakeTableSelector(selections=["public.inventory"]),
+            context_composer=FakeContextComposer(),
+            project_provider=FakeProjectProvider(),
+        )
+
+        result = await orch.execute("本月采购入库数量是多少？")
+
+        assert result.route == RouteType.TEXT_TO_SQL
+        request_id = result.metadata["request_id"]
+        assert isinstance(request_id, str) and request_id
+
+    async def test_request_ids_unique_per_execute(self) -> None:
+        """3 次独立 execute → 3 个不同 request_id（无复用 / 无固定值）。"""
+        rag = FakeRAG(response=_FakeRagResponse("答案"))
+        orch = _make_service(
+            router=FakeRouter(_rag_decision()), rag=rag,
+        )
+
+        ids = [
+            (await orch.execute(f"问题 {i}")).metadata["request_id"]
+            for i in range(3)
+        ]
+
+        assert len(set(ids)) == 3
+
+    def test_result_dto_structure_unchanged(self) -> None:
+        """AIOrchestrationResult 字段不变（request_id 只进 metadata）。"""
+        from dataclasses import fields
+
+        assert [f.name for f in fields(AIOrchestrationResult)] == [
+            "route", "content", "data", "metadata",
+        ]
+
+    async def test_request_id_not_in_arguments_or_downstream_context(self) -> None:
+        """Trace ID 只用于关联：不进 Tool arguments / 不进 T2S 上下文。"""
+        handler = _RecordingToolHandler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+        execution = _CountingToolExecution(registry=registry)
+        orch = _make_service(
+            router=FakeRouter(_tool_decision()),
+            tools=registry,
+            tool_execution_service=execution,
+        )
+
+        result = await orch.execute("查询物料 MAT-001 当前库存")
+        request_id = result.metadata["request_id"]
+
+        assert request_id not in json.dumps(
+            handler.last_arguments, ensure_ascii=False
+        )
+        assert request_id not in json.dumps(
+            execution.calls, ensure_ascii=False
+        )
 
 
 class TestToolArgumentExtractionBoundary:
