@@ -59,6 +59,16 @@ C19 Tool Execution Metrics Read Model（Step 17）：Metrics 是**只读**分析
     （Iterable[ToolExecutionRecord] → frozen Snapshot）；不重新测量时间 /
     不接受 Collector internals / 不带 request·project·tool 维度 / 无敏感字段 /
     无持久化 / 无单例；生产执行链不依赖它（Metrics 失败不影响 ToolResult）
+C22 Tool Execution Collector Retention（Step 20）：有限内存窗口
+    （max_records 默认 1000；FIFO 淘汰最新 N 条）；淘汰者对所有查询与 Metrics
+    不可见；无 TTL / 后台线程 / 自动 clear / 持久化
+C23 Tool Observability Read Query Boundary（Step 21）：Query Service 是只读
+    Read Facade（不存储 / 不算数 / 不清空）；retention 与 Collector 一致；
+    不依赖 DB / LLM / Registry / API
+C24 Tool Observability Snapshot Read Model（Step 22）：ToolExecutionSnapshot
+    是**独立对外** Read Model（frozen DTO + 显式逐字段映射）；不持有 Record /
+    Collector / Metrics Service；不含 arguments / SQL / secrets；Metrics 仍
+    由既有 Metrics Service 计算（不经 Snapshot）
 ```
 
 已有行为覆盖（不重复）：`tests/test_tool_chat_service.py` /
@@ -1627,6 +1637,11 @@ class TestC18InMemoryToolExecutionCollector:
 
     # ---- C18.6 不做聚合 / 统计 ----
     def test_c18_6_no_aggregation_api(self) -> None:
+        """无 count / success_rate / 分位数等统计。
+
+        Phase 3.11 Step 20：新增只读 ``max_records``（retention 窗口参数；
+        见 C22），仍不含任何统计 API。
+        """
         from backend.app.services.in_memory_tool_execution_collector import (
             InMemoryToolExecutionCollector,
         )
@@ -1636,7 +1651,7 @@ class TestC18InMemoryToolExecutionCollector:
             if not name.startswith("_")
         }
         assert public == {
-            "clear", "on_execution", "records",
+            "clear", "max_records", "on_execution", "records",
             "records_by_project_id", "records_by_request_id",
             "records_by_tool_name",
         }, public
@@ -1659,7 +1674,7 @@ class TestC18InMemoryToolExecutionCollector:
     def test_c18_8_no_execution_dependencies(self) -> None:
         imports = _walk_imports(_tree(self._COLLECTOR_MODULE))
         assert imports <= {
-            "__future__", "threading", "collections.abc",
+            "__future__", "threading", "collections", "collections.abc",
             "backend.app.services.tool_execution_record",
         }, imports
         identifiers = _identifiers(_tree(self._COLLECTOR_MODULE))
@@ -1718,6 +1733,782 @@ class TestC18InMemoryToolExecutionCollector:
         assert "Collector()" not in source          # 不实例化任何 Collector
         assert "tool_execution_metrics_service" not in source
         assert "tool_execution_observer" in source  # Step 18：仅构造参数注入
+
+
+# ============================================================
+# C22. Tool Execution Collector Retention（Phase 3.11 Step 20）
+# ============================================================
+
+def _c22_record(
+    *,
+    request_id: str = "req-c22",
+    round: int = 1,
+    tool_name: str = "get_inventory",
+    project_id: str | None = None,
+    success: bool = True,
+):
+    """C22 用：字段可区分的 Record（验证 FIFO 淘汰语义）。"""
+    from datetime import datetime, timedelta, timezone
+
+    from backend.app.services.tool_execution_record import (
+        ToolExecutionRecord,
+    )
+
+    started = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
+    return ToolExecutionRecord(
+        request_id=request_id,
+        round=round,
+        tool_name=tool_name,
+        started_at=started,
+        finished_at=started + timedelta(milliseconds=1),
+        duration_ms=1.0,
+        success=success,
+        project_id=project_id,
+        error_type=None if success else "ToolValidationError",
+    )
+
+
+def _c22_collector(max_records: int):
+    from backend.app.services.in_memory_tool_execution_collector import (
+        InMemoryToolExecutionCollector,
+    )
+
+    return InMemoryToolExecutionCollector(max_records=max_records)
+
+
+#: Collector 模块路径（与 TestC18 的类属性同值；此处模块级以便 C22 复用）
+_COLLECTOR_MODULE = "backend/app/services/in_memory_tool_execution_collector.py"
+
+
+def _c23_code_layer() -> str:
+    """Query Service 代码层文本（imports + 标识符 + 非 docstring 字符串）。
+
+    docstring / 注释里的"禁止 …"说明不算实现（避免文本误判）。
+    """
+    tree = _tree("backend/app/services/tool_observability_query_service.py")
+    return " ".join(
+        list(_walk_imports(tree))
+        + list(_identifiers(tree))
+        + _non_docstring_strings(tree)
+    ).lower()
+
+
+class TestC22CollectorRetention:
+    """C22：Collector 的**有限内存窗口**（FIFO）契约。
+
+    行为细节见 ``tests/test_in_memory_tool_execution_collector.py``
+    （Retention 测试类）；本类只锁 Contract（结构 / 边界 / 语义）。
+    """
+
+    def _bounded(self, max_records: int):
+        return _c22_collector(max_records)
+
+    # ---- C22.1 有限 max_records ----
+
+    def test_c22_1_collector_has_finite_max_records(self) -> None:
+        from backend.app.services.in_memory_tool_execution_collector import (
+            DEFAULT_MAX_RECORDS,
+            InMemoryToolExecutionCollector,
+        )
+
+        assert isinstance(DEFAULT_MAX_RECORDS, int) and DEFAULT_MAX_RECORDS == 1000
+        assert _collector().max_records == DEFAULT_MAX_RECORDS
+        assert self._bounded(7).max_records == 7
+
+    # ---- C22.2 参数校验（bool 明确拒绝） ----
+
+    def test_c22_2_max_records_validation(self) -> None:
+        for bad in (True, False, 1.5, "100", None):
+            with pytest.raises(TypeError):
+                self._bounded(bad)  # type: ignore[arg-type]
+        for bad in (0, -1):
+            with pytest.raises(ValueError):
+                self._bounded(bad)
+
+    # ---- C22.3 FIFO 策略 ----
+
+    def test_c22_3_retention_policy_is_fifo(self) -> None:
+        collector = self._bounded(3)
+        first = _c22_record(request_id="req-A")
+        second = _c22_record(request_id="req-B")
+        third = _c22_record(request_id="req-C")
+        for record in (first, second, third):
+            collector.on_execution(record)
+
+        for _ in range(3):                       # 读取不刷新顺序（非 LRU）
+            collector.records()
+
+        fourth = _c22_record(request_id="req-D")
+        collector.on_execution(fourth)
+
+        assert collector.records() == (second, third, fourth)
+
+    # ---- C22.4 保留最新 N ----
+
+    def test_c22_4_keeps_newest_records(self) -> None:
+        collector = self._bounded(2)
+        records = [
+            _c22_record(request_id=f"req-{round_}")
+            for round_ in range(1, 5)
+        ]
+        for record in records:
+            collector.on_execution(record)
+
+        assert collector.records() == tuple(records[-2:])
+        assert len(collector.records()) == 2
+
+    # ---- C22.5 淘汰者对所有查询不可见 ----
+
+    def test_c22_5_evicted_unavailable_through_all_queries(self) -> None:
+        collector = _c22_collector(1)
+        evicted = _c22_record(
+            request_id="req-evicted",
+            tool_name="get_work_order",
+            project_id="project-a",
+            success=False,
+        )
+        kept = _c22_record(request_id="req-kept")
+        collector.on_execution(evicted)
+        collector.on_execution(kept)
+
+        assert collector.records() == (kept,)
+        assert collector.records_by_request_id("req-evicted") == ()
+        assert collector.records_by_project_id("project-a") == ()
+        assert collector.records_by_tool_name("get_work_order") == ()
+
+    # ---- C22.6 records() 仍为不可变 tuple ----
+
+    def test_c22_6_records_snapshot_is_immutable_tuple(self) -> None:
+        collector = self._bounded(1)
+        collector.on_execution(_record_for_c18(1))
+        snapshot = collector.records()
+
+        assert isinstance(snapshot, tuple)
+        with pytest.raises(AttributeError):
+            snapshot.append(object())  # type: ignore[attr-defined]
+
+    # ---- C22.7 线程安全（append + 淘汰原子） ----
+
+    def test_c22_7_retention_is_thread_safe(self) -> None:
+        import threading
+
+        collector = self._bounded(10)
+
+        def worker() -> None:
+            for _ in range(30):
+                collector.on_execution(_record_for_c18(1))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        snapshot = collector.records()
+        assert len(snapshot) == 10
+        assert len({id(record) for record in snapshot}) == 10
+
+    # ---- C22.8 clear() 仍是显式清空 ----
+
+    def test_c22_8_clear_explicitly_clears_retained_records(self) -> None:
+        collector = self._bounded(3)
+        collector.on_execution(_record_for_c18(1))
+        collector.clear()
+        assert collector.records() == ()
+
+    # ---- C22.9 无自动 clear ----
+
+    def test_c22_9_no_automatic_clear(self) -> None:
+        """无任何执行路径自动 clear（Collector 内部只有 self._records.clear）。"""
+        for path in (
+            "backend/app/services/ai_orchestrator_service.py",
+            "backend/app/services/tool_execution_service.py",
+            "backend/app/api/orchestrator_chat.py",
+        ):
+            tree = _tree(path)
+            assert not any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "clear"
+                for node in ast.walk(tree)
+            ), path
+
+        collector_clears = {
+            ast.unparse(node.func)
+            for node in ast.walk(_tree(_COLLECTOR_MODULE))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "clear"
+        }
+        assert collector_clears == {"self._records.clear"}, collector_clears
+
+    # ---- C22.10 无 TTL ----
+
+    def test_c22_10_no_ttl(self) -> None:
+        source = _source(_COLLECTOR_MODULE)
+        identifiers = _identifiers(_tree(_COLLECTOR_MODULE))
+        for forbidden in ("ttl", "timer", "monotonic", "expires", "deadline"):
+            assert forbidden not in identifiers, forbidden
+        assert "time." not in source
+
+    # ---- C22.11 无后台线程 ----
+
+    def test_c22_11_no_background_thread(self) -> None:
+        source = _source(_COLLECTOR_MODULE)
+        assert "threading.Lock()" in source
+        assert "threading.Thread" not in source
+        identifiers = _identifiers(_tree(_COLLECTOR_MODULE))
+        for forbidden in ("daemon", "schedule", "create_task", "sleep"):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C22.12 Metrics 只看到保留窗口 ----
+
+    def test_c22_12_metrics_only_sees_retained_records(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        collector = self._bounded(2)
+        collector.on_execution(_record_for_c18(1))       # success=True
+        collector.on_execution(_record_for_c18(2))
+        collector.on_execution(_record_for_c18(3))
+
+        snapshot = ToolExecutionMetricsService.snapshot(collector.records())
+
+        assert snapshot.total_count == 2                 # evicted 不可见
+        assert snapshot.success_count == 2
+
+    # ---- C22.13 Record 不可变且从不被修改 ----
+
+    def test_c22_13_record_never_modified_by_retention(self) -> None:
+        import dataclasses
+
+        from backend.app.services.tool_execution_record import (
+            ToolExecutionRecord,
+        )
+
+        collector = self._bounded(1)
+        record = _c22_record(request_id="req-immutable")
+        before = dataclasses.asdict(record)
+
+        collector.on_execution(record)
+        collector.on_execution(_record_for_c18(2))       # 淘汰旧者
+
+        assert dataclasses.asdict(record) == before
+        assert isinstance(record, ToolExecutionRecord)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.success = False  # type: ignore[misc]
+
+    # ---- C22.14 无持久化 ----
+
+    def test_c22_14_no_persistence(self) -> None:
+        imports = _walk_imports(_tree(_COLLECTOR_MODULE))
+        for forbidden in (
+            "json", "pathlib", "os", "redis", "kafka", "celery", "pickle",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+
+    # ---- C22.15 无 DB / LLM / Tool 依赖 ----
+
+    def test_c22_15_no_db_llm_or_tool_dependency(self) -> None:
+        imports = _walk_imports(_tree(_COLLECTOR_MODULE))
+        for forbidden in (
+            "sqlalchemy", "backend.app.db", "backend.app.llm",
+            "backend.app.tools", "backend.app.api", "httpx",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+
+    # ---- C22.16 无 API 变化 ----
+
+    def test_c22_16_no_api_change(self) -> None:
+        from backend.app.api.orchestrator_chat import ChatRequest, ChatResponse
+
+        assert set(ChatResponse.model_fields) == {
+            "route", "content", "data", "metadata",
+        }
+        assert "max_records" not in ChatRequest.model_fields
+        # 组合根不注入 retention 配置（使用 Collector 默认值；无新配置层）：
+        # 构造点无 max_records 关键字参数（AST；docstring 说明不算）
+        calls = [
+            node
+            for node in ast.walk(_tree("backend/app/api/orchestrator_chat.py"))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "InMemoryToolExecutionCollector"
+        ]
+        assert len(calls) == 1, calls
+        assert calls[0].keywords == [], ast.dump(calls[0])[:80]
+
+    # ---- C22.17 ToolResult 不变 ----
+
+    def test_c22_17_tool_result_unchanged(self) -> None:
+        import dataclasses
+
+        from backend.app.tools.base import ToolResult
+
+        assert {f.name for f in dataclasses.fields(ToolResult)} == {
+            "tool_name", "success", "data", "error",
+        }
+
+    # ---- C22.18 AIOrchestrator 执行语义不变 ----
+
+    async def test_c22_18_orchestrator_semantics_unchanged(self) -> None:
+        """执行边界语义不变（retention 只是旁路窗口）；Orchestrator / Router
+        代码层**无** retention 概念（不感知 max_records / eviction）。"""
+        from backend.app.services.tool_execution_context import (
+            ToolExecutionContext,
+        )
+        from backend.app.tools.get_inventory import GET_INVENTORY_DEFINITION
+        from backend.app.tools.registry import ToolRegistry, ToolResult
+
+        class _Handler:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def __call__(self, arguments: dict) -> dict:
+                self.calls += 1
+                return {"qty": 1.0}
+
+        handler = _Handler()
+        registry = ToolRegistry()
+        registry.register(GET_INVENTORY_DEFINITION, handler)
+        collector = _c22_collector(1)
+        boundary = ToolExecutionService(registry=registry, observer=collector)
+
+        result = await boundary.execute(
+            "get_inventory",
+            arguments={"material_code": "MAT-001"},
+            context=ToolExecutionContext(request_id="req-c22", round=1),
+        )
+
+        assert isinstance(result, ToolResult)
+        assert result.success is True
+        assert handler.calls == 1
+        assert len(collector.records()) == 1
+
+        for path in (
+            "backend/app/services/ai_orchestrator_service.py",
+            "backend/app/services/ai_router_service.py",
+        ):
+            tree = _tree(path)
+            identifiers = _identifiers(tree)
+            strings = " ".join(_non_docstring_strings(tree)).lower()
+            for forbidden in ("max_records", "retention", "evict"):
+                assert forbidden not in identifiers, (path, forbidden)
+                assert forbidden not in strings, (path, forbidden)
+
+
+# ============================================================
+# C23. Tool Observability Read Query Boundary（Phase 3.11 Step 21）
+# ============================================================
+
+_C23_QUERY_MODULE = "backend/app/services/tool_observability_query_service.py"
+
+
+def _c23_query(
+    *records, max_records: int = 1000, metrics_service: Any = None,
+):
+    """C23 用：Collector + Query Service（默认 Metrics Service 或 Fake）。"""
+    from backend.app.services.in_memory_tool_execution_collector import (
+        InMemoryToolExecutionCollector,
+    )
+    from backend.app.services.tool_observability_query_service import (
+        ToolObservabilityQueryService,
+    )
+
+    collector = InMemoryToolExecutionCollector(max_records=max_records)
+    for record in records:
+        collector.on_execution(record)
+    if metrics_service is None:
+        query = ToolObservabilityQueryService(collector)
+    else:
+        query = ToolObservabilityQueryService(
+            collector, metrics_service=metrics_service
+        )
+    return query, collector
+
+
+class TestC23ReadQueryBoundary:
+    """C23：Query Service = **只读 Read Facade**（不存储 / 不算数 / 不清空）。
+
+    行为细节见 ``tests/test_tool_observability_query_service.py``；
+    本类只锁 Contract（结构 / 依赖方向 / 语义一致性）。
+    """
+
+    # ---- C23.1 只读 ----
+
+    def test_c23_1_query_service_is_read_only(self) -> None:
+        from backend.app.services.tool_observability_query_service import (
+            ToolObservabilityQueryService,
+        )
+
+        public = {
+            name
+            for name in dir(ToolObservabilityQueryService)
+            if not name.startswith("_")
+        }
+        assert not (public & {
+            "clear", "on_execution", "append", "add", "evict", "reset",
+            "delete", "pop",
+        }), public
+
+    # ---- C23.2 不持有自己的 Record storage ----
+
+    def test_c23_2_no_own_record_storage(self) -> None:
+        query, _collector = _c23_query(_c22_record())
+        assert set(vars(query)) == {"_collector", "_metrics_service"}
+
+        source = _source(_C23_QUERY_MODULE)
+        assert "self._records" not in source          # 无内部 Record 集合
+        assert "deque" not in _c23_code_layer()       # 不自建容器（代码层）
+
+    # ---- C23.3 / C23.4 不实现 Retention / FIFO ----
+
+    def test_c23_3_and_4_no_retention_or_fifo(self) -> None:
+        identifiers = _identifiers(_tree(_C23_QUERY_MODULE))
+        for forbidden in (
+            "deque", "max_records", "popleft", "evict", "append", "clear",
+            "threading", "lock",
+        ):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C23.5 不实现 Metrics arithmetic ----
+
+    def test_c23_5_no_metrics_arithmetic(self) -> None:
+        identifiers = _identifiers(_tree(_C23_QUERY_MODULE))
+        for forbidden in (
+            "sum", "max", "min", "len", "success_count", "failure_count",
+            "total_duration_ms", "average_duration_ms", "success_rate",
+            "failure_rate",
+        ):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C23.6 records 返回不可变 snapshot ----
+
+    def test_c23_6_records_is_immutable_tuple(self) -> None:
+        query, _collector = _c23_query(_c22_record())
+
+        snapshot = query.records()
+
+        assert isinstance(snapshot, tuple)
+        with pytest.raises(AttributeError):
+            snapshot.append(object())  # type: ignore[attr-defined]
+
+    # ---- C23.7 retention window 一致 ----
+
+    def test_c23_7_retention_window_consistent(self) -> None:
+        records = [
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B"),
+            _c22_record(request_id="req-C"),
+            _c22_record(request_id="req-D"),
+        ]
+        query, collector = _c23_query(*records, max_records=3)
+
+        assert collector.records() == tuple(records[-3:])   # Collector 权威
+        assert query.records() == tuple(records[-3:])       # Query 完全一致
+        assert query.records_by_request_id("req-A") == ()   # 已淘汰：不可恢复
+
+    # ---- C23.8 query 不修改 Collector ----
+
+    def test_c23_8_query_does_not_mutate_collector(self) -> None:
+        query, collector = _c23_query(
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B"),
+        )
+        before = collector.records()
+
+        query.records()
+        query.records_by_request_id("req-A")
+        query.records_by_project_id(None)
+        query.records_by_tool_name("get_inventory")
+        query.metrics()
+
+        assert collector.records() == before
+        assert len(collector.records()) == 2
+
+    # ---- C23.9 不暴露 clear ----
+
+    def test_c23_9_no_clear_exposure(self) -> None:
+        query, _collector = _c23_query(_c22_record())
+        assert not hasattr(query, "clear")
+        tree = _tree(_C23_QUERY_MODULE)
+        assert not any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "clear"
+            for node in ast.walk(tree)
+        )
+        assert "clear" not in _c23_code_layer()        # 无 clear 方法 / 调用
+
+    # ---- C23.10 ~ C23.13 不依赖 DB / LLM / Registry / API ----
+
+    def test_c23_10_to_13_no_forbidden_dependencies(self) -> None:
+        imports = _walk_imports(_tree(_C23_QUERY_MODULE))
+        for forbidden in (
+            "sqlalchemy", "psycopg", "backend.app.db", "backend.app.llm",
+            "backend.app.tools", "backend.app.api", "redis", "kafka",
+            "celery", "httpx", "requests", "os", "pathlib", "subprocess",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+        assert "backend.app.api" not in imports
+
+    # ---- C23.14 不暴露 secrets / SQL / arguments ----
+
+    def test_c23_14_no_sensitive_output(self) -> None:
+        query, _collector = _c23_query(
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B", success=False),
+        )
+
+        blob = repr(query.records()) + repr(query.metrics())
+        for forbidden in (
+            "arguments", "material_code", "SELECT", "postgresql://",
+            "password", "Authorization", "Bearer ", "api_key", "Traceback",
+        ):
+            assert forbidden not in blob, forbidden
+
+    # ---- C23.15 Metrics 复用现有 Metrics Service ----
+
+    def test_c23_15_metrics_reuses_existing_service(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+        from backend.app.services.tool_observability_query_service import (
+            ToolObservabilityQueryService,
+        )
+
+        class _FakeMetrics:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def snapshot(self, records: Any) -> str:  # type: ignore[valid-type]
+                self.calls += 1
+                return "FAKE-SNAPSHOT"
+
+        fake = _FakeMetrics()
+        query, collector = _c23_query(
+            _c22_record(), _c22_record(request_id="req-B"),
+            metrics_service=fake,
+        )
+
+        assert query.metrics() == "FAKE-SNAPSHOT"     # 返回值来自 Metrics Service
+        assert fake.calls == 1
+        assert _c23_query()[0].metrics_service is ToolExecutionMetricsService
+        assert issubclass(type(query), ToolObservabilityQueryService)
+        assert query.metrics_service is fake
+        assert collector.records() is not None
+
+
+# ============================================================
+# C24. Tool Observability Snapshot Read Model（Phase 3.11 Step 22）
+# ============================================================
+
+_C24_SNAPSHOT_MODULE = "backend/app/services/tool_observability_snapshot.py"
+
+
+class TestC24SnapshotReadModel:
+    """C24：``ToolExecutionSnapshot`` = 对外 Read Model（与内部 Record 解耦）。
+
+    行为细节见 ``tests/test_tool_observability_snapshot.py``；
+    本类只锁 Contract（结构 / 解耦 / 安全 / 语义一致性）。
+    """
+
+    def _snapshot(self):
+        from backend.app.services.tool_observability_snapshot import (
+            ToolExecutionSnapshot,
+        )
+
+        return ToolExecutionSnapshot.from_record(_c22_record())
+
+    # ---- C24.1 独立 DTO ----
+
+    def test_c24_1_snapshot_is_independent_dto(self) -> None:
+        from backend.app.services.tool_execution_record import (
+            ToolExecutionRecord,
+        )
+        from backend.app.services.tool_observability_snapshot import (
+            ToolExecutionSnapshot,
+        )
+
+        snapshot = self._snapshot()
+
+        assert isinstance(snapshot, ToolExecutionSnapshot)
+        assert not isinstance(snapshot, ToolExecutionRecord)
+        assert ToolExecutionSnapshot is not ToolExecutionRecord
+
+    # ---- C24.2 immutable ----
+
+    def test_c24_2_snapshot_is_frozen(self) -> None:
+        import dataclasses
+
+        snapshot = self._snapshot()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snapshot.tool_name = "other"  # type: ignore[misc]
+
+    # ---- C24.3 ~ C24.5 不持有 Record / Collector / Metrics Service ----
+
+    def test_c24_3_to_5_holds_no_external_objects(self) -> None:
+        snapshot = self._snapshot()
+
+        assert set(vars(snapshot)) == {
+            "request_id", "round", "tool_name", "started_at", "finished_at",
+            "duration_ms", "success", "project_id", "tool_call_id",
+            "error_code", "error_type",
+        }
+        for forbidden in ("record", "collector", "metrics_service"):
+            assert not hasattr(snapshot, forbidden), forbidden
+
+    # ---- C24.6 显式字段映射 ----
+
+    def test_c24_6_explicit_field_mapping(self) -> None:
+        from_record = next(
+            node
+            for node in ast.walk(_tree(_C24_SNAPSHOT_MODULE))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "from_record"
+        )
+        mapping = ast.unparse(from_record)
+
+        for field_name in (
+            "request_id", "round", "tool_name", "started_at", "finished_at",
+            "duration_ms", "success", "project_id", "tool_call_id",
+            "error_code", "error_type",
+        ):
+            assert f"{field_name}=record.{field_name}" in mapping, field_name
+
+    # ---- C24.7 不自动泄露字段 ----
+
+    def test_c24_7_no_automatic_field_leak(self) -> None:
+        tree = _tree(_C24_SNAPSHOT_MODULE)
+        calls = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+        }
+        assert not (calls & {"vars", "asdict"}), calls
+        attributes = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+        }
+        assert "__dict__" not in attributes
+
+    # ---- C24.8 ~ C24.10 无 arguments / SQL / secrets ----
+
+    def test_c24_8_to_10_no_sensitive_content(self) -> None:
+        import dataclasses
+
+        query, _collector = _c23_query(
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B", success=False),
+        )
+        names = {
+            field.name
+            for field in dataclasses.fields(type(self._snapshot()))
+        }
+        assert not (names & {
+            "arguments", "sql", "prompt", "api_key", "password",
+            "authorization", "traceback",
+        })
+        blob = repr(query.snapshots())
+        for forbidden in (
+            "arguments", "SELECT", "postgresql://", "password",
+            "Authorization", "Bearer ", "api_key", "Traceback",
+        ):
+            assert forbidden not in blob, forbidden
+
+    # ---- C24.11 retention 一致 ----
+
+    def test_c24_11_retention_window_consistent(self) -> None:
+        records = [
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B"),
+            _c22_record(request_id="req-C"),
+            _c22_record(request_id="req-D"),
+        ]
+        query, collector = _c23_query(*records, max_records=3)
+
+        assert [s.request_id for s in query.snapshots()] == [
+            r.request_id for r in collector.records()
+        ] == ["req-B", "req-C", "req-D"]
+        assert query.snapshots_by_request_id("req-A") == ()
+
+    # ---- C24.12 旧快照不随 Collector 变化 ----
+
+    def test_c24_12_old_snapshot_is_stable(self) -> None:
+        query, collector = _c23_query(_c22_record(request_id="req-A"))
+
+        snapshots = query.snapshots()
+        collector.on_execution(_c22_record(request_id="req-B"))
+
+        assert [s.request_id for s in snapshots] == ["req-A"]
+        assert len(query.snapshots()) == 2
+
+    # ---- C24.13 Metrics Service 不变 ----
+
+    def test_c24_13_metrics_service_unchanged(self) -> None:
+        import inspect
+
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        methods = {
+            name
+            for name, _ in inspect.getmembers(
+                ToolExecutionMetricsService, inspect.isfunction
+            )
+            if not name.startswith("_")
+        }
+        assert methods == {"snapshot"}, methods
+
+    # ---- C24.14 Query Service 原有 API 不变 ----
+
+    def test_c24_14_query_service_original_api_unchanged(self) -> None:
+        from backend.app.services.tool_observability_query_service import (
+            ToolObservabilityQueryService,
+        )
+
+        public = {
+            name
+            for name in dir(ToolObservabilityQueryService)
+            if not name.startswith("_")
+        }
+        assert public == {
+            "collector", "metrics", "metrics_service",
+            "records", "records_by_project_id", "records_by_request_id",
+            "records_by_tool_name",
+            "snapshots", "snapshots_by_project_id",
+            "snapshots_by_request_id", "snapshots_by_tool_name",
+        }, public
+
+    # ---- C24.15 Snapshot 查询只读 ----
+
+    def test_c24_15_snapshot_query_is_read_only(self) -> None:
+        query, collector = _c23_query(
+            _c22_record(request_id="req-A"),
+            _c22_record(request_id="req-B"),
+        )
+        before = collector.records()
+
+        query.snapshots()
+        query.snapshots_by_request_id("req-A")
+        query.snapshots_by_project_id(None)
+        query.snapshots_by_tool_name("get_inventory")
+
+        assert collector.records() == before
+        assert not hasattr(query, "clear")
 
 
 # ============================================================

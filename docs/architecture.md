@@ -2562,7 +2562,241 @@ Observer 抛异常              → ToolResult / AIOrchestrationResult 不变（
 未引入：Collector 内部创建 / Metrics API / HTTP / DB / Redis / Kafka / 持久化 /
         Dashboard / Prometheus / OpenTelemetry / Audit / Event Bus /
         Agent / MCP / LangGraph / Memory / Planning / Retry / Fallback
-生产接线仍 Deferred：API / 工厂不注入 observer（默认 0 事件）
+生产接线（Step 18 时点）：Deferred → DONE（Step 19 起由 Composition Root
+        注入 Application-lifetime Collector，见 §8.37）
+```
+
+## 8.37 Observability Composition Root / Lifecycle Contract（Phase 3.11 Step 19）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 19 — Observability Composition Root Lifecycle Contract.md`
+> 测试：`tests/test_tool_observability_composition.py` +
+> `tests/test_tool_architecture_contract.py`（C21）
+
+### 装配（Composition Root = `backend/app/api/orchestrator_chat.py`）
+
+```text
+_TOOL_REGISTRY            = build_default_tool_registry()          （既有）
+_TOOL_EXECUTION_COLLECTOR = InMemoryToolExecutionCollector()        ← Step 19（唯一创建点）
+_TOOL_EXECUTION_OBSERVER  = _TOOL_EXECUTION_COLLECTOR               （Protocol 引用）
+
+_default_orchestrator = AIOrchestratorService(..., tool_execution_observer=…)
+
+_build_orchestrator_for_project_id(project_id)
+    → build_orchestrator_for_project(project_id, base=…)      （Factory 签名不变）
+        （Factory 内部 resolved_observer = getattr(base, "tool_execution_observer", None)；
+          **继承** base 的观测出口；不创建 Collector）
+
+POST /api/ai/chat → ChatResponse{route, content, data, metadata}（contract 不变）
+```
+
+### 生命周期
+
+```text
+Collector          = Application lifetime（append / 只读查询 / 显式 clear；
+                     **有限 retention 窗口**（Step 20 起 max_records 默认 1000，
+                     FIFO 淘汰，见 §8.38）；
+                     仍无 start·stop·flush·persist·close·TTL·自动 clear /
+                     后台任务 / 持久化；无 get_default_collector()）
+request_id         = Request lifetime（每次 execute() 独立；Collector 共享不共享 id）
+ToolExecutionRecord = Request execution event（请求执行事件）
+Metrics            = Read-only derived view（Composition Root 不创建 / 不缓存）
+```
+
+### 依赖方向与边界（C21 锁定）
+
+```text
+AIOrchestrator：只依赖 ToolExecutionObserver（Protocol）——
+                import 层**不**出现 Collector；不创建 Collector
+RAG / Text-to-SQL：0 Tool Record；TOOL：1 Record（成功 / 失败各 1）
+capability denied：0 Record（拒绝先于执行）
+observer / collector 失败：ToolResult 与 API response 不变（不 retry / 不 fallback；
+                          不新增 try/except，复用 Step 15 隔离）
+API response：不含 request_id / Record / metrics
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：AIOrchestratorService / ToolExecutionService / ToolExecutionContext /
+        ToolExecutionRecord / ToolExecutionObserver /
+        InMemoryToolExecutionCollector / ToolExecutionMetricsService /
+        ToolRegistry / Tool / Handler / ToolResult / Router / main.py / DB schema
+未引入：第三方 DI 框架 / 全局单例 helper / 持久化 / HTTP Metrics API /
+        Dashboard / Prometheus / OpenTelemetry / Audit / Event Bus /
+        Redis / Kafka / Celery / Worker
+```
+
+## 8.38 Tool Execution Collector Retention Boundary（Phase 3.11 Step 20）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 20 — Tool Execution Collector Retention Boundary.md`
+> 测试：`tests/test_in_memory_tool_execution_collector.py`（Retention 测试类）+
+> `tests/test_tool_chat_architecture_contract.py`（C22）
+
+### 有限内存窗口（唯一新增概念）
+
+```text
+InMemoryToolExecutionCollector(max_records=DEFAULT_MAX_RECORDS)   # keyword-only
+DEFAULT_MAX_RECORDS = 1000
+collector.max_records        # 只读属性（构造后不可变）
+
+校验：bool → TypeError（isinstance(True, int) 必须显式排除）；
+      非 int → TypeError；< 1 → ValueError
+配置：仅构造参数；**无** settings.*.max_records 之类全局配置层；
+      组合根使用默认值（Step 20 未改动 api/orchestrator_chat.py）
+```
+
+### FIFO 淘汰（O(1)）
+
+```text
+on_execution(record) → deque(maxlen=max_records).append(record)
+    → 超限自动淘汰最旧（append O(1) / eviction O(1) / records() 快照 O(n)）
+
+max_records=3：A B C → B C D → C D E（始终保留最新 N 条）
+读取不刷新顺序（FIFO，非 LRU）；淘汰只由**条数**触发（与时间无关）
+Evicted Record cannot be recovered（所有查询 API 与 Metrics 均不可见）
+```
+
+### 语义边界（C22 锁定）
+
+```text
+records() / records_by_request_id / records_by_project_id / records_by_tool_name
+    → 只作用于当前 retention window；仍返回不可变 tuple 快照
+clear()        → 显式清空窗口；之后仍受 max_records 约束；无自动 clear
+Metrics        → 零修改；snapshot(collector.records()) 只统计当前窗口
+Record         → frozen，从不被修改（淘汰只释放引用）
+线程安全        → 单个 threading.Lock；append + 淘汰同临界区（原子）
+```
+
+```text
+Retention = finite in-memory window
+Persistence = NO
+TTL = NO
+Background cleanup = NO
+Database = NO
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：ToolExecutionService / ToolExecutionRecord / ToolExecutionObserver /
+        ToolExecutionMetricsService / AIOrchestrator / Router / ToolRegistry /
+        ToolResult / API / DB schema / main.py
+未引入：TTL / 时间窗口 / 定时线程 / 后台 Worker / LRU / 分桶容量 /
+        持久化 / DB / Redis / Kafka / Prometheus / OpenTelemetry / Audit
+```
+
+## 8.39 Tool Observability Read Query Boundary（Phase 3.11 Step 21）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 21 — Tool Observability Read Query Boundary.md`
+> 测试：`tests/test_tool_observability_query_service.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C23）
+
+### 只读读边界（Read Facade）
+
+```text
+ToolExecutionRecord
+        ↓
+InMemoryToolExecutionCollector（Record 存储 + Retention + 查询原语）
+        ↓
+有限 Retention Window
+        ↓
+ToolObservabilityQueryService            ← 本阶段唯一新增（无状态）
+        ├── records()                    → tuple[ToolExecutionRecord, ...]
+        ├── records_by_request_id / _project_id / _tool_name
+        └── metrics()                    → ToolExecutionMetricsSnapshot
+
+依赖方向（未来 HTTP API / Dashboard）：
+    API → Query Service → Collector      （禁止反向依赖 API）
+```
+
+```text
+构造：ToolObservabilityQueryService(collector, metrics_service=ToolExecutionMetricsService)
+只读属性：collector / metrics_service        **无** clear() / on_execution()
+```
+
+### 不是什么（严格边界）
+
+```text
+不是第二份存储：内部仅 {_collector, _metrics_service}（无 list / deque / 缓存）
+不是第二份 retention：无 FIFO / 淘汰 / max_records / 锁
+不是第二份过滤：过滤 + 顺序 + 字段校验原样委托 Collector
+不是第二份统计：metrics() = ToolExecutionMetricsService.snapshot(collector.records())
+不是 Repository / Port / Store Protocol（不过度抽象）
+```
+
+### 语义一致性（C23）
+
+```text
+retention：query.records() == collector.records()（当前窗口；已淘汰不可恢复）
+metrics  ：只统计当前窗口；与直接调用 Metrics Service 等价
+只读     ：所有查询不改变 Collector；返回值是不可变 tuple 快照
+安全     ：输出仅 Record + Snapshot；无 arguments / SQL / 凭据 /
+           DB / LLM / Registry / API 依赖
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：InMemoryToolExecutionCollector（retention 零变化）/ ToolExecutionService /
+        ToolExecutionRecord / ToolExecutionObserver / ToolExecutionMetricsService /
+        AIOrchestrator / Router / ToolRegistry / ToolResult / ToolChatService /
+        API（api/orchestrator_chat.py 本阶段未动）/ main.py / DB schema
+未引入：HTTP API / Dashboard / WebSocket / Database / Redis / Kafka / RabbitMQ /
+        Prometheus / OpenTelemetry / Audit / Event Bus / settings / 环境变量 /
+        后台线程 / 定时任务 / TTL / 新抽象（Repository / Port / Protocol）
+生产接线：无（由测试 / 未来装配显式构造；无单例 / 无 FastAPI dependency）
+```
+
+## 8.40 Tool Observability Snapshot Read Model（Phase 3.11 Step 22）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 22 — Tool Observability Snapshot Read Model.md`
+> 测试：`tests/test_tool_observability_snapshot.py` +
+> `tests/test_tool_chat_architecture_contract.py`（C24）
+
+### 对外 Read Model（与内部 Record 解耦）
+
+```text
+ToolExecutionRecord（内部 Execution Event；可演进）
+        ↓ ToolExecutionSnapshot.from_record()（显式逐字段映射）
+ToolExecutionSnapshot（frozen DTO；字段固定 11 项；对外契约）
+
+ToolObservabilityQueryService
+        ├── records*（内部 Execution Record 查询；不变）
+        ├── snapshots*（对外 Read Model 查询；Step 22 新增）
+        └── metrics()（聚合 Read Model；不变）
+```
+
+```text
+字段：request_id / round / tool_name / started_at / finished_at /
+      duration_ms / success / project_id / tool_call_id / error_code /
+      error_type
+禁止：vars(record) / asdict(record) / **record.__dict__
+      （Record 新增字段不会自动进入对外模型）
+```
+
+### 语义边界（C24）
+
+```text
+独立 DTO：不是 ToolExecutionRecord 的子类 / 别名；不持有 Record
+不持有：Collector / Metrics Service / DB / LLM / Tool 对象（内部只有 11 字段）
+retention：snapshots() 与 collector.records() 完全一致（已淘汰不可恢复）
+独立性  ：旧快照不随 Collector 的 append / 淘汰而变化
+Metrics ：仍由 ToolExecutionMetricsService 基于 Records 计算（不经 Snapshot）
+只读    ：snapshots*() 不改变 Collector；Query Service 仍无 clear()
+```
+
+### 未修改 / 未引入
+
+```text
+未修改：ToolExecutionRecord / ToolExecutionMetricsService /
+        InMemoryToolExecutionCollector（retention）/ ToolExecutionService /
+        ToolExecutionObserver / ToolExecutionContext / AIOrchestrator /
+        Router / ToolRegistry / ToolResult / ToolChatService /
+        API（0 修改）/ Composition Root / main.py / DB schema
+未引入：HTTP API / Dashboard / WebSocket / Database / Redis / Kafka /
+        Prometheus / OpenTelemetry / Audit / Event Bus / settings /
+        环境变量 / 后台线程 / 定时任务 / 分页 / 排序 / filter DSL /
+        序列化层（to_dict / JSON schema / Pydantic）
 ```
 
 ---

@@ -36,6 +36,35 @@
   (由 ProjectContextProvider.resolve() 解释为 ProjectContext.project_id)
 * 现有 ``/api/chat``（ChatService / RAG-only，Phase 3.5.6）行为**不变**：
   本端点是新增的 Orchestrator 总入口，不替换旧端点
+
+Phase 3.11 Step 19（Observability Composition Root / Lifecycle Contract）：
+
+    本模块同时是 Orchestrator 链路的 **Composition Root**（与既有
+    ``_TOOL_REGISTRY`` / ``_default_orchestrator`` 同一装配位置）：
+
+        Application Process
+            ↓ 仅此一处创建（service / core 模块不持有 Collector）
+        InMemoryToolExecutionCollector        （Application lifetime）
+            ↓ 同一对象；类型引用为 ToolExecutionObserver（Protocol）
+        ToolExecutionObserver
+            ↓ tool_execution_observer=...
+        AIOrchestratorService（默认 + per-project 各自实例）
+            ↓ TOOL 路径执行
+        ToolExecutionRecord → Collector
+
+    生命周期契约：
+
+        * Collector = Application lifetime（append / 只读查询 / 显式 clear；
+          **无** start / stop / flush / persist / close / TTL / max_records /
+          自动清理 / 后台任务 / 持久化）；
+        * request_id = 每次 ``AIOrchestratorService.execute()`` 独立
+          （Collector 共享**不**共享 request_id）；
+        * RAG / Text-to-SQL 路径 **0** Tool Record；capability denied **0** Record；
+        * Metrics 是只读下游：调用方在需要时 ``collector.records()`` →
+          ``ToolExecutionMetricsService.snapshot(...)``；本模块**不**创建
+          Snapshot / 不缓存 metrics / 不接 HTTP Metrics API；
+        * **无** ``get_default_collector()`` 之类工厂（避免隐式全局单例辅助）；
+          测试可自行构造 Collector 并注入 ``AIOrchestratorService``。
 """
 from __future__ import annotations
 
@@ -66,6 +95,10 @@ from backend.app.services.ai_router_service import (
     AIRouterService,
     ToolRegistryCapabilityAdapter,
 )
+from backend.app.services.in_memory_tool_execution_collector import (
+    InMemoryToolExecutionCollector,
+)
+from backend.app.services.tool_execution_observer import ToolExecutionObserver
 from backend.app.tools.get_inventory import build_default_tool_registry
 
 
@@ -195,11 +228,20 @@ class ChatResponse(BaseModel):
 # 的纵深防御约束）。
 _TOOL_REGISTRY = build_default_tool_registry()
 
+# Phase 3.11 Step 19：Observability Composition（Application lifetime）。
+# 仅本模块（Composition Root）创建 Collector；AIOrchestrator / 执行边界 /
+# Registry / Handler / Metrics 均**不**创建、不持有它（只接收 observer）。
+# 同一对象以 ToolExecutionObserver（Protocol）类型注入 → core 层不感知具体实现。
+_TOOL_EXECUTION_COLLECTOR = InMemoryToolExecutionCollector()
+_TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = _TOOL_EXECUTION_COLLECTOR
+
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     router=AIRouterService(
         tool_capabilities=ToolRegistryCapabilityAdapter(_TOOL_REGISTRY),
     ),
     tool_registry=_TOOL_REGISTRY,
+    # 观测出口（None 语义保留在 Orchestrator 层；此处显式装配 Application 级）
+    tool_execution_observer=_TOOL_EXECUTION_OBSERVER,
 )
 
 
@@ -238,6 +280,9 @@ def _build_orchestrator_for_project_id(
         build_orchestrator_for_project,
     )
 
+    # Phase 3.11 Step 19：观测出口随 base 继承（Factory 签名不变）——
+    # per-project Orchestrator 与默认 Orchestrator 共享同一 Application 级
+    # Collector（由本模块创建 / 持有），Factory 不创建也不接收该依赖。
     return build_orchestrator_for_project(
         project_id,
         base=_default_orchestrator,

@@ -133,6 +133,15 @@ def build_orchestrator_for_project(
                             构造 ``DefaultProjectConfigurationProvider``
                             （Factory 不再分别调用各 Provider）。
 
+    Observability（Phase 3.11 Step 19，**签名不变**）：
+
+        project-scoped Orchestrator 的观测出口**继承** ``base``：
+        ``base.tool_execution_observer`` → 同一 Application lifetime 内
+        per-project 与默认 Orchestrator 共享同一 Collector（由 Composition
+        Root / 调用方创建并持有；Factory **不**创建 Collector）。
+        base 无 observer（含 ``base=None`` 时构造的默认 base）→ ``None``
+        （0 Record，旧行为逐字不变）。
+
     Returns:
         新的 ``AIOrchestratorService``：
         - Router：新实例（capability 适配 per-project Tool Registry，
@@ -232,6 +241,13 @@ def build_orchestrator_for_project(
     if base is None:
         base = _build_default_base()
 
+    # ---- 4.5) Phase 3.11 Step 19：Observability 出口（不创建 Collector） ----
+    # 继承 base 的观测出口：同一 Application lifetime 内 per-project 与默认
+    # Orchestrator 共享同一 Collector（Collector 由 Composition Root 创建）；
+    # base 无 observer（含 base=None 的默认 base）→ None（0 Record，旧行为）。
+    # 保持 Factory 签名不变（HTTP 不能注入任何配置 / 观测依赖）。
+    resolved_observer = getattr(base, "tool_execution_observer", None)
+
     logger.info(
         "project orchestrator built",
         extra={
@@ -278,6 +294,9 @@ def build_orchestrator_for_project(
         # Phase 3.8.4：项目知识检索范围（服务器端 Provider 解析；
         # knowledge_enabled=False 时为 None，且 RAG 不可达）
         knowledge_scope=knowledge_scope,
+        # Phase 3.11 Step 19：Observability 出口（Application lifetime 共享；
+        # Collector 由 Composition Root / 调用方创建 —— Factory 不创建）
+        tool_execution_observer=resolved_observer,
     )
 
 

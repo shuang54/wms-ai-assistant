@@ -33,6 +33,13 @@ C20 AIOrchestrator Tool Observability Integration（Step 18）：TOOL 路径接�
     ToolExecutionObserver 注入；RAG / Text-to-SQL / capability denied
     均 0 Record；observer 失败不改变 ToolResult；不 retry / 不 fallback；
     不创建 Collector / 不接 API / 不持久化 / Metrics 仍为只读下游
+C21 Observability Composition / Lifecycle（Step 19）：Collector 由
+    Composition Root（api/orchestrator_chat.py）唯一创建并持有
+    （Application lifetime）；AIOrchestrator 只依赖 ToolExecutionObserver
+    Protocol；request_id 仍为 request lifetime；Collector 不自动 clear /
+    不持久化 / 无生命周期方法；Metrics 不进入 Composition Root；
+    API response contract / ToolResult / 失败语义不变；无全局单例 helper /
+    无第三方 DI 框架
 ```
 
 复用既有测试（**不**重复实现相同断言）：
@@ -97,6 +104,10 @@ _MODULE_PATHS = {
     "inventory": "backend/app/tools/get_inventory.py",
     "work_order": "backend/app/tools/get_work_order.py",
     "tool_chat": "backend/app/services/tool_chat_service.py",
+    # Phase 3.11 Step 19：Orchestrator 链路的 Composition Root + Service Factory
+    "orchestrator_chat": "backend/app/api/orchestrator_chat.py",
+    "factory": "backend/app/services/project_orchestrator_factory.py",
+    "collector": "backend/app/services/in_memory_tool_execution_collector.py",
 }
 
 #: 上层编排模块（Tool 不得依赖）
@@ -1481,4 +1492,285 @@ class TestC20OrchestratorToolObservability:
         # Orchestrator 不感知 Metrics（代码层无 import / 无标识符）
         haystack = _code_layer_haystack("orchestrator")
         for forbidden in ("metrics", "snapshot", "aggregate", "percentile"):
+            assert forbidden not in haystack, forbidden
+
+
+# ============================================================
+# C21. Observability Composition / Lifecycle（Phase 3.11 Step 19）
+# ============================================================
+
+def _constructs_collector(key: str) -> bool:
+    """模块内是否出现 ``InMemoryToolExecutionCollector(...)`` 构造。"""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "InMemoryToolExecutionCollector"
+        for node in ast.walk(_module_ast(key))
+    )
+
+
+def _calls_clear(key: str) -> bool:
+    """模块内是否出现 ``*.clear()`` 调用（自动清理的反面证据）。"""
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "clear"
+        for node in ast.walk(_module_ast(key))
+    )
+
+
+class TestC21ObservabilityComposition:
+    """C21：Observability 组件的**创建权 / 生命周期 / 依赖方向**（Step 19）。
+
+    行为细节见 ``tests/test_tool_observability_composition.py``；
+    本类只锁 Contract（结构 / 边界 / 生命周期语义）。
+    """
+
+    _QUESTION = "查询物料 MAT-001 当前库存"
+
+    # ---- C21.1 Collector 由 Composition Root 创建 ----
+
+    def test_c21_1_collector_created_by_composition_root(self) -> None:
+        for key in (
+            "orchestrator", "execution", "router", "extractor", "tool_chat",
+            "factory", "collector", "registry",
+        ):
+            assert _constructs_collector(key) is False, key
+        assert _constructs_collector("orchestrator_chat") is True
+
+    # ---- C21.2 AIOrchestrator 不创建 Collector ----
+
+    def test_c21_2_orchestrator_does_not_create_collector(self) -> None:
+        assert _constructs_collector("orchestrator") is False
+        source = _module_source("orchestrator")
+        assert "InMemoryToolExecutionCollector" not in source
+        assert "Collector()" not in source
+        assert "get_default_collector" not in source
+
+    # ---- C21.3 只依赖 ToolExecutionObserver（Protocol） ----
+
+    def test_c21_3_orchestrator_depends_on_observer_protocol_only(self) -> None:
+        import inspect
+
+        from backend.app.services.ai_orchestrator_service import (
+            AIOrchestratorService,
+        )
+
+        imports = _walk_imports(_module_ast("orchestrator"))
+        assert "backend.app.services.tool_execution_observer" in imports
+        assert not any("collector" in name for name in imports), imports
+        parameter = inspect.signature(
+            AIOrchestratorService.__init__
+        ).parameters["tool_execution_observer"]
+        assert "ToolExecutionObserver" in str(parameter.annotation)
+
+    # ---- C21.4 Application lifetime 共享同一 Collector ----
+
+    def test_c21_4_shared_collector_within_application_lifetime(self) -> None:
+        from backend.app.api import orchestrator_chat as root
+
+        assert root._TOOL_EXECUTION_OBSERVER is root._TOOL_EXECUTION_COLLECTOR
+        assert (
+            root._default_orchestrator.tool_execution_observer
+            is root._TOOL_EXECUTION_COLLECTOR
+        )
+        # Service Factory：继承 base 的观测出口（同一 Collector），
+        # 且**签名不变**（HTTP 不能注入任何配置 / 观测依赖）
+        import inspect
+
+        from backend.app.services.project_orchestrator_factory import (
+            build_orchestrator_for_project,
+        )
+
+        factory_source = _module_source("factory")
+        assert 'getattr(base, "tool_execution_observer", None)' in factory_source
+        assert "tool_execution_observer" not in inspect.signature(
+            build_orchestrator_for_project
+        ).parameters
+
+    # ---- C21.5 request_id 仍为 request lifetime（不共享） ----
+
+    def test_c21_5_request_id_remains_request_scoped(self) -> None:
+        haystack = _code_layer_haystack("orchestrator_chat")
+        for forbidden in ("uuid", "new_request_id", "request_id"):
+            assert forbidden not in haystack, forbidden
+        calls = [
+            node
+            for node in ast.walk(_module_ast("orchestrator"))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "new_request_id"
+        ]
+        assert len(calls) == 1          # 唯一 request_id 生成点（request lifetime）
+
+    # ---- C21.6 Collector 不自动 clear ----
+
+    def test_c21_6_collector_not_auto_cleared(self) -> None:
+        """无自动清理 / 无时间驱动淘汰。
+
+        Phase 3.11 Step 20：Collector 新增**条数**驱动的 retention
+        （``max_records``，见 C22）；但仍**无** TTL / 定时线程 / 定时任务，
+        也仍不被任何执行路径自动 ``clear()``。
+        """
+        for key in ("orchestrator_chat", "factory", "orchestrator"):
+            assert _calls_clear(key) is False, key
+        identifiers = _identifiers(_module_ast("collector"))
+        for forbidden in ("ttl", "timer", "schedule", "daemon"):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C21.7 Collector 不持久化 ----
+
+    def test_c21_7_collector_does_not_persist(self) -> None:
+        imports = _walk_imports(_module_ast("collector"))
+        for forbidden in (
+            "json", "pathlib", "os", "sqlalchemy", "redis", "kafka",
+            "celery", "pickle", "sqlite3",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+        haystack = _code_layer_haystack("orchestrator_chat")
+        for forbidden in ("sqlalchemy", "redis", "kafka", "celery", "pathlib"):
+            assert forbidden not in haystack, forbidden
+
+    # ---- C21.8 Metrics 不进入 Composition Root ----
+
+    def test_c21_8_metrics_not_in_composition_root(self) -> None:
+        for key in ("orchestrator_chat", "factory", "orchestrator", "collector"):
+            imports = _walk_imports(_module_ast(key))
+            assert not any("metrics" in name for name in imports), key
+        haystack = _code_layer_haystack("orchestrator_chat")
+        for forbidden in ("snapshot", "success_rate", "average_duration"):
+            assert forbidden not in haystack, forbidden
+
+    # ---- C21.9 API response contract 不变 ----
+
+    def test_c21_9_api_response_contract_unchanged(self) -> None:
+        from backend.app.api.orchestrator_chat import ChatResponse
+
+        assert set(ChatResponse.model_fields) == {
+            "route", "content", "data", "metadata",
+        }
+
+    # ---- C21.10 RAG / TEXT_TO_SQL 不产生 Tool Record ----
+
+    async def test_c21_10_non_tool_routes_create_zero_records(self) -> None:
+        from backend.app.services.in_memory_tool_execution_collector import (
+            InMemoryToolExecutionCollector,
+        )
+        from backend.app.services.sql_executor_service import (
+            SQLExecutionResult,
+        )
+        from backend.app.services.text_to_sql_service import TextToSQLResult
+
+        from tests.test_ai_orchestrator import (
+            _FakeRagResponse,
+            _rag_decision,
+            _sql_decision,
+        )
+
+        collector = InMemoryToolExecutionCollector()
+
+        rag_result = await _c20_orchestrator(
+            router=FakeRouter(_rag_decision()),
+            rag=FakeRAG(response=_FakeRagResponse("ok")),
+            observer=collector,
+        ).execute("采购入库怎么操作？")
+        sql_result = await _c20_orchestrator(
+            router=FakeRouter(_sql_decision()),
+            t2s=FakeTextToSQL(result=TextToSQLResult(
+                question="统计文档数量",
+                sql="SELECT count(*) FROM public.knowledge_document LIMIT 1",
+                validated=True, attempts=1,
+                referenced_tables=("public.knowledge_document",),
+            )),
+            sql_executor=FakeSQLExecutor(result=SQLExecutionResult(
+                columns=("count",), rows=((1,),), row_count=1,
+                truncated=False, execution_time_ms=1.0,
+            )),
+            observer=collector,
+        ).execute("统计当前知识库文档数量")
+
+        assert rag_result.route == RouteType.RAG
+        assert sql_result.route == RouteType.TEXT_TO_SQL
+        assert collector.records() == ()
+
+    # ---- C21.11 Tool 执行失败语义不变 ----
+
+    async def test_c21_11_tool_failure_semantics_unchanged(self) -> None:
+        from backend.app.services.in_memory_tool_execution_collector import (
+            InMemoryToolExecutionCollector,
+        )
+
+        collector = InMemoryToolExecutionCollector()
+
+        result = await _c20_orchestrator(
+            registry=ToolRegistry(), observer=collector
+        ).execute(self._QUESTION)
+
+        records = collector.records()
+        assert len(records) == 1
+        assert records[0].success is False          # 失败仍产生 1 条 Record
+        assert result.metadata["tool_success"] is False
+
+    # ---- C21.12 Observer failure isolation 不变 ----
+
+    async def test_c21_12_observer_failure_isolation_unchanged(self) -> None:
+        registry, handler = _c20_registry()
+        observer = _C20ExplodingObserver()
+
+        result = await _c20_orchestrator(
+            registry=registry, observer=observer
+        ).execute(self._QUESTION)
+
+        assert result.data.success is True          # ToolResult 未被改写
+        assert handler.calls == 1                   # 无 retry / 无重跑
+        assert observer.calls == 1
+
+    # ---- C21.13 无第三方 DI 框架 ----
+
+    def test_c21_13_no_third_party_di_framework(self) -> None:
+        for key in ("orchestrator_chat", "factory", "orchestrator"):
+            imports = _walk_imports(_module_ast(key))
+            for forbidden in (
+                "dependency_injector", "injector", "punq", "lagom",
+            ):
+                assert not any(
+                    name == forbidden or name.startswith(forbidden + ".")
+                    for name in imports
+                ), (key, forbidden)
+
+    # ---- C21.14 无 global singleton helper ----
+
+    def test_c21_14_no_global_singleton_helper(self) -> None:
+        collector_tree = _module_ast("collector")
+        assert not any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith(("get_default", "get_global"))
+            for node in collector_tree.body
+        )
+        # Collector 模块无模块级实例（实例只在 Composition Root 创建）
+        assert not any(
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "InMemoryToolExecutionCollector"
+            for node in collector_tree.body
+        )
+        haystack = _code_layer_haystack("orchestrator_chat")
+        assert "get_default_collector" not in haystack
+        assert "_global_collector" not in haystack
+
+    # ---- C21.15 Composition Root 只持有 Composition 对象 ----
+
+    def test_c21_15_composition_root_holds_only_composition_objects(self) -> None:
+        from backend.app.api import orchestrator_chat as root
+
+        collector = root._TOOL_EXECUTION_COLLECTOR
+        assert set(vars(collector)) == {"_max_records", "_records", "_lock"}
+        haystack = _code_layer_haystack("orchestrator_chat")
+        for forbidden in (
+            "create_engine", "get_engine", "create_llm_client", "session",
+        ):
             assert forbidden not in haystack, forbidden

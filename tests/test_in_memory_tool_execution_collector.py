@@ -26,6 +26,9 @@ Determinism（同插入顺序 → 同查询结果）
 统计禁用（无 count / success_rate / p95 …）
 无单例（显式实例）/ 输入校验 / 线程安全 smoke
 集成：ToolExecutionService（成功 + 失败）/ ToolChatService（round 1,2,3 + request_id）
+Retention（Phase 3.11 Step 20）：max_records 校验 / FIFO 淘汰 / 查询窗口 /
+    Metrics 只读当前窗口 / clear 语义 / 并发 append + 淘汰 / 不可变快照 /
+    无 TTL·后台清理·持久化
 ```
 
 0 DB / 0 Network / 0 Real LLM。
@@ -491,7 +494,11 @@ class TestSecurityAndDeterminism:
         )
 
     def test_no_aggregation_api(self) -> None:
-        """无 count / success_rate / 分位数等统计（属 Metrics，后续阶段）。"""
+        """无 count / success_rate / 分位数等统计（属 Metrics，后续阶段）。
+
+        Phase 3.11 Step 20：新增只读 ``max_records``（retention 窗口参数），
+        仍不含任何统计 API。
+        """
         public = {
             name
             for name in dir(InMemoryToolExecutionCollector)
@@ -499,6 +506,7 @@ class TestSecurityAndDeterminism:
         }
         assert public == {
             "clear",
+            "max_records",
             "on_execution",
             "records",
             "records_by_project_id",
@@ -527,7 +535,7 @@ class TestSecurityAndDeterminism:
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module)
         assert imported <= {
-            "__future__", "threading", "collections.abc",
+            "__future__", "threading", "collections", "collections.abc",
             "backend.app.services.tool_execution_record",
         }, imported
         for forbidden in (
@@ -723,3 +731,398 @@ class TestIntegrationWithBoundary:
             ToolExecutionService(
                 registry=_mock_registry(), observer="not-an-observer"  # type: ignore[arg-type]
             )
+
+
+# ============================================================
+# Phase 3.11 Step 20：Retention / Capacity（max_records）
+# ============================================================
+
+def _retention_collector(
+    max_records: int, count: int
+) -> tuple[InMemoryToolExecutionCollector, list[ToolExecutionRecord]]:
+    """构造有界 Collector 并写入 ``count`` 条（request_id = req-0…）。"""
+    collector = InMemoryToolExecutionCollector(max_records=max_records)
+    records = [
+        _record(
+            request_id=f"req-{index}",
+            tool_name=(
+                "get_inventory" if index % 2 == 0 else "get_work_order"
+            ),
+            project_id="project-a" if index % 3 == 0 else None,
+            success=index % 2 == 0,
+        )
+        for index in range(count)
+    ]
+    for record in records:
+        collector.on_execution(record)
+    return collector, records
+
+
+class TestRetentionConfiguration:
+    def test_default_max_records(self) -> None:
+        from backend.app.services.in_memory_tool_execution_collector import (
+            DEFAULT_MAX_RECORDS,
+        )
+
+        collector = InMemoryToolExecutionCollector()
+        assert collector.max_records == DEFAULT_MAX_RECORDS == 1000
+
+    def test_explicit_max_records(self) -> None:
+        assert InMemoryToolExecutionCollector(max_records=7).max_records == 7
+
+    def test_minimal_window_of_one(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=1)
+        first, second = _record(request_id="req-1"), _record(
+            request_id="req-2"
+        )
+
+        collector.on_execution(first)
+        assert collector.records() == (first,)
+
+        collector.on_execution(second)
+        assert collector.records() == (second,)      # 只保留最新 1 条
+
+    @pytest.mark.parametrize("bad", [True, False, 1.5, 1.0, "100", None])
+    def test_non_int_rejected_with_type_error(self, bad: Any) -> None:
+        with pytest.raises(TypeError):
+            InMemoryToolExecutionCollector(max_records=bad)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", [0, -1, -100])
+    def test_non_positive_rejected_with_value_error(self, bad: int) -> None:
+        with pytest.raises(ValueError):
+            InMemoryToolExecutionCollector(max_records=bad)
+
+    def test_max_records_is_read_only_property(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=5)
+        assert collector.max_records == 5
+        with pytest.raises(AttributeError):
+            collector.max_records = 10  # type: ignore[misc]
+
+
+class TestFifoRetention:
+    def test_under_capacity_keeps_all(self) -> None:
+        collector, records = _retention_collector(max_records=5, count=3)
+        assert collector.records() == tuple(records)
+
+    def test_exactly_capacity_keeps_all(self) -> None:
+        collector, records = _retention_collector(max_records=3, count=3)
+        assert collector.records() == tuple(records)
+        assert len(collector.records()) == 3
+
+    def test_one_over_capacity_evicts_oldest(self) -> None:
+        collector, records = _retention_collector(max_records=3, count=3)
+        fourth = _record(request_id="req-new")
+
+        collector.on_execution(fourth)
+
+        assert collector.records() == (*records[1:], fourth)
+
+    def test_multiple_evictions_keep_newest_n(self) -> None:
+        collector, records = _retention_collector(max_records=3, count=6)
+        assert collector.records() == tuple(records[-3:])
+
+    def test_oldest_evicted_identity(self) -> None:
+        collector, records = _retention_collector(max_records=2, count=3)
+        retained = collector.records()
+        assert records[0] not in retained            # A 已淘汰
+        assert retained == (records[1], records[2])
+
+    def test_retention_is_fifo_not_lru(self) -> None:
+        """读取（查询）不刷新顺序：FIFO 只按写入顺序淘汰。"""
+        collector, records = _retention_collector(max_records=3, count=3)
+        for _ in range(5):                            # 反复读取最旧记录
+            collector.records()
+            collector.records_by_request_id("req-0")
+
+        fourth = _record(request_id="req-new")
+        collector.on_execution(fourth)
+
+        assert collector.records() == (*records[1:], fourth)
+
+
+class TestRetentionQueryApis:
+    def test_records_respects_retention(self) -> None:
+        collector, records = _retention_collector(max_records=3, count=5)
+        assert collector.records() == tuple(records[-3:])
+
+    def test_request_query_respects_retention(self) -> None:
+        collector, _records = _retention_collector(max_records=3, count=5)
+
+        assert collector.records_by_request_id("req-0") == ()   # 已淘汰
+        assert collector.records_by_request_id("req-1") == ()   # 已淘汰
+        assert len(collector.records_by_request_id("req-4")) == 1
+
+    def test_project_query_respects_retention(self) -> None:
+        collector, _records = _retention_collector(max_records=2, count=4)
+        # 保留 index 2（project_id=None）/ index 3（project-a）
+        assert len(collector.records_by_project_id("project-a")) == 1
+        assert len(collector.records_by_project_id(None)) == 1
+        # 已淘汰者（index 0 → project-a）不再出现
+        assert collector.records_by_request_id("req-0") == ()
+
+    def test_tool_query_respects_retention(self) -> None:
+        collector, _records = _retention_collector(max_records=2, count=4)
+        # 保留 index 2（get_inventory）/ 3（get_work_order）
+        assert len(collector.records_by_tool_name("get_inventory")) == 1
+        assert len(collector.records_by_tool_name("get_work_order")) == 1
+        assert collector.records_by_tool_name("unknown_tool") == ()
+
+    def test_evicted_record_not_recoverable_from_any_api(self) -> None:
+        collector, records = _retention_collector(max_records=2, count=3)
+        evicted = records[0]
+
+        assert evicted not in collector.records()
+        assert evicted not in collector.records_by_request_id(
+            evicted.request_id
+        )
+        assert evicted not in collector.records_by_project_id(
+            evicted.project_id
+        )
+        assert evicted not in collector.records_by_tool_name(evicted.tool_name)
+
+
+class TestRetentionMetrics:
+    def test_metrics_only_counts_retained_records(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        collector = InMemoryToolExecutionCollector(max_records=3)
+        # A success / B success / C failure / D success
+        collector.on_execution(_record(request_id="req-A", success=True))
+        collector.on_execution(_record(request_id="req-B", success=True))
+        collector.on_execution(_record(request_id="req-C", success=False))
+        collector.on_execution(_record(request_id="req-D", success=True))
+
+        snapshot = ToolExecutionMetricsService.snapshot(collector.records())
+
+        assert snapshot.total_count == 3
+        assert snapshot.success_count == 2
+        assert snapshot.failure_count == 1
+
+    def test_evicted_record_absent_from_metrics(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        collector = InMemoryToolExecutionCollector(max_records=1)
+        collector.on_execution(_record(request_id="req-old", success=False))
+        collector.on_execution(_record(request_id="req-new", success=True))
+
+        snapshot = ToolExecutionMetricsService.snapshot(collector.records())
+
+        assert snapshot.total_count == 1        # evicted 的 failure 不可见
+        assert snapshot.success_count == 1
+        assert snapshot.failure_count == 0
+        assert snapshot.failure_rate == 0.0
+
+    def test_metrics_after_clear_is_empty_semantics(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        collector = InMemoryToolExecutionCollector(max_records=2)
+        collector.on_execution(_record())
+        collector.clear()
+
+        snapshot = ToolExecutionMetricsService.snapshot(collector.records())
+
+        assert snapshot.total_count == 0
+        assert snapshot.success_rate is None
+        assert snapshot.average_duration_ms is None
+        assert snapshot.max_duration_ms is None
+
+
+class TestRetentionClear:
+    def test_clear_empties_window(self) -> None:
+        collector, _records = _retention_collector(max_records=3, count=3)
+        collector.clear()
+        assert collector.records() == ()
+
+    def test_append_after_clear_respects_capacity(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=2)
+        collector.on_execution(_record(request_id="req-0"))
+        collector.clear()
+
+        fresh = [
+            _record(request_id=f"req-{index}") for index in range(3)
+        ]
+        for record in fresh:
+            collector.on_execution(record)
+
+        assert collector.records() == tuple(fresh[-2:])
+        assert collector.max_records == 2
+
+
+class TestRetentionThreadSafety:
+    def test_concurrent_append_final_count_within_capacity(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=10)
+
+        def worker(worker_id: int) -> None:
+            for index in range(50):
+                collector.on_execution(
+                    _record(
+                        request_id=f"req-{worker_id}",
+                        round=index + 1,
+                    )
+                )
+
+        threads = [
+            threading.Thread(target=worker, args=(wid,)) for wid in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        records = collector.records()
+        assert len(records) == 10                 # 恰好窗口大小
+        assert len(records) <= collector.max_records
+
+    def test_concurrent_append_no_duplicate_or_corrupt_records(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=25)
+
+        def worker(worker_id: int) -> None:
+            for index in range(40):
+                collector.on_execution(
+                    _record(request_id=f"req-{worker_id}", round=index + 1)
+                )
+
+        threads = [
+            threading.Thread(target=worker, args=(wid,)) for wid in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        snapshot = collector.records()
+        assert len({id(record) for record in snapshot}) == len(snapshot)
+        for record in snapshot:
+            assert isinstance(record, ToolExecutionRecord)
+            record.assert_field_whitelist()
+            assert record.round >= 1
+
+    def test_snapshot_never_exceeds_capacity(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=5)
+        stop = threading.Event()
+        observed: list[int] = []
+
+        def writer() -> None:
+            index = 0
+            while not stop.is_set():
+                index += 1
+                collector.on_execution(
+                    _record(request_id=f"req-{index}", round=index)
+                )
+
+        def reader() -> None:
+            for _ in range(300):
+                observed.append(len(collector.records()))
+
+        threads = [threading.Thread(target=writer)] + [
+            threading.Thread(target=reader) for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads[1:]:
+            thread.join()
+        stop.set()
+        threads[0].join()
+
+        assert observed and max(observed) <= 5
+
+
+class TestRetentionImmutability:
+    def test_records_returns_tuple_under_retention(self) -> None:
+        collector, _records = _retention_collector(max_records=2, count=4)
+        snapshot = collector.records()
+        assert isinstance(snapshot, tuple)
+        with pytest.raises(AttributeError):
+            snapshot.append(object())  # type: ignore[attr-defined]
+
+    def test_snapshot_stable_after_eviction(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=2)
+        first, second = _record(request_id="req-1"), _record(
+            request_id="req-2"
+        )
+        collector.on_execution(first)
+        collector.on_execution(second)
+
+        snapshot = collector.records()
+        collector.on_execution(_record(request_id="req-3"))
+
+        assert snapshot == (first, second)        # 旧快照不受淘汰影响
+        assert len(collector.records()) == 2
+
+    def test_record_not_modified_by_retention(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=1)
+        record = _record(request_id="req-keep", project_id="project-a")
+        before = dataclasses.asdict(record)
+
+        collector.on_execution(record)
+        collector.on_execution(_record(request_id="req-evicts"))  # 淘汰旧者
+        collector.on_execution(record)                            # 重新写入
+
+        assert dataclasses.asdict(collector.records()[0]) == before
+        assert collector.records()[0] is record
+
+
+class TestRetentionSecurity:
+    def test_no_ttl_or_background_identifiers(self) -> None:
+        import ast
+        import inspect
+
+        from backend.app.services import (
+            in_memory_tool_execution_collector as module,
+        )
+
+        tree = ast.parse(inspect.getsource(module))
+        identifiers = {
+            node.id.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+        } | {
+            node.attr.lower()
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+        }
+        for forbidden in (
+            "ttl", "timer", "sleep", "daemon", "schedule", "monotonic",
+            "create_task", "thread",
+        ):
+            assert forbidden not in identifiers, forbidden
+        assert "threading.Thread" not in inspect.getsource(module)
+
+    def test_collector_holds_no_external_capability(self) -> None:
+        collector = InMemoryToolExecutionCollector(max_records=3)
+        assert set(vars(collector)) == {"_max_records", "_records", "_lock"}
+        for forbidden in (
+            "engine", "session", "connect", "execute", "registry",
+            "handler", "llm", "client",
+        ):
+            assert not hasattr(collector, forbidden), forbidden
+
+    def test_no_persistence_imports(self) -> None:
+        import ast
+        import inspect
+
+        from backend.app.services import (
+            in_memory_tool_execution_collector as module,
+        )
+
+        tree = ast.parse(inspect.getsource(module))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        for forbidden in (
+            "json", "pathlib", "os", "sqlalchemy", "redis", "kafka",
+            "celery", "pickle", "sqlite3",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imported
+            ), forbidden
