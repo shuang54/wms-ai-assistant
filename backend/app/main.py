@@ -18,6 +18,7 @@ from backend.app.api import (
     orchestrator_chat,
     rag,
     tool_chat,
+    tool_observability,
     usage,
 )
 from backend.app.config import settings
@@ -41,6 +42,9 @@ def create_app() -> FastAPI:
         orchestrator_chat.router, prefix="/api", tags=["ai-chat"]
     )
     app.include_router(usage.router, prefix="/api", tags=["usage"])
+    app.include_router(
+        tool_observability.router, prefix="/api", tags=["observability"]
+    )
     return app
 
 

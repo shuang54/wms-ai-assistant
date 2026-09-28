@@ -2896,3 +2896,509 @@ class _CountingExecution(ToolExecutionService):
         return await super().execute(
             tool_name, arguments=arguments, context=context
         )
+
+
+# ============================================================
+# C26. Tool Observability Serialization Boundary（Phase 3.11 Step 24）
+# ============================================================
+
+_C26_SERIALIZATION_MODULE = (
+    "backend/app/services/tool_observability_serialization.py"
+)
+
+
+class TestC26SerializationBoundary:
+    """C26：Read Model → JSON-safe dict 的转换边界（只读 / 纯函数 / 不改语义）。
+
+        C26.1  Snapshot → JSON-safe dict
+        C26.2  Metrics → JSON-safe dict
+        C26.3  Explicit field mapping
+        C26.4  不使用 vars / asdict / __dict__
+        C26.5  datetime → ISO 8601
+        C26.6  timezone preserved
+        C26.7  None 语义保留（不写成 0）
+        C26.8  no extra fields
+        C26.9  no forbidden fields
+        C26.10 no mutation
+        C26.11 deterministic
+        C26.12 no DB
+        C26.13 no LLM
+        C26.14 no Tool execution
+        C26.15 no HTTP API
+
+    行为细节见 ``tests/test_tool_observability_serialization.py``；
+    本类只锁 Contract（结构 / 依赖方向 / 边界）。
+    """
+
+    _EXPECTED_SNAPSHOT_FIELDS = (
+        "request_id", "round", "tool_name", "started_at", "finished_at",
+        "duration_ms", "success", "project_id", "tool_call_id",
+        "error_code", "error_type",
+    )
+    _EXPECTED_METRICS_FIELDS = (
+        "total_count", "success_count", "failure_count", "success_rate",
+        "failure_rate", "total_duration_ms", "average_duration_ms",
+        "max_duration_ms",
+    )
+
+    def _snapshot(self):
+        from backend.app.services.tool_observability_snapshot import (
+            ToolExecutionSnapshot,
+        )
+
+        return ToolExecutionSnapshot.from_record(_c22_record())
+
+    def _metrics(self):
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+
+        return ToolExecutionMetricsService.snapshot(
+            (_c22_record(), _c22_record(success=False))
+        )
+
+    # ---- C26.1 / C26.2 JSON-safe dict ----
+
+    def test_c26_1_and_2_json_safe_dicts(self) -> None:
+        import json
+
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+            snapshot_to_dict,
+        )
+
+        snapshot_dict = snapshot_to_dict(self._snapshot())
+        metrics_dict = metrics_to_dict(self._metrics())
+
+        for serialized in (snapshot_dict, metrics_dict):
+            assert isinstance(serialized, dict)
+            for value in serialized.values():
+                assert isinstance(
+                    value, (str, int, float, bool, type(None))
+                ), value
+            json.dumps(serialized)
+
+    # ---- C26.3 explicit field mapping ----
+
+    def test_c26_3_explicit_field_mapping(self) -> None:
+        source = _source(_C26_SERIALIZATION_MODULE)
+
+        for field_name in self._EXPECTED_SNAPSHOT_FIELDS:
+            assert f"snapshot.{field_name}" in source, field_name
+        for field_name in self._EXPECTED_METRICS_FIELDS:
+            assert f"metrics.{field_name}" in source, field_name
+
+    # ---- C26.4 no automatic serialization ----
+
+    def test_c26_4_no_automatic_serialization(self) -> None:
+        tree = _tree(_C26_SERIALIZATION_MODULE)
+        calls = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert not (calls & {"vars", "asdict"}), calls
+        identifiers = _identifiers(tree)
+        assert "__dict__" not in identifiers
+        assert "model_dump" not in identifiers
+
+    # ---- C26.5 / C26.6 datetime → ISO 8601 + timezone ----
+
+    def test_c26_5_and_6_datetime_iso8601_with_timezone(self) -> None:
+        from backend.app.services.tool_observability_serialization import (
+            snapshot_to_dict,
+        )
+
+        result = snapshot_to_dict(self._snapshot())
+
+        assert isinstance(result["started_at"], str)
+        assert result["started_at"].endswith("+00:00")
+        assert result["started_at"] == (
+            self._snapshot().started_at.isoformat()
+        )
+        assert "T" in result["finished_at"]
+
+    # ---- C26.7 None semantics ----
+
+    def test_c26_7_none_semantics_preserved(self) -> None:
+        from backend.app.services.tool_execution_metrics_service import (
+            ToolExecutionMetricsService,
+        )
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+        )
+
+        empty = metrics_to_dict(ToolExecutionMetricsService.snapshot(()))
+
+        assert empty["success_rate"] is None
+        assert empty["failure_rate"] is None
+        assert empty["average_duration_ms"] is None
+        assert empty["max_duration_ms"] is None
+        assert empty["total_duration_ms"] == 0.0
+
+    # ---- C26.8 no extra fields ----
+
+    def test_c26_8_no_extra_fields(self) -> None:
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+            snapshot_to_dict,
+        )
+
+        assert set(snapshot_to_dict(self._snapshot())) == set(
+            self._EXPECTED_SNAPSHOT_FIELDS
+        )
+        assert set(metrics_to_dict(self._metrics())) == set(
+            self._EXPECTED_METRICS_FIELDS
+        )
+
+    # ---- C26.9 no forbidden fields ----
+
+    def test_c26_9_no_forbidden_fields(self) -> None:
+        import json
+
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+            snapshot_to_dict,
+        )
+
+        blob = json.dumps(
+            [snapshot_to_dict(self._snapshot()), metrics_to_dict(self._metrics())],
+            ensure_ascii=False,
+        )
+        for forbidden in (
+            "arguments", "sql", "result", "prompt", "password", "api_key",
+            "Authorization", "Traceback", "postgresql://", "SELECT",
+        ):
+            assert forbidden not in blob, forbidden
+
+    # ---- C26.10 no mutation ----
+
+    def test_c26_10_no_mutation(self) -> None:
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+            snapshot_to_dict,
+        )
+
+        snapshot = self._snapshot()
+        metrics = self._metrics()
+        snapshot_before, metrics_before = repr(snapshot), repr(metrics)
+
+        snapshot_to_dict(snapshot)
+        metrics_to_dict(metrics)
+
+        assert repr(snapshot) == snapshot_before
+        assert repr(metrics) == metrics_before
+
+    # ---- C26.11 deterministic ----
+
+    def test_c26_11_deterministic(self) -> None:
+        from backend.app.services.tool_observability_serialization import (
+            metrics_to_dict,
+            snapshot_to_dict,
+        )
+
+        snapshot = self._snapshot()
+        metrics = self._metrics()
+
+        assert snapshot_to_dict(snapshot) == snapshot_to_dict(snapshot)
+        assert metrics_to_dict(metrics) == metrics_to_dict(metrics)
+
+    # ---- C26.12 ~ C26.14 无 DB / LLM / Tool 执行 ----
+
+    def test_c26_12_to_14_no_db_llm_or_tool_execution(self) -> None:
+        tree = _tree(_C26_SERIALIZATION_MODULE)
+        imports = _walk_imports(tree)
+        for forbidden in (
+            "sqlalchemy", "psycopg", "redis", "kafka", "celery", "httpx",
+            "requests", "json", "pathlib", "os", "subprocess",
+            "backend.app.db", "backend.app.llm", "backend.app.tools",
+            "backend.app.api",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+        identifiers = _identifiers(tree)
+        for forbidden in (
+            "execute", "registry", "handler", "session", "engine", "commit",
+            "now", "perf_counter", "random", "uuid", "open",
+        ):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C26.15 无 HTTP API ----
+
+    def test_c26_15_no_http_api(self) -> None:
+        tree = _tree(_C26_SERIALIZATION_MODULE)
+        imports = _walk_imports(tree)
+        assert not any(
+            name.startswith("fastapi") for name in imports
+        ), imports
+        identifiers = _identifiers(tree)
+        for forbidden in (
+            "apireuter", "fastapi", "response", "request", "depends",
+            "status_code", "endpoint",
+        ):
+            assert forbidden not in identifiers, forbidden
+
+        api_dir = os.path.join(REPO_ROOT, "backend", "app", "api")
+        for filename in sorted(os.listdir(api_dir)):
+            if not filename.endswith(".py"):
+                continue
+            if filename == "tool_observability.py":
+                # Step 25：唯一被允许的序列化边界消费方（Read API）
+                continue
+            with open(
+                os.path.join(api_dir, filename), encoding="utf-8"
+            ) as handle:
+                api_source = handle.read()
+            assert (
+                "tool_observability_serialization" not in api_source
+            ), filename
+            assert "snapshot_to_dict" not in api_source, filename
+
+
+# ============================================================
+# C27. Tool Observability HTTP Read Boundary（Phase 3.11 Step 25）
+# ============================================================
+
+_C27_API_MODULE = "backend/app/api/tool_observability.py"
+
+
+class TestC27HttpReadBoundary:
+    """C27：Tool Observability **只读** HTTP 边界。
+
+        C27.1  GET records 只读                C27.2  GET metrics 只读
+        C27.3  API → QueryService only         C27.4  API ↛ Collector
+        C27.5  API ↛ ToolExecutionService      C27.6  API ↛ ToolRegistry
+        C27.7  API ↛ Tool Handler              C27.8  使用 Snapshot Read Model
+        C27.9  使用 Serialization Boundary     C27.10 API 不计算 Metrics
+        C27.11 API 不创建 Collector            C27.12 使用 Application Collector
+        C27.13 GET 不触发 Tool 执行            C27.14~16 无 DB / LLM / 持久化
+        C27.17 响应无凭据                      C27.18 响应无 Tool args/result
+        C27.19 Metrics 无 identifier           C27.20 无 Query DSL
+
+    行为细节见 ``tests/test_tool_observability_api.py``；
+    本类只锁 Contract（结构 / 依赖方向 / 边界）。
+    """
+
+    @staticmethod
+    def _record(
+        *,
+        request_id: str = "req-c27",
+        success: bool = True,
+        duration_ms: float = 5.0,
+        project_id: str | None = "project-a",
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from backend.app.services.tool_execution_record import (
+            ToolExecutionRecord,
+        )
+
+        started = datetime(2026, 9, 26, 10, 20, 30, tzinfo=timezone.utc)
+        return ToolExecutionRecord(
+            request_id=request_id,
+            round=1,
+            tool_name="get_inventory",
+            started_at=started,
+            finished_at=started + timedelta(milliseconds=duration_ms),
+            duration_ms=duration_ms,
+            success=success,
+            project_id=project_id,
+            error_type=None if success else "ToolValidationError",
+        )
+
+    @classmethod
+    def _client(cls):
+        from fastapi.testclient import TestClient
+
+        from backend.app.api import orchestrator_chat as root
+        from backend.app.main import app
+
+        root._TOOL_EXECUTION_COLLECTOR.clear()
+        return TestClient(app), root
+
+    # ---- C27.1 / C27.2 read-only ----
+
+    def test_c27_1_and_2_only_get_endpoints(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        methods = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "router"
+        }
+        assert methods == {"get"}, methods
+        for forbidden in ("post", "put", "delete", "patch"):
+            assert forbidden not in methods, forbidden
+
+    def test_c27_1_and_2_get_does_not_change_collector_state(self) -> None:
+        client, root = self._client()
+        try:
+            root._TOOL_EXECUTION_COLLECTOR.on_execution(self._record())
+            before = root._TOOL_EXECUTION_COLLECTOR.records()
+
+            client.get("/api/observability/tools")
+            client.get("/api/observability/tools/metrics")
+
+            assert root._TOOL_EXECUTION_COLLECTOR.records() == before
+        finally:
+            root._TOOL_EXECUTION_COLLECTOR.clear()
+
+    # ---- C27.3 ~ C27.7 依赖方向 ----
+
+    def test_c27_3_to_7_dependency_direction(self) -> None:
+        imports = _walk_imports(_tree(_C27_API_MODULE))
+        for forbidden in (
+            "backend.app.services.in_memory_tool_execution_collector",
+            "backend.app.services.tool_execution_record",
+            "backend.app.services.tool_execution_service",
+            "backend.app.services.tool_execution_observer",
+            "backend.app.services.ai_orchestrator_service",
+            "backend.app.tools",
+            "backend.app.db",
+            "backend.app.llm",
+            "sqlalchemy",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+        # 唯一数据来源 = Composition Root 的 QueryService accessor
+        assert (
+            "backend.app.api.orchestrator_chat" in imports
+            or "get_tool_observability_query_service"
+            in _identifiers(_tree(_C27_API_MODULE))
+        )
+
+    # ---- C27.8 / C27.9 Read Model + Serialization ----
+
+    def test_c27_8_and_9_read_model_and_serialization(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        identifiers = _identifiers(tree)
+        for required in ("snapshots", "snapshot_to_dict", "metrics_to_dict"):
+            assert required in identifiers, required
+        for forbidden in ("isoformat", "asdict", "vars"):
+            assert forbidden not in identifiers, forbidden
+        # 不绕过 Read Model 直取 Record：无 ``query.records()`` 调用
+        assert not [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "records"
+            and isinstance(node.value, ast.Name)
+        ]
+
+    # ---- C27.10 / C27.20 不计算 / 无 DSL ----
+
+    def test_c27_10_api_does_not_calculate_metrics(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp):
+                assert not isinstance(node.op, (ast.Div, ast.FloorDiv))
+        identifiers = _identifiers(tree)
+        for forbidden in ("sum", "max", "min", "mean", "statistics", "round"):
+            assert forbidden not in identifiers, forbidden
+
+    def test_c27_20_no_query_dsl(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        params = [
+            arg.arg
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for arg in node.args.args
+        ]
+        assert params == [], params
+        assert not [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "fastapi"
+            and any(alias.name == "Query" for alias in node.names)
+        ]
+        identifiers = _identifiers(tree)
+        for forbidden in ("params", "limit", "offset", "sort", "filter"):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C27.11 / C27.12 Collector ----
+
+    def test_c27_11_api_does_not_create_collector(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        identifiers = _identifiers(tree)          # 不含 docstring 文本
+        assert "inmemorytoolexecutioncollector" not in identifiers
+        assert not [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.endswith("Collector")
+        ]
+
+    def test_c27_12_uses_application_collector(self) -> None:
+        from backend.app.api import orchestrator_chat as root
+        from backend.app.api import tool_observability as api
+
+        query = api.get_tool_observability_query_service()
+
+        assert query.collector is root._TOOL_EXECUTION_COLLECTOR
+
+    # ---- C27.13 GET 不触发 Tool 执行 ----
+
+    def test_c27_13_get_does_not_execute_tool(self) -> None:
+        client, root = self._client()
+        try:
+            payload = client.get("/api/observability/tools").json()
+            assert payload == {"records": []}
+            assert root._TOOL_EXECUTION_COLLECTOR.records() == ()
+        finally:
+            root._TOOL_EXECUTION_COLLECTOR.clear()
+
+    # ---- C27.14 ~ C27.16 无 DB / LLM / 持久化 ----
+
+    def test_c27_14_to_16_no_db_llm_or_persistence(self) -> None:
+        tree = _tree(_C27_API_MODULE)
+        imports = _walk_imports(tree)
+        for forbidden in (
+            "sqlalchemy", "psycopg", "redis", "kafka", "celery",
+            "backend.app.db", "backend.app.llm", "pathlib", "pickle",
+        ):
+            assert not any(
+                name == forbidden or name.startswith(forbidden + ".")
+                for name in imports
+            ), forbidden
+        identifiers = _identifiers(tree)
+        for forbidden in (
+            "session", "engine", "commit", "open", "dump", "save", "persist",
+        ):
+            assert forbidden not in identifiers, forbidden
+
+    # ---- C27.17 ~ C27.19 响应安全 ----
+
+    def test_c27_17_to_19_response_security(self) -> None:
+        client, root = self._client()
+        try:
+            root._TOOL_EXECUTION_COLLECTOR.on_execution(
+                self._record(request_id="req-secret-1", project_id="project-a")
+            )
+            root._TOOL_EXECUTION_COLLECTOR.on_execution(
+                self._record(request_id="req-secret-2", success=False)
+            )
+            records_text = client.get("/api/observability/tools").text
+            metrics_text = client.get("/api/observability/tools/metrics").text
+            metrics_payload = client.get(
+                "/api/observability/tools/metrics"
+            ).json()
+
+            for forbidden in (
+                "SELECT", "postgresql://", "password", "api_key",
+                "Authorization", "Bearer ", "Traceback", "MAT-001",
+                "arguments", "result",
+            ):
+                assert forbidden not in records_text, forbidden
+                assert forbidden not in metrics_text, forbidden
+            for key in ("request_id", "project_id", "tool_name"):
+                assert key not in metrics_payload, key
+            assert "req-secret-1" not in metrics_text
+        finally:
+            root._TOOL_EXECUTION_COLLECTOR.clear()

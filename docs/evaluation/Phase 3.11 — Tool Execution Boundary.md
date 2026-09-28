@@ -7,6 +7,14 @@
 > `_resolve_tool_name` / `_extract_tool_arguments_from_question` 实现均已删除——
 > Tool 选择统一于 Router（Step 3），参数提取迁至 `ToolArgumentExtractor`（Step 6）。
 > 当前架构：`docs/architecture.md` §8.23 / §8.24 / §8.25。
+>
+> Historical note（Phase 3.11 Step 23 Audit 补充）：本文 §5 记录的
+> "链路 B 绕开 Orchestrator：ToolChatService 直接 `registry.execute()`"
+> 是 **Step 1 勘察时点**的现状；该直连已在 **Step 9** 迁移为
+> `ToolChatService → ToolExecutionService → ToolRegistry`（见
+> `docs/evaluation/Phase 3.11 Step 9 — ToolChatService Execution Boundary Migration.md`）。
+> 本文其余"现状"描述同理按各自 Step 时点理解；Step 23 的架构审计结论见
+> `docs/evaluation/Phase 3.11 Step 23 — Tool Observability Architecture Hardening & Contract Audit.md`。
 
 ---
 

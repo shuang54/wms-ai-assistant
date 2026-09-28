@@ -99,6 +99,9 @@ from backend.app.services.in_memory_tool_execution_collector import (
     InMemoryToolExecutionCollector,
 )
 from backend.app.services.tool_execution_observer import ToolExecutionObserver
+from backend.app.services.tool_observability_query_service import (
+    ToolObservabilityQueryService,
+)
 from backend.app.tools.get_inventory import build_default_tool_registry
 
 
@@ -234,6 +237,30 @@ _TOOL_REGISTRY = build_default_tool_registry()
 # 同一对象以 ToolExecutionObserver（Protocol）类型注入 → core 层不感知具体实现。
 _TOOL_EXECUTION_COLLECTOR = InMemoryToolExecutionCollector()
 _TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = _TOOL_EXECUTION_COLLECTOR
+
+
+def get_tool_observability_query_service() -> ToolObservabilityQueryService:
+    """Phase 3.11 Step 25：只读查询边界装配（Composition Root accessor）。
+
+    Tool Observability Read API（``api/tool_observability.py``）需要
+    ``ToolObservabilityQueryService``，但**不得**接触 Collector（§七）。
+    因此由本 Composition Root 提供 accessor：
+
+        api/tool_observability.py
+            ↓ get_tool_observability_query_service()（本函数）
+        ToolObservabilityQueryService（只读）
+            ↓
+        Application 级 **同一个** Collector（本模块持有，唯一创建点）
+
+    * 不创建第二个 Collector（每次调用返回新的 QueryService 实例，
+      数据源始终是 ``_TOOL_EXECUTION_COLLECTOR``）；
+    * QueryService 只读：无 clear / append / evict（C23.9）；
+    * 本函数只是装配，不做查询 / 聚合 / 缓存。
+
+    Returns:
+        绑定 Application 级 Collector 的 ``ToolObservabilityQueryService``。
+    """
+    return ToolObservabilityQueryService(_TOOL_EXECUTION_COLLECTOR)
 
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     router=AIRouterService(

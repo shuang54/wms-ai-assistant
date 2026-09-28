@@ -2799,6 +2799,199 @@ Metrics ：仍由 ToolExecutionMetricsService 基于 Records 计算（不经 Sna
         序列化层（to_dict / JSON schema / Pydantic）
 ```
 
+## 8.41 Tool Observability Architecture Audit（Phase 3.11 Step 23）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 23 — Tool Observability Architecture Hardening & Contract Audit.md`
+> 测试：`tests/test_tool_observability_architecture_audit.py`（C25，20 用例）
+> **生产代码修改 = 0**
+
+### 静态依赖图（实测：顶层无环）
+
+```text
+context  → （无内部依赖）
+record   → context, tools.base
+observer → record
+collector→ record          metrics → record        snapshot → record
+service  → context, observer, record, registry, projects.capabilities
+           + 延迟：ai_orchestrator_service（AIOrchestratorCapabilityError，Phase 3.8.2）
+query    → collector, metrics, record, snapshot
+orchestrator → context, extractor, observer, registry, service
+tool_chat_service → context, registry, service
+api/orchestrator_chat → collector, observer, orchestrator（+ 延迟：factory）
+api/tool_chat → orchestrator, registry, service, tool_chat_service
+```
+
+```text
+顶层依赖图 = DAG（无环）；函数内延迟 import 仅 2 处（历史决策，保持）
+```
+
+### 方向（Audit 结论）
+
+```text
+允许：Execution → Observability（service → observer → record）
+      Query → Collector → Metrics（只读）
+禁止（实测均为 NO）：
+    Collector/Metrics/Query/Snapshot/Record/Observer → Execution·Orchestrator·API
+    Service → Collector（只依赖 Observer Protocol）
+    Orchestrator → Collector / Metrics / Query / Snapshot
+    ToolRegistry → Orchestrator / Observability
+```
+
+### Contract Matrix
+
+```text
+Layer        Can Write                 Can Read    Execute Tool   DB   LLM
+Service      execution only            ToolResult  YES          间接*  NO
+Record       NO                        data        NO           NO    NO
+Observer     NO（接收点）              Record      NO           NO    NO
+Collector    Record 集合（内存）        Record      NO           NO    NO
+Metrics      NO                        Record      NO           NO    NO
+Query        NO                        Collector   NO           NO    NO
+Snapshot     NO                        Record      NO           NO    NO
+* DB 访问只可能发生在 Tool Handler 内部（由 Tool 定义决定）
+```
+
+### 审计结论（无真实缺陷）
+
+```text
+Record / Collector / Observer / Metrics / Query / Snapshot 全部 PASS
+API：无 Tool Observability HTTP 端点；api 不依赖 Query · Snapshot
+Composition：Collector 唯一创建点 = api/orchestrator_chat.py；
+             Orchestrator 不创建 Collector / Observer / Query Service
+Project：capability 拒绝 → 0 Record；Query 不做权限判断、不扩大权限
+Security：Observability 层 import 白名单（无 DB / LLM / HTTP / 进程）
+→ 生产代码 0 修改；历史残留以 Historical note 补充说明（不改写历史事实）
+```
+
+## 8.42 Tool Observability Serialization Boundary（Phase 3.11 Step 24）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 24 — Tool Observability Serialization Boundary.md`
+> 测试：`tests/test_tool_observability_serialization.py`（32）+
+> `tests/test_tool_chat_architecture_contract.py`（C26，11）
+> **不开发 HTTP API**（可序列化 ≠ 应当暴露）
+
+### 链路（只读单向）
+
+```text
+Execution
+    ↓
+Record
+    ↓
+Observer
+    ↓
+Collector
+    ↓
+QueryService
+    ├── Snapshot Read Model
+    │       ↓ snapshot_to_dict()
+    │   Serialization Boundary → JSON-safe primitive dict
+    │
+    └── Metrics Read Model
+            ↓ metrics_to_dict()
+        Serialization Boundary → JSON-safe primitive dict
+```
+
+```text
+Serialization
+    ↓
+JSON-safe primitive structure      （str / int / float / bool / None）
+
+Serialization
+    X
+    ↓
+Execution / Tool / DB / LLM / Network      （永不触发）
+```
+
+### Contract
+
+```text
+backend/app/services/tool_observability_serialization.py
+
+    snapshot_to_dict(snapshot) -> dict[str, Any]   # 11 字段，显式映射
+    metrics_to_dict(metrics)   -> dict[str, Any]   # 8 字段，显式映射
+
+C26.1  Snapshot → JSON-safe dict      C26.2  Metrics → JSON-safe dict
+C26.3  Explicit field mapping         C26.4  无 vars / asdict / __dict__
+C26.5  datetime → ISO 8601            C26.6  timezone 保留（含非 UTC offset）
+C26.7  None 语义保留（不写成 0）      C26.8  无多余字段
+C26.9  无禁用字段                     C26.10 不改入参（Snapshot/Metrics/Record）
+C26.11 deterministic                  C26.12~14 无 DB / LLM / Tool 执行
+C26.15 无 HTTP API（api/** 不 import 本模块）
+
+datetime → .isoformat()（沿用项目既有约定：cli/knowledge.py::_iso、
+          text_to_sql_* generated_at）；naive datetime → ValueError
+字段：不新增 / 不删除 / 不重命名 / 不改语义；契约漂移 → ValueError
+无反序列化（dict → DTO）；模块不 import json（json.dumps 属调用方）
+```
+
+## 8.43 Tool Observability HTTP Read Boundary（Phase 3.11 Step 25）
+
+> 记录：`docs/evaluation/Phase 3.11 Step 25 — Tool Observability HTTP Read Boundary.md`
+> 接口：`docs/api.md` §2.5 / §2.6
+> 测试：`tests/test_tool_observability_api.py`（31）+
+> `tests/test_tool_chat_architecture_contract.py`（C27，11）
+> **只做 Read API**（无写 / 无执行 / 无持久化）
+
+### 链路
+
+```text
+Tool Execution
+      ↓
+ToolExecutionRecord
+      ↓
+Observer
+      ↓
+Collector（Application lifetime；唯一创建点 = api/orchestrator_chat.py）
+      ↓
+QueryService（只读）
+      ↓
+Snapshot / Metrics
+      ↓
+Serialization
+      ↓
+FastAPI Read API
+      ↓
+JSON
+```
+
+```text
+GET /api/observability/tools           → {"records": [Snapshot × 11 字段]}
+GET /api/observability/tools/metrics   → Metrics 8 字段（扁平；无维度）
+
+第一版无 query parameter（无 project_id / tool_name / request_id /
+limit / offset / sort / 时间范围）；不排序 / 不过滤 / 不分页 / 不聚合。
+```
+
+### 禁止方向
+
+```text
+FastAPI
+   X → Collector            （API 只经 QueryService accessor）
+   X → ToolExecutionService
+   X → ToolRegistry
+   X → Tool Handler
+   X → ToolExecutionRecord / AIOrchestrator
+
+Collector 仍由 Composition Root 唯一创建；
+API 通过 ``get_tool_observability_query_service()`` 复用**同一个**
+Application 级 Collector（不创建第二个）。
+```
+
+### Contract（C27）
+
+```text
+C27.1  GET records 只读        C27.2  GET metrics 只读
+C27.3  API → QueryService only C27.4~7 不依赖 Collector / 执行边界 /
+                               Registry / Handler
+C27.8  使用 Snapshot Read Model（不调 query.records()）
+C27.9  使用 Serialization Boundary（不自己 isoformat）
+C27.10 API 不计算 Metrics      C27.11 API 不创建 Collector
+C27.12 使用 Application Collector  C27.13 GET 不触发 Tool 执行
+C27.14~16 无 DB / LLM / 持久化 C27.17 响应无凭据
+C27.18 响应无 Tool args/result C27.19 Metrics 无 identifier
+C27.20 无 Query DSL
+```
+
 ---
 
 # 9. Prompt Architecture

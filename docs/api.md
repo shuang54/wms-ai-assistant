@@ -247,6 +247,118 @@ LLM 家族异常（LLMConfigError 503 / LLMRequestError、LLMResponseError 502�
 > 配置：`TOOL_MAX_ROUNDS`（环境变量，默认 5，钳制 [1, 20]），
 > 读取自 `settings.tool.max_rounds`。
 
+### 2.5 GET /api/observability/tools（Phase 3.11 Step 25）
+
+Tool 执行快照**只读**列表（Read Model → JSON）。
+
+```text
+Method:       GET
+Auth:         当前项目现有 API 机制（本阶段未新增认证机制）
+Side Effect:  None（不触发 Tool 执行 / 不写 Collector）
+Persistence:  None（纯内存；不落库）
+```
+
+数据来源：
+
+```text
+Application-lifetime InMemory Collector（唯一创建点：
+backend/app/api/orchestrator_chat.py）
+    ↓ ToolObservabilityQueryService（只读查询边界）
+    ↓ ToolExecutionSnapshot（11 字段 Read Model）
+    ↓ snapshot_to_dict()（Serialization Boundary）
+    ↓ JSON
+```
+
+说明：
+
+```text
+Retention：     当前 Collector max_records（FIFO；默认 1000）
+Persistence：   None
+Multi-process： 每个 process 独立内存数据（不共享、不聚合）
+Query DSL：     第一版无 query parameter（无 project_id / tool_name /
+                request_id / limit / offset / sort）
+排序 / 过滤 / 分页 / 聚合：本端点不做（沿用 QueryService 语义）
+```
+
+Response 200：
+
+```json
+{
+  "records": [
+    {
+      "request_id": "0f9c...",
+      "round": 1,
+      "tool_name": "get_inventory",
+      "started_at": "2026-09-26T10:20:30.123456+00:00",
+      "finished_at": "2026-09-26T10:20:30.125000+00:00",
+      "duration_ms": 1.574,
+      "success": true,
+      "project_id": "project-a",
+      "tool_call_id": null,
+      "error_code": null,
+      "error_type": null
+    }
+  ]
+}
+```
+
+空数据：`{"records": []}`。
+
+安全：响应**只**含 Snapshot 的 11 个字段（无 Tool arguments / ToolResult.data /
+SQL / prompt / 凭据 / 连接信息 / traceback / Collector 内部状态）。
+
+### 2.6 GET /api/observability/tools/metrics（Phase 3.11 Step 25）
+
+Tool 执行聚合统计（无维度；只读）。
+
+```text
+Method:       GET
+Auth:         当前项目现有 API 机制（本阶段未新增认证机制）
+Side Effect:  None
+Persistence:  None
+```
+
+Response 200：
+
+```json
+{
+  "total_count": 10,
+  "success_count": 8,
+  "failure_count": 2,
+  "success_rate": 0.8,
+  "failure_rate": 0.2,
+  "total_duration_ms": 123.45,
+  "average_duration_ms": 12.345,
+  "max_duration_ms": 40.0
+}
+```
+
+空数据（`null` **不是** `0` —— 与 Metrics Read Model 语义一致）：
+
+```json
+{
+  "total_count": 0,
+  "success_count": 0,
+  "failure_count": 0,
+  "success_rate": null,
+  "failure_rate": null,
+  "total_duration_ms": 0.0,
+  "average_duration_ms": null,
+  "max_duration_ms": null
+}
+```
+
+错误响应：
+
+| HTTP | 触发条件                     | detail                  |
+| ---- | ---------------------------- | ----------------------- |
+| 500  | 观测数据不可用（未预期异常） | `"Tool 观测数据不可用"` |
+
+> 不暴露 traceback / 内部模块路径 / SQL / 数据库信息（§十三）。
+
+安全：Metrics 不含 request_id / project_id / tool_name 等 identifier；
+不含维度聚合（by_tool / by_project / by_request 均未实现）。
+
 ---
 
 ## 3. 错误响应
