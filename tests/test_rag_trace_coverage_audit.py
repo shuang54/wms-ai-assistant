@@ -46,14 +46,15 @@ _RAG_QUESTION = "采购入库的操作步骤是什么"
 _TRACE_ENDPOINT = "/api/observability/assistant-trace"
 _CHUNK_CONTENT = "CHUNK-CONTENT-SENTINEL-STEP42"
 
-#: RAG 相关模块（本次审计对象）
+#: RAG 相关模块（本次审计对象）。
+#: 注（Phase 3.12 Step 43）：``rag_service.py`` 已建立 **Runtime** 观测边界
+#: （读取 contextvar 里的 assistant_request_id 并产生进程内 Observation；
+#: 无持久化）；其余三个模块仍然完全无 request_id。
 _RAG_MODULES = (
-    "backend/app/services/rag_service.py",
     "backend/app/services/context_builder.py",
     "backend/app/reranker/client.py",
     "backend/app/services/vector_search_service.py",
 )
-
 
 def _source(relative: str) -> str:
     return (_REPO_ROOT / relative).read_text(encoding="utf-8")
@@ -240,17 +241,52 @@ class TestRagHttpExposure:
 
 
 # ============================================================
-# 3. RAG 服务层：无 request_id / 无持久化 / 无 DTO 扩展
+# 3. RAG 服务层：核心无 request_id / 无持久化 / 无 DTO 扩展
+#    （Step 43：RagService 增加 **Runtime** 观测边界 —— 无持久化）
 # ============================================================
 
 class TestRagServiceCurrentState:
     @pytest.mark.parametrize("module", _RAG_MODULES)
-    def test_no_request_id_in_rag_modules(self, module: str) -> None:
-        """审计结论：RAG / Context / Reranker / Vector Search 均无 request_id。"""
+    def test_no_request_id_in_rag_core_modules(self, module: str) -> None:
+        """审计结论：Context / Reranker / Vector Search 仍**完全没有** request_id。
+
+        （Step 43 只在 ``rag_service.py`` 建立 Runtime 观测边界；
+          下游核心模块 0 修改 —— 保持审计结论的可验证性。）
+        """
         source = _source(module)
 
         assert "request_id" not in source
         assert "assistant_request_id" not in source
+
+    def test_rag_service_trace_usage_is_runtime_observation_only(self) -> None:
+        """``rag_service.py`` 的 request_id 只用于 **Runtime Observation**：
+        读取 contextvar + 构造进程内 Observation；**不**新增函数参数、
+        **不**写日志 extra、**不**访问 DB / Repository。
+        """
+        import inspect
+
+        from backend.app.services.rag_service import RagService
+
+        source = _source("backend/app/services/rag_service.py")
+
+        assert "current_assistant_request_id()" in source
+        assert "RagExecutionObservation" in source
+        # 公开 API 契约不变（request_id 不是参数）
+        assert list(inspect.signature(RagService.answer).parameters) == [
+            "self", "query", "top_k", "knowledge_scope",
+        ]
+        assert "request_id" not in inspect.signature(
+            RagService.answer
+        ).parameters
+        # 观测走内存 DTO，不走日志 extra（日志仍只记检索事实）
+        for extra in TestRagLoggingCoverage._log_extra_keys(
+            "backend/app/services/rag_service.py"
+        ):
+            assert "request_id" not in extra
+            assert "assistant_request_id" not in extra
+        # 仍然没有持久化能力
+        assert "sqlalchemy" not in source.lower()
+        assert "Repository" not in source
 
     @pytest.mark.parametrize(
         "module",

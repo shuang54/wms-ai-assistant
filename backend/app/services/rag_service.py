@@ -45,12 +45,25 @@ RagResponse(answer, sources)
         * API Key / Authorization Header 一律由 LLMClient / EmbeddingClient
           内部处理；本 Service 不读、不写、不打印。
         * Reranker 不执行数据库操作、不调用 LLM、不修改知识库数据。
+- Runtime Observability（Phase 3.12 Step 43）：
+        * 可选 ``observer``（构造参数；``None`` = 旧行为、零开销、0 观测）；
+        * observer 存在且处于 ``assistant_trace_scope`` 内时，每次 ``answer()``
+          产生**一条** ``RagExecutionObservation``（frozen；字段白名单）——
+          成功 / 空检索 / 异常三条路径都会产生（异常路径记录后 re-raise 原异常）；
+        * ``request_id`` 来自 ``current_assistant_request_id()``（contextvar）：
+          **不新增函数参数**，公开 API 契约不变；未绑定 scope → 不记录
+          （避免产生无法关联的噪声数据）；
+        * 观测是 **best-effort**：observer / Collector 抛错只记 warning，
+          **绝不**把 RAG 成功变成 RAG 失败，也绝不覆盖原始异常；
+        * 纯运行时：无 DB / 无持久化 / 无 metrics / 无 TTL / 无后台任务；
+          DTO 不含 query / answer / content / embedding / prompt / SQL / 凭据。
 """
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
 
@@ -62,7 +75,14 @@ from backend.app.reranker.client import (
     RerankerClient,
     get_default_reranker_client,
 )
+from backend.app.services.assistant_trace import (
+    current_assistant_request_id,
+)
 from backend.app.services.context_builder import ContextBuilder
+from backend.app.services.rag_execution_observation import (
+    RagExecutionObservation,
+    RagExecutionObserver,
+)
 from backend.app.services.vector_search_service import (
     VectorSearchResult,
     VectorSearchService,
@@ -83,6 +103,11 @@ __all__ = [
 # ============================================================
 
 DEFAULT_EMPTY_ANSWER: Final[str] = "知识库中没有找到与该问题相关的信息。"
+
+
+def _utc_now() -> datetime:
+    """UTC now（观测时间戳；仅诊断用，不参与业务判断）。"""
+    return datetime.now(timezone.utc)
 
 PROMPTS_DIR: Final[Path] = Path(__file__).resolve().parents[1] / "prompts"
 SYSTEM_PROMPT_PATH: Final[Path] = PROMPTS_DIR / "rag_system.txt"
@@ -166,6 +191,8 @@ class RagService:
                                  （配置开关是链路形态的唯一权威）
         - llm_client: None 时懒加载默认
         - context_builder: None 时按 max_context_chars 构造
+        - observer: RAG 执行观测出口（Phase 3.12 Step 43；``None`` = 不观测）；
+                    必须提供可调用的 ``record(observation)``
         - system_prompt: None 时从文件加载
         - user_prompt_template: None 时从文件加载
         - empty_answer_text: 默认 DEFAULT_EMPTY_ANSWER
@@ -181,7 +208,16 @@ class RagService:
         system_prompt: str | None = None,
         user_prompt_template: str | None = None,
         empty_answer_text: str = DEFAULT_EMPTY_ANSWER,
+        observer: RagExecutionObserver | None = None,
     ) -> None:
+        # Phase 3.12 Step 43：可选观测出口（None = 旧行为；不生成 ID / 不校验 ID）
+        if observer is not None and not callable(
+            getattr(observer, "record", None)
+        ):
+            raise TypeError(
+                "observer 必须提供可调用的 record(observation)"
+                f"（got {type(observer).__name__}）"
+            )
         self._vector_search_service = vector_search_service
         self._reranker_client = reranker_client
         self._llm_client = llm_client
@@ -189,6 +225,7 @@ class RagService:
         self._system_prompt = system_prompt
         self._user_prompt_template = user_prompt_template
         self._empty_answer_text = empty_answer_text
+        self._observer = observer
 
     # ---------- 依赖解析（懒加载） ----------
 
@@ -246,6 +283,37 @@ class RagService:
         top_k: int | None = None,
         knowledge_scope: ProjectKnowledgeScope | None = None,
     ) -> RagResponse:
+        """对 query 执行 RAG，返回 RagResponse（**公开契约不变**）。
+
+        Phase 3.12 Step 43：本方法是**观测包装层** —— 有 observer 且处于
+        ``assistant_trace_scope`` 内时，成功 / 空检索 / 异常三条路径各产生
+        一条 ``RagExecutionObservation``（best-effort；观测失败只 warning，
+        绝不改变 RAG 的成功/失败，也绝不覆盖原始异常）。业务流水线在
+        :meth:`_answer_pipeline`（行为与本阶段之前完全一致）。
+        """
+        draft = self._begin_observation()
+        try:
+            response = await self._answer_pipeline(
+                query,
+                top_k=top_k,
+                knowledge_scope=knowledge_scope,
+                draft=draft,
+            )
+        except BaseException:
+            # 观测"安全结束"后**原样**抛出 RAG 原始异常
+            self._finish_observation(draft)
+            raise
+        self._finish_observation(draft)
+        return response
+
+    async def _answer_pipeline(
+        self,
+        query: str,
+        *,
+        top_k: int | None = None,
+        knowledge_scope: ProjectKnowledgeScope | None = None,
+        draft: _ObservationDraft,
+    ) -> RagResponse:
         """对 query 执行 RAG，返回 RagResponse。
 
         Pipeline:
@@ -286,6 +354,7 @@ class RagService:
                            Reranker 返回分数数量与候选数不一致。
         """
         started = time.perf_counter()
+        draft.mark_started(started_monotonic=started)
         reranker = self._get_reranker()
 
         if top_k is None:
@@ -294,6 +363,8 @@ class RagService:
                 if reranker is not None
                 else settings.rag.default_top_k
             )
+        draft.top_k = top_k
+        draft.reranker_used = reranker is not None
 
         # ---- 1. Vector Search（Reranker 开启时扩大召回窗口）----
         # Phase 3.8.4：knowledge_scope 非 None 时显式传递（项目内检索）；
@@ -325,6 +396,9 @@ class RagService:
                     query, top_k=top_k, knowledge_scope=knowledge_scope
                 )
 
+        # 观测：Vector Search 候选条数（空检索同样记录 —— 空检索 ≠ 没有执行）
+        draft.result_count = len(results)
+
         # ---- 2. 空检索 → 不调 Reranker、不调 LLM ----
         if not results:
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -352,10 +426,13 @@ class RagService:
                 reranker, query, results, top_k=top_k
             )
             rerank_elapsed_ms = (time.perf_counter() - rerank_started) * 1000
+        draft.rerank_elapsed_ms = rerank_elapsed_ms
 
         # ---- 4. Context ----
         context_builder = self._get_context_builder()
         context_result = context_builder.build(results)
+        draft.context_truncated = bool(context_result.truncated)
+        draft.context_chars = int(context_result.total_chars)
 
         # ---- 5. LLM ----
         system_prompt = self._get_system_prompt()
@@ -382,6 +459,11 @@ class RagService:
             )
             for r in context_result.used_chunks
         )
+        # 观测：命中 identifier（去重 + 首次出现顺序由 DTO 契约保证；
+        # 不含 similarity / content / query / answer）
+        draft.used_chunks_count = len(sources)
+        draft.chunk_ids = tuple(source.chunk_id for source in sources)
+        draft.document_ids = tuple(source.document_id for source in sources)
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info(
@@ -405,10 +487,129 @@ class RagService:
             used_chunks_count=len(sources),
         )
 
+    # ---------- Runtime Observability（Phase 3.12 Step 43；best-effort） ----------
+
+    def _begin_observation(self) -> _ObservationDraft:
+        """创建观测草稿（observer 缺失 / 未绑定 Trace → disabled 草稿）。
+
+        * ``observer is None`` → disabled（零开销；不读 contextvar）；
+        * ``current_assistant_request_id() is None``（旧链路 / 直连 Service）
+          → disabled（**不记录** —— 没有关联键的观测只会成为噪声）；
+        * 本方法**不生成 ID**、不访问 DB、不做 I/O；任何意外只 warning。
+        """
+        if self._observer is None:
+            return _ObservationDraft(request_id=None)
+        try:
+            request_id = current_assistant_request_id()
+        except Exception as exc:  # noqa: BLE001 —— 观测不得影响主链路
+            logger.warning(
+                "RAG observation disabled",
+                extra={"error_type": type(exc).__name__},
+            )
+            return _ObservationDraft(request_id=None)
+        return _ObservationDraft(request_id=request_id)
+
+    def _finish_observation(self, draft: _ObservationDraft) -> None:
+        """提交观测（best-effort：任何失败只 warning，**绝不** raise）。
+
+        成功路径与异常路径都调用本方法：异常路径记录的是"执行到哪一步"
+        的部分事实（``duration_ms`` 为失败前耗时），随后调用方 re-raise
+        原始异常（本方法不吞异常、不替换异常）。
+        """
+        if not draft.enabled or self._observer is None:
+            return
+        try:
+            observation = draft.to_observation(
+                finished_monotonic=time.perf_counter()
+            )
+            self._observer.record(observation)
+        except Exception as exc:  # noqa: BLE001 —— 观测失败隔离
+            logger.warning(
+                "RAG observation failed",
+                extra={"error_type": type(exc).__name__},
+            )
+
 
 # ============================================================
 # Helpers（私有）
 # ============================================================
+
+class _ObservationDraft:
+    """RAG 观测**草稿**（私有；pipeline 逐步填充 → frozen Observation）。
+
+    为什么用草稿：
+
+        * pipeline 的字段在不同阶段产生（top_k → result_count → rerank →
+          context → sources），草稿让 instrumentation 保持"一行一赋值"，
+          不必把统计值层层 return；
+        * ``enabled=False``（无 observer / 未绑定 Trace）时**不产生任何 DTO**；
+        * 不保存 query / answer / content / prompt；只保存白名单字段。
+    """
+
+    __slots__ = (
+        "request_id",
+        "started_at",
+        "started_monotonic",
+        "top_k",
+        "result_count",
+        "used_chunks_count",
+        "context_truncated",
+        "context_chars",
+        "reranker_used",
+        "rerank_elapsed_ms",
+        "chunk_ids",
+        "document_ids",
+    )
+
+    def __init__(self, *, request_id: str | None) -> None:
+        self.request_id = request_id
+        self.started_at: datetime = _utc_now()
+        self.started_monotonic: float | None = None
+        self.top_k: int = 0
+        self.result_count: int = 0
+        self.used_chunks_count: int = 0
+        self.context_truncated: bool = False
+        self.context_chars: int = 0
+        self.reranker_used: bool = False
+        self.rerank_elapsed_ms: float | None = None
+        self.chunk_ids: tuple[int, ...] = ()
+        self.document_ids: tuple[int, ...] = ()
+
+    @property
+    def enabled(self) -> bool:
+        """是否会产生观测（有 observer **且** 绑定了 Assistant Trace）。"""
+        return self.request_id is not None
+
+    def mark_started(self, *, started_monotonic: float) -> None:
+        """记录 pipeline 起点（与日志的 ``elapsed_ms`` 使用同一基准）。"""
+        self.started_monotonic = started_monotonic
+
+    def to_observation(
+        self, *, finished_monotonic: float
+    ) -> RagExecutionObservation:
+        """草稿 → frozen ``RagExecutionObservation``（仅 enabled 时调用）。"""
+        assert self.request_id is not None      # enabled 前提（内部不变量）
+        started = (
+            self.started_monotonic
+            if self.started_monotonic is not None
+            else finished_monotonic
+        )
+        return RagExecutionObservation(
+            request_id=self.request_id,
+            started_at=self.started_at,
+            finished_at=_utc_now(),
+            duration_ms=max(0.0, (finished_monotonic - started) * 1000),
+            result_count=self.result_count,
+            used_chunks_count=self.used_chunks_count,
+            top_k=self.top_k,
+            context_truncated=self.context_truncated,
+            context_chars=self.context_chars,
+            reranker_used=self.reranker_used,
+            rerank_elapsed_ms=self.rerank_elapsed_ms,
+            chunk_ids=self.chunk_ids,
+            document_ids=self.document_ids,
+        )
+
 
 async def _rerank_chunks(
     reranker: RerankerClient,

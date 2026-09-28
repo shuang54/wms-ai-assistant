@@ -3618,6 +3618,45 @@ Recommendation：**Defer implementation**
     正文 · embedding vector · prompt / messages / raw response · 凭据 / DB 对象
 ```
 
+## 8.59 RAG Runtime Observability（Phase 3.12 Step 43）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 43 — RAG Runtime Observability.md`
+> 测试：`tests/test_rag_runtime_observability.py`（44）
+> **Runtime Only**：无表 / 无 Repository / 无 Migration / 无新 HTTP API /
+> Assistant Trace 未修改；RAG 核心算法（Vector Search · Reranker ·
+> ContextBuilder）0 修改。
+
+```text
+AIOrchestratorService.execute()
+      │  request_id = A（唯一生成点）+ assistant_trace_scope(A)
+      ↓
+RagService.answer()                          ← 公开签名不变（0 新增参数）
+      │  current_assistant_request_id() → A
+      ├── observation = disabled?（无 observer / 未绑定 Trace）→ 0 观测
+      ↓ _ObservationDraft（top_k → result_count → rerank → context → ids）
+RagService._finish_observation(draft)        ← best-effort（失败只 warning）
+      ↓ observer.record(observation)
+InMemoryRagExecutionCollector（deque(maxlen=1000) + 单锁；FIFO；无 TTL）
+      ↓
+RagObservabilityQueryService（只读 Facade；校验先于查询；无 clear）
+      ↓
+tuple[RagExecutionObservation, ...]          （内部；**无** HTTP API）
+```
+
+```text
+RagExecutionObservation（frozen；13 字段白名单）
+    request_id · started_at · finished_at · duration_ms · result_count ·
+    used_chunks_count · top_k · context_truncated · context_chars ·
+    reranker_used · rerank_elapsed_ms · chunk_ids · document_ids
+（**无** query / answer / content / embedding / similarity / prompt /
+  messages / raw response / SQL / 凭据）
+
+生命周期：成功 · 空检索（result_count=0）· 异常（记录后 **re-raise 原异常**）
+关联：observation.request_id == 响应 metadata.request_id
+      == llm_usage_record.assistant_request_id（同一 Scope）
+隔离：observer 缺失 / 未绑定 Trace → 0 观测；观测失败绝不改变 RAG 成败
+```
+
 ---
 
 # 9. Prompt Architecture

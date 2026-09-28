@@ -231,6 +231,13 @@ lint → unavailable（未安装 ruff / flake8；未新增工具）
 
 ## 10. Limitations
 
+> 后续（Phase 3.12 Step 43）：已在 **Runtime** 层建立
+> `RagService → RagExecutionObservation → InMemoryRagExecutionCollector`
+> 观测边界（见 `Phase 3.12 Step 43 — RAG Runtime Observability.md`）；
+> 本文 §3 "NOT AVAILABLE" 中的**持久化**缺口（无记录表 / 无法跨重启回放）
+> 仍然成立 —— Step 43 只补齐进程内观测，不改任何持久化事实。
+
+
 ```text
 * 审计基于静态阅读 + 现有测试 + 无 DB 的 fake 链路；未做真实检索压测
 * Reranker 默认关闭（settings.reranker.enabled=false），其日志字段来自代码阅读
