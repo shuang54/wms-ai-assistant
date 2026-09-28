@@ -3431,6 +3431,45 @@ C41.9  无 prompt / args / SQL / secrets
 Failure Isolation：DB 写入失败 → warning → Assistant 结果不变（无 retry / 队列）
 ```
 
+## 8.54 Assistant Trace → LLM Usage Read Boundary（Phase 3.12 Step 37）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 37 — Assistant Trace LLM Usage Read Boundary.md`
+> 测试：`tests/test_llm_usage_trace_read.py`（34，含 C42）/
+> `tests/test_llm_usage_trace_read_db.py`（8，DB-gated）
+> **不新增 HTTP API**（应用层只读边界）
+
+```text
+Assistant Trace A
+        ↓
+LLMUsageQueryService.list_by_assistant_request_id("A")     ← 校验（DB 之前）
+        ↓
+LLMUsageRepository.list_by_assistant_request_id("A")
+        ↓ build_trace_select()（唯一 trace SQL 构造点）
+    SELECT id, assistant_request_id, request_id, provider, model,
+           prompt_tokens, completion_tokens, total_tokens, created_at
+    FROM ai_ops.llm_usage_record
+    WHERE assistant_request_id = :assistant_request_id      （精确匹配；NULL 不匹配）
+    ORDER BY created_at ASC, id ASC                          （调用发生顺序）
+        ↓ [LLMUsageTraceRow]（frozen；非 ORM）
+        ↓ [LLMUsageTraceRecordView]（9 字段；显式映射）
+LLM Usage Records
+```
+
+```text
+与既有读边界的关系（并列，不替代）
+    LLM_USAGE_READ_COLUMNS / LLMUsageRecordRow / LLMUsageRecordView（8 字段）
+        —— analytics 读路径（/api/usage/analytics 响应结构未变）
+    LLM_USAGE_TRACE_READ_COLUMNS / LLMUsageTraceRow / LLMUsageTraceRecordView（9 字段）
+        —— Assistant Trace 读路径（本小节）
+    Repository / Query Service 均为**同一个类**新增方法（无第二套 Repository）
+C42.1  精确匹配                    C42.2  NULL 不参与匹配
+C42.3  bound parameter             C42.4  不 SELECT *（显式 9 列）
+C42.5  返回 frozen Row DTO         C42.6  Service 无 ORM / Session
+C42.7  不新增 HTTP endpoint        C42.8  request_id（Provider ID）语义不变
+C42.9  历史 NULL 兼容              C42.10 不读取 prompt / messages / secrets
+无分页 / 不聚合 / 不组装 Trace DTO（Tool · RAG 联接属未来阶段）
+```
+
 ---
 
 # 9. Prompt Architecture

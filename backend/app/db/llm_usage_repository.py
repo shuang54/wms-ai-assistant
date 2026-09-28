@@ -77,7 +77,9 @@ __all__ = [
     "LLMUsageRepository",
     "LLMUsageRepositoryError",
     "LLMUsageRecordRow",
+    "LLMUsageTraceRow",
     "LLM_USAGE_READ_COLUMNS",
+    "LLM_USAGE_TRACE_READ_COLUMNS",
 ]
 
 #: ON CONFLICT target —— 必须与 partial unique index 的谓词一致。
@@ -87,6 +89,25 @@ _REQUEST_ID_INDEX_WHERE = text(LLM_USAGE_REQUEST_ID_PREDICATE)
 #: 只读查询允许返回的字段（§十八：显式列，不用 SELECT *）。
 LLM_USAGE_READ_COLUMNS: Final[tuple[str, ...]] = (
     "id",
+    "request_id",
+    "provider",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "created_at",
+)
+
+#: Phase 3.12 Step 37：Assistant Trace 只读查询允许返回的字段
+#: （= 上面 8 列 + assistant_request_id；仍显式列举，不用 SELECT *）。
+#:
+#: 为什么不直接扩展 ``LLM_USAGE_READ_COLUMNS``：那会改变 analytics read
+#: 边界（Row → View → Aggregation → `/api/usage/analytics` 响应结构），
+#: 而 Step 37 明确不修改既有 Analytics Response。因此 **新增独立列白名单 +
+#: 独立 Row / View**，两条读路径互不影响。
+LLM_USAGE_TRACE_READ_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
+    "assistant_request_id",
     "request_id",
     "provider",
     "model",
@@ -116,8 +137,9 @@ class LLMUsageRecordRow:
     created_at: datetime
 
 
-#: Assistant Trace ID 长度上限（与 ORM 列 VARCHAR(128) 一致；Step 36）。
-_ASSISTANT_REQUEST_ID_MAX_LENGTH: Final[int] = 128
+#: Assistant Trace ID 长度上限（与 ORM 列 ``VARCHAR(128)`` 一致；
+#: Step 36 写入校验 / Step 37 只读查询共用同一常量）。
+ASSISTANT_REQUEST_ID_MAX_LENGTH: Final[int] = 128
 
 
 def _validate_optional_assistant_request_id(value: object) -> str | None:
@@ -137,12 +159,64 @@ def _validate_optional_assistant_request_id(value: object) -> str | None:
         )
     if not value:
         raise ValueError("assistant_request_id 不能为空字符串（None 表示未绑定）")
-    if len(value) > _ASSISTANT_REQUEST_ID_MAX_LENGTH:
+    if len(value) > ASSISTANT_REQUEST_ID_MAX_LENGTH:
         raise ValueError(
             "assistant_request_id 超出长度上限 "
-            f"（{len(value)} > {_ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
+            f"（{len(value)} > {ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
         )
     return value
+
+
+def _validate_required_assistant_request_id(value: object) -> str:
+    """**必填** Assistant Trace ID（Step 37 只读查询）。
+
+    * 必须是 ``str`` 且 strip 后非空（``""`` / ``"   "`` → ValueError）；
+    * 长度上限 = ORM 列 ``VARCHAR(128)``（超长 → ValueError）；
+    * 只做**校验**：不 truncate / 不 normalize / 不 strip 后使用
+      （返回值与入参逐字符一致）/ 不生成 UUID 兜底。
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            "assistant_request_id 必须是 str"
+            f"（当前: {type(value).__name__}）"
+        )
+    if not value.strip():
+        raise ValueError("assistant_request_id 不能为空或纯空白")
+    if len(value) > ASSISTANT_REQUEST_ID_MAX_LENGTH:
+        raise ValueError(
+            "assistant_request_id 超出长度上限 "
+            f"（{len(value)} > {ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class LLMUsageTraceRow:
+    """Assistant Trace 只读记录（Phase 3.12 Step 37；**不是** ORM 对象）。
+
+    字段严格等于 ``LLM_USAGE_TRACE_READ_COLUMNS``（显式列；无 prompt /
+    messages / raw_response / tool 数据 / 凭据）。
+
+    与 ``LLMUsageRecordRow`` 的关系：
+
+        LLMUsageRecordRow   —— analytics read 边界（8 字段，**不含**
+                               assistant_request_id；Step 36/37 均未修改）
+        LLMUsageTraceRow    —— Assistant Trace read 边界（9 字段，含
+                               assistant_request_id）
+
+    两个 Row 互不替代：前者保持 `/api/usage/analytics` 的既有响应结构。
+    """
+
+    id: int
+    assistant_request_id: str
+    #: Provider 请求 ID（字段名保持 ``request_id``，**不改名成 trace_id**）。
+    request_id: str | None
+    provider: str | None
+    model: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    created_at: datetime
 
 
 class LLMUsageRepositoryError(Exception):
@@ -407,6 +481,103 @@ class LLMUsageRepository:
                 f"LLM Usage 查询失败: {type(exc).__name__}"
             ) from exc
         return [self._to_row(row) for row in rows]
+
+    # ---------- Phase 3.12 Step 37：Assistant Trace 只读查询 ----------
+
+    @staticmethod
+    def _trace_read_columns() -> tuple[Any, ...]:
+        """显式 SELECT 列（Assistant Trace 读路径；不允许 `SELECT *`）。"""
+        return tuple(
+            getattr(LLMUsageRecord, name)
+            for name in LLM_USAGE_TRACE_READ_COLUMNS
+        )
+
+    def build_trace_select(self, *, assistant_request_id: str) -> Any:
+        """构造 Assistant Trace 只读 SELECT（唯一一处 trace SQL 构造点）。
+
+        SQL：
+
+            SELECT id, assistant_request_id, request_id, provider, model,
+                   prompt_tokens, completion_tokens, total_tokens, created_at
+            FROM ai_ops.llm_usage_record
+            WHERE assistant_request_id = :assistant_request_id
+            ORDER BY created_at ASC, id ASC
+
+        * **精确匹配**：只返回 ``assistant_request_id = :param`` 的行；
+          ``assistant_request_id IS NULL``（历史 / 旧链路）**永不**匹配
+          —— 不生成 ``NULL OR ...``；
+        * 过滤下推 PostgreSQL（**不在 Python 里全表过滤**）；
+        * 值走 bound parameter（无字符串拼接 / 无 ``text()`` 拼接用户输入）；
+        * 确定性排序 ``created_at ASC, id ASC``：同一次 Assistant 请求内
+          按 LLM 调用发生的先后顺序返回（``id`` 提供 tie-breaker，不暴露
+          给上层 DTO —— 它本来就在白名单里，仅用于排序稳定）；
+        * 无 LIMIT / OFFSET（一次 Assistant 请求的 LLM 调用数量天然有限；
+          分页属未来阶段）。
+        """
+        return (
+            select(*self._trace_read_columns())
+            .where(
+                LLMUsageRecord.assistant_request_id == assistant_request_id
+            )
+            .order_by(
+                LLMUsageRecord.created_at.asc(),
+                LLMUsageRecord.id.asc(),
+            )
+        )
+
+    @staticmethod
+    def _to_trace_row(raw: Any) -> LLMUsageTraceRow:
+        """Core Row → Assistant Trace 只读 record（ORM 不外泄）。"""
+        data = raw._mapping  # noqa: SLF001 —— SQLAlchemy Row 的读取约定
+        return LLMUsageTraceRow(
+            id=data["id"],
+            assistant_request_id=data["assistant_request_id"],
+            request_id=data["request_id"],
+            provider=data["provider"],
+            model=data["model"],
+            prompt_tokens=data["prompt_tokens"],
+            completion_tokens=data["completion_tokens"],
+            total_tokens=data["total_tokens"],
+            created_at=data["created_at"],
+        )
+
+    def list_by_assistant_request_id(
+        self, assistant_request_id: str
+    ) -> list[LLMUsageTraceRow]:
+        """只读：按 Assistant Trace ID 取该次 Assistant 请求的全部 LLM Usage。
+
+        只负责 ``DB Query → Row DTO``：不做聚合 / 不做业务解释 /
+        不组装 Trace / 不查 Tool / 不查 RAG；无写事务。
+
+        Args:
+            assistant_request_id: 必填、非空（strip 后非空）、≤128 字符的
+                Assistant Trace ID（= ``AIOrchestratorService.execute()``
+                的 request_id；由调用方提供，本层**不生成**）。
+
+        Returns:
+            ``list[LLMUsageTraceRow]``（``created_at ASC, id ASC``）；
+            无匹配 → ``[]``（**不是错误**；``NULL`` 行不参与匹配）。
+
+        Raises:
+            ValueError:                assistant_request_id 非法
+                                       （触达数据库**之前**拦截）。
+            LLMUsageRepositoryError:   DB 未配置或查询失败。
+        """
+        validated = _validate_required_assistant_request_id(
+            assistant_request_id
+        )
+        factory = self._get_session_factory()
+        statement = self.build_trace_select(
+            assistant_request_id=validated
+        )
+        try:
+            with factory() as session:  # 读路径不开启写事务
+                rows = session.execute(statement).all()
+        except SQLAlchemyError as exc:
+            raise LLMUsageRepositoryError(
+                f"LLM Usage Trace 查询失败: {type(exc).__name__}"
+            ) from exc
+        return [self._to_trace_row(row) for row in rows]
 
     def get_by_request_id(self, *, request_id: str) -> LLMUsageRecordRow | None:
         """只读：按 request_id 取一条 Usage Record。

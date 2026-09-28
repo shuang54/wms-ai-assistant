@@ -38,18 +38,22 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 
 from backend.app.db.llm_usage_repository import (
+    ASSISTANT_REQUEST_ID_MAX_LENGTH,
     LLMUsageRecordRow,
     LLMUsageRepository,
     LLMUsageRepositoryError,
+    LLMUsageTraceRow,
 )
 
 __all__ = [
     "LLMUsageRecordView",
+    "LLMUsageTraceRecordView",
     "LLMUsageQueryFilter",
     "LLMUsageQueryService",
     "LLMUsageQueryError",
     "LLMUsageQueryInputError",
     "LLM_USAGE_VIEW_FIELDS",
+    "LLM_USAGE_TRACE_VIEW_FIELDS",
     "MIN_QUERY_LIMIT",
     "MAX_QUERY_LIMIT",
     "DEFAULT_QUERY_LIMIT",
@@ -159,6 +163,96 @@ LLM_USAGE_VIEW_FIELDS: frozenset[str] = frozenset(
 
 
 # ============================================================
+# Phase 3.12 Step 37：Assistant Trace 只读视图
+# ============================================================
+
+@dataclass(frozen=True)
+class LLMUsageTraceRecordView:
+    """Assistant Trace 只读视图（``assistant_request_id`` 精确匹配的结果）。
+
+    与 ``LLMUsageRecordView``（analytics read 边界）**并列而不替代**：
+
+        LLMUsageRecordView       8 字段（不含 assistant_request_id；
+                                 `/api/usage/analytics` 响应结构不变）
+        LLMUsageTraceRecordView  9 字段（+ assistant_request_id）
+
+    字段白名单（不做业务解释 / 不聚合 / 不组装 Trace）：
+
+        id / assistant_request_id / request_id / provider / model /
+        prompt_tokens / completion_tokens / total_tokens / created_at
+
+    ``request_id`` 的语义**保持**为「Provider 请求 ID」（**不改名**为
+    trace_id / provider_request_id）；Assistant Trace 身份由
+    ``assistant_request_id`` 表达。
+
+    绝不携带：ORM Model / Session / Connection / Engine / prompt /
+    messages / raw response / SQL / RAG context / tool arguments /
+    API key / password / authorization / database URL / cost。
+    """
+
+    id: int
+    assistant_request_id: str
+    #: Provider 请求 ID（保持既有字段名与语义）。
+    request_id: str | None
+    provider: str | None
+    model: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        if isinstance(self.id, bool) or not isinstance(self.id, int):
+            raise ValueError(
+                f"id 必须是 int（got {type(self.id).__name__}）"
+            )
+        if not isinstance(self.assistant_request_id, str):
+            raise ValueError(
+                "assistant_request_id 必须是 str"
+                f"（got {type(self.assistant_request_id).__name__}）"
+            )
+        if not self.assistant_request_id.strip():
+            raise ValueError("assistant_request_id 不能为空或纯空白")
+        for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"{name} 必须是 int 或 None"
+                    f"（got {type(value).__name__}）"
+                )
+            if value < 0:
+                raise ValueError(f"{name} 不允许负数（got {value}）")
+        if not isinstance(self.created_at, datetime):
+            raise ValueError(
+                "created_at 必须是 datetime"
+                f"（got {type(self.created_at).__name__}）"
+            )
+
+    @classmethod
+    def from_row(cls, row: LLMUsageTraceRow) -> "LLMUsageTraceRecordView":
+        """Repository Row → 只读 DTO（唯一转换入口；显式逐字段映射）。"""
+        return cls(
+            id=row.id,
+            assistant_request_id=row.assistant_request_id,
+            request_id=row.request_id,
+            provider=row.provider,
+            model=row.model,
+            prompt_tokens=row.prompt_tokens,
+            completion_tokens=row.completion_tokens,
+            total_tokens=row.total_tokens,
+            created_at=row.created_at,
+        )
+
+
+#: Assistant Trace 视图字段集合（测试 / 未来接入点校验用）。
+LLM_USAGE_TRACE_VIEW_FIELDS: frozenset[str] = frozenset(
+    field.name for field in fields(LLMUsageTraceRecordView)
+)
+
+
+# ============================================================
 # Query Filter（§八 / §九：只有表上真实存在的字段）
 # ============================================================
 
@@ -229,6 +323,38 @@ def _validate_optional_text(name: str, value: object) -> None:
         )
     if not value.strip():
         raise LLMUsageQueryInputError(f"{name} 不允许为空字符串")
+
+
+def _validate_required_assistant_request_id(value: object) -> str:
+    """**必填** Assistant Trace ID（Step 37；先于任何 DB 访问）。
+
+    * 非 ``str``（含 ``None``）→ ``LLMUsageQueryInputError``；
+    * ``""`` / ``"   "``（strip 后为空）→ ``LLMUsageQueryInputError``；
+    * 超长（> ``ASSISTANT_REQUEST_ID_MAX_LENGTH`` = 128，与 ORM 列一致）
+      → ``LLMUsageQueryInputError``；
+    * 只校验：不 truncate / 不 normalize / 不生成 UUID 兜底；
+      返回值与入参逐字符一致。
+
+    为什么抛 ``LLMUsageQueryInputError``（而不是裸 ``ValueError``）：
+    沿用本模块既有约定（`_validate_optional_text` 等同样如此），
+    语义就是"输入非法（不是 DB 错误）"；Repository 层对应的校验
+    抛 ``ValueError``（其既有约定）。
+    """
+    if not isinstance(value, str):
+        raise LLMUsageQueryInputError(
+            "assistant_request_id 必须是 str"
+            f"（got {type(value).__name__}）"
+        )
+    if not value.strip():
+        raise LLMUsageQueryInputError(
+            "assistant_request_id 不允许为空或纯空白"
+        )
+    if len(value) > ASSISTANT_REQUEST_ID_MAX_LENGTH:
+        raise LLMUsageQueryInputError(
+            "assistant_request_id 超出长度上限 "
+            f"（{len(value)} > {ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
+        )
+    return value
 
 
 def _validate_optional_datetime(name: str, value: object) -> None:
@@ -370,6 +496,44 @@ class LLMUsageQueryService:
             offset=offset,
         )
         return self.query(query_filter)
+
+    def list_by_assistant_request_id(
+        self, assistant_request_id: str
+    ) -> list[LLMUsageTraceRecordView]:
+        """按 Assistant Trace ID 查询该次 Assistant 请求的全部 LLM Usage
+        （Phase 3.12 Step 37）。
+
+        Pipeline：
+
+            validate input（DB 之前）
+                  ↓
+            repository.list_by_assistant_request_id()
+                  ↓
+            [LLMUsageTraceRecordView]（created_at ASC, id ASC）
+
+        只做这四件事；**不** 自动查 Tool / RAG / Conversation / 其它 Trace，
+        **不** 聚合，**不** 组装 Trace DTO（§十一 / §二十）。
+
+        Args:
+            assistant_request_id: 必填、非空（strip 后非空）、≤128 字符；
+                即 ``/api/ai/chat`` 成功响应 ``metadata.request_id``。
+
+        Returns:
+            ``list[LLMUsageTraceRecordView]``；
+            无匹配 → ``[]``（**不是错误**）；
+            ``assistant_request_id IS NULL`` 的历史 / 旧链路记录**不参与匹配**。
+
+        Raises:
+            LLMUsageQueryInputError:   assistant_request_id 非法
+                                       （None / 空 / 纯空白 / 非 str / 超长；
+                                       在触达数据库之前拒绝）。
+            LLMUsageRepositoryError:   DB 未配置 / 查询失败（原样透传）。
+        """
+        validated = _validate_required_assistant_request_id(
+            assistant_request_id
+        )
+        rows = self._repository.list_by_assistant_request_id(validated)
+        return [LLMUsageTraceRecordView.from_row(row) for row in rows]
 
     def query(
         self,
