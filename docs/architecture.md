@@ -3470,6 +3470,46 @@ C42.9  历史 NULL 兼容              C42.10 不读取 prompt / messages / secr
 无分页 / 不聚合 / 不组装 Trace DTO（Tool · RAG 联接属未来阶段）
 ```
 
+## 8.55 Assistant Trace Read Model（Phase 3.12 Step 38）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 38 — Assistant Trace Read Model.md`
+> 测试：`tests/test_assistant_trace_query_service.py`（35，含 C43）/
+> `tests/test_assistant_trace_query_service_db.py`（6，DB-gated）
+> **Read Model Composition ≠ Trace System**；**不新增 HTTP API**
+
+```text
+Assistant Trace A
+        │
+        ├── LLM Usage[]          ← LLMUsageQueryService（PostgreSQL；Step 37）
+        │
+        └── Tool Execution[]     ← ToolObservabilityQueryService（Runtime 内存）
+                ↓
+        AssistantTraceView（frozen；tuple; 不排序/不去重/不聚合）
+
+AssistantTraceQueryService
+       │
+       ├── LLMUsageQueryService            （只读 Query Service）
+       └── ToolObservabilityQueryService   （只读 Query Service）
+
+No Repository · No ORM · No SQL · No Session · No HTTP · No persistence
+（Collector 仍由 api/orchestrator_chat.py 唯一创建；本服务不创建 Collector）
+```
+
+```text
+AssistantTraceView(assistant_request_id: str,
+                   llm_usage: tuple[LLMUsageTraceRecordView, ...],   # 9 字段
+                   tool_executions: tuple[ToolExecutionSnapshot, ...]) # 11 字段
+
+Empty Semantics：LLM=0/Tool=0 合法（返回空 tuple，不是错误）；未知 ID 同样返回空 View
+Ordering：llm_usage = created_at ASC, id ASC（Step 37）；tool_executions = Collector 写入顺序
+Errors：下游异常原样透传（**绝不**把 DB 故障降级为 []）；输入非法 → ValueError（下游零调用）
+C43.1 只依赖 Query Service      C43.2 不依赖 Repository
+C43.3 不依赖 SQLAlchemy         C43.4 不访问 Session（且不创建 Collector）
+C43.5 不生成 request_id         C43.6 不执行 Tool
+C43.7 不执行 LLM                C43.8 不新增 HTTP endpoint
+C43.9 immutable result          C43.10 不暴露 secrets
+```
+
 ---
 
 # 9. Prompt Architecture
