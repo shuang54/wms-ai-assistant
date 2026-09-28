@@ -359,6 +359,174 @@ Response 200：
 安全：Metrics 不含 request_id / project_id / tool_name 等 identifier；
 不含维度聚合（by_tool / by_project / by_request 均未实现）。
 
+### 2.8 GET /api/observability/tools/metrics/persistent（Phase 3.11 Step 33）
+
+Tool 执行**持久指标**（数据库 `ai_ops.tool_execution_record` 聚合；只读）。
+
+```text
+Method:       GET（无写方法）
+Auth:         当前项目现有 API 机制（未新增认证）
+Side Effect:  None（不写库 / 不触发 Tool 执行 / 不修改内存 Collector）
+Persistence:  None（只读）
+Query:        project_id · tool_name · success（精确过滤；均可省略）
+              **无** limit / offset（聚合结果是单行，不是列表）
+```
+
+数据来源：
+
+```text
+ToolExecutionPersistentQueryService.metrics(...)
+    ↓ Repository.get_metrics()（count(*) / count(*) FILTER / sum / avg / max）
+    ↓ PostgreSQL
+```
+
+Response 200（有数据）：
+
+```json
+{
+  "total_count": 5,
+  "success_count": 3,
+  "failure_count": 2,
+  "success_rate": 0.6,
+  "failure_rate": 0.4,
+  "total_duration_ms": 1500.0,
+  "average_duration_ms": 300.0,
+  "max_duration_ms": 500.0
+}
+```
+
+Response 200（空数据集；`null` **不是** `0`）：
+
+```json
+{
+  "total_count": 0,
+  "success_count": 0,
+  "failure_count": 0,
+  "success_rate": null,
+  "failure_rate": null,
+  "total_duration_ms": 0.0,
+  "average_duration_ms": null,
+  "max_duration_ms": null
+}
+```
+
+过滤示例（精确匹配；省略 = 不过滤；无匹配 → 计数 0）：
+
+```text
+GET /api/observability/tools/metrics/persistent?project_id=project-a
+GET /api/observability/tools/metrics/persistent?tool_name=get_inventory
+GET /api/observability/tools/metrics/persistent?success=false   （false ≠ 省略）
+GET /api/observability/tools/metrics/persistent
+    ?project_id=project-a&tool_name=get_inventory&success=true
+```
+
+错误响应：
+
+| HTTP | 触发条件                   | detail                        |
+| ---- | -------------------------- | ----------------------------- |
+| 422  | 过滤值非法（success=maybe） | FastAPI 默认校验错误          |
+| 502  | 数据库未配置 / 查询失败     | `"Tool 持久观测指标不可用"`   |
+| 500  | 其它未预期异常             | `"Tool 观测数据不可用"`       |
+
+> 与 Runtime 指标（§2.6）**并列**：DB 失败**不会**回退到内存指标；
+> 响应不含 identifier / Tool args / SQL / traceback（仅 8 个指标字段）。
+
+### 2.7 GET /api/observability/tools/history（Phase 3.11 Step 30）
+
+Tool 执行**持久历史**（数据库 `ai_ops.tool_execution_record`）只读列表。
+
+```text
+Method:       GET（无 POST / PUT / PATCH / DELETE）
+Auth:         当前项目现有 API 机制（本阶段未新增认证机制）
+Side Effect:  None（不写库 / 不触发 Tool 执行 / 不修改内存 Collector）
+Persistence:  None（只读）
+Query:        limit（1~1000，默认 100）+ offset（>= 0，默认 0）
+              —— 仅 LIMIT + OFFSET 分页；无 cursor / keyset / total_count
+              + 精确过滤：project_id · tool_name · success（均可省略）
+```
+
+过滤示例（**精确匹配**；条件之间 AND；省略 = 不过滤）：
+
+```text
+GET /api/observability/tools/history?project_id=project-a
+GET /api/observability/tools/history?tool_name=get_inventory
+GET /api/observability/tools/history?success=true
+GET /api/observability/tools/history?success=false      （false ≠ 省略）
+GET /api/observability/tools/history
+    ?project_id=project-a&tool_name=get_inventory&success=true
+    &limit=20&offset=0
+
+语义：WHERE project_id = :p AND tool_name = :t AND success = :s
+      → ORDER BY started_at DESC, id DESC
+      → LIMIT :limit OFFSET :offset        （过滤先于分页）
+无匹配 → 200 {"items": [], "limit": …, "offset": …}（不是 404）
+不支持：LIKE / ILIKE / 正则 / 模糊 / 关键词 / 时间范围（均为 Deferred）
+```
+
+分页示例：
+
+```text
+GET /api/observability/tools/history?limit=100&offset=0     第 1 页
+GET /api/observability/tools/history?limit=100&offset=100   第 2 页
+GET /api/observability/tools/history?limit=100&offset=200   第 3 页
+
+所有页共用同一确定性排序（started_at DESC, id DESC）
+→ 跨页无重复 / 无遗漏；offset 超出记录数 → 200 + items=[]（不是 404）
+```
+
+数据来源：
+
+```text
+ToolExecutionPersistentQueryService.list_recent(limit)
+    ↓
+ToolExecutionRepository（ORDER BY started_at DESC, id DESC LIMIT n）
+    ↓
+ToolExecutionSnapshot → snapshot_to_dict() → JSON
+```
+
+与 Runtime 端点（§2.5）的关系：
+
+```text
+Runtime      = 本进程内存 Collector（近期观测；多进程各自独立）
+Persistent   = 数据库长期历史（跨进程 / 跨重启）
+parallel —— 不 merge · 不 fallback · 不去重
+```
+
+Response 200：
+
+```json
+{
+  "items": [
+    {
+      "request_id": "step30-test-001",
+      "round": 1,
+      "tool_name": "get_inventory",
+      "started_at": "2026-09-28T12:00:00+00:00",
+      "finished_at": "2026-09-28T12:00:00.007500+00:00",
+      "duration_ms": 7.5,
+      "success": true,
+      "project_id": "test-project",
+      "tool_call_id": null,
+      "error_code": null,
+      "error_type": null
+    }
+  ]
+}
+```
+
+空库：`{"items": []}`（200）。
+
+错误响应：
+
+| HTTP | 触发条件                          | detail                      |
+| ---- | --------------------------------- | --------------------------- |
+| 422  | limit 非法（0 / -1 / 1001 / abc） | FastAPI 默认校验错误        |
+| 502  | 数据库未配置 / 查询失败           | `"Tool 观测历史数据不可用"` |
+| 500  | 其它未预期异常                    | `"Tool 观测数据不可用"`     |
+
+> DB 失败**不会**回退到内存视图（Runtime 与 Persistent 严格并列）；
+> 响应只含 Snapshot 的 11 个字段，不含数据库主键 `id` / `created_at`。
+
 ---
 
 ## 3. 错误响应

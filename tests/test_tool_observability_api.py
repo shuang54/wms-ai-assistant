@@ -35,8 +35,18 @@ from backend.app.services.in_memory_tool_execution_collector import (
     InMemoryToolExecutionCollector,
 )
 from backend.app.services.tool_execution_record import ToolExecutionRecord
+from backend.app.db.tool_execution_repository import (
+    ToolExecutionRepositoryError,
+)
 from backend.app.services.tool_observability_query_service import (
     ToolObservabilityQueryService,
+)
+from backend.app.services.tool_execution_metrics_service import (
+    ToolExecutionMetricsService,
+    ToolExecutionMetricsSnapshot,
+)
+from backend.app.services.tool_observability_snapshot import (
+    ToolExecutionSnapshot,
 )
 from backend.app.tools.registry import ToolRegistry
 
@@ -391,6 +401,13 @@ class TestApiArchitectureBoundary:
         assert "metrics" in identifiers
 
     def test_api_does_not_import_collector_or_record(self) -> None:
+        """API 只经 accessor 拿 QueryService / PersistentQueryService。
+
+        Step 30：允许的唯一 db 依赖 = ``ToolExecutionRepositoryError`` 类型
+        （错误映射；与 ``api/usage.py`` 导入 ``LLMUsageRepositoryError``
+        的既有 precedent 一致）—— 不得 import Repository 类 / Session /
+        ORM Model / SQLAlchemy。
+        """
         imported = _imported_modules()
 
         for forbidden in (
@@ -401,7 +418,8 @@ class TestApiArchitectureBoundary:
             "backend.app.services.ai_orchestrator_service",
             "backend.app.services.ai_router_service",
             "backend.app.tools",
-            "backend.app.db",
+            "backend.app.db.session",
+            "backend.app.db.models",
             "backend.app.llm",
             "sqlalchemy",
         ):
@@ -409,6 +427,11 @@ class TestApiArchitectureBoundary:
                 name == forbidden or name.startswith(forbidden + ".")
                 for name in imported
             ), forbidden
+        # 唯一允许的 db 模块 = 仓储错误类型所在模块
+        db_imports = {
+            name for name in imported if name.startswith("backend.app.db")
+        }
+        assert db_imports == {"backend.app.db.tool_execution_repository"}
 
     def test_api_does_not_import_registry_or_handler(self) -> None:
         imported = _imported_modules()
@@ -600,3 +623,652 @@ class TestApiSecurity:
             "MAT-001", "DATA-LEAK-MARKER", "material_code", "qty",
         ):
             assert forbidden not in text, forbidden
+
+
+# ============================================================
+# Persistent History API（Phase 3.11 Step 30）
+# ============================================================
+
+_HISTORY_FIELDS = (
+    "request_id", "round", "tool_name", "started_at", "finished_at",
+    "duration_ms", "success", "project_id", "tool_call_id", "error_code",
+    "error_type",
+)
+
+
+def _snapshot_from(record: ToolExecutionRecord) -> ToolExecutionSnapshot:
+    return ToolExecutionSnapshot.from_record(record)
+
+
+class _FakePersistentQueryService:
+    """记录分页 / 过滤参数 + 返回预置快照 / 可注入异常（duck-typed；无需 DB）。"""
+
+    def __init__(
+        self,
+        snapshots: list[ToolExecutionSnapshot] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._snapshots = snapshots or []
+        self._error = error
+        self.calls: list[tuple[int, int]] = []
+        self.filters: list[dict[str, object]] = []
+        self.metrics_calls: list[dict[str, object]] = []
+        self._metrics_snapshot = ToolExecutionMetricsService.snapshot(())
+        self._metrics_error: Exception | None = None
+
+    def _set_metrics(
+        self,
+        snapshot: ToolExecutionMetricsSnapshot,
+        error: Exception | None = None,
+    ) -> None:
+        self._metrics_snapshot = snapshot
+        self._metrics_error = error
+
+    def list_recent(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        project_id: str | None = None,
+        tool_name: str | None = None,
+        success: bool | None = None,
+    ) -> list[ToolExecutionSnapshot]:
+        self.calls.append((limit, offset))
+        self.filters.append({
+            "project_id": project_id,
+            "tool_name": tool_name,
+            "success": success,
+        })
+        if self._error is not None:
+            raise self._error
+        return list(self._snapshots[offset: offset + limit])
+
+    # ---- Step 33：Persistent Metrics ----
+
+    def metrics(
+        self,
+        *,
+        project_id: str | None = None,
+        tool_name: str | None = None,
+        success: bool | None = None,
+    ) -> ToolExecutionMetricsSnapshot:
+        self.metrics_calls.append({
+            "project_id": project_id,
+            "tool_name": tool_name,
+            "success": success,
+        })
+        if self._metrics_error is not None:
+            raise self._metrics_error
+        return self._metrics_snapshot
+
+
+@pytest.fixture()
+def history(monkeypatch):
+    """返回 (client, 装配 fake persistent query service 的工厂)。"""
+    root._TOOL_EXECUTION_COLLECTOR.clear()
+
+    def _install(
+        snapshots: list[ToolExecutionSnapshot] | None = None,
+        error: Exception | None = None,
+    ) -> _FakePersistentQueryService:
+        service = _FakePersistentQueryService(snapshots, error)
+        monkeypatch.setattr(
+            api_module,
+            "get_tool_execution_persistent_query_service",
+            lambda: service,
+        )
+        return service
+
+    with TestClient(app) as test_client:
+        yield test_client, _install
+    root._TOOL_EXECUTION_COLLECTOR.clear()
+
+
+class TestPersistentHistoryApi:
+    def test_empty_history_returns_200_with_empty_items(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        response = client.get("/api/observability/tools/history")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "items": [], "limit": 100, "offset": 0
+        }
+        assert service.calls == [(100, 0)]         # 默认 limit + offset
+
+    def test_one_record(self, history) -> None:
+        client, install = history
+        record = _record(request_id="step30-test-001")
+        install([_snapshot_from(record)])
+
+        payload = client.get("/api/observability/tools/history").json()
+
+        assert len(payload["items"]) == 1
+        item = payload["items"][0]
+        assert item["request_id"] == "step30-test-001"
+        assert item["round"] == 1
+        assert item["tool_name"] == "get_inventory"
+        assert item["success"] is True
+        assert item["project_id"] == "project-a"
+        assert item["duration_ms"] == 12.5
+        assert item["started_at"] == "2026-09-26T10:20:30.123456+00:00"
+
+    def test_multiple_records_keep_service_order(self, history) -> None:
+        client, install = history
+        install([
+            _snapshot_from(_record(request_id="step30-new")),
+            _snapshot_from(_record(request_id="step30-old")),
+        ])
+
+        items = client.get("/api/observability/tools/history").json()["items"]
+
+        assert [i["request_id"] for i in items] == [
+            "step30-new", "step30-old"
+        ]
+
+    def test_limit_values(self, history) -> None:
+        client, install = history
+        service = install([_snapshot_from(_record())])
+
+        for value in (1, 100, 1000):
+            response = client.get(
+                f"/api/observability/tools/history?limit={value}"
+            )
+            assert response.status_code == 200
+        assert service.calls == [(1, 0), (100, 0), (1000, 0)]
+
+    # ---- Step 31：offset（分页） ----
+
+    def test_offset_values(self, history) -> None:
+        client, install = history
+        service = install([_snapshot_from(_record())])
+
+        for value in (0, 1, 100):
+            response = client.get(
+                f"/api/observability/tools/history?offset={value}"
+            )
+            assert response.status_code == 200
+            assert response.json()["offset"] == value
+        assert service.calls == [(100, 0), (100, 1), (100, 100)]
+
+    def test_limit_and_offset_together(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        payload = client.get(
+            "/api/observability/tools/history?limit=2&offset=2"
+        ).json()
+
+        assert payload == {"items": [], "limit": 2, "offset": 2}
+        assert service.calls == [(2, 2)]
+
+    def test_empty_page_returns_200(self, history) -> None:
+        """offset 超出记录数 → 200 + items=[]（不是 404）。"""
+        client, install = history
+        install([_snapshot_from(_record(request_id="only-one"))])
+
+        response = client.get(
+            "/api/observability/tools/history?limit=100&offset=100"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "items": [], "limit": 100, "offset": 100
+        }
+
+    def test_page_consistency_via_api(self, history) -> None:
+        """分页一致性：三页拼起来 == 一次取全（无重复 / 无遗漏 / 顺序稳定）。"""
+        client, install = history
+        install([
+            _snapshot_from(_record(request_id=f"step31-{index}"))
+            for index in range(5)
+        ])
+
+        page1 = client.get(
+            "/api/observability/tools/history?limit=2&offset=0"
+        ).json()["items"]
+        page2 = client.get(
+            "/api/observability/tools/history?limit=2&offset=2"
+        ).json()["items"]
+        page3 = client.get(
+            "/api/observability/tools/history?limit=2&offset=4"
+        ).json()["items"]
+        whole = client.get(
+            "/api/observability/tools/history?limit=5&offset=0"
+        ).json()["items"]
+
+        assert [i["request_id"] for i in page1 + page2 + page3] == [
+            i["request_id"] for i in whole
+        ]
+        assert len(page3) == 1
+
+    def test_invalid_limit_returns_422_not_500(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        for bad in ("0", "-1", "1001", "abc"):
+            response = client.get(
+                f"/api/observability/tools/history?limit={bad}"
+            )
+            assert response.status_code == 422, bad
+        assert service.calls == []                 # 校验在进入端点之前
+
+    def test_invalid_offset_returns_422_without_touching_service(
+        self, history
+    ) -> None:
+        client, install = history
+        service = install([])
+
+        for bad in ("-1", "-100", "abc"):
+            response = client.get(
+                f"/api/observability/tools/history?offset={bad}"
+            )
+            assert response.status_code == 422, bad
+        assert service.calls == []                 # Service / Repository / DB 未触达
+
+    def test_large_offset_is_valid(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        response = client.get(
+            "/api/observability/tools/history?limit=1&offset=999999999"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "items": [], "limit": 1, "offset": 999_999_999
+        }
+        assert service.calls == [(1, 999_999_999)]
+
+    def test_db_failure_returns_502_without_fallback(self, history) -> None:
+        """DB failure ≠ empty：502，且**绝不**回退到内存 Collector。"""
+        client, install = history
+        install(error=ToolExecutionRepositoryError("db down"))
+        _seed(_record(request_id="runtime-only-A"))   # 内存里有数据
+
+        response = client.get("/api/observability/tools/history")
+
+        assert response.status_code == 502
+        assert "runtime-only-A" not in response.text
+        assert response.json()["detail"] == "Tool 观测历史数据不可用"
+
+    # ---- Step 32：精确过滤（project_id / tool_name / success） ----
+
+    def test_filters_are_forwarded_to_service(self, history) -> None:
+        client, install = history
+        service = install([_snapshot_from(_record())])
+
+        client.get(
+            "/api/observability/tools/history"
+            "?project_id=project-a&tool_name=get_inventory&success=true"
+            "&limit=20&offset=5"
+        )
+
+        assert service.calls == [(20, 5)]
+        assert service.filters == [{
+            "project_id": "project-a",
+            "tool_name": "get_inventory",
+            "success": True,
+        }]
+
+    def test_success_false_is_forwarded_as_false(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        client.get("/api/observability/tools/history?success=false")
+
+        assert service.filters[0]["success"] is False  # 不是 None
+
+    def test_no_filters_means_none(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        client.get("/api/observability/tools/history")
+
+        assert service.filters == [{
+            "project_id": None, "tool_name": None, "success": None
+        }]
+
+    def test_empty_string_filter_is_forwarded(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        client.get("/api/observability/tools/history?project_id=&tool_name=")
+
+        assert service.filters[0]["project_id"] == ""
+        assert service.filters[0]["tool_name"] == ""
+
+    def test_invalid_success_value_returns_422(self, history) -> None:
+        client, install = history
+        service = install([])
+
+        assert client.get(
+            "/api/observability/tools/history?success=maybe"
+        ).status_code == 422
+        assert service.calls == []                     # 未进入端点
+
+    def test_filter_and_pagination_combined_response(self, history) -> None:
+        client, install = history
+        install([
+            _snapshot_from(_record(request_id="filtered-1")),
+            _snapshot_from(_record(request_id="filtered-2")),
+        ])
+
+        payload = client.get(
+            "/api/observability/tools/history"
+            "?project_id=project-a&limit=1&offset=1"
+        ).json()
+
+        assert payload["limit"] == 1
+        assert payload["offset"] == 1
+        assert [i["request_id"] for i in payload["items"]] == ["filtered-2"]
+
+    def test_runtime_endpoints_unaffected_by_filters(self, history) -> None:
+        """Runtime 端点不接受过滤参数（多余参数被忽略），仍只读内存。"""
+        client, install = history
+        service = install(error=ToolExecutionRepositoryError("db down"))
+        _seed(_record(request_id="memory-A"))
+
+        payload = client.get(
+            "/api/observability/tools?project_id=does-not-exist"
+        ).json()
+
+        assert [r["request_id"] for r in payload["records"]] == ["memory-A"]
+        assert service.calls == []
+
+    def test_db_failure_response_has_no_internals(self, history) -> None:
+        client, install = history
+        install(
+            error=ToolExecutionRepositoryError(
+                "SELECT * FROM ai_ops.tool_execution_record "
+                "postgresql://user:pw@host/db"
+            )
+        )
+
+        response = client.get("/api/observability/tools/history")
+        text = response.text.upper()
+
+        for forbidden in (
+            "SELECT", "POSTGRESQL://", "PASSWORD", "TRACEBACK",
+            "AI_OPS", "TOOL_EXECUTION_REPOSITORY",
+        ):
+            assert forbidden not in text, forbidden
+
+    def test_response_field_whitelist(self, history) -> None:
+        client, install = history
+        install([_snapshot_from(_record())])
+
+        payload = client.get("/api/observability/tools/history").json()
+        item = payload["items"][0]
+
+        assert set(payload) == {"items", "limit", "offset"}
+        assert tuple(item) == _HISTORY_FIELDS
+        for forbidden in (
+            "id", "created_at", "database_name", "arguments", "result",
+            "data", "sql", "prompt", "llm_response", "exception_message",
+            "traceback",
+        ):
+            assert forbidden not in item, forbidden
+
+    def test_get_only_no_write_endpoints(self) -> None:
+        import ast as _ast
+
+        tree = _ast.parse(
+            open(
+                os.path.join(
+                    _REPO_ROOT, "backend", "app", "api",
+                    "tool_observability.py",
+                ),
+                encoding="utf-8",
+            ).read()
+        )
+        methods = {
+            node.attr
+            for node in _ast.walk(tree)
+            if isinstance(node, _ast.Attribute)
+            and isinstance(node.value, _ast.Name)
+            and node.value.id == "router"
+        }
+        assert methods == {"get"}, methods
+
+    # ---- Runtime / Persistent 隔离（§十四） ----
+
+    def test_persistent_history_api_does_not_read_memory_collector(
+        self, history
+    ) -> None:
+        """collector 有 A，数据库有 B → /history 只返回 B。"""
+        client, install = history
+        install([_snapshot_from(_record(request_id="database-B"))])
+        _seed(_record(request_id="memory-A"))
+
+        items = client.get("/api/observability/tools/history").json()["items"]
+
+        assert [i["request_id"] for i in items] == ["database-B"]
+        assert "memory-A" not in client.get(
+            "/api/observability/tools/history"
+        ).text
+
+    def test_runtime_history_api_does_not_read_database(self, history) -> None:
+        """运行时端点仍只读 Collector：持久服务**从未被调用**。"""
+        client, install = history
+        service = install(
+            error=ToolExecutionRepositoryError("db down")
+        )
+        _seed(_record(request_id="memory-A"))
+
+        payload = client.get("/api/observability/tools").json()
+
+        assert [r["request_id"] for r in payload["records"]] == ["memory-A"]
+        assert service.calls == []                 # 未触达持久化链路
+        # metrics 端点同理
+        assert (
+            client.get("/api/observability/tools/metrics").json()["total_count"]
+            == 1
+        )
+        assert service.calls == []
+
+    def test_history_does_not_modify_collector(self, history) -> None:
+        client, install = history
+        install([_snapshot_from(_record(request_id="database-B"))])
+        _seed(_record(request_id="memory-A"))
+        before = root._TOOL_EXECUTION_COLLECTOR.records()
+
+        client.get("/api/observability/tools/history")
+
+        assert root._TOOL_EXECUTION_COLLECTOR.records() == before
+
+
+# ============================================================
+# Persistent Metrics API（Phase 3.11 Step 33）
+# ============================================================
+
+_METRICS_PATH = "/api/observability/tools/metrics/persistent"
+
+_METRICS_FIELDS = (
+    "total_count", "success_count", "failure_count", "success_rate",
+    "failure_rate", "total_duration_ms", "average_duration_ms",
+    "max_duration_ms",
+)
+
+
+class TestPersistentMetricsApi:
+    def test_empty_metrics_200(self, history) -> None:
+        client, install = history
+        service = install()
+
+        response = client.get(_METRICS_PATH)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "total_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "success_rate": None,
+            "failure_rate": None,
+            "total_duration_ms": 0.0,
+            "average_duration_ms": None,
+            "max_duration_ms": None,
+        }
+        assert service.metrics_calls == [{
+            "project_id": None, "tool_name": None, "success": None
+        }]
+
+    def test_populated_metrics(self, history) -> None:
+        client, install = history
+        service = install()
+        service._set_metrics(  # noqa: SLF001 —— 测试装配
+            ToolExecutionMetricsSnapshot(
+                total_count=5,
+                success_count=3,
+                failure_count=2,
+                success_rate=0.6,
+                failure_rate=0.4,
+                total_duration_ms=600.0,
+                average_duration_ms=120.0,
+                max_duration_ms=300.0,
+            )
+        )
+
+        payload = client.get(_METRICS_PATH).json()
+
+        assert payload["total_count"] == 5
+        assert payload["success_count"] == 3
+        assert payload["failure_count"] == 2
+        assert payload["success_rate"] == pytest.approx(0.6)
+        assert payload["failure_rate"] == pytest.approx(0.4)
+        assert payload["total_duration_ms"] == 600.0
+        assert payload["average_duration_ms"] == 120.0
+        assert payload["max_duration_ms"] == 300.0
+
+    def test_filters_forwarded(self, history) -> None:
+        client, install = history
+        service = install()
+
+        client.get(
+            f"{_METRICS_PATH}"
+            "?project_id=project-a&tool_name=get_inventory&success=true"
+        )
+
+        assert service.metrics_calls == [{
+            "project_id": "project-a",
+            "tool_name": "get_inventory",
+            "success": True,
+        }]
+
+    def test_success_false_forwarded_as_false(self, history) -> None:
+        client, install = history
+        service = install()
+
+        client.get(f"{_METRICS_PATH}?success=false")
+
+        assert service.metrics_calls[0]["success"] is False
+
+    def test_injection_string_forwarded_as_literal(self, history) -> None:
+        client, install = history
+        service = install()
+
+        response = client.get(
+            f"{_METRICS_PATH}?project_id=%27%20OR%201%3D1%20--"
+        )
+
+        assert response.status_code == 200
+        assert service.metrics_calls[0]["project_id"] == "' OR 1=1 --"
+
+    def test_invalid_success_returns_422(self, history) -> None:
+        client, install = history
+        service = install()
+
+        response = client.get(f"{_METRICS_PATH}?success=maybe")
+
+        assert response.status_code == 422
+        assert service.metrics_calls == []
+
+    def test_db_failure_returns_502_without_runtime_fallback(
+        self, history
+    ) -> None:
+        client, install = history
+        service = install()
+        service._set_metrics(  # noqa: SLF001
+            ToolExecutionMetricsService.snapshot(()),
+            error=ToolExecutionRepositoryError("db down"),
+        )
+        _seed(_record(request_id="memory-A"))     # 内存里有数据
+
+        response = client.get(f"{_METRICS_PATH}")
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Tool 持久观测指标不可用"
+        assert "total_count" not in response.text   # 未回退到内存指标
+        assert "memory-A" not in response.text
+
+    def test_unexpected_error_returns_500(self, history) -> None:
+        client, install = history
+        service = install()
+        service._set_metrics(  # noqa: SLF001
+            ToolExecutionMetricsService.snapshot(()),
+            error=RuntimeError("boom"),
+        )
+
+        response = client.get(_METRICS_PATH)
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Tool 观测数据不可用"
+
+    def test_response_field_whitelist_and_security(self, history) -> None:
+        client, install = history
+        install()
+
+        payload = client.get(
+            f"{_METRICS_PATH}?project_id=project-a&tool_name=get_inventory"
+        ).json()
+
+        assert tuple(payload) == _METRICS_FIELDS
+        for forbidden in (
+            "id", "request_id", "project_id", "tool_name", "tool_call_id",
+            "arguments", "result", "data", "sql", "prompt", "llm_response",
+            "password", "api_key", "database_url", "traceback", "rows",
+        ):
+            assert forbidden not in payload, forbidden
+
+    def test_no_limit_or_offset_parameters(self) -> None:
+        import inspect
+
+        signature = inspect.signature(api_module.persistent_tool_execution_metrics)
+
+        assert list(signature.parameters) == [
+            "project_id", "tool_name", "success"
+        ]
+
+    def test_runtime_metrics_unchanged_when_persistent_broken(
+        self, history
+    ) -> None:
+        """Runtime Metrics 仍只读内存：持久侧故障不影响它。"""
+        client, install = history
+        service = install()
+        service._set_metrics(  # noqa: SLF001
+            ToolExecutionMetricsService.snapshot(()),
+            error=ToolExecutionRepositoryError("db down"),
+        )
+        _seed(_record(request_id="memory-A"))
+        _seed(_record(request_id="memory-B", success=False))
+
+        assert client.get(f"{_METRICS_PATH}").status_code == 502
+        metrics_calls = list(service.metrics_calls)
+        runtime = client.get("/api/observability/tools/metrics")
+
+        assert runtime.status_code == 200
+        assert runtime.json()["total_count"] == 2
+        # 运行时端点不触达持久化链路（调用次数不变）
+        assert service.metrics_calls == metrics_calls
+        assert service.calls == []
+
+    def test_persistent_metrics_is_read_only(self, history) -> None:
+        client, install = history
+        install()
+        _seed(_record(request_id="memory-A"))
+        before = root._TOOL_EXECUTION_COLLECTOR.records()
+
+        client.get(_METRICS_PATH)
+
+        assert root._TOOL_EXECUTION_COLLECTOR.records() == before

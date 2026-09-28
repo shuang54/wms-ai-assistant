@@ -475,19 +475,22 @@ class TestC25QuerySnapshotApi:
         assert "__dict__" not in _identifiers("snapshot")
 
     def test_c25_13_only_allowlisted_tool_observability_http_api(self) -> None:
-        """Tool Observability HTTP 端点**仅限** Step 25 的两个只读端点。
+        """Tool Observability HTTP 端点**仅限**已批准的三个只读端点。
 
-        Step 23 审计时点为 0 端点；Step 25 有意引入 Read API（§四）后，
-        本断言改为"白名单"形式：除 ``/api/observability/tools`` 与
-        ``/api/observability/tools/metrics`` 外，不得出现任何
+        Step 23 审计时点为 0 端点；Step 25 引入 Runtime Read API；
+        Step 30 引入 Persistent History API。本断言保持"白名单"形式：
+        除 ``/observability/tools`` · ``/observability/tools/metrics`` ·
+        ``/observability/tools/history`` 外，不得出现任何
         observability / metrics / snapshot 端点。
 
         只看**路由路径**（装饰器里的字符串），避免把既有 import 名称
         （如 ``tool_execution_service``）误判成端点。
         """
         allowed_paths = {
-            "/observability/tools",
-            "/observability/tools/metrics",
+            "/observability/tools",              # Runtime（内存）
+            "/observability/tools/metrics",      # Runtime Metrics（内存）
+            "/observability/tools/history",      # Persistent History（Step 30）
+            "/observability/tools/metrics/persistent",   # Persistent Metrics（Step 33）
         }
         api_dir = os.path.join(REPO_ROOT, "backend", "app", "api")
         routes: list[tuple[str, str]] = []

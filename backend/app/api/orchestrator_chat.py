@@ -65,6 +65,24 @@ Phase 3.11 Step 19（Observability Composition Root / Lifecycle Contract）：
           Snapshot / 不缓存 metrics / 不接 HTTP Metrics API；
         * **无** ``get_default_collector()`` 之类工厂（避免隐式全局单例辅助）；
           测试可自行构造 Collector 并注入 ``AIOrchestratorService``。
+
+Phase 3.11 Step 28（Persistence Adapter Integration）：
+
+    观测出口由单一 Collector 升级为 **fan-out**（同一位置装配）：
+
+        ToolExecutionObserver（Protocol；core 层不感知实现）
+            ├── InMemoryToolExecutionCollector    （runtime store；API 内存视图）
+            └── ToolExecutionPersistenceAdapter   （→ Service → Repository → ai_ops）
+
+    生命周期契约（Step 19 不变 + Step 28 追加）：
+
+        * Collector 仍是**唯一**一个（本模块创建，Application lifetime）；
+        * 新增的 Service / Adapter 亦只在本模块创建（Composition Root 唯一装配点）；
+          Adapter / Collector 互不依赖（并列挂在 Observer 端口上）；
+        * 持久化失败由 Adapter 收敛为 warning → Tool 执行结果不变
+          （无 retry / queue / 异步 / 批量写入）；
+        * HTTP API（Step 25）**仍只读内存**；数据库是长期历史，
+          QueryService → PostgreSQL = NOT IMPLEMENTED（Deferred）。
 """
 from __future__ import annotations
 
@@ -99,6 +117,16 @@ from backend.app.services.in_memory_tool_execution_collector import (
     InMemoryToolExecutionCollector,
 )
 from backend.app.services.tool_execution_observer import ToolExecutionObserver
+from backend.app.services.tool_execution_persistence_adapter import (
+    CompositeToolExecutionObserver,
+    ToolExecutionPersistenceAdapter,
+)
+from backend.app.services.tool_execution_persistence_service import (
+    ToolExecutionPersistenceService,
+)
+from backend.app.services.tool_execution_persistent_query_service import (
+    ToolExecutionPersistentQueryService,
+)
 from backend.app.services.tool_observability_query_service import (
     ToolObservabilityQueryService,
 )
@@ -236,7 +264,24 @@ _TOOL_REGISTRY = build_default_tool_registry()
 # Registry / Handler / Metrics 均**不**创建、不持有它（只接收 observer）。
 # 同一对象以 ToolExecutionObserver（Protocol）类型注入 → core 层不感知具体实现。
 _TOOL_EXECUTION_COLLECTOR = InMemoryToolExecutionCollector()
-_TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = _TOOL_EXECUTION_COLLECTOR
+
+# Phase 3.11 Step 28：Observer fan-out（内存 + 持久化，两者互相独立）。
+# 同一 Record 依次交给两个**并列**的 Observer 实现：
+#     ├── InMemoryToolExecutionCollector（runtime store；API 读的内存视图）
+#     └── ToolExecutionPersistenceAdapter → Service → Repository → ai_ops
+# 不新增第二个 Collector；Collector / Adapter 互不依赖（并列挂在端口上）。
+# 持久化失败由 Adapter 收敛为 warning → 绝不影响 Tool 执行结果
+# （执行边界 Step 15 亦有一层隔离）。
+_TOOL_EXECUTION_PERSISTENCE_SERVICE = ToolExecutionPersistenceService()
+_TOOL_EXECUTION_PERSISTENCE_ADAPTER = ToolExecutionPersistenceAdapter(
+    persistence_service=_TOOL_EXECUTION_PERSISTENCE_SERVICE
+)
+_TOOL_EXECUTION_OBSERVER: ToolExecutionObserver = (
+    CompositeToolExecutionObserver(
+        _TOOL_EXECUTION_COLLECTOR,
+        _TOOL_EXECUTION_PERSISTENCE_ADAPTER,
+    )
+)
 
 
 def get_tool_observability_query_service() -> ToolObservabilityQueryService:
@@ -261,6 +306,37 @@ def get_tool_observability_query_service() -> ToolObservabilityQueryService:
         绑定 Application 级 Collector 的 ``ToolObservabilityQueryService``。
     """
     return ToolObservabilityQueryService(_TOOL_EXECUTION_COLLECTOR)
+
+
+# Phase 3.11 Step 30：Persistent History（数据库只读）装配。
+# 与 Runtime 观测链**并列**（不是 fallback / 不 merge）：
+#     Collector（内存）    ← Runtime API（GET /api/observability/tools）
+#     Repository（ai_ops） ← Persistent API（GET .../tools/history）
+# 二者互不引用。**本模块不直接接触 Repository / SQLAlchemy / Session**：
+# 仓储由 QueryService 在构造时按默认依赖创建（Step 29），此处只持有
+# 模块级**同一个**只读服务实例（**不**每请求新建；不新增全局单例框架）。
+_TOOL_HISTORY_QUERY_SERVICE = ToolExecutionPersistentQueryService()
+
+
+def get_tool_execution_persistent_query_service() -> (
+    ToolExecutionPersistentQueryService
+):
+    """Phase 3.11 Step 30：持久历史只读查询装配（Composition Root accessor）。
+
+        api/tool_observability.py（Persistent History 端点）
+            ↓ get_tool_execution_persistent_query_service()
+        ToolExecutionPersistentQueryService（只读；Step 29）
+            ↓
+        ToolExecutionRepository → ai_ops.tool_execution_record
+
+    * API 层**不**接触 Repository / Session / SQLAlchemy / ORM Model；
+    * 只读：无 create / update / delete 路径；
+    * 与 Runtime 查询（Collector）互相独立：**无 fallback / 无 merge**。
+
+    Returns:
+        绑定 Application 级 Repository 的查询服务（模块级同一实例）。
+    """
+    return _TOOL_HISTORY_QUERY_SERVICE
 
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     router=AIRouterService(

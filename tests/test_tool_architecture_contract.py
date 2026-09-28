@@ -1567,12 +1567,18 @@ class TestC21ObservabilityComposition:
     # ---- C21.4 Application lifetime 共享同一 Collector ----
 
     def test_c21_4_shared_collector_within_application_lifetime(self) -> None:
+        """Step 21 时点：观测出口 == Collector。
+        Step 28：观测出口升级为 fan-out（Collector + PersistenceAdapter），
+        Collector 仍是**同一个** Application 级实例（未创建第二个）。"""
         from backend.app.api import orchestrator_chat as root
 
-        assert root._TOOL_EXECUTION_OBSERVER is root._TOOL_EXECUTION_COLLECTOR
+        assert (
+            root._TOOL_EXECUTION_OBSERVER.observers[0]
+            is root._TOOL_EXECUTION_COLLECTOR
+        )
         assert (
             root._default_orchestrator.tool_execution_observer
-            is root._TOOL_EXECUTION_COLLECTOR
+            is root._TOOL_EXECUTION_OBSERVER
         )
         # Service Factory：继承 base 的观测出口（同一 Collector），
         # 且**签名不变**（HTTP 不能注入任何配置 / 观测依赖）

@@ -2992,6 +2992,348 @@ C27.18 响应无 Tool args/result C27.19 Metrics 无 identifier
 C27.20 无 Query DSL
 ```
 
+## 8.44 Tool Observability Persistence Boundary（Phase 3.11.26 — Survey & Design）
+
+> ADR：`docs/decisions/ADR-3.11.26-tool-observability-persistence-boundary.md`
+> 记录：`docs/evaluation/Phase 3.11.26 — Tool Observability Persistence Boundary.md`
+> 测试：`tests/test_tool_observability_persistence_architecture.py`（C28~C32，16）
+> **状态：Proposed（设计已接受；实现 Deferred）—— 本阶段 0 生产代码修改、
+> 0 新表 / 0 migration / 0 DB 连接**
+
+### Survey（真实代码）
+
+```text
+DB 入口：backend/app/db/session.py（get_engine / get_session_factory /
+         get_db / ping_database）
+ORM：    backend/app/db/models/（knowledge_document · knowledge_chunk = public；
+         llm_usage_record = ai_ops）
+Repository：backend/app/db/llm_usage_repository.py（项目**唯一** Repository；
+         注入的是 session_factory，事务内部化，返回内部 Row record）
+迁移：   无 Alembic；init_db() = CREATE SCHEMA ai_ops + create_all + 幂等 DDL
+UnitOfWork：无（0 处）；Transaction：有（单次 Repository 操作粒度）
+```
+
+### 推荐 Boundary（未来；本阶段不实现）
+
+```text
+ToolExecutionService（无 DB）
+    ↓
+ToolExecutionRecord（frozen）
+    ↓
+ToolExecutionObserver（端口不变）
+    ├── InMemoryToolExecutionCollector   （现状：runtime store）
+    └── PersistenceAdapter（未来）→ PersistenceService → Repository → ai_ops
+```
+
+```text
+Decision = Option B（Observer → Adapter → Repository）
+    驳回 A（Execution → Repository：执行边界获得 DB 依赖）
+    驳回 C（Collector → Repository：Collector 变成写入者）
+    驳回 D（QueryService → Repository：只读层获得写能力）
+
+输入类型：ToolExecutionRecord（不是 Snapshot / dict）
+失败隔离：DB 写失败 → warning；ToolResult 不变；无 retry / 队列 / 异步
+Multi-process：现状 process-local（workers>1 各看各的）；
+               持久化后目标 = 共享 PostgreSQL 全量视图
+Retention：Runtime(内存 1000) 与 Persistent(数据库长期) **必须分离**
+安全：落库字段 = Record 11 项；表落 ai_ops（避免被 Text-to-SQL 当业务表）；
+      当前 Record 已足够安全 → 未修改 Record
+```
+
+### 契约（当前边界保护）
+
+```text
+C28  ToolExecutionService 无 SQLAlchemy / Repository / DB Session
+C29  Tool Handler 不依赖 Observability Persistence
+C30  Collector 无 SQLAlchemy / Repository / DB Session
+C31  QueryService 无数据库写能力
+C32  Observability API 不 import Repository / SQLAlchemy
+```
+
+## 8.45 Tool Observability Persistence Model & Repository（Phase 3.11.27）
+
+> 记录：`docs/evaluation/Phase 3.11.27 — Tool Observability Persistence Model & Repository.md`
+> 测试：`tests/test_tool_execution_repository.py`（29）+
+> `tests/test_tool_execution_repository_db.py`（10，DB-gated）+
+> `tests/test_tool_observability_persistence_architecture.py`（C33，8）
+> **Runtime Integration = NOT IMPLEMENTED**
+
+### 持久化底座（Step 27）
+
+```text
+backend/app/db/models/tool_execution_record.py
+    class ToolExecutionRecordModel(Base)   → ai_ops.tool_execution_record
+    列 = id(BIGINT 自增) + ToolExecutionRecord 的 11 个字段
+    started_at / finished_at = DateTime(timezone=True)（TIMESTAMP WITH TIME ZONE）
+    request_id **不是**主键 / 唯一键（一次 request 可多条执行）
+    索引最小：request_id（已实现查询）+ started_at（时间序）
+              project_id / tool_name **未预建**
+
+backend/app/db/tool_execution_repository.py
+    ToolExecutionRepository
+        create(record) -> ToolExecutionRecordRow
+        get_by_request_id(request_id) -> list[ToolExecutionRecordRow]
+    事务：with factory() as session, session.begin()（与 LLMUsageRepository 一致）
+    失败：SQLAlchemyError → ROLLBACK → ToolExecutionRepositoryError
+    返回：内部 frozen Row（不返回 ORM）；不做校验 / 聚合 / 序列化 / retry
+    初始化：init_db()（CREATE SCHEMA ai_ops + create_all），无 Alembic
+```
+
+### C33（Repository 边界）
+
+```text
+Repository 可以依赖：SQLAlchemy / Session / ORM Model / ToolExecutionRecord
+ToolExecutionService 不得 import：Repository / SQLAlchemy / RecordRow
+Collector 不得 import：Repository / backend.app.db
+Observer / QueryService / Snapshot / Metrics / API 不得 import Repository
+Adapter / PersistenceService：仍未创建（Deferred）
+全 backend 扫描：除 db 层两个文件外，无任何模块 import tool_execution_repository
+运行时：ToolExecutionService → ToolRegistry；Observer → InMemoryCollector（未变）
+```
+
+## 8.46 Tool Observability Persistence Integration（Phase 3.11 Step 28）
+
+> 记录：`docs/evaluation/Phase 3.11.28 — Tool Observability Persistence Integration.md`
+> 测试：`tests/test_tool_execution_persistence_service.py`（18）+
+> `tests/test_tool_execution_persistence_adapter.py`（20）+
+> `tests/test_tool_execution_persistence_integration.py`（10，DB-gated）+
+> `tests/test_tool_observability_persistence_architecture.py`（C34，11）
+> **QueryService → PostgreSQL = NOT IMPLEMENTED**（API 仍只读内存）
+
+```text
+AIOrchestrator
+      ↓
+ToolExecutionService（无 DB 依赖）
+      ↓
+ToolRegistry → ToolResult
+      ↓
+ToolExecutionRecord
+      ↓
+CompositeToolExecutionObserver（fan-out；子 observer 互相隔离）
+      ├───────────────────────────┐
+      ↓                           ↓
+InMemoryCollector             PersistenceAdapter
+      ↓                           ↓
+QueryService                  PersistenceService
+      ↓                           ↓
+HTTP API                      Repository → ai_ops.tool_execution_record
+```
+
+```text
+Composition Root（api/orchestrator_chat.py）装配：
+    _TOOL_EXECUTION_COLLECTOR                （唯一；生命周期不变）
+    _TOOL_EXECUTION_PERSISTENCE_SERVICE      （Step 28）
+    _TOOL_EXECUTION_PERSISTENCE_ADAPTER      （Step 28）
+    _TOOL_EXECUTION_OBSERVER = Composite(collector, adapter)
+
+失败隔离（C34.6 / C34.7）：DB 写失败 → warning → ToolResult 不变；
+    无 retry / queue / batch / 异步 / outbox（同步单行写入）
+日志白名单：tool_name / request_id / round / project_id / error_type；
+    不使用 logger.exception（无 traceback）
+C34.1  Adapter 实现 Observer 协议          C34.2  无 SQLAlchemy/ORM/Repository
+C34.3  Service 可依赖 Repository            C34.4  ExecutionService 无持久化依赖
+C34.5  Collector 无持久化依赖               C34.6  Adapter 失败不传播
+C34.7  Composite 子失败后继续               C34.8  仅 Composition Root 创建 Adapter
+C34.9  无 API import Repository             C34.10 Tool Handler 无持久化依赖
+DB residue = 0（测试数据 synthetic；只 TRUNCATE 本表）
+```
+
+## 8.47 Tool Observability Persistent Query Boundary（Phase 3.11 Step 29）
+
+> 记录：`docs/evaluation/Phase 3.11.29 — Tool Observability Persistent Query Boundary.md`
+> 测试：`tests/test_tool_execution_persistent_query_service.py`（20）+
+> `tests/test_tool_execution_persistent_query_service_db.py`（9，DB-gated）+
+> `tests/test_tool_execution_repository.py`（+12 list_recent）+
+> `tests/test_tool_observability_persistence_architecture.py`（C35，10）
+> **HTTP API = unchanged**（仍只读内存）
+
+```text
+Runtime（未变）                         Persistent（Step 29 新增）
+──────────────                          ──────────────────────────
+ToolObservabilityQueryService           ToolExecutionPersistentQueryService
+      ↓                                         ↓
+InMemoryCollector                       ToolExecutionRepository.list_recent()
+      ↓                                         ↓
+Snapshot / Metrics                      SELECT ... ORDER BY started_at DESC,
+      ↓                                        id DESC LIMIT :limit
+HTTP API                                        ↓
+                                        ToolExecutionSnapshot（显式映射）
+```
+
+```text
+Limit：MIN=1 / MAX=1000（模块级常量）/ DEFAULT=100；非法 → ValueError（不触达 DB）
+错误：无数据 → []；DB 失败 → ToolExecutionRepositoryError（**不**返回 []）
+安全：SELECT only + 显式列；Read Model 严格 11 字段（主键 id 不外泄）
+C35.1  可依赖 Repository            C35.2  无 SQLAlchemy / Session / ORM
+C35.3  Repository 可执行 SELECT      C35.4  查询无 INSERT/UPDATE/DELETE/DDL
+C35.5  不 import Collector           C35.6  不 import 执行链 / Registry / Handler
+C35.7  不修改 Collector              C35.8  HTTP API 不依赖本服务
+C35.9  Snapshot 仍 11 字段           C35.10 ORM Model 不泄漏到 Service / API
+两者并列（不 fallback / 不 merge）：Runtime = 近期进程内观测；
+Persistent = 长期数据库历史；合并会引入去重 / 排序 / 窗口 / 分页语义冲突。
+```
+
+## 8.48 Tool Observability Persistent History API（Phase 3.11 Step 30）
+
+> 记录：`docs/evaluation/Phase 3.11.30 — Tool Observability Persistent History API.md`
+> 接口：`docs/api.md` §2.7
+> 测试：`tests/test_tool_observability_api.py`（+12）+
+> `tests/test_tool_observability_history_api_db.py`（8，DB-gated）+
+> `tests/test_tool_observability_persistence_architecture.py`（C36，9）
+
+```text
+Runtime History API                          Persistent History API
+─────────────────                            ───────────────────────
+GET /api/observability/tools                 GET /api/observability/tools/history
+      ↓                                            ↓
+ToolObservabilityQueryService               ToolExecutionPersistentQueryService
+      ↓                                            ↓
+InMemoryCollector                           Repository → ai_ops.tool_execution_record
+      ↓                                            ↓
+Snapshot / Metrics                          Snapshot × 11 字段 → {"items": [...]}
+
+parallel · not fallback · not merged · no dedup
+```
+
+```text
+唯一 query param：limit（1~1000，默认 100；非法 → 422）
+空库 → 200 {"items": []}；DB 失败 → 502（**不回退**内存视图）；
+响应 = Snapshot 11 字段（无 id / created_at / arguments / sql / prompt / traceback）
+C36.1  API 可依赖 PersistentQueryService     C36.2  不 import SQLAlchemy/Session/ORM/Repository
+C36.3  不依赖 ToolExecutionService/Registry/Handler
+C36.4  History 端点不 import Collector/Runtime QueryService
+C36.5  History API 不修改 Runtime API 行为    C36.6  响应仅 Snapshot 11 字段
+C36.7  无 Runtime → Persistent fallback       C36.8  无 Persistent → Runtime fallback
+C36.9  无 POST / PUT / PATCH / DELETE         C36.10 只经 PersistentQueryService 读取
+Composition Root 装配：模块级 PersistentQueryService + accessor
+（API 不接触 Repository / SQLAlchemy / Session；不每请求新建）
+```
+
+## 8.49 Tool Observability Persistent History Pagination（Phase 3.11 Step 31）
+
+> 记录：`docs/evaluation/Phase 3.11.31 — Tool Observability Persistent History Pagination.md`
+> 接口：`docs/api.md` §2.7
+> 测试：Repository（+6）/ Service（+5）/ API（+7）/
+> `tests/test_tool_observability_history_api_db.py`（13，DB-gated）/
+> C37（9）
+
+```text
+Persistent History
+        ↓
+PersistentQueryService.list_recent(limit, offset)      （不排序 / 不过滤）
+        ↓
+Repository
+        ↓
+SELECT <显式列> FROM ai_ops.tool_execution_record
+ORDER BY started_at DESC, id DESC                      （跨页同一排序窗口）
+LIMIT :limit OFFSET :offset
+        ↓
+GET /api/observability/tools/history?limit=100&offset=0
+        ↓
+{"items": [...11 字段...], "limit": 100, "offset": 0}
+```
+
+```text
+limit  1~1000（默认 100）；offset >= 0（默认 0；无 MAX_OFFSET）
+非法参数 → 422（Service / Repository / DB 均未触达）
+空页 / 超大 offset → 200 + items = []（不是 404；不做 COUNT 判断）
+DB 失败 → 502（无 fallback 到内存视图）
+仅 LIMIT + OFFSET：无 cursor / keyset / page DTO / total_count / COUNT
+C37.1  History API 允许 limit + offset
+C37.2  无 filter（project_id / tool_name / success / 时间范围 / keyword）
+C37.3  Repository：ORDER BY started_at DESC, id DESC + LIMIT + OFFSET
+C37.4  Service 不自行排序        C37.5  API 不自行排序
+C37.6  Runtime API 无分页        C37.7  Persistent API 不读 Collector
+C37.8  无 fallback               C37.9  无 total_count / COUNT
+C37.10 无 Metrics aggregation
+Runtime 端点（GET /api/observability/tools · /metrics）仍 0 参数、仍读内存。
+```
+
+## 8.50 Tool Observability Persistent History Filtering（Phase 3.11 Step 32）
+
+> 记录：`docs/evaluation/Phase 3.11.32 — Tool Observability Persistent History Filtering.md`
+> 接口：`docs/api.md` §2.7
+> 测试：Repository（+10）/ Service（+6）/ API（+6）/
+> `tests/test_tool_observability_history_filtering_db.py`（14，DB-gated）/
+> C38（10）
+
+```text
+Persistent History API
+        ↓
+PersistentQueryService.list_recent(limit, offset,
+                                   project_id, tool_name, success)
+        ↓
+Repository
+        ↓
+WHERE project_id = :p [AND tool_name = :t] [AND success = :s]   ← bound parameters
+        ↓
+ORDER BY started_at DESC, id DESC
+        ↓
+LIMIT :limit
+        ↓
+OFFSET :offset
+        ↓
+GET /api/observability/tools/history?project_id=…&tool_name=…&success=…
+                                   &limit=…&offset=…
+```
+
+```text
+仅**精确**匹配；条件之间 AND；None = 不追加条件（无空 WHERE）
+``""`` 是普通字符串值；success=False **≠** 未提供
+非法参数（limit / offset / success）→ 422（不触达 Service / Repository / DB）
+无匹配 / 空页 → 200 + items=[]（不是 404）；DB 失败 → 502（无 fallback）
+SQL 安全：bound parameters（无字符串拼接 / 无 text() 拼接；注入串仅作字面值）
+C38.1  History API 支持 limit/offset/project_id/tool_name/success
+C38.2  Runtime API 不增加这些参数      C38.3  过滤在 Repository / SQL 层
+C38.4  Service 无 Python filtering     C38.5  API 无 Python filtering
+C38.6  过滤值必须 bound parameters     C38.7  过滤先于 LIMIT / OFFSET
+C38.8  排序仍 started_at DESC, id DESC C38.9  无 COUNT / SUM / AVG / Metrics
+C38.10 无 LIKE / ILIKE / regex / fuzzy / keyword
+C38.11 无 Runtime / Persistent fallback C38.12 Snapshot 仍 11 字段
+Runtime 端点（/tools · /metrics）仍 0 参数、仍只读内存；持久侧过滤不影响它们。
+```
+
+## 8.51 Tool Observability Persistent Metrics（Phase 3.11 Step 33）
+
+> 记录：`docs/evaluation/Phase 3.11.33 — Tool Observability Persistent Metrics.md`
+> 接口：`docs/api.md` §2.8
+> 测试：Repository（+11）/ Service（+11）/ API（+12）/
+> `tests/test_tool_observability_persistent_metrics_db.py`（13，DB-gated）/
+> C39（12）
+
+```text
+Runtime Metrics                              Persistent Metrics
+──────────────────────                       ────────────────────────────────
+GET /api/observability/tools/metrics         GET /api/observability/tools/metrics/persistent
+      ↓                                            ↓
+InMemoryCollector（内存）                    PersistentQueryService.metrics(...)
+      ↓                                            ↓
+ToolExecutionMetricsService.snapshot()       Repository.get_metrics()（SQL 聚合）
+      ↓                                            ↓
+ToolExecutionMetricsSnapshot（8 字段）       PostgreSQL（ai_ops.tool_execution_record）
+
+parallel · not merged · no fallback
+```
+
+```text
+SQL：SELECT count(*) / count(*) FILTER (WHERE success) / sum / avg / max
+     FROM ai_ops.tool_execution_record
+     [WHERE project_id = :p] [AND tool_name = :t] [AND success = :s]
+     （无过滤 → 无 WHERE；无 ORDER BY / LIMIT / OFFSET / GROUP BY / SELECT *）
+
+过滤：与 History 完全一致的**精确**匹配（bound parameters；无 LIKE / regex / fuzzy）
+参数：project_id · tool_name · success（**无** limit / offset）
+空数据集：计数 0；rates / avg / max = None（不是 0）；total_duration_ms = 0.0
+错误：非法值 → 422；无匹配 → 200 + 计数 0；DB 失败 → 502（无 fallback）
+响应：8 个指标字段（无 identifier / Snapshot 字段 / args / SQL / traceback）
+C39.1  Persistent Metrics API 存在    C39.2  Runtime Metrics 不变
+C39.3  只依赖 PersistentQueryService  C39.4  Service 无 ORM / Session
+C39.5  Repository 执行 SQL 聚合       C39.6  过滤在 SQL 层（bound）
+C39.7  无 Python 全量聚合             C39.8  无 SELECT * / 无关列
+C39.9  无 LIKE / ILIKE / regex / fuzzy C39.10 无 fallback / merge
+C39.11 响应无敏感字段                 C39.12 无 limit / offset
+```
+
 ---
 
 # 9. Prompt Architecture

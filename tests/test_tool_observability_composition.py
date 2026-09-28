@@ -236,12 +236,23 @@ def _code_layer(path: str) -> str:
 
 class TestComposition:
     def test_composition_root_creates_collector(self) -> None:
+        """Step 19：Composition Root 创建唯一 Collector。
+        Step 28：观测出口升级为 fan-out（Collector + PersistenceAdapter），
+        但 Collector 仍是**同一个** Application 级实例。"""
         from backend.app.api import orchestrator_chat as root
+        from backend.app.services.tool_execution_persistence_adapter import (
+            CompositeToolExecutionObserver,
+        )
 
         assert isinstance(
             root._TOOL_EXECUTION_COLLECTOR, InMemoryToolExecutionCollector
         )
-        assert root._TOOL_EXECUTION_OBSERVER is root._TOOL_EXECUTION_COLLECTOR
+        assert isinstance(
+            root._TOOL_EXECUTION_OBSERVER, CompositeToolExecutionObserver
+        )
+        assert root._TOOL_EXECUTION_OBSERVER.observers[0] is (
+            root._TOOL_EXECUTION_COLLECTOR
+        )
 
     def test_collector_implements_observer_protocol(self) -> None:
         from backend.app.api import orchestrator_chat as root
@@ -251,10 +262,16 @@ class TestComposition:
         )
 
     def test_orchestrator_receives_same_observer(self) -> None:
+        """Step 28：Orchestrator 拿到的是 fan-out 观测出口（同一对象），
+        其第一个子 observer 是 Application 级 Collector。"""
         from backend.app.api import orchestrator_chat as root
 
         assert (
             root._default_orchestrator.tool_execution_observer
+            is root._TOOL_EXECUTION_OBSERVER
+        )
+        assert (
+            root._TOOL_EXECUTION_OBSERVER.observers[0]
             is root._TOOL_EXECUTION_COLLECTOR
         )
 
@@ -283,7 +300,7 @@ class TestComposition:
         assert captured["base"] is root._default_orchestrator
         assert (
             root._default_orchestrator.tool_execution_observer
-            is root._TOOL_EXECUTION_COLLECTOR
+            is root._TOOL_EXECUTION_OBSERVER
         )
 
     def test_project_orchestrator_inherits_collector(self) -> None:
@@ -302,6 +319,10 @@ class TestComposition:
 
         assert (
             orchestrator.tool_execution_observer
+            is root._TOOL_EXECUTION_OBSERVER
+        )
+        assert (
+            root._TOOL_EXECUTION_OBSERVER.observers[0]
             is root._TOOL_EXECUTION_COLLECTOR
         )
 

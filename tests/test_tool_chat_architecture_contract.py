@@ -3249,6 +3249,10 @@ class TestC27HttpReadBoundary:
     # ---- C27.3 ~ C27.7 依赖方向 ----
 
     def test_c27_3_to_7_dependency_direction(self) -> None:
+        """Step 25 时点：API 不依赖任何 db / 执行链模块。
+        Step 30：允许的唯一 db 依赖 = ``ToolExecutionRepositoryError`` 类型
+        （错误映射；与 ``api/usage.py`` 的既有 precedent 一致）——
+        仍然不得 import Repository 类 / Session / ORM Model / SQLAlchemy。"""
         imports = _walk_imports(_tree(_C27_API_MODULE))
         for forbidden in (
             "backend.app.services.in_memory_tool_execution_collector",
@@ -3257,7 +3261,8 @@ class TestC27HttpReadBoundary:
             "backend.app.services.tool_execution_observer",
             "backend.app.services.ai_orchestrator_service",
             "backend.app.tools",
-            "backend.app.db",
+            "backend.app.db.session",
+            "backend.app.db.models",
             "backend.app.llm",
             "sqlalchemy",
         ):
@@ -3265,12 +3270,13 @@ class TestC27HttpReadBoundary:
                 name == forbidden or name.startswith(forbidden + ".")
                 for name in imports
             ), forbidden
-        # 唯一数据来源 = Composition Root 的 QueryService accessor
-        assert (
-            "backend.app.api.orchestrator_chat" in imports
-            or "get_tool_observability_query_service"
-            in _identifiers(_tree(_C27_API_MODULE))
-        )
+        assert {
+            name for name in imports if name.startswith("backend.app.db")
+        } == {"backend.app.db.tool_execution_repository"}
+        # 数据来源 = Composition Root 的 accessor（Runtime + Persistent）
+        identifiers = _identifiers(_tree(_C27_API_MODULE))
+        assert "get_tool_observability_query_service" in identifiers
+        assert "get_tool_execution_persistent_query_service" in identifiers
 
     # ---- C27.8 / C27.9 Read Model + Serialization ----
 
@@ -3293,33 +3299,54 @@ class TestC27HttpReadBoundary:
     # ---- C27.10 / C27.20 不计算 / 无 DSL ----
 
     def test_c27_10_api_does_not_calculate_metrics(self) -> None:
+        """不计算：无除法 / 无聚合函数调用（``round`` 是 DTO 字段名，不是计算）。"""
         tree = _tree(_C27_API_MODULE)
         for node in ast.walk(tree):
             if isinstance(node, ast.BinOp):
                 assert not isinstance(node.op, (ast.Div, ast.FloorDiv))
-        identifiers = _identifiers(tree)
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
         for forbidden in ("sum", "max", "min", "mean", "statistics", "round"):
-            assert forbidden not in identifiers, forbidden
+            assert forbidden not in called, forbidden
 
     def test_c27_20_no_query_dsl(self) -> None:
+        """Step 30：Runtime 端点无 query parameter。
+        Step 31：History 端点支持且仅支持 ``limit`` + ``offset``
+        （无 cursor / keyset / page / total_count / 任何 filter）。
+        Runtime 端点（``list_tool_executions`` / ``tool_execution_metrics``）
+        仍然无参数（见下方断言）。"""
         tree = _tree(_C27_API_MODULE)
-        params = [
-            arg.arg
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            for arg in node.args.args
-        ]
-        assert params == [], params
-        assert not [
+        functions = [
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "fastapi"
-            and any(alias.name == "Query" for alias in node.names)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
+        params = {
+            node.name: [arg.arg for arg in node.args.args]
+            for node in functions
+        }
+        # Step 32：+ 精确过滤参数（project_id / tool_name / success）
+        assert params["list_tool_execution_history"] == [
+            "limit", "offset", "project_id", "tool_name", "success"
+        ]
+        assert params["list_tool_executions"] == []
+        assert params["tool_execution_metrics"] == []
         identifiers = _identifiers(tree)
-        for forbidden in ("params", "limit", "offset", "sort", "filter"):
+        for forbidden in (
+            "cursor", "page", "page_size", "sort", "filter",
+            "keyword", "start_time", "end_time",
+        ):
             assert forbidden not in identifiers, forbidden
+        # History 响应 DTO 不含 total_count（``total_count`` 只属于 Runtime
+        # Metrics 响应，不是分页计数）
+        from backend.app.api.tool_observability import (
+            ToolExecutionHistoryResponse,
+        )
+
+        assert "total_count" not in ToolExecutionHistoryResponse.model_fields
 
     # ---- C27.11 / C27.12 Collector ----
 
@@ -3357,16 +3384,21 @@ class TestC27HttpReadBoundary:
     # ---- C27.14 ~ C27.16 无 DB / LLM / 持久化 ----
 
     def test_c27_14_to_16_no_db_llm_or_persistence(self) -> None:
+        """无 DB 连接 / LLM / 持久化实现（Step 30：仅允许仓储错误类型）。"""
         tree = _tree(_C27_API_MODULE)
         imports = _walk_imports(tree)
         for forbidden in (
             "sqlalchemy", "psycopg", "redis", "kafka", "celery",
-            "backend.app.db", "backend.app.llm", "pathlib", "pickle",
+            "backend.app.db.session", "backend.app.db.models",
+            "backend.app.llm", "pathlib", "pickle",
         ):
             assert not any(
                 name == forbidden or name.startswith(forbidden + ".")
                 for name in imports
             ), forbidden
+        assert {
+            name for name in imports if name.startswith("backend.app.db")
+        } == {"backend.app.db.tool_execution_repository"}
         identifiers = _identifiers(tree)
         for forbidden in (
             "session", "engine", "commit", "open", "dump", "save", "persist",
