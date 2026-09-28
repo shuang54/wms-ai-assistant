@@ -116,6 +116,35 @@ class LLMUsageRecordRow:
     created_at: datetime
 
 
+#: Assistant Trace ID 长度上限（与 ORM 列 VARCHAR(128) 一致；Step 36）。
+_ASSISTANT_REQUEST_ID_MAX_LENGTH: Final[int] = 128
+
+
+def _validate_optional_assistant_request_id(value: object) -> str | None:
+    """可选 Assistant Trace ID（``str | None``；Step 36）。
+
+    * ``None`` = 未绑定 Assistant Trace Scope（旧链路 / 历史行为）→ 写 NULL；
+    * 非空 ``str`` = 该次 Assistant 请求的 request_id；
+    * 其它类型 / 空字符串 / 超长 → ``ValueError``（触达 DB 之前拦截）；
+    * **不生成 / 不推断 / 不截断 / 不转换**（不把 request_id 当替代值）。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            "assistant_request_id 必须是 str 或 None"
+            f"（当前: {type(value).__name__}）"
+        )
+    if not value:
+        raise ValueError("assistant_request_id 不能为空字符串（None 表示未绑定）")
+    if len(value) > _ASSISTANT_REQUEST_ID_MAX_LENGTH:
+        raise ValueError(
+            "assistant_request_id 超出长度上限 "
+            f"（{len(value)} > {_ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
+        )
+    return value
+
+
 class LLMUsageRepositoryError(Exception):
     """LLM Usage 持久化失败（事务已回滚）。
 
@@ -163,6 +192,7 @@ class LLMUsageRepository:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        assistant_request_id: str | None = None,
     ) -> Any:
         """构造幂等 INSERT（本仓储唯一一处写入 SQL 构造点）。
 
@@ -174,7 +204,10 @@ class LLMUsageRepository:
         * `DO NOTHING`（不是 `DO UPDATE`）：first-write-wins，
           重复写入不得覆盖已有 provider / model / token；
         * `index_where` 必须与 partial unique index 谓词一致；
-        * 写入字段严格等于 `_WRITE_FIELDS`（§二十三）。
+        * 写入字段严格等于 `_WRITE_FIELDS`（§二十三）；
+        * Phase 3.12 Step 36：`assistant_request_id`（Assistant Trace 关联）
+          与 `request_id`（Provider 请求 ID）是**两个不同维度**，
+          互不覆盖；未绑定 Scope → None（写 NULL）。
         """
         return (
             postgresql_insert(LLMUsageRecord)
@@ -185,6 +218,7 @@ class LLMUsageRepository:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                assistant_request_id=assistant_request_id,
             )
             .on_conflict_do_nothing(
                 index_elements=_REQUEST_ID_CONFLICT_TARGET,
@@ -202,20 +236,25 @@ class LLMUsageRepository:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        assistant_request_id: str | None = None,
     ) -> int | None:
         """**幂等**写入一条 request-level Usage Record。
 
         值语义由调用方（Persistence Service）保证：
         request_id / provider / model / token 字段均来自
-        LLMObservation 与 LLMUsage 原值（NULL 保持 NULL，不补 0）。
+        LLMObservation 与 LLMUsage 原值（NULL 保持 NULL，不补 0）；
+        assistant_request_id 来自 Assistant Trace Scope（未绑定 → NULL）。
 
         Args:
-            request_id:        Provider 请求 ID（可 None）。
-            provider:          Provider 标识（可 None）。
-            model:             实际响应模型（可 None）。
-            prompt_tokens:     Prompt token（可 None）。
-            completion_tokens: Completion token（可 None）。
-            total_tokens:      总 token（原样，可 None）。
+            request_id:           Provider 请求 ID（可 None）。
+            provider:             Provider 标识（可 None）。
+            model:                实际响应模型（可 None）。
+            prompt_tokens:        Prompt token（可 None）。
+            completion_tokens:    Completion token（可 None）。
+            total_tokens:         总 token（原样，可 None）。
+            assistant_request_id: Assistant Trace ID（可 None；**不参与幂等**，
+                                  不生成 / 不回填 —— 由 Persistence Service
+                                  传入，本层只做类型与长度校验）。
 
         Returns:
             新记录的 `id`；
@@ -223,8 +262,13 @@ class LLMUsageRepository:
             —— 这是**正常幂等结果，不是错误**，调用方不得把它当失败。
 
         Raises:
-            LLMUsageRepositoryError: DB 未配置或写入失败（事务已回滚）。
+            ValueError:               assistant_request_id 非法
+                                      （非 str / 空 / 超长）—— 触达 DB 之前拦截。
+            LLMUsageRepositoryError:  DB 未配置或写入失败（事务已回滚）。
         """
+        validated_assistant_request_id = _validate_optional_assistant_request_id(
+            assistant_request_id
+        )
         factory = self._get_session_factory()
         statement = self.build_idempotent_insert(
             request_id=request_id,
@@ -233,6 +277,7 @@ class LLMUsageRepository:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            assistant_request_id=validated_assistant_request_id,
         )
         try:
             with factory() as session, session.begin():

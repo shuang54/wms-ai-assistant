@@ -3388,6 +3388,49 @@ execution_time_ms / selected_tables / project_id / rag_used_chunks / refused）
 语义与内容完全不变；request_id 不进入 Tool arguments / LLM messages / Prompt。
 ```
 
+## 8.53 Assistant Trace → LLM Usage → Tool Execution（Phase 3.12 Step 36）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 36 — LLM Usage Trace Correlation.md`
+> 测试：`tests/test_assistant_trace.py`（18）/
+> `tests/test_llm_usage_trace_correlation.py`（14，含 C41）/
+> `tests/test_llm_usage_trace_correlation_db.py`（6，DB-gated）
+> **不新增 HTTP API / 不改 analytics / 不改 RAG·Tool·T2S·Router**
+
+```text
+                    Assistant Trace
+                         │
+                   request_id = A          ← AIOrchestratorService.execute()
+                         │                    （唯一生成点，Step 35）
+        ┌────────────────┴────────────────┐
+        ↓                                 ↓
+  LLM Usage Record                 Tool Execution Record
+  assistant_request_id = A         request_id = A
+  request_id           = P         （ai_ops.tool_execution_record）
+  （ai_ops.llm_usage_record）
+```
+
+```text
+传播方式：services/assistant_trace.py
+    execute() → with assistant_trace_scope(A)
+        ↓ contextvar（per-task；asyncio.to_thread 会复制 context）
+    LLM Usage Persistence Boundary
+        ↓ current_assistant_request_id() → A
+    LLMUsageRepository.create(assistant_request_id=A, request_id=P)
+
+Data Model：ai_ops.llm_usage_record + assistant_request_id VARCHAR(128) NULL
+    · 与 request_id（Provider 请求 ID）**两个维度**，互不覆盖
+    · 不参与幂等（partial unique index 仍只约束 request_id）
+    · 旧链路 / 历史数据保持 NULL；读边界（Row / View / analytics）未变
+    · schema 演进：init_db() 幂等 ADD COLUMN IF NOT EXISTS（无 Alembic）
+
+C41.1  Assistant request_id → LLM Usage      C41.2  provider ID 独立
+C41.3  API 不生成 request_id                 C41.4  Orchestrator 唯一来源
+C41.5  Tool Record 与 LLM Usage 同 ID        C41.6  RAG / T2S → 0 Tool Record
+C41.7  历史 NULL 兼容（读边界未变）           C41.8  持久化失败不影响执行
+C41.9  无 prompt / args / SQL / secrets
+Failure Isolation：DB 写入失败 → warning → Assistant 结果不变（无 retry / 队列）
+```
+
 ---
 
 # 9. Prompt Architecture

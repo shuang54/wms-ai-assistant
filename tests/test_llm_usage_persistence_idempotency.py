@@ -86,6 +86,8 @@ _APPROVED_WRITE_KEYS = {
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    # Phase 3.12 Step 36：Assistant Trace 关联（可 NULL；不参与幂等）
+    "assistant_request_id",
 }
 
 _TRUNCATE_SQL = text(

@@ -91,6 +91,7 @@ from backend.app.services.text_to_sql_service import (
 TEXT_TO_SQL_REFUSAL_MESSAGE: Final[str] = (
     "当前 AI 数据查询服务仅支持只读查询，不支持删除、修改等操作。"
 )
+from backend.app.services.assistant_trace import assistant_trace_scope
 from backend.app.services.tool_argument_extractor import ToolArgumentExtractor
 from backend.app.services.tool_execution_context import (
     ToolExecutionContext,
@@ -527,41 +528,46 @@ class AIOrchestratorService:
         request_id = new_request_id()
 
         # ---- 1) 路由决策 ----
-        try:
-            decision: RouteDecision = await self._router.route(
-                question=normalized, context=context
-            )
-        except AIRouterInputError as exc:
-            raise AIOrchestratorInputError(str(exc)) from exc
-        except AIRouterError as exc:
+        # Phase 3.12 Step 36：整个执行（含 Router 的 LLM fallback、RAG /
+        # Tool / Text-to-SQL 内部的 LLM 调用）都在同一个 Assistant Trace
+        # Scope 内 —— LLM Usage 持久化因此可以把 usage 事实关联到本
+        # request_id（不改 LLM Client / RAG / Text-to-SQL 参数签名）。
+        with assistant_trace_scope(request_id):
+            try:
+                decision: RouteDecision = await self._router.route(
+                    question=normalized, context=context
+                )
+            except AIRouterInputError as exc:
+                raise AIOrchestratorInputError(str(exc)) from exc
+            except AIRouterError as exc:
+                raise AIOrchestratorRouteError(
+                    f"Router 决策失败: {type(exc).__name__}"
+                ) from exc
+
+            # ---- 2) 单次执行（无 Agent / 无 Loop / 无重规划） ----
+            try:
+                if decision.route == RouteType.RAG:
+                    return await self._run_rag(
+                        decision, normalized, request_id=request_id
+                    )
+                if decision.route == RouteType.TOOL:
+                    return await self._run_tool(
+                        decision, normalized, request_id=request_id
+                    )
+                if decision.route == RouteType.TEXT_TO_SQL:
+                    return await self._run_text_to_sql(
+                        decision, normalized, request_id=request_id
+                    )
+            except AIOrchestratorError:
+                raise
+            except Exception as exc:
+                raise AIOrchestratorExecutionError(
+                    f"能力执行失败: {type(exc).__name__}"
+                ) from exc
+
             raise AIOrchestratorRouteError(
-                f"Router 决策失败: {type(exc).__name__}"
-            ) from exc
-
-        # ---- 2) 单次执行（无 Agent / 无 Loop / 无重规划） ----
-        try:
-            if decision.route == RouteType.RAG:
-                return await self._run_rag(
-                    decision, normalized, request_id=request_id
-                )
-            if decision.route == RouteType.TOOL:
-                return await self._run_tool(
-                    decision, normalized, request_id=request_id
-                )
-            if decision.route == RouteType.TEXT_TO_SQL:
-                return await self._run_text_to_sql(
-                    decision, normalized, request_id=request_id
-                )
-        except AIOrchestratorError:
-            raise
-        except Exception as exc:
-            raise AIOrchestratorExecutionError(
-                f"能力执行失败: {type(exc).__name__}"
-            ) from exc
-
-        raise AIOrchestratorRouteError(
-            f"未知 route: {decision.route!r}"
-        )
+                f"未知 route: {decision.route!r}"
+            )
 
     # ---------- Phase 3.8.2：能力硬校验（Router 是分类器，不是安全边界） ----------
 

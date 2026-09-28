@@ -63,6 +63,7 @@ from backend.app.db.llm_usage_repository import (
 )
 from backend.app.llm.accounting_consumer import consume_usage
 from backend.app.llm.observability import LLMObservation
+from backend.app.services.assistant_trace import current_assistant_request_id
 from backend.app.services.llm_usage_persistence_runtime import (
     LLMUsagePersistenceRuntimeBridge,
 )
@@ -120,6 +121,12 @@ class LLMUsagePersistenceService:
             # 本表只保存 usage 事实 → 无 usage 不落库（不退化为 audit log）
             return None
 
+        # Phase 3.12 Step 36：Assistant Trace 关联 —— 只读取当前上下文里的
+        # 一个不可变字符串（由 Orchestrator 的 request_id 绑定）；未绑定
+        # （旧链路 / 直连 Service / 后台脚本）→ None → 写 NULL。
+        # 绝不生成 / 回填 / 覆盖 observation.request_id（Provider 请求 ID）。
+        assistant_request_id = current_assistant_request_id()
+
         return self._repository.create(
             request_id=observation.request_id,
             provider=observation.provider,
@@ -127,6 +134,7 @@ class LLMUsagePersistenceService:
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
+            assistant_request_id=assistant_request_id,
         )
 
 

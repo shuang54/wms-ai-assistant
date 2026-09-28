@@ -88,6 +88,8 @@ requires_db = pytest.mark.skipif(
 )
 
 #: Persistence Service 允许传给 Repository 的字段（精确白名单）。
+#: Phase 3.12 Step 36：+ assistant_request_id（Assistant Trace 关联；
+#: 未绑定 Scope → None，仍然是"白名单内的字段"，不引入任何 payload）。
 _APPROVED_WRITE_KEYS = {
     "request_id",
     "provider",
@@ -95,6 +97,7 @@ _APPROVED_WRITE_KEYS = {
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    "assistant_request_id",
 }
 
 _RUNTIME_MODULES = [
@@ -135,6 +138,7 @@ class FakeRepository:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        assistant_request_id: str | None = None,
     ) -> int:
         thread_name = threading.current_thread().name
         if self.on_call is not None:
@@ -148,6 +152,7 @@ class FakeRepository:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
+            "assistant_request_id": assistant_request_id,
         }
         self.calls.append(call)
         self.threads.append(thread_name)
@@ -1304,6 +1309,8 @@ class TestDeterministicBehavior:
                 "prompt_tokens": None,     # NULL ≠ 0（partial usage 原样）
                 "completion_tokens": 200,
                 "total_tokens": None,
+                # Step 36：未绑定 Assistant Trace Scope → NULL（不生成 / 不回填）
+                "assistant_request_id": None,
             }
 
     def test_partial_usage_stays_null_on_async_path(self) -> None:

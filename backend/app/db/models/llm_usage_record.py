@@ -17,6 +17,11 @@
   llm_pricing 表（§十三 / §十四）；
 - **request_id 来自 LLMObservation.request_id**（Provider 真实请求 ID）；
   缺失存 NULL，**绝不生成 UUID 冒充**（§九，方案 A：保持最小）；
+- **assistant_request_id（Phase 3.12 Step 36）来自 Assistant Trace Scope**
+  （``services/assistant_trace.py``，由 Orchestrator 的 request_id 绑定）；
+  仅用于把 usage 事实关联到一次 Assistant 请求；未绑定 Scope（旧链路 /
+  直连 Service / 历史数据）存 NULL，**绝不**用 request_id 冒充、绝不用
+  时间戳 / UUID 回填；该列不参与幂等（幂等仍只由 request_id 决定）；
 - **provider 来自 LLMObservation.provider**；缺失 NULL，
   禁止 "unknown" / "deepseek" / "default" 隐式填充（§十）；
 - **model 来自 LLMObservation.model**（Provider 实际返回），
@@ -139,6 +144,24 @@ class LLMUsageRecord(Base):
         comment=(
             "实际响应的模型（来自 LLMObservation.model）；"
             "禁止使用配置 model 兜底"
+        ),
+    )
+
+    # ---- Assistant Trace 关联（Phase 3.12 Step 36）----
+    # 与 request_id（Provider 请求 ID）是**两个不同维度**：
+    #   request_id            = Provider / LLM 侧 trace（chatcmpl-… 或空）
+    #   assistant_request_id  = 一次 /api/ai/chat 请求的 Assistant Trace ID
+    # 由 AIOrchestratorService.execute() 生成（Step 35）并经
+    # assistant_trace_scope 传播到 LLM Usage Persistence Boundary。
+    # 旧链路（/api/chat · /api/rag/answer · /api/chat/with-tools）没有该
+    # Scope → 保持 NULL（历史数据同样是 NULL）；**绝不**用 request_id
+    # 冒充 / 覆盖 / 回填。
+    assistant_request_id: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment=(
+            "Assistant Trace ID（一次 /api/ai/chat 请求的 request_id）；"
+            "旧链路 / 未绑定 Scope 时为 NULL，绝不生成或回填"
         ),
     )
 

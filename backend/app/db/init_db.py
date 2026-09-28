@@ -114,13 +114,50 @@ def ensure_request_id_idempotency_index(conn: Any) -> bool:
     return True
 
 
+# Phase 3.12 Step 36：Assistant Trace 关联列（assistant_request_id）。
+#
+# 与 request_id 索引同理：`Base.metadata.create_all(checkfirst=True)` 对
+# **已存在**的表整体跳过，不会补建后来新增的列 → 必须有显式幂等 DDL，
+# 对全新库同样幂等（`IF NOT EXISTS`）。
+# nullable：旧链路（/api/chat · /api/rag/answer · /api/chat/with-tools）
+# 与历史数据没有该关联，必须保持 NULL。
+_CREATE_ASSISTANT_REQUEST_ID_COLUMN_SQL: Final[str] = (
+    f"ALTER TABLE {_USAGE_TABLE} "
+    "ADD COLUMN IF NOT EXISTS assistant_request_id VARCHAR(128)"
+)
+
+
+def ensure_assistant_request_id_column(conn: Any) -> bool:
+    """确保 `ai_ops.llm_usage_record.assistant_request_id` 列存在
+    （Phase 3.12 Step 36）。
+
+    幂等行为：列已存在 → 什么都不做（`ADD COLUMN IF NOT EXISTS`）；
+    不修改任何已有数据（历史行保持 NULL），不新建表、不引入 Alembic。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  列已存在或本次成功新增。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+    """
+    if not inspect(conn).has_table("llm_usage_record", schema=LLM_USAGE_SCHEMA):
+        return False
+
+    conn.execute(text(_CREATE_ASSISTANT_REQUEST_ID_COLUMN_SQL))
+    logger.info("LLM usage assistant_request_id column ensured")
+    return True
+
+
 def init_db() -> None:
-    """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引。
+    """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引 / 关联列。
 
     幂等行为：
         - pgvector extension 已存在 → 不报错
         - ORM 表已存在 → create_all 不会重复创建（只补缺失的表）
         - request_id 幂等索引已存在 → 不报错（IF NOT EXISTS）
+        - assistant_request_id 列已存在 → 不报错（IF NOT EXISTS），
+          历史数据保持 NULL（Phase 3.12 Step 36）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
@@ -152,6 +189,10 @@ def init_db() -> None:
             #    （对**已存在**的表，create_all 不会补建新增索引，
             #     必须显式 DDL；有重复数据则不自动清理，直接停止）
             ensure_request_id_idempotency_index(conn)
+
+            # 6. Phase 3.12 Step 36：Assistant Trace 关联列
+            #    （同样对已存在的表显式补齐；不改任何历史数据）
+            ensure_assistant_request_id_column(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -176,7 +217,11 @@ def main() -> int:
     return 0
 
 
-__all__ = ["init_db", "ensure_request_id_idempotency_index"]
+__all__ = [
+    "init_db",
+    "ensure_request_id_idempotency_index",
+    "ensure_assistant_request_id_column",
+]
 
 
 if __name__ == "__main__":

@@ -81,6 +81,8 @@ _APPROVED_COLUMNS = {
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    # Phase 3.12 Step 36：Assistant Trace 关联列（nullable；旧数据 / 旧链路 NULL）
+    "assistant_request_id",
     "created_at",
 }
 

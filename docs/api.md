@@ -579,6 +579,9 @@ Side Effect:  按 route：RAG 检索 + LLM / Tool 只读执行 / Text-to-SQL 只
 范围        rag / tool / text_to_sql 三条成功路径 + T2S refusal 均携带
 可关联       Tool 路径下 == ai_ops.tool_execution_record.request_id
              → 可用它查询 GET /api/observability/tools/history（响应项含 request_id）
+             LLM usage（Phase 3.12 Step 36）：
+             == ai_ops.llm_usage_record.assistant_request_id
+             （该表另有 request_id = Provider 请求 ID，两个维度不同，勿混用）
 错误响应     4xx / 5xx **不含** request_id（错误契约本阶段未变）
 不包含       Tool arguments / ToolResult.data / SQL / prompt / LLM 响应 / 凭据 /
              traceback / DB 连接信息（metadata 只增加 request_id 一个键）
