@@ -3811,6 +3811,27 @@ Ordering：LLM created_at,id ASC · Tool id ASC · RAG id ASC（组合层不重�
 Source：Persistent only（不读 InMemoryRagExecutionCollector）
 ```
 
+## 8.65 Assistant Trace Unified Timeline（Phase 3.12 Step 49 — Design Only / DEFER）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 49 — Assistant Trace Unified Timeline Design.md`
+> **Design Only**：未实现 `events`；未改 AssistantTraceResponse / QueryService /
+> 任何 Repository / 持久化 / Runtime；无新表 / 无 Event Bus / 无 OTel。
+> 0 新增测试（Step 49 §十五允许）。
+
+```text
+事实：LLM 只有 created_at（完成/入库时刻）；Tool / RAG 有 started_at + duration_ms
+     → 不存在统一"事件开始时间"；Tool/RAG Trace 读模型刻意无主键 → 无 source_id
+排序现状：LLM created_at,id ASC · Tool id ASC · RAG id ASC（组合层不重排）
+架构现状：单一 route、无并行、无多步 → 三个独立列表已完整
+
+结论：**DEFER**（时间排序 ≠ 因果排序；正确实现需改 LLM Usage 持久化）
+未来最小实现：仅在组合层派生 events（event_type ∈ {llm,tool,rag}；
+    occurred_at = created_at / started_at；duration_ms = None(llm) 或原值；
+    tie-break = occurred_at → source_priority(rag,tool,llm) → 段内序号）
+红线：不暴露 query / answer / content / similarity / embedding / prompt /
+     messages / raw_response / SQL / 凭据 / ORM / traceback / 数据库主键
+```
+
 ---
 
 # 9. Prompt Architecture
