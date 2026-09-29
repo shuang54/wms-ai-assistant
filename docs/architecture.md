@@ -3877,6 +3877,14 @@ Purpose:  Assistant Trace LLM Usage exact-match lookup
       Historical NULL values unchanged · No backfill · No composite index ·
       既有索引未删除 / 未改动（pkey · created_at · uq request_id）
 
+LLM Usage 生产接线（Phase 3.12 Step 55 审计 → `docs/evaluation/phase-3.12-step-55-llm-usage-production-wiring-audit.md`）：
+    Implementation exists ✅（sink / service / bridge / repository / 幂等 / 隔离 / tests）
+    Production wiring exists ❌（`get_default_llm_client()` 不传 accounting_sink
+        → `LLMClient.__init__` 回落到 **NoopAccountingSink**；刻意设计，非 bug）
+    ⇒ 生产默认 Assistant Trace `llm_usage[] = []`（Tool / RAG 段正常）
+    最小接线点（仅设计）：`llm/client.py::get_default_llm_client()`（**不**改
+        `create_llm_client()` 默认语义）；Recommendation = **DESIGN READY**
+
 Trace 数据量 / 分页（Phase 3.12 Step 54 审计 → `docs/evaluation/phase-3.12-step-54-trace-pagination-audit.md`）：
     三段均**有界**（LLM ≤4 · Tool ≤1 · RAG ≤1 ⇒ 单 id 上限 **6** 条，默认配置）
     排序键不同（LLM created_at,id / Tool id / RAG id）· Tool·RAG **不暴露主键**
