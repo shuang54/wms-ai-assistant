@@ -535,10 +535,14 @@ class TestDeferredBoundaries:
         assert not [
             p for p in paths if "rag" in p.lower() and "answer" not in p
         ], paths                                          # 无 RAG Query/Metrics API
+        # Step 48 已完成：Assistant Trace 新增 additive 的 ``rag_executions``
         trace = app.openapi()["components"]["schemas"][
             "AssistantTraceResponse"
         ]["properties"]
-        assert "rag" not in str(list(trace)).lower()       # 未接 Assistant Trace
+        assert "rag_executions" in trace
+        assert list(trace)[:3] == [
+            "assistant_request_id", "llm_usage", "tool_executions",
+        ]
 
     def test_write_port_is_the_existing_observer_interface(self) -> None:
         """写侧复用既有 ``record()`` 端口；不新造生命周期。"""
@@ -555,11 +559,13 @@ class TestDeferredBoundaries:
         assert "def record(" in collector
 
     def test_assistant_trace_and_http_api_unchanged(self) -> None:
+        """Step 48：Trace 只**新增** rag_executions；旧字段与 RAG 端点集合不变。"""
         schema = app.openapi()["components"]["schemas"]["AssistantTraceResponse"]
 
-        assert list(schema["properties"]) == [
+        assert list(schema["properties"])[:3] == [
             "assistant_request_id", "llm_usage", "tool_executions",
         ]
+        assert list(schema["properties"])[3:] == ["rag_executions"]
         paths = sorted(app.openapi()["paths"])
         assert [p for p in paths if "rag" in p.lower()] == ["/api/rag/answer"]
 

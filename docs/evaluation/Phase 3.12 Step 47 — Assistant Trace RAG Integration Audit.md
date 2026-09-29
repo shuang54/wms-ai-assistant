@@ -225,6 +225,12 @@ tests/test_assistant_trace_rag_integration_contract.py   34 passed（纯离线�
 
 ## 12. Limitations
 
+> 后续（Phase 3.12 Step 48）：本设计已**实现** —— `rag_executions` 已进入
+> Assistant Trace 响应（additive），RAG 段数据源 = `RagExecutionPersistentQueryService`
+> （PostgreSQL），`RagExecutionRepositoryError` 已加入 502 元组
+> （见 `Phase 3.12 Step 48 — Assistant Trace RAG Integration.md`）。
+> 仍 deferred：统一 events 排序 · project 级授权 · retention。
+
 ```text
 * 本阶段为设计态：RAG Trace DTO / 映射函数均未在生产代码中实现
   （映射只存在于测试内的 `_ProposedRagExecutionTrace`）

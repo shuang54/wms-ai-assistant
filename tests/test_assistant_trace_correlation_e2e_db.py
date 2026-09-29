@@ -358,6 +358,7 @@ class TestAssistantTraceCorrelationE2eDb:
             "assistant_request_id": "step40-not-exist",
             "llm_usage": [],
             "tool_executions": [],
+            "rag_executions": [],   # Step 48（additive）
         }
 
 

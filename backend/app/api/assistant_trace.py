@@ -45,12 +45,16 @@ from backend.app.api.orchestrator_chat import (
     get_assistant_trace_query_service,
 )
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
+from backend.app.db.rag_execution_repository import (
+    RagExecutionRepositoryError,
+)
 from backend.app.db.tool_execution_repository import (
     ToolExecutionRepositoryError,
 )
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,
+    RagExecutionTraceView,
 )
 from backend.app.services.llm_usage_query_service import (
     LLMUsageTraceRecordView,
@@ -106,23 +110,69 @@ class ToolExecutionTraceResponse(BaseModel):
     error_type: str | None = None
 
 
+class RagExecutionTraceResponse(BaseModel):
+    """Trace 中的一条 RAG 执行（Phase 3.12 Step 48；**13 字段**）。
+
+    对应 ``RagExecutionTraceView``（Persistent Read Model）：
+    ``ai_ops.rag_execution_record`` → Persistent Query Service → View → 本 DTO。
+
+    Attributes:
+        request_id:          Assistant Trace ID（与 Tool 段 ``request_id``
+                             同名同义；**不新增** correlation id）。
+        started_at / finished_at / duration_ms: 执行时间与端到端耗时。
+        result_count / used_chunks_count / top_k: 检索与 Context 事实。
+        context_truncated / context_chars: Context 截断与规模。
+        reranker_used / rerank_elapsed_ms: Reranker 参与与耗时
+                                            （未使用 → ``None``，**不是 0**）。
+        chunk_ids / document_ids: 命中 identifier（去重 + 首次出现顺序；
+                                  **仅 ID**，无正文 / 无 similarity）。
+
+    Note:
+        * **不含**数据库主键 ``id``（排序由仓储 ``ORDER BY id ASC`` 保证；
+          与 ``ToolExecutionTraceResponse`` 一致，不暴露存储细节）；
+        * **不含** query / answer / chunk content / document content /
+          similarity / embedding / prompt / messages / raw_response / SQL /
+          credentials / project_id。
+    """
+
+    request_id: str
+    started_at: datetime
+    finished_at: datetime
+    duration_ms: float
+    result_count: int
+    used_chunks_count: int
+    top_k: int
+    context_truncated: bool
+    context_chars: int
+    reranker_used: bool
+    rerank_elapsed_ms: float | None = None
+    chunk_ids: list[int] = Field(default_factory=list)
+    document_ids: list[int] = Field(default_factory=list)
+
+
 class AssistantTraceResponse(BaseModel):
     """``GET /api/observability/assistant-trace/{assistant_request_id}`` 响应。
 
     Attributes:
         assistant_request_id: 回显请求的 Assistant Trace ID（逐字符一致）。
         llm_usage:            该 Trace 的 LLM Usage（``created_at ASC, id ASC``）。
-        tool_executions:      该 Trace 的 Tool 执行（Collector 写入顺序）。
+        tool_executions:      该 Trace 的 Tool 执行（落库顺序 ``id ASC``）。
+        rag_executions:       该 Trace 的 RAG 执行（落库顺序 ``id ASC``；
+                              Phase 3.12 Step 48 新增 —— **additive**）。
 
     Note:
-        LLM 与 Tool 当前来自**不同数据源**（PostgreSQL / Runtime Memory），
-        本层不做合并 / 去重 / 聚合；空 Trace（两个数组均为 ``[]``）是合法结果，
+        三段均来自 **PostgreSQL 持久化读边界**（llm_usage_record /
+        tool_execution_record / rag_execution_record）；本层不做合并 / 去重 /
+        聚合；空 Trace（三个数组均为 ``[]``）是合法结果，
         不代表 HTTP resource-not-found。
     """
 
     assistant_request_id: str
     llm_usage: list[LLMUsageTraceResponse] = Field(default_factory=list)
     tool_executions: list[ToolExecutionTraceResponse] = Field(
+        default_factory=list
+    )
+    rag_executions: list[RagExecutionTraceResponse] = Field(
         default_factory=list
     )
 
@@ -163,6 +213,27 @@ def _tool_execution_response(
     )
 
 
+def _rag_execution_response(
+    view: RagExecutionTraceView,
+) -> RagExecutionTraceResponse:
+    """``RagExecutionTraceView`` → API DTO（显式逐字段映射；不含主键）。"""
+    return RagExecutionTraceResponse(
+        request_id=view.request_id,
+        started_at=view.started_at,
+        finished_at=view.finished_at,
+        duration_ms=view.duration_ms,
+        result_count=view.result_count,
+        used_chunks_count=view.used_chunks_count,
+        top_k=view.top_k,
+        context_truncated=view.context_truncated,
+        context_chars=view.context_chars,
+        reranker_used=view.reranker_used,
+        rerank_elapsed_ms=view.rerank_elapsed_ms,
+        chunk_ids=list(view.chunk_ids),
+        document_ids=list(view.document_ids),
+    )
+
+
 def _to_trace_response(trace: AssistantTraceView) -> AssistantTraceResponse:
     """``AssistantTraceView`` → API DTO（顺序保持，只做 tuple → list）。"""
     return AssistantTraceResponse(
@@ -170,6 +241,9 @@ def _to_trace_response(trace: AssistantTraceView) -> AssistantTraceResponse:
         llm_usage=[_llm_usage_response(v) for v in trace.llm_usage],
         tool_executions=[
             _tool_execution_response(s) for s in trace.tool_executions
+        ],
+        rag_executions=[
+            _rag_execution_response(r) for r in trace.rag_executions
         ],
     )
 
@@ -181,7 +255,11 @@ def _to_trace_response(trace: AssistantTraceView) -> AssistantTraceResponse:
         200: {"description": "该 Assistant Trace 的只读 Read Model（可为空）"},
         400: {"description": "assistant_request_id 非法（如纯空白）"},
         422: {"description": "路径参数校验失败（长度越界）"},
-        502: {"description": "LLM Usage 数据源不可用（数据库未配置 / 查询失败）"},
+        502: {
+            "description": (
+                "持久化数据源不可用（LLM Usage / Tool / RAG 数据库未配置 / 查询失败）"
+            )
+        },
         500: {"description": "Trace 观测数据不可用"},
     },
 )
@@ -208,10 +286,10 @@ async def get_assistant_trace(
     语义：
 
         * **只读**：不写库 / 不触发 Tool / 不调用 LLM / 不重新路由；
-        * **空 Trace 合法**：LLM 与 Tool 任意一侧或两侧为空 → ``[]``，
+        * **空 Trace 合法**：LLM / Tool / RAG 任意一侧或多侧为空 → ``[]``，
           仍返回 ``200``（不返回 404）；
         * 顺序保持下游语义（LLM ``created_at ASC, id ASC``；
-          Tool Collector 写入顺序），HTTP 层不重排；
+          Tool / RAG 落库顺序 ``id ASC``），HTTP 层不重排 / 不合并 / 不去重；
         * 下游失败**原样呈现**为 5xx（绝不降级成 ``200`` + 空 Trace）。
 
     错误映射：
@@ -219,18 +297,21 @@ async def get_assistant_trace(
         400  assistant_request_id 非法（服务层校验：纯空白等）
         422  路径参数长度越界（FastAPI Path 校验）
         502  持久化数据源不可用（LLMUsageRepositoryError /
-             ToolExecutionRepositoryError —— 两者均为 PostgreSQL 读边界）
+             ToolExecutionRepositoryError / RagExecutionRepositoryError
+             —— 三者均为 PostgreSQL 读边界；Step 48 补入 RAG 仓储错误）
         500  其它未预期错误（不暴露 traceback / SQL / 凭据 / 内部模块路径）
 
     安全：响应只包含 ``assistant_request_id`` / ``llm_usage[]``（9 字段）/
-        ``tool_executions[]``（11 字段），不含 prompt / messages / arguments /
-        ToolResult.data / SQL / DB 连接 / Session / 凭据。
+        ``tool_executions[]``（11 字段）/ ``rag_executions[]``（13 字段），
+        不含 prompt / messages / arguments / ToolResult.data / SQL /
+        DB 连接 / Session / 凭据 / 数据库主键 / chunk 正文 / similarity。
 
-    数据源（Step 41）：LLM → ``ai_ops.llm_usage_record``；
-        Tool → ``ai_ops.tool_execution_record``；两者均**持久化**，
-        因此进程重启 / 多 worker / Runtime Collector 淘汰后仍可查询。
-        Runtime（``/api/observability/tools``）与 History
-        （``/api/observability/tools/history``）语义**不变**，且不与本端点合并。
+    数据源（Step 41 / Step 48）：LLM → ``ai_ops.llm_usage_record``；
+        Tool → ``ai_ops.tool_execution_record``；RAG →
+        ``ai_ops.rag_execution_record``；三者均**持久化**，因此进程重启 /
+        多 worker / Runtime Collector 淘汰后仍可查询。
+        Runtime（``/api/observability/tools`` 与 RAG Runtime 查询服务）语义
+        **不变**，且不与本端点合并。
     """
     try:
         service: AssistantTraceQueryService = (
@@ -243,7 +324,11 @@ async def get_assistant_trace(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"非法输入: {exc}",
         )
-    except (LLMUsageRepositoryError, ToolExecutionRepositoryError) as exc:
+    except (
+        LLMUsageRepositoryError,
+        ToolExecutionRepositoryError,
+        RagExecutionRepositoryError,
+    ) as exc:
         logger.error(
             "assistant trace data source unavailable",
             extra={"error_type": type(exc).__name__},
@@ -269,6 +354,7 @@ __all__ = [
     "AssistantTraceResponse",
     "LLMUsageTraceResponse",
     "ToolExecutionTraceResponse",
+    "RagExecutionTraceResponse",
     "MIN_ASSISTANT_REQUEST_ID_LENGTH",
     "MAX_ASSISTANT_REQUEST_ID_LENGTH",
 ]

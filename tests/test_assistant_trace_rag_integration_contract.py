@@ -165,17 +165,23 @@ class _SpyRepository:
 
 class TestCurrentTraceContract:
     def test_response_model_fields(self) -> None:
+        """Step 48 实现后：三个旧字段不变 + additive 的 ``rag_executions``。"""
+        assert list(AssistantTraceResponse.model_fields)[
+            : len(_CURRENT_RESPONSE_FIELDS)
+        ] == list(_CURRENT_RESPONSE_FIELDS)
         assert list(AssistantTraceResponse.model_fields) == [
-            *_CURRENT_RESPONSE_FIELDS,
+            *_CURRENT_RESPONSE_FIELDS, "rag_executions",
         ]
 
-    def test_read_model_is_frozen_and_two_sources(self) -> None:
+    def test_read_model_is_frozen_and_three_sources(self) -> None:
         assert [f.name for f in fields(AssistantTraceView)] == [
             "assistant_request_id", "llm_usage", "tool_executions",
+            "rag_executions",
         ]
         with pytest.raises(ValueError):
             AssistantTraceView(
-                assistant_request_id="A", llm_usage=[], tool_executions=[]
+                assistant_request_id="A", llm_usage=[], tool_executions=[],
+                rag_executions=[],
             )
 
     def test_nested_dto_field_counts(self) -> None:
@@ -204,16 +210,18 @@ class TestCurrentTraceContract:
 
         assert "LLMUsageRepositoryError" in names
         assert "ToolExecutionRepositoryError" in names
-        # 设计缺口（Step 48 必须补）：RAG 仓储错误当前会落到 catch-all → 500
-        assert "RagExecutionRepositoryError" not in names
+        # Step 48 已修复：RAG 仓储错误同样映射 502（不再落到 catch-all → 500）
+        assert "RagExecutionRepositoryError" in names
 
-    def test_http_contract_exposes_no_rag_yet(self) -> None:
+    def test_http_contract_exposes_rag_executions(self) -> None:
         schema = app.openapi()["components"]["schemas"][
             "AssistantTraceResponse"
         ]["properties"]
 
-        assert list(schema) == list(_CURRENT_RESPONSE_FIELDS)
-        assert "rag_executions" not in schema
+        assert "rag_executions" in schema
+        assert list(schema)[: len(_CURRENT_RESPONSE_FIELDS)] == list(
+            _CURRENT_RESPONSE_FIELDS
+        )
 
     def test_trace_service_has_no_write_capability(self) -> None:
         for forbidden in ("execute", "record", "clear", "metrics", "persist"):
@@ -468,11 +476,13 @@ class TestRuntimeVsPersistentAndCompatibility:
                 assert forbidden not in imported, (relative, forbidden)
 
     def test_proposed_change_is_additive(self) -> None:
+        """Step 48 实现：新增字段是 additive（旧字段不改名 / 不删除 / 语义不变）。"""
         current = list(_CURRENT_RESPONSE_FIELDS)
-        proposed = [*current, "rag_executions"]
+        implemented = list(AssistantTraceResponse.model_fields)
 
-        assert proposed[: len(current)] == current        # 旧字段不改名 / 不删除
-        assert AssistantTraceResponse.model_fields.keys() == set(current)
+        assert implemented[: len(current)] == current
+        assert set(current) <= set(implemented)
+        assert "rag_executions" in implemented
         # 旧客户端解析（忽略未知字段）仍可用
         payload = json.dumps(
             {"assistant_request_id": "A", "llm_usage": [], "tool_executions": [],

@@ -49,6 +49,12 @@ _TOOL_FIELDS = (
     "duration_ms", "success", "project_id", "tool_call_id", "error_code",
     "error_type",
 )
+#: Step 48：RAG Trace 字段（**不含**数据库主键 id）
+_RAG_FIELDS = (
+    "request_id", "started_at", "finished_at", "duration_ms", "result_count",
+    "used_chunks_count", "top_k", "context_truncated", "context_chars",
+    "reranker_used", "rerank_elapsed_ms", "chunk_ids", "document_ids",
+)
 
 
 def _source(relative: str) -> str:
@@ -188,7 +194,20 @@ class _DuckTraceView:
         self.assistant_request_id = "A"
         self.llm_usage = (_DuckLlmRow(),)
         self.tool_executions = (_DuckToolRow(),)
+        self.rag_executions = ()          # Step 48：RAG 段（空）
         self.internal_debug = "LEAK"
+
+
+class _FakeRagQueryService:
+    """RAG 持久化读边界替身（离线测试**零 DB**：默认无记录）。"""
+
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self._rows = rows or []
+        self.calls: list[str] = []
+
+    def list_by_request_id(self, request_id: str) -> list[Any]:
+        self.calls.append(request_id)
+        return list(self._rows)
 
 
 class _FakeTraceService:
@@ -226,6 +245,8 @@ def trace_api(monkeypatch):
                     repository=repository  # type: ignore[arg-type]
                 )
             ),
+            # Step 48：离线测试不得触达 PostgreSQL → 注入 RAG 读边界替身
+            rag_execution_query_service=_FakeRagQueryService(),
         )
         monkeypatch.setattr(
             trace_module,
@@ -304,6 +325,7 @@ class TestTraceEndpoint:
             "assistant_request_id": "not-exist",
             "llm_usage": [],
             "tool_executions": [],
+            "rag_executions": [],                          # Step 48（additive）
         }
 
     def test_ordering_preserved(self, trace_api) -> None:
@@ -531,6 +553,7 @@ class TestRegressionAndOpenAPI:
         components = spec["components"]["schemas"]
         assert list(components["AssistantTraceResponse"]["properties"]) == [
             "assistant_request_id", "llm_usage", "tool_executions",
+            "rag_executions",                          # Step 48（additive）
         ]
         assert list(components["LLMUsageTraceResponse"]["properties"]) == list(
             _LLM_FIELDS
@@ -538,6 +561,9 @@ class TestRegressionAndOpenAPI:
         assert list(
             components["ToolExecutionTraceResponse"]["properties"]
         ) == list(_TOOL_FIELDS)
+        assert list(
+            components["RagExecutionTraceResponse"]["properties"]
+        ) == list(_RAG_FIELDS)
         # 只检查本端点 + 其 schema（全 App spec 的其它端点文案不属本阶段范围）
         subset_text = str({
             "operation": operation,
@@ -547,6 +573,7 @@ class TestRegressionAndOpenAPI:
                     "AssistantTraceResponse",
                     "LLMUsageTraceResponse",
                     "ToolExecutionTraceResponse",
+                    "RagExecutionTraceResponse",
                 )
             },
         })

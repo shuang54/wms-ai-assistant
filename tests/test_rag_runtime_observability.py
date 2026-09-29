@@ -732,14 +732,16 @@ class TestRuntimeOnlyBoundaries:
         # RAG 相关端点仍只有历史 /api/rag/answer
         assert [p for p in paths if "rag" in p.lower()] == ["/api/rag/answer"]
 
-    def test_assistant_trace_api_unchanged(self) -> None:
+    def test_assistant_trace_api_three_legacy_fields_unchanged(self) -> None:
+        """Step 48：Trace 响应 additive —— 旧三个字段与语义不变。"""
         schema = app.openapi()["components"]["schemas"][
             "AssistantTraceResponse"
         ]
 
-        assert list(schema["properties"]) == [
+        assert list(schema["properties"])[:3] == [
             "assistant_request_id", "llm_usage", "tool_executions",
         ]
+        assert "rag_executions" in schema["properties"]
 
     def test_rag_public_contract_unchanged(self) -> None:
         import inspect

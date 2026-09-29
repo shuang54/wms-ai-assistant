@@ -95,6 +95,18 @@ def _response_body(request_id: str, content: str = "已收到问题") -> dict[st
     }
 
 
+class _FakeRagQueryService:
+    """RAG 持久化读边界替身（离线测试**零 DB**：默认无记录）。"""
+
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self._rows = rows or []
+        self.calls: list[str] = []
+
+    def list_by_request_id(self, request_id: str) -> list[Any]:
+        self.calls.append(request_id)
+        return list(self._rows)
+
+
 class _InMemoryUsageRepository:
     """内存 Usage Repository（duck-typed；**仅 LLM Provider / DB 替身**）。"""
 
@@ -334,6 +346,8 @@ def e2e(monkeypatch):
                     repository=repository  # type: ignore[arg-type]
                 ),
                 tool_observability_query_service=persistent_tools,
+                # Step 48：离线测试不得触达 PostgreSQL → RAG 读边界替身
+                rag_execution_query_service=_FakeRagQueryService(),
             ),
         )
         return repository, handler, persistent_tools, collector
@@ -497,6 +511,7 @@ def test_trace_security(e2e) -> None:
     payload = response.json()
     assert set(payload) == {
         "assistant_request_id", "llm_usage", "tool_executions",
+        "rag_executions",                              # Step 48（additive）
     }
 
 

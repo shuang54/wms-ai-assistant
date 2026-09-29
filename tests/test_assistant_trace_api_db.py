@@ -191,6 +191,7 @@ class TestAssistantTraceApiDb:
             "assistant_request_id": "step39-not-exist",
             "llm_usage": [],
             "tool_executions": [],
+            "rag_executions": [],   # Step 48（additive）
         }
 
     def test_legacy_null_usage_not_attached(self, trace_api_db) -> None:

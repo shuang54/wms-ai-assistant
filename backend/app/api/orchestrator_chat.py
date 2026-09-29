@@ -126,6 +126,7 @@ from backend.app.services.in_memory_tool_execution_collector import (
 )
 from backend.app.services.rag_observability_runtime import (
     get_observed_rag_service,
+    get_rag_execution_persistent_query_service,
 )
 from backend.app.services.tool_execution_observer import ToolExecutionObserver
 from backend.app.services.tool_execution_persistence_adapter import (
@@ -331,6 +332,11 @@ def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
             get_tool_execution_persistent_query_service()
         ),
         llm_usage_query_service=LLMUsageQueryService(),
+        # Phase 3.12 Step 48：RAG 段使用**持久化**读边界（应用级同一实例；
+        # 不在 API 层创建 Repository / Session / QueryService）。
+        rag_execution_query_service=(
+            get_rag_execution_persistent_query_service()
+        ),
     )
 
 

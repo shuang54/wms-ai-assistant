@@ -319,6 +319,7 @@ class TestPersistentToolTrace:
             "assistant_request_id": "step41-not-exist",
             "llm_usage": [],
             "tool_executions": [],
+            "rag_executions": [],   # Step 48（additive）
         }
 
     def test_5_restart_like_new_boundary_still_reads(

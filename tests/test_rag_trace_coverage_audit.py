@@ -461,24 +461,26 @@ class TestLegacyRagEndpointCurrentState:
 
 
 # ============================================================
-# 6. Assistant Trace Read Model 当前没有 RAG 段落
+# 6. Assistant Trace 的 RAG 段落（Step 48 实现后：有 RAG 段、无敏感字段）
 # ============================================================
 
-class TestAssistantTraceHasNoRagSection:
-    def test_trace_schemas_have_no_rag_fields(self) -> None:
+class TestAssistantTraceRagSection:
+    def test_trace_schemas_still_have_no_sensitive_rag_fields(self) -> None:
         spec = app.openapi()
         components = spec["components"]["schemas"]
         names = (
             "AssistantTraceResponse",
             "LLMUsageTraceResponse",
             "ToolExecutionTraceResponse",
+            "RagExecutionTraceResponse",
         )
         text = str({name: components[name] for name in names}).lower()
 
-        for absent in ("rag", "retrieval", "chunk", "reranker", "similarity"):
-            assert absent not in text, absent
+        for absent in ("similarity", "query", "content", "embedding"):
+            assert f'"{absent}"' not in text, absent
 
-    def test_trace_endpoint_returns_only_two_sections(self) -> None:
+    def test_trace_endpoint_returns_three_sections(self) -> None:
+        """Step 48：三个独立列表（不合并为 events；旧字段顺序不变）。"""
         spec = app.openapi()
         path = "/api/observability/assistant-trace/{assistant_request_id}"
         properties = spec["components"]["schemas"][
@@ -487,6 +489,7 @@ class TestAssistantTraceHasNoRagSection:
 
         assert list(properties) == [
             "assistant_request_id", "llm_usage", "tool_executions",
+            "rag_executions",
         ]
         assert path in spec["paths"]
 

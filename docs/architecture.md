@@ -3777,6 +3777,40 @@ Compat：新增 rag_executions = additive（旧字段不改名 / 不删除 / 语
 Ordering：方案 A（三个独立列表，各自顺序保持）→ 不引入统一 events
 ```
 
+## 8.64 Assistant Trace RAG Integration（Phase 3.12 Step 48 — Implemented）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 48 — Assistant Trace RAG Integration.md`
+> 契约：Step 47（§8.63）
+> 测试：`tests/test_assistant_trace_rag_integration.py`（23）·
+> `tests/test_assistant_trace_rag_integration_e2e_db.py`（6，DB-gated）
+> 生产改动：`assistant_trace_query_service.py` · `api/assistant_trace.py` ·
+> `api/orchestrator_chat.py`（Composition Root 注入）；RAG Runtime/Persistence、
+> LLM Usage、Tool Execution、Router、Orchestrator、DB Schema 全未改。
+
+```text
+GET /api/observability/assistant-trace/{assistant_request_id}
+      ↓
+AssistantTraceQueryService.get_trace(A)
+      ├── LLMUsageQueryService                 （ai_ops.llm_usage_record）
+      ├── ToolExecutionPersistentQueryService  （ai_ops.tool_execution_record）
+      └── RagExecutionPersistentQueryService   （ai_ops.rag_execution_record）← Step 48
+      ↓
+AssistantTraceView + rag_executions（tuple[RagExecutionTraceView]）
+      ↓ 显式逐字段映射
+AssistantTraceResponse{ assistant_request_id, llm_usage, tool_executions,
+                        rag_executions }                ← additive（旧字段不变）
+
+RagExecutionTraceResponse（13 字段）：request_id · started_at · finished_at ·
+    duration_ms · result_count · used_chunks_count · top_k · context_truncated ·
+    context_chars · reranker_used · rerank_elapsed_ms · chunk_ids · document_ids
+    （**无**数据库主键 id；无 query / content / similarity / embedding / 凭据）
+
+Error：RagExecutionRepositoryError 加入 502 元组（原会落 catch-all → 500）
+Empty：rag_executions = [] → 200；DB 失败 → 502（**不为 []**）
+Ordering：LLM created_at,id ASC · Tool id ASC · RAG id ASC（组合层不重排）
+Source：Persistent only（不读 InMemoryRagExecutionCollector）
+```
+
 ---
 
 # 9. Prompt Architecture

@@ -27,6 +27,7 @@ from backend.app.db.tool_execution_repository import ToolExecutionRecordRow
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,
+    RagExecutionTraceView,
 )
 from backend.app.services.llm_usage_query_service import (
     LLMUsageTraceRecordView,
@@ -159,16 +160,31 @@ def _tool_boundary(
     )
 
 
+class _FakeRagService:
+    """RAG 持久化读边界替身（离线测试**零 DB**：默认无记录）。"""
+
+    def __init__(self, rows: list[Any] | None = None) -> None:
+        self._rows = rows or []
+        self.calls: list[str] = []
+
+    def list_by_request_id(self, request_id: str) -> list[Any]:
+        self.calls.append(request_id)
+        return list(self._rows)
+
+
 def _service(
     *,
     llm: Any = None,
     tools: Any = None,
+    rag: Any = None,
 ) -> AssistantTraceQueryService:
     return AssistantTraceQueryService(
         llm_usage_query_service=llm if llm is not None else _FakeLlmUsageService(),
         tool_observability_query_service=(
             tools if tools is not None else _tool_boundary()
         ),
+        # Step 48：离线测试不得触达 PostgreSQL → RAG 读边界替身
+        rag_execution_query_service=rag if rag is not None else _FakeRagService(),
     )
 
 
@@ -412,6 +428,13 @@ class TestSecurity:
     def test_11_view_fields_are_whitelisted(self) -> None:
         assert [f.name for f in fields(AssistantTraceView)] == [
             "assistant_request_id", "llm_usage", "tool_executions",
+            "rag_executions",                       # Step 48（additive）
+        ]
+        assert [f.name for f in fields(RagExecutionTraceView)] == [
+            "request_id", "started_at", "finished_at", "duration_ms",
+            "result_count", "used_chunks_count", "top_k", "context_truncated",
+            "context_chars", "reranker_used", "rerank_elapsed_ms",
+            "chunk_ids", "document_ids",            # **无**数据库主键 id
         ]
         assert [f.name for f in fields(LLMUsageTraceRecordView)] == [
             "id", "assistant_request_id", "request_id", "provider", "model",
@@ -550,6 +573,7 @@ class TestC43AssistantTraceReadModel:
             "get_trace",
             "llm_usage_query_service",
             "tool_observability_query_service",
+            "rag_execution_query_service",          # Step 48（持久化读边界）
         }, public
 
     def test_c43_8_no_unexpected_http_endpoint(self) -> None:
