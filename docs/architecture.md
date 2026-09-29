@@ -3887,6 +3887,17 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+Outcome 契约设计（Phase 3.12 Step 62 Audit → `docs/evaluation/phase-3.12-step-62-assistant-outcome-contract-audit.md`）：
+    候选 Contract（**仅测试内 projection，未实现**）：outcome ∈ {SUCCESS, EMPTY, REFUSED, FAILED}
+    优先级 **REFUSED > FAILED > EMPTY > SUCCESS**；判定白名单 = status_code · route ·
+        refused · tool_success · rag_used_chunks（禁 detail/content/data/prompt/SQL/chunk/凭据）
+    关键结论：**HTTP 200 ≠ 业务 SUCCESS**（TOOL 失败 = 200 + tool_success=false ⇒ FAILED）；
+        REFUSED/EMPTY 均 = 200；T2SQL 0 行定为 SUCCESS（candidate decision）；
+        LLM/Tool/RAG/Executor 状态均 ≠ Assistant outcome（Case J 当前 Not observable）
+    未来增量推荐：`metadata.outcome`（envelope 不变）· Trace 走统一 Outcome Read Model（方案 3）
+    error_class = 后续可选扩展（需 allowlist 枚举；当前异常类名非稳定契约）
+    测试：`tests/test_assistant_outcome_contract_audit.py`（21 离线；含 A~J projection cases）
+
 Outcome 边界（Phase 3.12 Step 61 Audit → `docs/evaluation/phase-3.12-step-61-assistant-trace-outcome-audit.md`）：
     `AIOrchestrationResult` = route + content + data + metadata（**无** outcome / status 字段）
     route = 能力选择结果 ≠ 业务 Outcome；outcome 语义分散：`metadata.tool_success`（TOOL）·
