@@ -3851,6 +3851,32 @@ Source：Persistent only（不读 InMemoryRagExecutionCollector）
 红线：不得为 cursor 重新暴露数据库主键；分页字段不得携带业务数据
 ```
 
+## 8.67 LLM Usage Assistant Request ID Index（Phase 3.12 Step 51 — Audit / Design Only）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 51 — LLM Usage Request ID Index Audit.md`
+> **Design Only**：未执行 migration；未改 API / DTO / 查询语义 / 数据 / 既有索引。
+> Production Code = 0 · DB Schema = 0 · DB 写入 = 0。
+
+```text
+现状（实测 pg_indexes）：
+    llm_usage_record_pkey          UNIQUE (id)
+    ix_llm_usage_record_created_at (created_at)
+    uq_llm_usage_record_request_id UNIQUE (request_id) WHERE request_id IS NOT NULL
+        ↑ 键是 **Provider request_id**，不是 assistant_request_id
+    ⇒ assistant_request_id（varchar(128) NULL，无 FK / 无 UNIQUE）**无索引**
+
+查询：WHERE assistant_request_id = ? ORDER BY created_at ASC, id ASC
+    （每次 Assistant Trace 请求一次；单请求 1~4 行，选择性极高）
+
+结论：**IMPLEMENT — Option A**（单列索引；本阶段只设计，不执行）
+    CREATE INDEX IF NOT EXISTS ix_llm_usage_record_assistant_request_id
+        ON ai_ops.llm_usage_record (assistant_request_id);
+    不做：UNIQUE · NOT NULL · backfill · 复合索引 · 删除/改动既有索引 · Alembic
+落地路径：① Model __table_args__ 增加 Index（新库随 create_all 创建）；
+          ② init_db 增加 ensure_assistant_request_id_index() 幂等 DDL（既有库）
+            —— create_all 对已存在的表不补建索引（项目既有结论）
+```
+
 ---
 
 # 9. Prompt Architecture
