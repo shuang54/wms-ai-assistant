@@ -3832,6 +3832,25 @@ Source：Persistent only（不读 InMemoryRagExecutionCollector）
      messages / raw_response / SQL / 凭据 / ORM / traceback / 数据库主键
 ```
 
+## 8.66 Assistant Trace 读取扩展性（Phase 3.12 Step 50 — Design Only / DEFER）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 50 — Assistant Trace Read Scalability Design.md`
+> **Design Only**：未实现分页 / 上限 / cursor；未改 Response / QueryService /
+> Repository / Schema / 索引；无缓存 / 无新基础设施。Production Code = 0。
+
+```text
+现状：一次 Trace = 三次独立只读 SQL（显式列 · bound params · 稳定排序 · 无 N+1）
+    排序：LLM created_at,id ASC · Tool id ASC · RAG id ASC
+    上限：三个读边界均**无** LIMIT/OFFSET/cursor → unbounded by request_id
+规模（真实架构）：RAG 路由 rag=1/llm≤1；Tool 路由 tool=1/llm≤1；
+    T2S 路由 llm≤4（DEFAULT_MAX_ATTEMPTS=3 + fallback）→ 单请求 ≈6~10 行、KB 级
+索引：Tool ✓ · RAG ✓ · LLM **assistant_request_id 无索引**（唯一实质风险点）
+
+结论：**DEFER**（分页收益 < 成本；cursor 与"Tool/RAG 不暴露主键"冲突）
+    真正待办（独立最小步骤）：llm_usage_record.assistant_request_id 索引
+红线：不得为 cursor 重新暴露数据库主键；分页字段不得携带业务数据
+```
+
 ---
 
 # 9. Prompt Architecture
