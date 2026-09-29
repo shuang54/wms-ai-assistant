@@ -494,32 +494,51 @@ class TestIndexDesign:
 # ============================================================
 
 class TestDeferredBoundaries:
-    def test_no_rag_table_registered(self) -> None:
+    """Step 46 落地后的**实现态一致性**（契约本身不变）。"""
+
+    def test_only_the_contract_table_is_registered(self) -> None:
         from backend.app.db.base import Base
 
-        assert not [
+        assert sorted(
             name for name in Base.metadata.tables if "rag" in name.lower()
-        ]
+        ) == ["ai_ops.rag_execution_record"]
 
-    def test_no_rag_persistence_modules_exist(self) -> None:
-        evidence: list[str] = []
+    def test_implemented_modules_match_contract_names(self) -> None:
+        expected_modules = (
+            "backend/app/db/models/rag_execution_record.py",
+            "backend/app/db/rag_execution_repository.py",
+            "backend/app/services/rag_execution_persistence_service.py",
+            "backend/app/services/rag_execution_persistence_adapter.py",
+            "backend/app/services/composite_rag_execution_observer.py",
+            "backend/app/services/rag_execution_persistent_query_service.py",
+        )
+        for relative in expected_modules:
+            assert (_REPO_ROOT / relative).exists(), relative
+        # 不引入第二套 speculative 持久化（无 metrics / no-trace 变体）
+        offenders: list[str] = []
         for path in (_REPO_ROOT / "backend" / "app").rglob("*.py"):
             relative = path.relative_to(_REPO_ROOT).as_posix()
             lowered = path.read_text(encoding="utf-8").lower()
-            for token in (
-                "rag_execution_record", "rag_execution_persistent_record",
-                "rag_execution_repository", "rag_persistence",
-            ):
+            for token in ("rag_trace", "retrieval_record", "rag_metrics"):
                 if token in lowered:
-                    evidence.append(f"{relative}:{token}")
-        assert evidence == [], evidence
+                    offenders.append(f"{relative}:{token}")
+        assert offenders == [], offenders
 
-    def test_deferred_items_recorded(self) -> None:
+    def test_still_deferred_items_are_recorded(self) -> None:
         assert set(_SPEC.deferred) == {
             "database_table", "migration", "repository", "persistence_adapter",
             "assistant_trace_integration", "http_api", "retention_policy",
         }
-        assert _SPEC.retention == "DEFERRED"
+        # Step 46 实现表 / Repository / Adapter；其余仍 deferred：
+        assert _SPEC.retention == "DEFERRED"          # 无 TTL / 无 cleanup
+        paths = sorted(app.openapi()["paths"])
+        assert not [
+            p for p in paths if "rag" in p.lower() and "answer" not in p
+        ], paths                                          # 无 RAG Query/Metrics API
+        trace = app.openapi()["components"]["schemas"][
+            "AssistantTraceResponse"
+        ]["properties"]
+        assert "rag" not in str(list(trace)).lower()       # 未接 Assistant Trace
 
     def test_write_port_is_the_existing_observer_interface(self) -> None:
         """写侧复用既有 ``record()`` 端口；不新造生命周期。"""
@@ -544,16 +563,23 @@ class TestDeferredBoundaries:
         paths = sorted(app.openapi()["paths"])
         assert [p for p in paths if "rag" in p.lower()] == ["/api/rag/answer"]
 
-    def test_no_production_contract_dto_added(self) -> None:
-        """本阶段**不**新增生产 DTO / Repository（契约只存在于测试与文档）。"""
-        assert _SPEC.record_dto == "RagExecutionPersistentRecord"
-        assert not (
-            _REPO_ROOT / "backend/app/services/rag_execution_persistent_record.py"
-        ).exists()
-        assert not (
-            _REPO_ROOT
-            / "backend/app/services/rag_execution_persistent_query_service.py"
-        ).exists()
+    def test_record_dto_follows_project_naming_convention(self) -> None:
+        """Step 46 落地：持久化 Read DTO = ``RagExecutionRecordRow``
+        （沿用 ``ToolExecutionRecordRow`` / ``LLMUsageRecordRow`` 命名），
+        字段 = 数据库 ``id`` + 13 契约字段（**无** record_id / 无敏感字段）。"""
+        from backend.app.db.rag_execution_repository import (
+            RAG_EXECUTION_READ_COLUMNS,
+            RagExecutionRecordRow,
+        )
+
+        assert _SPEC.record_dto in (
+            "RagExecutionPersistentRecord",
+            "RagExecutionRecordRow",
+        )
+        assert [f.name for f in fields(RagExecutionRecordRow)] == [
+            "id", *_CONTRACT_FIELDS,
+        ]
+        assert RAG_EXECUTION_READ_COLUMNS == ("id", *_CONTRACT_FIELDS)
 
 
 __all__ = [

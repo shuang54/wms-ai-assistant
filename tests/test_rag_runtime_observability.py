@@ -756,12 +756,13 @@ class TestRuntimeOnlyBoundaries:
         assert observer_param is not None
         assert observer_param.default is None          # 可选（默认不观测）
 
-    def test_no_rag_persistence_table(self) -> None:
+    def test_one_rag_persistence_table_only(self) -> None:
+        """Step 46：仅有契约定义的 1 张 RAG 表；Runtime 侧无持久化能力。"""
         from backend.app.db.base import Base
 
-        assert not [
+        assert sorted(
             name for name in Base.metadata.tables if "rag" in name.lower()
-        ]
+        ) == ["ai_ops.rag_execution_record"]
         # API 模块本身**不**持有 RAG Collector（Step 44 的生产接线放在
         # Service 层 runtime 装配模块；Composition Root 只注入已接线实例）
         assert not hasattr(root, "_RAG_EXECUTION_COLLECTOR")

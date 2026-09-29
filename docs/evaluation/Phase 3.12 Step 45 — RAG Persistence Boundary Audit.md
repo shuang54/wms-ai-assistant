@@ -210,6 +210,16 @@ No Conversation / Memory / Agent / MCP / OpenTelemetry / Streaming / Dashboard
 
 ## 13. Limitations
 
+> 后续（Phase 3.12 Step 46）：本契约已**落地实现** ——
+> `ai_ops.rag_execution_record`（1 张表）+ Repository + PersistenceService +
+> PersistenceAdapter + CompositeObserver + PersistentQueryService，
+> 并接入 `/api/ai/chat` 生产装配（见
+> `Phase 3.12 Step 46 — RAG Persistent Execution Record.md`）。
+> 契约字段 / 禁止字段 / 错误语义 / 索引设计**逐条保持**；
+> 仍 deferred：Assistant Trace 集成 · RAG Query·Metrics HTTP API ·
+> retention / TTL / cleanup · 幂等约束。
+
+
 ```text
 * 契约为**设计态**：尚未有任何实现可供端到端验证（Step 46 才落地）
 * `chunk_ids` / `document_ids` 的数组列形态（JSONB vs int[]）与序列化细节

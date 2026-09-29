@@ -338,18 +338,25 @@ class TestRagServiceCurrentState:
             "metadata",
         ]
 
-    def test_no_rag_persistent_record_exists(self) -> None:
-        """审计结论：不存在 RAG 执行记录表 / Repository / Service。"""
+    def test_only_contract_defined_rag_persistence_exists(self) -> None:
+        """Step 46 后的现状：**只有**契约定义的那一套 RAG 持久化。
+
+        存在：``ai_ops.rag_execution_record`` + Repository + Adapter / Service /
+        QueryService（均由 Step 45 契约定义）；
+        仍不存在：任何 speculative 变体（rag_trace / retrieval_record /
+        rag_metrics / RAG 持久化 HTTP API）。
+        """
+        from backend.app.db.base import Base
+
+        assert sorted(
+            name for name in Base.metadata.tables if "rag" in name.lower()
+        ) == ["ai_ops.rag_execution_record"]
         offenders: list[str] = []
         backend_dir = _REPO_ROOT / "backend" / "app"
         for path in backend_dir.rglob("*.py"):
             relative = path.relative_to(_REPO_ROOT).as_posix()
-            source = path.read_text(encoding="utf-8")
-            lowered = source.lower()
-            for token in (
-                "rag_execution_record", "rag_trace", "retrieval_record",
-                "rag_repository",
-            ):
+            lowered = path.read_text(encoding="utf-8").lower()
+            for token in ("rag_trace", "retrieval_record", "rag_metrics"):
                 if token in lowered:
                     offenders.append(f"{relative}:{token}")
         assert offenders == [], offenders

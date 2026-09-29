@@ -20,6 +20,7 @@ from __future__ import annotations
 from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
+from backend.app.db.models.rag_execution_record import RagExecutionRecordModel
 from backend.app.db.models.tool_execution_record import ToolExecutionRecordModel
 
 _MODELS: tuple[type, ...] = (
@@ -27,6 +28,7 @@ _MODELS: tuple[type, ...] = (
     KnowledgeChunk,
     LLMUsageRecord,
     ToolExecutionRecordModel,
+    RagExecutionRecordModel,
 )
 
 
@@ -35,6 +37,7 @@ __all__ = [
     "KnowledgeChunk",
     "LLMUsageRecord",
     "ToolExecutionRecordModel",
+    "RagExecutionRecordModel",
 ]
 
 

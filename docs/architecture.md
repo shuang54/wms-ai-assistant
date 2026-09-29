@@ -3717,6 +3717,39 @@ Contract（Step 46 实现时必须满足）
               retention / TTL / cleanup
 ```
 
+## 8.62 RAG Persistent Execution Record（Phase 3.12 Step 46）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 46 — RAG Persistent Execution Record.md`
+> 契约：Step 45（`docs/evaluation/Phase 3.12 Step 45 — …Audit.md`）
+> 测试：`tests/test_rag_execution_persistence.py`（37）·
+> `tests/test_rag_execution_persistence_db.py`（18，DB-gated）·
+> `tests/test_rag_runtime_observability_e2e_db.py`（8，DB-gated）
+> Schema：**新增 1 张表** `ai_ops.rag_execution_record`（create_all 创建；无 Alembic）
+
+```text
+POST /api/ai/chat → RagService → RagExecutionObservation（13 字段）
+      ↓ observer.record()
+CompositeRagExecutionObserver
+      ├── InMemoryRagExecutionCollector（Runtime 视图）
+      └── RagExecutionPersistenceAdapter（失败只 warning；绝不穿透）
+                ↓ RagExecutionPersistenceService.persist()
+                ↓ RagExecutionRepository.create()（内部事务；INSERT RETURNING）
+                ↓
+          ai_ops.rag_execution_record（id + 13 列；JSONB 存 chunk_ids/document_ids）
+                ↓
+          RagExecutionPersistentQueryService.list_by_request_id(request_id)
+                （只读；空 → []；DB 失败 → RagExecutionRepositoryError）
+
+装配（应用级单实例）：services/rag_observability_runtime.py
+    RagService(observer=Composite(collector, adapter))
+    accessors：get_observed_rag_service() · get_rag_execution_persistence_adapter()
+        · get_rag_execution_persistent_query_service()
+
+/api/rag/answer · /api/chat → observer=None → 0 写入（未人为生成 request_id）
+Assistant Trace → UNCHANGED（不含 RAG；集成 deferred）
+安全 → 无 query / content / similarity / embedding / prompt / SQL / 凭据 / project_id
+```
+
 ---
 
 # 9. Prompt Architecture

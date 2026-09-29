@@ -40,9 +40,13 @@ from backend.app.main import app
 from backend.app.services.rag_execution_observation import (
     RagExecutionObservation,
 )
+from backend.app.services.composite_rag_execution_observer import (
+    CompositeRagExecutionObserver,
+)
 from backend.app.services.rag_observability_runtime import (
     get_observed_rag_service,
     get_rag_execution_collector,
+    get_rag_execution_persistence_adapter,
     get_rag_observability_query_service,
 )
 from backend.app.services.vector_search_service import VectorSearchResult
@@ -120,6 +124,25 @@ def collector():
     target.clear()
     yield target
     target.clear()
+
+
+@pytest.fixture(autouse=True)
+def no_db_writes(monkeypatch):
+    """本文件（非 DB-gated）**不得写数据库**：
+
+    只替换 RAG 持久化 Adapter 的 **DB 写边界**（计数 no-op）——
+    Composite fan-out / Collector / RagService / 装配仍全部真实。
+    真正的持久化链路由 ``tests/test_rag_runtime_observability_e2e_db.py``
+    （RUN_DB_TESTS=1）验证。
+    """
+    persisted: list[str] = []
+    adapter = get_rag_execution_persistence_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "record",
+        lambda observation: persisted.append(observation.request_id),
+    )
+    return persisted
 
 
 @pytest.fixture()
@@ -208,15 +231,23 @@ class TestProductionWiringE2E:
         assert query.collector is collector
 
     def test_wiring_identity_is_the_app_level_instance(
-        self, client, rag_boundaries, collector
+        self, client, rag_boundaries, collector, no_db_writes
     ) -> None:
         rag = get_observed_rag_service()
 
-        # Composition Root 注入的就是应用级已接线实例（单实例 / 单 Collector）
+        # Composition Root 注入的就是应用级已接线实例（单实例 / 单 Composite）
         assert orch_module._default_orchestrator._rag is rag
-        assert rag._observer is collector
+        observer = rag._observer
+        assert isinstance(observer, CompositeRagExecutionObserver)
+        assert observer.observers == (
+            collector,
+            get_rag_execution_persistence_adapter(),
+        )
         # 真实 Router（未替换）
         assert orch_module._default_orchestrator._router is not None
+        # 真实 fan-out 确实触达持久化边界（DB 写在非 DB 测试中被替换）
+        request_id = _post_rag(client).json()["metadata"]["request_id"]
+        assert no_db_writes == [request_id]
         # 旧链路仍是**未观测**实例（Step 44 §六：不给旧 API 伪造 trace）
         assert rag_module._rag_service is not rag
         assert rag_module._rag_service._observer is None
@@ -438,14 +469,17 @@ class TestContractAndSecurityE2E:
         ]
         assert [p for p in paths if "rag" in p.lower()] == ["/api/rag/answer"]
 
-    def test_runtime_only_no_persistence(self) -> None:
+    def test_runtime_object_has_no_persistence_capability(self) -> None:
+        """Step 46：持久化在**并列的 Adapter** 上；RagService / Collector 本身
+        仍不持有 Repository / Session（Runtime 与 Persistent 边界清晰）。"""
         from backend.app.db.base import Base
 
-        assert not [n for n in Base.metadata.tables if "rag" in n.lower()]
-        # 接线是纯内存对象（无 Repository / 无 Session）
+        rag_tables = sorted(n for n in Base.metadata.tables if "rag" in n.lower())
+        assert rag_tables == ["ai_ops.rag_execution_record"]   # 仅契约定义的 1 张表
         rag = get_observed_rag_service()
-        assert not hasattr(rag, "_repository")
-        assert not hasattr(rag, "_session")
+        for forbidden in ("_repository", "_session", "_engine"):
+            assert not hasattr(rag, forbidden), forbidden
+        assert not hasattr(get_rag_execution_collector(), "_repository")
 
 
 __all__ = [

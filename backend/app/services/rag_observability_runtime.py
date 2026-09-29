@@ -45,8 +45,20 @@
 """
 from __future__ import annotations
 
+from backend.app.services.composite_rag_execution_observer import (
+    CompositeRagExecutionObserver,
+)
 from backend.app.services.in_memory_rag_execution_collector import (
     InMemoryRagExecutionCollector,
+)
+from backend.app.services.rag_execution_persistence_adapter import (
+    RagExecutionPersistenceAdapter,
+)
+from backend.app.services.rag_execution_persistence_service import (
+    RagExecutionPersistenceService,
+)
+from backend.app.services.rag_execution_persistent_query_service import (
+    RagExecutionPersistentQueryService,
 )
 from backend.app.services.rag_observability_query_service import (
     RagObservabilityQueryService,
@@ -56,6 +68,8 @@ from backend.app.services.rag_service import RagService
 __all__ = [
     "get_observed_rag_service",
     "get_rag_execution_collector",
+    "get_rag_execution_persistence_adapter",
+    "get_rag_execution_persistent_query_service",
     "get_rag_observability_query_service",
 ]
 
@@ -64,10 +78,32 @@ __all__ = [
 #: RAG 服务实例在 Orchestrator 内部构造，因此接线点放在本 Service 层模块。
 _RAG_EXECUTION_COLLECTOR = InMemoryRagExecutionCollector()
 
-#: Application 级 **已接线** RagService（observer = 上面的 Collector）。
+# Phase 3.12 Step 46：持久化 fan-out（内存 + PostgreSQL，两者互相独立）。
+# 同一 Observation 依次交给两个**并列**的 observer 实现：
+#     ├── InMemoryRagExecutionCollector（runtime store；Runtime 查询视图）
+#     └── RagExecutionPersistenceAdapter → Service → Repository → ai_ops
+# 不新增第二个 Collector；Collector / Adapter 互不依赖（并列挂在端口上）；
+# 持久化失败由 Adapter 收敛为 warning → 绝不影响 RAG 业务结果
+# （RagService 侧另有一层 best-effort 隔离）。
+_RAG_EXECUTION_PERSISTENCE_SERVICE = RagExecutionPersistenceService()
+_RAG_EXECUTION_PERSISTENCE_ADAPTER = RagExecutionPersistenceAdapter(
+    _RAG_EXECUTION_PERSISTENCE_SERVICE
+)
+_RAG_EXECUTION_OBSERVER: CompositeRagExecutionObserver = (
+    CompositeRagExecutionObserver(
+        _RAG_EXECUTION_COLLECTOR,
+        _RAG_EXECUTION_PERSISTENCE_ADAPTER,
+    )
+)
+
+#: Application 级 **已接线** RagService（observer = 上面的 Composite）。
 #: 构造是廉价的（Vector Search / LLM / ContextBuilder 仍懒加载；
 #: 不在 import 时连接 DB / 加载模型）。
-_RAG_SERVICE = RagService(observer=_RAG_EXECUTION_COLLECTOR)
+_RAG_SERVICE = RagService(observer=_RAG_EXECUTION_OBSERVER)
+
+#: 持久读边界（只读；模块级**同一实例**，与 Tool 侧 Step 30/41 同模式）。
+#: 构造期不连接数据库（Repository 按操作懒解析 session factory）。
+_RAG_PERSISTENT_QUERY_SERVICE = RagExecutionPersistentQueryService()
 
 
 def get_rag_execution_collector() -> InMemoryRagExecutionCollector:
@@ -108,3 +144,31 @@ def get_rag_observability_query_service() -> RagObservabilityQueryService:
     * 本阶段**不接 HTTP API**：仅供内部测试 / 后续组合使用。
     """
     return RagObservabilityQueryService(_RAG_EXECUTION_COLLECTOR)
+
+
+def get_rag_execution_persistence_adapter() -> RagExecutionPersistenceAdapter:
+    """Application 级 RAG 持久化 Adapter（**同一实例**）。
+
+    * 不是工厂：永远返回模块级同一个 Adapter（唯一创建点 = 本模块）；
+    * 供装配断言 / 测试注入（例如替换 ``record`` 以模拟持久化失败）；
+    * 生产链路不额外调用它（RagService 通过 Composite observer 触达）。
+    """
+    return _RAG_EXECUTION_PERSISTENCE_ADAPTER
+
+
+def get_rag_execution_persistent_query_service() -> (
+    RagExecutionPersistentQueryService
+):
+    """RAG 持久读边界装配（Composition Root accessor；只读）。
+
+        （未来）Assistant Trace / 内部调用
+            ↓ get_rag_execution_persistent_query_service()
+        RagExecutionPersistentQueryService（只读；本阶段无 HTTP API）
+            ↓
+        RagExecutionRepository → ai_ops.rag_execution_record
+
+    * 模块级**同一实例**（不每请求新建；不新增全局单例框架）；
+    * 只读：无 create / update / delete / clear；
+    * 与 Runtime 查询（Collector）互相独立：**无 fallback / 无 merge**。
+    """
+    return _RAG_PERSISTENT_QUERY_SERVICE
