@@ -3877,7 +3877,17 @@ Purpose:  Assistant Trace LLM Usage exact-match lookup
       Historical NULL values unchanged · No backfill · No composite index ·
       既有索引未删除 / 未改动（pkey · created_at · uq request_id）
 
-LLM Usage 生产接线（Phase 3.12 Step 55 审计 → `docs/evaluation/phase-3.12-step-55-llm-usage-production-wiring-audit.md`）：
+LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.12-step-56-llm-usage-production-wiring.md`）：
+    `get_default_llm_client()` → `get_default_accounting_sink()`（**进程级单例**）
+        ├── `get_engine() is None`（无 DATABASE_URL）→ **NoopAccountingSink**（旧行为）
+        └── DB 已配置 → **DatabaseLLMAccountingSink** → Repository → ai_ops.llm_usage_record
+    `create_llm_client()` 默认语义**不变**（None → Noop）；无新增配置 / 环境变量
+    实测：`/api/ai/chat` RAG → 1 行 usage（provider id 与 assistant_request_id 不同）
+          → `GET /api/observability/assistant-trace/{A}` 读回；失败/无 DB → 0 行且业务不变
+    测试：`tests/test_llm_usage_production_wiring.py`（14）·
+          `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
+
+审计（Phase 3.12 Step 55 → `docs/evaluation/phase-3.12-step-55-llm-usage-production-wiring-audit.md`）：
     Implementation exists ✅（sink / service / bridge / repository / 幂等 / 隔离 / tests）
     Production wiring exists ❌（`get_default_llm_client()` 不传 accounting_sink
         → `LLMClient.__init__` 回落到 **NoopAccountingSink**；刻意设计，非 bug）

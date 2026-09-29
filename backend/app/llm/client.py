@@ -56,6 +56,28 @@ Phase 3.10.15 Persistence Runtime Boundary：
     不使用 create_task / fire-and-forget；LLM 业务结果与 Retry 行为
     不受持久化影响。
 
+Phase 3.12 Step 56 LLM Usage Production Wiring：
+
+    **默认 Client**（``get_default_llm_client()``，生产路径：
+    /api/ai/chat → RAG / Tool / Text-to-SQL 的懒加载 client）在
+    **DB 已配置**时接入 ``DatabaseLLMAccountingSink``（真实持久化到
+    ``ai_ops.llm_usage_record``，供 Assistant Trace 的 ``llm_usage[]`` 读取）：
+
+        get_default_llm_client()
+            ├── get_engine() is None（DATABASE_URL 未配置）
+            │       → 保持 NoopAccountingSink（旧行为；不产生告警噪声）
+            └── DB 已配置
+                    → DatabaseLLMAccountingSink（同步 usage → 线程边界 → Repository）
+                      （sink 与 Client 同生命周期：**进程级单例**）
+
+    边界（不得违反）：
+        * ``create_llm_client()`` 的默认语义**不变**（不传 sink → Noop），
+          显式构造 / 测试 / 评估脚本行为完全不受影响；
+        * 只改默认 Client 的 sink 选择，不改 LLM 协议 / Prompt / 参数；
+        * 失败隔离不变：DB 不可用 / 写入失败 → sink 收敛为 warning，
+          **绝不**变成 LLM 业务失败，也**不**触发 retry / sleep / backoff；
+        * 非 DB 环境（DATABASE_URL 为空）行为与 Step 56 之前完全一致。
+
 详见 docs/architecture.md §8、AGENTS.md §9。
 """
 from __future__ import annotations
@@ -939,6 +961,10 @@ def create_llm_client(
     Phase 3.10.11：``accounting_sink`` 同理（与 observation_sink
     相互独立）；None → 默认 No-op（行为与 3.10.10 完全一致）。
 
+    Phase 3.12 Step 56：本工厂的**默认语义刻意不变**（None → Noop）——
+    生产默认接线只发生在 :func:`get_default_llm_client()`（默认 Client
+    单例）；显式构造 / 测试 / 评估脚本仍得到与之前完全一致的行为。
+
     业务代码应调用本工厂，而不是直接 new 具体实现，
     便于未来切换不同 Provider / 协议。
     """
@@ -968,22 +994,90 @@ def create_llm_client(
 
 _default_client: LLMClient | None = None
 
+#: Phase 3.12 Step 56：生产默认 accounting sink（**进程级单例**，
+#: 与默认 Client 同生命周期；不按 request / 不按 LLM call 重新创建）。
+_default_accounting_sink: LLMAccountingSink | None = None
+
+
+def _build_default_accounting_sink() -> LLMAccountingSink:
+    """构造生产默认 accounting sink（DB 已配置 → Database sink；否则 Noop）。
+
+    判定依据（**不新增配置项 / 不新增环境变量**）——复用项目既有语义：
+
+        ``get_engine() is None``  ⇔  ``DATABASE_URL`` 未配置 ⇔ DB 功能禁用
+        （与 ``db/session.py`` / ``/api/health`` 的既有判定一致）
+
+        * DB 禁用 → ``NoopAccountingSink``：行为与 Step 56 之前**完全一致**
+          （不产生"持久化失败"告警噪声；无 DB 的开发环境不受影响）；
+        * DB 已配置（生产）→ ``DatabaseLLMAccountingSink``：真实持久化
+          （usage → 线程边界 → Repository → ``ai_ops.llm_usage_record``）。
+
+    失败隔离（Step 55 审计结论，本函数不改变）：
+        即使 DB 不可达 / 写入失败，sink 也只把失败收敛为 warning ——
+        LLM 业务结果不变，且**不**触发 retry / sleep / backoff。
+
+    依赖方向：``db.session`` / ``services.llm_usage_persistence_service``
+        均为**函数内延迟 import**（避免模块级循环依赖；本函数只在默认
+        Client 首次构造时执行一次）。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "LLM usage persistence disabled (DATABASE_URL 未配置；"
+            "默认 Client 使用 Noop accounting sink)"
+        )
+        return NoopAccountingSink()
+
+    from backend.app.services.llm_usage_persistence_service import (
+        DatabaseLLMAccountingSink,
+    )
+
+    logger.info("LLM usage persistence enabled (DatabaseLLMAccountingSink)")
+    return DatabaseLLMAccountingSink()
+
+
+def get_default_accounting_sink() -> LLMAccountingSink:
+    """生产默认 accounting sink（**进程级单例**）。
+
+    与 :func:`get_default_llm_client()` 同生命周期：首次需要时构造一次，
+    之后所有 LLM 调用复用同一实例（不按 request / 不按 call 重建）。
+
+    无 DB（``DATABASE_URL`` 未配置）时返回 ``NoopAccountingSink``。
+    """
+    global _default_accounting_sink
+    if _default_accounting_sink is None:
+        _default_accounting_sink = _build_default_accounting_sink()
+    return _default_accounting_sink
+
 
 def get_default_llm_client() -> LLMClient:
-    """获取默认 LLM Client（模块级单例）。
+    """获取默认 LLM Client（模块级单例；**生产默认路径**）。
 
-    测试时可调用 reset_default_llm_client() 重新构造。
+    Phase 3.12 Step 56：本函数是 LLM Usage 持久化的**唯一生产接线点** ——
+    默认 Client 在 DB 已配置时接入 ``DatabaseLLMAccountingSink``，
+    使 ``/api/ai/chat`` 的 LLM 调用可通过 Assistant Trace 的
+    ``llm_usage[]`` 读取（关联键 ``assistant_request_id`` 由
+    Orchestrator 的 ``assistant_trace_scope`` 提供，本层不生成 / 不覆盖）。
+
+    ``create_llm_client()``（显式构造路径）默认语义**不变**（Noop）。
+
+    测试时可调用 reset_default_llm_client() 重新构造（同时重置 sink 单例）。
     """
     global _default_client
     if _default_client is None:
-        _default_client = create_llm_client(settings.llm)
+        _default_client = create_llm_client(
+            settings.llm,
+            accounting_sink=get_default_accounting_sink(),
+        )
     return _default_client
 
 
 def reset_default_llm_client() -> None:
-    """测试辅助：重置默认客户端缓存。"""
-    global _default_client
+    """测试辅助：重置默认客户端缓存（含 accounting sink 单例）。"""
+    global _default_client, _default_accounting_sink
     _default_client = None
+    _default_accounting_sink = None
 
 
 __all__ = [
@@ -1001,6 +1095,7 @@ __all__ = [
     "OpenAICompatibleClient",
     "create_llm_client",
     "get_default_llm_client",
+    "get_default_accounting_sink",
     "reset_default_llm_client",
     "load_system_prompt",
 ]
