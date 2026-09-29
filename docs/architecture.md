@@ -3887,6 +3887,14 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+Trace 分页边界（Phase 3.12 Step 59 Audit → `docs/evaluation/phase-3.12-step-59-assistant-trace-pagination-audit.md`）：
+    Pagination = **NOT IMPLEMENTED**（HTTP 仅 1 path 参数；无 limit/offset/page/cursor/total/has_more）
+    单请求上限 = **3 条**（默认装配；代码级最坏 12）· Payload < 1.5 KiB
+    排序稳定（LLM created_at,id · Tool id · RAG id）· 查询 = **3 次 SELECT**（无 N+1 / 无 lazy loading）
+    索引：llm.assistant_request_id · tool.request_id · rag.request_id（均 btree，valid）
+    当前 dev volume = 0 · 决策 = **DEFER**（触发条件见文档；OFFSET vs cursor 推迟）
+    测试：`tests/test_assistant_trace_pagination_audit.py`（14 离线 + 2 DB-gated）
+
 真实 Smoke（Phase 3.12 Step 58 → `docs/evaluation/phase-3.12-step-58-real-llm-usage-smoke.md`）：
     真实 DeepSeek（api.deepseek.com）→ **生产默认 Client**（非 Mock；sink = Database）→
     恰好 1 条 usage（provider=deepseek · model=**响应值** deepseek-flash · total_tokens=10）
