@@ -3750,6 +3750,33 @@ Assistant Trace → UNCHANGED（不含 RAG；集成 deferred）
 安全 → 无 query / content / similarity / embedding / prompt / SQL / 凭据 / project_id
 ```
 
+## 8.63 Assistant Trace × RAG 集成（Phase 3.12 Step 47 — Audit / Design Only）
+
+> 记录：`docs/evaluation/Phase 3.12 Step 47 — Assistant Trace RAG Integration Audit.md`
+> 测试：`tests/test_assistant_trace_rag_integration_contract.py`（34，纯离线）
+> **Design Only**：Assistant Trace HTTP API / QueryService / RAG 持久化全部未改；
+> Production Code = 0 · DB Schema unchanged · 0 网络 / 0 DeepSeek。
+
+```text
+Current                                Proposed（未实现）
+AssistantTrace                         AssistantTrace
+    ├── llm_usage  → LLMUsageQueryService      ├── llm_usage  （不变）
+    └── tool_executions → ToolPersistentQS     ├── tool_executions（不变）
+                                               └── rag_executions
+                                                     → RagExecutionPersistentQS
+                                                       （PostgreSQL；非内存）
+
+Correlation：LLM assistant_request_id = Tool request_id = RAG request_id = A
+DTO（设计）：13 字段；**裁剪数据库主键 id**（与 ToolExecutionTraceResponse 一致）
+    谨慎保留：chunk_ids / document_ids（暴露级别等同既有 /api/ai/chat sources）
+    永不进入：query / answer / content / similarity / embedding / prompt /
+             messages / raw response / SQL / 凭据 / ORM / traceback
+Error：empty ≠ failure；RagExecutionRepositoryError 必须透传（**不为 []**）
+    ⚠ 实现缺口：当前 502 分支只列举 LLM + Tool 仓储错误 → RAG 错误会落到 500
+Compat：新增 rag_executions = additive（旧字段不改名 / 不删除 / 语义不变）
+Ordering：方案 A（三个独立列表，各自顺序保持）→ 不引入统一 events
+```
+
 ---
 
 # 9. Prompt Architecture
