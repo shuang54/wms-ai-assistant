@@ -3887,6 +3887,15 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+真实 Smoke（Phase 3.12 Step 58 → `docs/evaluation/phase-3.12-step-58-real-llm-usage-smoke.md`）：
+    真实 DeepSeek（api.deepseek.com）→ **生产默认 Client**（非 Mock；sink = Database）→
+    恰好 1 条 usage（provider=deepseek · model=**响应值** deepseek-flash · total_tokens=10）
+    → `GET /api/observability/assistant-trace/{A}` 可读（llm_usage=1）
+    assistant_request_id（step58-smoke-…）**≠** provider request_id（9368cae4…）✅
+    清理：精确 DELETE（WHERE assistant_request_id = A AND provider）→ residue = 0
+    测试：`tests/test_llm_usage_real_llm_smoke.py`（默认 SKIPPED；
+        `RUN_REAL_LLM_TEST=1` 或 `RUN_REAL_LLM_TESTS=1` 显式 opt-in；未引入新 marker/配置）
+
 DB 安全审计（Phase 3.12 Step 57 → `docs/evaluation/phase-3.12-step-57-llm-usage-production-db-safety.md`）：
     Session / Transaction / Connection **全部短生命周期**（per-record；实测 commit/rollback/close
     + 连接归还 Pool + 0 idle-in-transaction + 0 Session 泄漏）
