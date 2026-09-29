@@ -382,7 +382,9 @@ class TestToolPathContext:
         assert set(result.metadata) == {
             "decision_source", "route_reason", "tool_name", "tool_success",
             "request_id",              # Step 35：Assistant Trace ID
+            "outcome",                 # Step 63：Assistant Outcome（4 态；本路径 SUCCESS）
         }
+        assert result.metadata["outcome"] == "SUCCESS"
         context = execution.contexts[0]
         # 唯一关联字段：metadata.request_id == ToolExecutionRecord.request_id
         assert result.metadata["request_id"] == context.request_id

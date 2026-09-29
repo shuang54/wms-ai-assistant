@@ -3887,6 +3887,42 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+## 8.68 Assistant Outcome Contract（Phase 3.12 Step 63 — Implemented）
+
+> 实现：`backend/app/dto/assistant_outcome.py`（StrEnum + 纯判定函数）·
+> `ai_orchestrator_service.py`（4 处 metadata 站点）
+> 测试：`tests/test_assistant_outcome.py`（22）
+> （任务书建议编写为 §8.14；该编号已被 Phase 3.10.14 占用 → 使用下一个空位 §8.68）
+
+```text
+Assistant Outcome（4 态固定；minimal production contract）
+    ├── SUCCESS   请求已完成并产生有效业务响应（含 T2SQL row_count=0）
+    ├── EMPTY     正常完成但无可提供的业务结果（仅 RAG rag_used_chunks=0）
+    ├── REFUSED   系统明确拒绝执行（预期安全行为；Text-to-SQL refusal）
+    └── FAILED    无法正常完成（LLM / RAG / T2SQL 耗尽 / SQL 执行失败 / 能力禁用 /
+                  **Tool 业务失败（HTTP 200 + tool_success=false）**）
+
+Outcome ≠ HTTP status · Outcome ≠ LLM status · Outcome ≠ Tool status ·
+Outcome ≠ RAG status  · Outcome ≠ SQL execution status
+
+判定责任：AIOrchestratorService（Assistant 层唯一判定点）
+判定输入白名单：route · refused · tool_success · rag_used_chunks
+    （+ 调用方失败状态；禁止 exception.message / prompt / SQL / chunk 正文 / 凭据 /
+      stack trace；**禁止 content 文本匹配**）
+优先级：REFUSED > FAILED > EMPTY > SUCCESS
+
+Current external representation: `metadata.outcome`（envelope 不变：
+    route / content / data / metadata；HTTP 语义不变 —— Tool 失败仍 200、
+    refusal 仍 200、RAG 空检索仍 200）
+异常路径（4xx/5xx）：响应体仍为 `{"detail": ...}`（未追加字段）→
+    FAILED 在错误响应上**不对外暴露**（已知限制，见 Step 63 报告）
+
+error_class = **not implemented**（未来可选扩展，需 allowlist 枚举）
+Trace persistence = **not implemented**（本阶段仅 Runtime Outcome）
+```
+
+---
+
 Outcome 契约设计（Phase 3.12 Step 62 Audit → `docs/evaluation/phase-3.12-step-62-assistant-outcome-contract-audit.md`）：
     候选 Contract（**仅测试内 projection，未实现**）：outcome ∈ {SUCCESS, EMPTY, REFUSED, FAILED}
     优先级 **REFUSED > FAILED > EMPTY > SUCCESS**；判定白名单 = status_code · route ·

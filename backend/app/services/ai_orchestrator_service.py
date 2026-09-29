@@ -50,6 +50,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
+from backend.app.dto.assistant_outcome import determine_assistant_outcome
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.context import DataSource, ProjectContext
 from backend.app.projects.knowledge_provider import ProjectKnowledgeScope
@@ -638,6 +639,13 @@ class AIOrchestratorService:
             raise AIOrchestratorExecutionError(
                 f"RAG 执行失败: {type(exc).__name__}"
             ) from exc
+        # Phase 3.12 Step 63：Assistant Outcome（Orchestrator 层判定）
+        # —— 仅使用白名单信号（route / rag_used_chunks），不做 content 匹配
+        rag_used_chunks = getattr(rag_response, "used_chunks_count", None)
+        outcome = determine_assistant_outcome(
+            route=RouteType.RAG.value,
+            rag_used_chunks=rag_used_chunks,
+        )
         return AIOrchestrationResult(
             route=RouteType.RAG,
             content=getattr(rag_response, "answer", None),
@@ -651,11 +659,11 @@ class AIOrchestratorService:
                     if self._knowledge_scope is not None
                     else None
                 ),
-                "rag_used_chunks": getattr(
-                    rag_response, "used_chunks_count", None
-                ),
+                "rag_used_chunks": rag_used_chunks,
                 # Phase 3.12 Step 35：Assistant Trace ID（非敏感；仅关联用）
                 "request_id": request_id,
+                # Phase 3.12 Step 63：Assistant-level 业务结果（4 态固定）
+                "outcome": outcome,
             },
         )
 
@@ -743,6 +751,12 @@ class AIOrchestratorService:
                 f"Tool 执行失败: {type(exc).__name__}"
             ) from exc
         content = _tool_result_to_content(tool_result)
+        # Phase 3.12 Step 63：Tool 业务失败（HTTP 仍为 200）⇒ outcome=FAILED
+        # （HTTP 200 ≠ 业务成功；判定只依赖 tool_success，不读 content 文本）
+        tool_outcome = determine_assistant_outcome(
+            route=RouteType.TOOL.value,
+            tool_success=tool_result.success,
+        )
         return AIOrchestrationResult(
             route=RouteType.TOOL,
             content=content,
@@ -756,6 +770,8 @@ class AIOrchestratorService:
                 # ToolExecutionRecord.request_id 完全一致（同一 ID，
                 # 不新建第二套）；不含 arguments / ToolResult.data。
                 "request_id": request_id,
+                # Phase 3.12 Step 63：Assistant-level 业务结果（4 态固定）
+                "outcome": tool_outcome,
             },
         )
 
@@ -862,6 +878,11 @@ class AIOrchestratorService:
                     "refused": True,
                     # Phase 3.12 Step 35：refusal 亦为成功响应 → 携带 trace id
                     "request_id": request_id,
+                    # Phase 3.12 Step 63：拒绝是**预期安全行为** ⇒ REFUSED（非 FAILED）
+                    "outcome": determine_assistant_outcome(
+                        route=RouteType.TEXT_TO_SQL.value,
+                        refused=True,
+                    ),
                 },
             )
 
@@ -893,6 +914,12 @@ class AIOrchestratorService:
                 "project_id": project.project_id,
                 # Phase 3.12 Step 35：Assistant Trace ID（非敏感；仅关联用）
                 "request_id": request_id,
+                # Phase 3.12 Step 63：SQL 执行成功 ⇒ SUCCESS
+                # （row_count == 0 也是 SUCCESS —— 查询已给出"无匹配数据"这一有效结果；
+                #  determine_assistant_outcome 不接受 row_count，从接口层面杜绝误判 EMPTY）
+                "outcome": determine_assistant_outcome(
+                    route=RouteType.TEXT_TO_SQL.value
+                ),
             },
         )
 

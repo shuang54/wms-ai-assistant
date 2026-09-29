@@ -195,13 +195,17 @@ class TestRagInsideTraceScope:
         assert records == {"records": []}
 
     def test_rag_metadata_keys_current_state(self, rag_env) -> None:
-        """RAG metadata 现状：4 个既有键 + request_id（无检索耗时 / 无命中明细）。"""
+        """RAG metadata 现状：4 个既有键 + request_id + outcome（无检索耗时 / 无命中明细）。
+
+        （Step 63 增补：``outcome`` —— Assistant Outcome（4 态固定）；本用例 chunks≥1 ⇒ SUCCESS。）
+        """
         _response, payload = _ask_rag()
 
         assert set(payload["metadata"]) == {
             "decision_source", "route_reason", "knowledge_scope",
-            "rag_used_chunks", "request_id",
+            "rag_used_chunks", "request_id", "outcome",
         }
+        assert payload["metadata"]["outcome"] == "SUCCESS"
         # 检索事实不在 metadata（仅 used_chunks_count 一个计数）
         for absent in (
             "top_k", "elapsed_ms", "rerank_elapsed_ms", "chunk_ids",

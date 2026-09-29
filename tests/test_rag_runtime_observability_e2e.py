@@ -60,6 +60,7 @@ _CHUNK_SENTINEL = "E2E-SENTINEL-CHUNK-CONTENT"
 _RAG_METADATA_KEYS = {
     "decision_source", "route_reason", "knowledge_scope",
     "rag_used_chunks", "request_id",
+    "outcome",                     # Step 63：Assistant Outcome（4 态；本用例 SUCCESS）
 }
 _FORBIDDEN_RESPONSE_KEYS = (
     "query", "answer_duplicate", "embedding", "prompt", "messages",
