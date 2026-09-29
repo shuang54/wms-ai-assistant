@@ -3887,6 +3887,17 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+DB 安全审计（Phase 3.12 Step 57 → `docs/evaluation/phase-3.12-step-57-llm-usage-production-db-safety.md`）：
+    Session / Transaction / Connection **全部短生命周期**（per-record；实测 commit/rollback/close
+    + 连接归还 Pool + 0 idle-in-transaction + 0 Session 泄漏）
+    Pool（实测）：pool_size=5 · max_overflow=10 · pool_pre_ping=True ·
+        pool_timeout=30s（SQLAlchemy 默认）· pool_recycle=-1（未配置）→ **15 并发连接上限**
+    失败隔离：连接超时 / 断连 / INSERT 失败 / 事务失败 / **池超时**（TimeoutError ⊂ SQLAlchemyError）
+        / 取消 → 全部收敛为 warning，**不改变 LLM 业务结果、不触发 retry**（未发现未隔离路径）
+    幂等：ON CONFLICT DO NOTHING + `uq_llm_usage_record_request_id`（UNIQUE, request_id）；
+        `assistant_request_id` **非唯一**（仅关联键，不参与幂等）
+    测试：`tests/test_llm_usage_production_db_safety.py`（10 离线 + 3 DB-gated）
+
 审计（Phase 3.12 Step 55 → `docs/evaluation/phase-3.12-step-55-llm-usage-production-wiring-audit.md`）：
     Implementation exists ✅（sink / service / bridge / repository / 幂等 / 隔离 / tests）
     Production wiring exists ❌（`get_default_llm_client()` 不传 accounting_sink
