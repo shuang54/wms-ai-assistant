@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.db.base import Base
 from backend.app.db.models.llm_usage_record import (
+    LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX,
     LLM_USAGE_REQUEST_ID_INDEX,
     LLM_USAGE_REQUEST_ID_PREDICATE,
     LLM_USAGE_SCHEMA,
@@ -149,6 +150,39 @@ def ensure_assistant_request_id_column(conn: Any) -> bool:
     return True
 
 
+_CREATE_ASSISTANT_REQUEST_ID_INDEX_SQL: Final[str] = (
+    f"CREATE INDEX IF NOT EXISTS {LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX} "
+    f"ON {_USAGE_TABLE} (assistant_request_id)"
+)
+
+
+def ensure_assistant_request_id_index(conn: Any) -> bool:
+    """确保 `ai_ops.llm_usage_record.assistant_request_id` 的索引存在
+    （Phase 3.12 Step 52）。
+
+    用途：Assistant Trace 的 LLM Usage 读边界按
+    ``WHERE assistant_request_id = ?`` 精确匹配（每次 Trace 请求一次），
+    该列此前没有专用索引（Step 51 审计结论）。
+
+    幂等行为：索引已存在 → 什么都不做（`CREATE INDEX IF NOT EXISTS`）；
+    不修改列定义（仍 VARCHAR(128) NULL）· 不 backfill 历史 NULL 行 ·
+    不建 UNIQUE / 不建复合索引 · 不删除或改动既有索引。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  索引已存在或本次成功创建。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+    """
+    if not inspect(conn).has_table("llm_usage_record", schema=LLM_USAGE_SCHEMA):
+        return False
+
+    conn.execute(text(_CREATE_ASSISTANT_REQUEST_ID_INDEX_SQL))
+    logger.info("LLM usage assistant_request_id index ensured")
+    return True
+
+
 def init_db() -> None:
     """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引 / 关联列。
 
@@ -158,6 +192,8 @@ def init_db() -> None:
         - request_id 幂等索引已存在 → 不报错（IF NOT EXISTS）
         - assistant_request_id 列已存在 → 不报错（IF NOT EXISTS），
           历史数据保持 NULL（Phase 3.12 Step 36）
+        - assistant_request_id 索引已存在 → 不报错（IF NOT EXISTS，
+          Phase 3.12 Step 52；不改任何数据）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
@@ -193,6 +229,11 @@ def init_db() -> None:
             # 6. Phase 3.12 Step 36：Assistant Trace 关联列
             #    （同样对已存在的表显式补齐；不改任何历史数据）
             ensure_assistant_request_id_column(conn)
+
+            # 7. Phase 3.12 Step 52：Assistant Trace 关联索引
+            #    （普通 B-tree · 非唯一；对已存在的表显式补齐；
+            #     只影响执行计划，不改变查询结果 / 数据）
+            ensure_assistant_request_id_index(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -221,6 +262,7 @@ __all__ = [
     "init_db",
     "ensure_request_id_idempotency_index",
     "ensure_assistant_request_id_column",
+    "ensure_assistant_request_id_index",
 ]
 
 

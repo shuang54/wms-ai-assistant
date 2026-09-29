@@ -100,6 +100,21 @@ LLM_USAGE_SCHEMA: Final[str] = "ai_ops"
 #: request_id 为 NULL 的"无幂等身份"记录仍然可以有多行。
 LLM_USAGE_REQUEST_ID_INDEX: Final[str] = "uq_llm_usage_record_request_id"
 
+#: Assistant Trace 关联索引（Phase 3.12 Step 52）：**普通 B-tree · 非唯一**。
+#:
+#: 服务 ``LLMUsageRepository.build_trace_select()`` 的
+#: ``WHERE assistant_request_id = ? ORDER BY created_at ASC, id ASC``
+#: （GET /api/observability/assistant-trace/{id} 每次请求一次）。
+#:
+#: * **非唯一**：一次 Assistant Request 允许多条 LLM Usage；
+#: * **非复合**：每个 assistant_request_id 只有 1~4 行，排序成本可忽略
+#:   （Step 51 §十二：不为理论 ORDER BY 优化引入复合索引）；
+#: * **不改列定义**：assistant_request_id 仍为 VARCHAR(128) NULL；
+#: * 只影响执行计划，**不改变任何查询结果 / 排序 / 语义**。
+LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX: Final[str] = (
+    "ix_llm_usage_record_assistant_request_id"
+)
+
 #: partial index 谓词（repository 的 ON CONFLICT target 必须一致）。
 LLM_USAGE_REQUEST_ID_PREDICATE: Final[str] = "request_id IS NOT NULL"
 
@@ -201,6 +216,14 @@ class LLMUsageRecord(Base):
             unique=True,
             postgresql_where=text(LLM_USAGE_REQUEST_ID_PREDICATE),
         ),
+        # Phase 3.12 Step 52：Assistant Trace 关联索引（普通 B-tree · 非唯一）。
+        # 供 Assistant Trace 的 LLM Usage 精确匹配查询使用；
+        # 既有库由 `init_db.ensure_assistant_request_id_index()` 幂等补齐
+        # （create_all 不会给已存在的表补建索引）。
+        Index(
+            LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX,
+            "assistant_request_id",
+        ),
         # 与业务 schema（public）隔离：避免本表被 Text-to-SQL 的
         # schema 发现当作业务表。
         {"schema": LLM_USAGE_SCHEMA},
@@ -219,4 +242,5 @@ __all__ = [
     "LLM_USAGE_SCHEMA",
     "LLM_USAGE_REQUEST_ID_INDEX",
     "LLM_USAGE_REQUEST_ID_PREDICATE",
+    "LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX",
 ]

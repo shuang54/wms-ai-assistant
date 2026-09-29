@@ -1,5 +1,14 @@
 # Phase 3.12 Step 51 — LLM Usage Assistant Request ID Index Audit
 
+> **实施状态（Phase 3.12 Step 52）**：本审计的结论 **IMPLEMENT / Option A 已落地** ——
+> `ix_llm_usage_record_assistant_request_id` 已在 Model 声明并经
+> `init_db.ensure_assistant_request_id_index()` 幂等创建；
+> 列定义 / 历史 NULL 数据 / API / 查询语义 / 排序**全部不变**（无 backfill、
+> 无 UNIQUE、无复合索引、未删除既有索引）。
+> 测试：`tests/test_llm_usage_assistant_request_id_index.py`
+>
+> 以下为**设计态**审计原文（保留历史结论）。
+>
 > 只做**索引必要性确认 + 最小索引设计**；**未执行 migration**、未改 API / DTO /
 > 查询语义 / 数据 / 既有索引。Production Code = 0 · DB Schema = 0 · DB 写入 = 0。
 >
