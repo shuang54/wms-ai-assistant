@@ -3887,6 +3887,14 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+多路径关联（Phase 3.12 Step 60 Audit → `docs/evaluation/phase-3.12-step-60-assistant-trace-multi-path.md`）：
+    同一 `/api/ai/chat` 入口下：RAG → llm_usage 1 + rag_executions 1（request_id = A）
+    · TOOL → tool_executions 1（request_id = B）· TEXT_TO_SQL → llm_usage **2**（真实重试 2 次）
+    跨请求隔离 A/B/C 严格集合成立（无污染）· Empty = 200 + 三段 [] ·
+    Failure（LLM 500）→ HTTP 500 + llm_usage []（usage=None 不落库）+ rag 1（异常路径设计）
+    Provider request_id ≠ assistant_request_id（互不覆盖）
+    测试：`tests/test_assistant_trace_multi_path_e2e.py`（2 离线 + 7 DB-gated；入口统一）
+
 Trace 分页边界（Phase 3.12 Step 59 Audit → `docs/evaluation/phase-3.12-step-59-assistant-trace-pagination-audit.md`）：
     Pagination = **NOT IMPLEMENTED**（HTTP 仅 1 path 参数；无 limit/offset/page/cursor/total/has_more）
     单请求上限 = **3 条**（默认装配；代码级最坏 12）· Payload < 1.5 KiB
