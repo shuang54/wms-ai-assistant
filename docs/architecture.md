@@ -3887,6 +3887,17 @@ LLM Usage 生产接线（Phase 3.12 Step 56 实施 → `docs/evaluation/phase-3.
     测试：`tests/test_llm_usage_production_wiring.py`（14）·
           `tests/test_llm_usage_production_wiring_e2e_db.py`（9，DB-gated）
 
+Outcome 边界（Phase 3.12 Step 61 Audit → `docs/evaluation/phase-3.12-step-61-assistant-trace-outcome-audit.md`）：
+    `AIOrchestrationResult` = route + content + data + metadata（**无** outcome / status 字段）
+    route = 能力选择结果 ≠ 业务 Outcome；outcome 语义分散：`metadata.tool_success`（TOOL）·
+        `metadata.refused`（T2SQL refusal）· 空检索靠 `rag_used_chunks=0` + 固定文案推断 ·
+        失败靠 HTTP 5xx（LLM / RAG / 生成耗尽 状态码相同，仅 detail 类名不同）
+    Tool 业务失败 = **HTTP 200**；refusal = 200 + data=None；失败 detail 仅含**异常类名**（无原件）
+    Trace 只能回答"调用了什么"（3 段 records），**不能**回答 route / success / refusal / empty /
+        HTTP 结果 / 失败原因（Tool 记录 error_code·error_type 在通用异常时为 None）
+    决策：**OUTCOME_BOUNDARY_MISSING**（Future Step Candidate 仅记录，未实现）
+    测试：`tests/test_assistant_trace_outcome_audit.py`（10 离线）
+
 多路径关联（Phase 3.12 Step 60 Audit → `docs/evaluation/phase-3.12-step-60-assistant-trace-multi-path.md`）：
     同一 `/api/ai/chat` 入口下：RAG → llm_usage 1 + rag_executions 1（request_id = A）
     · TOOL → tool_executions 1（request_id = B）· TEXT_TO_SQL → llm_usage **2**（真实重试 2 次）
