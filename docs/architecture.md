@@ -3877,6 +3877,12 @@ Purpose:  Assistant Trace LLM Usage exact-match lookup
       Historical NULL values unchanged · No backfill · No composite index ·
       既有索引未删除 / 未改动（pkey · created_at · uq request_id）
 
+Trace 数据量 / 分页（Phase 3.12 Step 54 审计 → `docs/evaluation/phase-3.12-step-54-trace-pagination-audit.md`）：
+    三段均**有界**（LLM ≤4 · Tool ≤1 · RAG ≤1 ⇒ 单 id 上限 **6** 条，默认配置）
+    排序键不同（LLM created_at,id / Tool id / RAG id）· Tool·RAG **不暴露主键**
+    响应体积：典型 <1.2 KiB · 上限场景 <1.5 KiB（实测真实 DTO）
+    结论 **Pagination Status: DEFER**（无 page / cursor / LIMIT / OFFSET；Triggers A~H 见文档）
+
 生产安全（Phase 3.12 Step 53 审计 → `docs/evaluation/phase-3.12-step-53-index-production-safety.md`）：
     init_db **不**被应用启动调用（main.py / api / 部署物 = 0 DDL 调用点）→ 保留 Option A
     局限：普通 CREATE INDEX 阻塞写且位于 init_db 单事务（锁窗口 = 整个事务）；无 lock_timeout
