@@ -3876,6 +3876,12 @@ Purpose:  Assistant Trace LLM Usage exact-match lookup
 不变：API contract unchanged · Query semantics unchanged ·
       Historical NULL values unchanged · No backfill · No composite index ·
       既有索引未删除 / 未改动（pkey · created_at · uq request_id）
+
+生产安全（Phase 3.12 Step 53 审计 → `docs/evaluation/phase-3.12-step-53-index-production-safety.md`）：
+    init_db **不**被应用启动调用（main.py / api / 部署物 = 0 DDL 调用点）→ 保留 Option A
+    局限：普通 CREATE INDEX 阻塞写且位于 init_db 单事务（锁窗口 = 整个事务）；无 lock_timeout
+    CONCURRENTLY 与 `engine.begin()` 事务模型不兼容 → Option B 不可直接落地
+    生产建索引 = 运维一次性操作（Option C Runbook：检查存在/定义/validity → 低峰 CONCURRENTLY → 复查）
 ```
 
 ---
