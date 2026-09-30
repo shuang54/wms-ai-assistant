@@ -4210,6 +4210,30 @@ PostgreSQL E2E（Phase 3.12 Step 69；`tests/test_assistant_timeline_db_e2e.py`�
 
 ---
 
+## 8.75 Trace ↔ Timeline Outcome 一致性（Phase 3.12 Step 71 — Audit / PASS）
+
+> 记录：`docs/evaluation/phase-3.12-step-71-trace-timeline-outcome-audit.md`
+> 测试：`tests/test_assistant_trace_timeline_outcome_consistency.py`（17 DB-gated；离线全 SKIP）
+
+```text
+结论：同一 assistant_request_id 上，
+      Trace.outcome  ≡  Timeline.outcome_event.status（同源 assistant_outcome_record）
+      10 个场景矩阵全部一致（SUCCESS / EMPTY / FAILED / REFUSED / null）
+      反例覆盖：Tool failure（HTTP **200** 但 FAILED）、RAG empty（HTTP 200 但 EMPTY）、
+                历史请求（两侧 null，不推断）
+
+source_id：Trace.outcome 无 source_id；Timeline.outcome_event.source_id = 真实 PK
+一致性：LLM 段 Trace[].id == Timeline[].source_id（Trace 暴露主键）
+        Tool/RAG 段按 数量 + 内容 + 顺序 一致（Trace **不**暴露主键，Step 48）
+        **不**要求跨组全局排序（无 sequence）
+安全：Trace + Timeline 双视图扫描无敏感字段 / 哨兵；error body 仅 {"detail"}
+契约锁定：Trace 5 字段 · Timeline 5 字段 · Event 9 字段；
+          两侧均无 timeline / events / sequence / event_id / trace_id / span_id
+未发现生产 bug；backend/ 改动 = 0
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
