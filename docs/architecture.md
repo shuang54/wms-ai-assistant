@@ -4117,6 +4117,29 @@ AssistantTimelineEvent（frozen；9 字段）
 
 ---
 
+## 8.72 Assistant Timeline HTTP API 可行性（Phase 3.12 Step 67 — Audit Only / READY）
+
+> 记录：`docs/evaluation/phase-3.12-step-67-timeline-api-audit.md`
+> 测试：`tests/test_assistant_timeline_api_audit.py`（26；离线 · 无 DB · 无网络）
+> **未实现 endpoint**（App 中无 timeline 路径；`api/` 无 timeline 模块；main.py 未注册）。
+
+```text
+候选：GET /api/observability/assistant-timeline/{assistant_request_id}   ← NOT IMPLEMENTED
+响应（候选）：{ assistant_request_id, llm_events[], tool_events[],
+               rag_events[], outcome_event }      （**分组**：无 merged events[]）
+顺序：Grouped ordering only（llm created_at,id · tool/rag id · outcome ≤1）；
+       HTTP 层**不得**跨组排序 / 生成 sequence
+错误：沿用 Trace 约定 400（非法 id）/ 422（长度）/ 502（读边界不可用）/ 500；
+       不泄漏 DB 异常文本 · 未知 request → **200 + 空分组**（不是 404）
+安全：只输出 identity / source / event_type / timing / status；
+       source_id = 内部 BIGINT 主键（**唯一事件身份**，暴露并文档化；隐藏则无身份）
+体积：真实规模 ≈1.38 KiB；100 events ≈18.8 KiB（< 64 KiB）⇒ Pagination = DEFER
+授权：项目**无** request-level 认证（知道 id 即可读）—— 与既有 Trace API 同级别，仅记录
+决策：**READY FOR API IMPLEMENTATION**（条件是遵守上述契约，不实现 Unified Timeline）
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
