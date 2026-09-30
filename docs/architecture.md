@@ -4171,6 +4171,13 @@ source_id = **内部事件标识**（来源表 BIGINT 主键）：
     显式逐字段映射    → 无 model_dump / asdict；API 不接触 Repository / Engine / Session
 授权：本接口**没有** request-level authorization
     （知道 assistant_request_id 即可读取；与既有 Trace API 同一暴露级别；未引入认证）
+
+PostgreSQL E2E（Phase 3.12 Step 69；`tests/test_assistant_timeline_db_e2e.py`，14 项）：
+    Fake LLM（MockTransport）+ 真实 persistence + 真实 PG + 真实 API
+    Case A RAG（llm1/rag1/tool0/SUCCESS）· B Tool（tool1）· C T2SQL retry（llm2，
+        按 created_at,id；**不**声称 attempt）· D RAG failure（实测 llm0/rag1/FAILED）·
+        E Refusal（llm1/REFUSED）· F 缺 Outcome（null）· G 跨请求隔离 · H 未知（200 空）
+    source_id 均等于**真实 DB 主键**；安全全链扫描通过；Step 69 residue = 0
 ```
 
 ---
