@@ -651,11 +651,9 @@ class TestMissingIdentityAudit:
             "tool_executions",
             "rag_executions",
         ]
-        assert not [
-            path
-            for path in app.openapi()["paths"]
-            if "timeline" in path.lower()
-        ]
+        # Step 68：Timeline 已作为**独立端点**实现；Trace 响应本身仍不含
+        # timeline 字段（本断言关心的是"Trace contract 未被改"）
+        assert "timeline" not in AssistantTraceResponse.model_fields
 
 
 # ============================================================

@@ -4140,6 +4140,41 @@ AssistantTimelineEvent（frozen；9 字段）
 
 ---
 
+## 8.73 Assistant Timeline HTTP Read API（Phase 3.12 Step 68 — Implemented）
+
+```text
+GET /api/observability/assistant-timeline/{assistant_request_id}
+    router: backend/app/api/assistant_timeline.py（tags=["observability"]，prefix="/api"）
+    DTO   : backend/app/dto/assistant_timeline_api.py
+             AssistantTimelineEventResponse（**9 字段**）· AssistantTimelineResponse（5 字段）
+    装配   : orchestrator_chat.get_assistant_timeline_query_service()（Composition Root）
+
+响应（Grouped Timeline Projection）：
+    { assistant_request_id, llm_events[], tool_events[], rag_events[], outcome_event }
+    事件 9 字段：assistant_request_id · source · event_type · source_id ·
+                started_at · finished_at · duration_ms · created_at · status
+
+**这是 Grouped Timeline Projection，不是 Unified Timeline**：
+    没有 event_id · sequence · span_id · parent_event_id · trace_id
+    没有全局排序（四组各自有序：llm created_at,id / tool·rag id / outcome ≤1）
+    没有 pagination（DEFER）· 没有 merged events[]
+
+source_id = **内部事件标识**（来源表 BIGINT 主键）：
+    仅用于同一次 assistant_request_id 内区分事件；
+    **不是** global event id、**不**表示顺序、**不得**跨请求 / 跨系统引用
+
+契约：
+    unknown request   → 200 + 四段空（**不是** 404）
+    历史无 outcome    → outcome_event = null（不推断）
+    错误映射          → 400（非法 id）/ 422（路径长度）/ 502（读边界）/ 500（未知）
+                        detail 固定文案，不泄漏 DB 异常 / SQL / 路径 / 凭据
+    显式逐字段映射    → 无 model_dump / asdict；API 不接触 Repository / Engine / Session
+授权：本接口**没有** request-level authorization
+    （知道 assistant_request_id 即可读取；与既有 Trace API 同一暴露级别；未引入认证）
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

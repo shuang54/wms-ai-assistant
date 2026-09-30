@@ -445,6 +445,8 @@ class TestC33RepositoryBoundary:
             _MODULES["api"],
             # Step 41：Assistant Trace API 同样只导入**错误类型**（502）
             "backend/app/api/assistant_trace.py",
+            # Step 68：Assistant Timeline API 同样只导入**错误类型**（502）
+            "backend/app/api/assistant_timeline.py",
         }
         offenders: list[str] = []
         backend_dir = os.path.join(REPO_ROOT, "backend", "app")

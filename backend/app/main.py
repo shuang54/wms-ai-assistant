@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.app.api import (
+    assistant_timeline,
     assistant_trace,
     chat,
     health,
@@ -48,6 +49,11 @@ def create_app() -> FastAPI:
     )
     app.include_router(
         assistant_trace.router, prefix="/api", tags=["observability"]
+    )
+    # Phase 3.12 Step 68：Assistant Timeline 只读 HTTP 边界
+    # （Grouped Timeline Projection；与 Trace 端点并列，互不影响）。
+    app.include_router(
+        assistant_timeline.router, prefix="/api", tags=["observability"]
     )
     return app
 

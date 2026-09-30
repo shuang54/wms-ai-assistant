@@ -659,8 +659,14 @@ class TestBoundaries:
             "tool_executions",
             "rag_executions",
         ]
+        # Step 68：Timeline 是**独立端点**（GET .../assistant-timeline/{id}），
+        # 未并入 Trace 响应 —— Trace schema 里仍然**没有** timeline 字段。
         assert not [
-            path for path in app.openapi()["paths"] if "timeline" in path.lower()
+            field
+            for field in app.openapi()["components"]["schemas"][
+                "AssistantTraceResponse"
+            ]["properties"]
+            if "timeline" in field.lower()
         ]
 
     def test_service_has_no_db_access(self) -> None:

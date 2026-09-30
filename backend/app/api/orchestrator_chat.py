@@ -346,6 +346,43 @@ def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
     )
 
 
+def get_assistant_timeline_query_service() -> "AssistantTimelineQueryService":
+    """Phase 3.12 Step 68：Assistant Timeline 只读 HTTP 边界的装配 accessor。
+
+         api/assistant_timeline.py
+             ↓ get_assistant_timeline_query_service()（本函数）
+         AssistantTimelineQueryService（Step 66 分组投影）
+             ├── LLMUsageQueryService（→ ai_ops.llm_usage_record）
+             ├── ToolExecutionPersistentQueryService（→ ai_ops.tool_execution_record）
+             ├── RagExecutionPersistentQueryService（→ ai_ops.rag_execution_record）
+             └── AssistantOutcomeQueryService（→ ai_ops.assistant_outcome_record）
+
+    * 四个数据源**全部复用**既有持久化读边界（与 Trace 组合根一致）；
+    * **不创建** Repository / Session / Engine（API 层不接触 DB）；
+    * 本函数只装配，不查询 / 不聚合 / 不缓存 / 不投影。
+    """
+    from backend.app.services.assistant_outcome_query_service import (
+        AssistantOutcomeQueryService,
+    )
+    from backend.app.services.assistant_timeline_query_service import (
+        AssistantTimelineQueryService,
+    )
+    from backend.app.services.llm_usage_query_service import (
+        LLMUsageQueryService,
+    )
+
+    return AssistantTimelineQueryService(
+        llm_usage_query_service=LLMUsageQueryService(),
+        tool_execution_query_service=(
+            get_tool_execution_persistent_query_service()
+        ),
+        rag_execution_query_service=(
+            get_rag_execution_persistent_query_service()
+        ),
+        outcome_query_service=AssistantOutcomeQueryService(),
+    )
+
+
 def get_tool_observability_query_service() -> ToolObservabilityQueryService:
     """Phase 3.11 Step 25：只读查询边界装配（Composition Root accessor）。
 

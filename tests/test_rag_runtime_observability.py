@@ -721,8 +721,10 @@ class TestRuntimeOnlyBoundaries:
     def test_no_new_http_api(self) -> None:
         paths = sorted(app.openapi()["paths"])
 
-        # 观测类端点集合未扩大（无 /api/observability/rag*）
+        # 观测类端点集合：Step 68 新增 **Timeline** 只读端点（分组投影），
+        # 仍未扩大 RAG 侧端点（无 /api/observability/rag*）
         assert [p for p in paths if "observability" in p] == [
+            "/api/observability/assistant-timeline/{assistant_request_id}",
             "/api/observability/assistant-trace/{assistant_request_id}",
             "/api/observability/tools",
             "/api/observability/tools/history",

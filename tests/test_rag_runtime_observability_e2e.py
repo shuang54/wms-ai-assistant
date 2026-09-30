@@ -461,7 +461,9 @@ class TestContractAndSecurityE2E:
     def test_no_new_http_api_for_rag_observability(self) -> None:
         paths = sorted(app.openapi()["paths"])
 
+        # Step 68：新增 Assistant Timeline 只读端点（分组投影；非 RAG 端点）
         assert [p for p in paths if "observability" in p] == [
+            "/api/observability/assistant-timeline/{assistant_request_id}",
             "/api/observability/assistant-trace/{assistant_request_id}",
             "/api/observability/tools",
             "/api/observability/tools/history",

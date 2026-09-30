@@ -786,23 +786,41 @@ class TestAuditHygiene:
                       "api_" + "key", "TestClient"):
             assert token not in identifiers, token
 
-    def test_17_no_timeline_endpoint_registered(self) -> None:
-        """Step 67：**不**新增 endpoint；审计确认 App 里确实没有 timeline 路径。"""
+    def test_17_audit_state_at_step_67_then_implemented_at_step_68(self) -> None:
+        """Step 67 审计时点：NOT IMPLEMENTED；Step 68 已按候选契约实现。
+
+        本断言改为**校验实现与审计候选一致**（仍是审计文件的职责）：
+            * 路径 = 候选路径；
+            * 响应顶层 5 字段，无 merged ``events`` / 无 sequence；
+            * 事件 9 字段；
+            * 不并入既有 Trace 响应。
+        """
         from backend.app.main import app
 
-        paths = sorted(app.openapi()["paths"])
-        assert not [path for path in paths if "timeline" in path.lower()]
-        assert CANDIDATE_PATH not in paths
-        # 也不存在 api 模块文件（未注册、未实现）
-        assert not list(
-            Path("backend/app/api").glob("assistant_timeline*.py")
-        )
+        spec = app.openapi()
+        assert CANDIDATE_PATH in spec["paths"]
+        response_schema = spec["components"]["schemas"][
+            "AssistantTimelineResponse"
+        ]["properties"]
+        assert tuple(response_schema) == CANDIDATE_TIMELINE_FIELDS
+        assert "events" not in response_schema
+        assert "sequence" not in response_schema
+        event_schema = spec["components"]["schemas"][
+            "AssistantTimelineEventResponse"
+        ]["properties"]
+        assert "source_id" in event_schema
+        assert "event_id" not in event_schema
+        # 既有 Trace 响应仍未并入 timeline
+        assert "timeline" not in spec["components"]["schemas"][
+            "AssistantTraceResponse"
+        ]["properties"]
 
-    def test_17b_no_timeline_router_module(self) -> None:
-        """未把 timeline router 挂进 create_app()（静态检查）。"""
+    def test_17b_router_registered_with_project_convention(self) -> None:
+        """Step 68：按既有约定注册（prefix="/api" · tags=["observability"]）。"""
         source = Path("backend/app/main.py").read_text(encoding="utf-8")
-        assert "assistant_timeline" not in source
-        assert "timeline" not in source
+        assert "assistant_timeline.router" in source
+        assert 'prefix="/api"' in source
+        assert 'tags=["observability"]' in source
 
     def test_17c_dataclass_shape_is_serializable_without_internals(self) -> None:
         """dataclasses.asdict 结果不含 ORM / Session / 连接对象。"""
