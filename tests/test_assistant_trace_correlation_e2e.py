@@ -510,9 +510,12 @@ def test_trace_security(e2e) -> None:
     assert _TOOL_QUESTION not in response.text               # 问题文本外泄
     payload = response.json()
     assert set(payload) == {
-        "assistant_request_id", "llm_usage", "tool_executions",
+        "assistant_request_id",
+        "outcome",                                     # Step 64（additive）
+        "llm_usage", "tool_executions",
         "rag_executions",                              # Step 48（additive）
     }
+    assert payload["outcome"] is None                  # 离线装配未接终态持久化
 
 
 def test_tool_trace_survives_runtime_collector_clear(e2e) -> None:

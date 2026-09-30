@@ -320,6 +320,9 @@ def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
     * 持久历史读边界是模块级单例（``get_tool_execution_persistent_query_service()``）；
     * 本函数只装配，不查询 / 不聚合 / 不缓存。
     """
+    from backend.app.services.assistant_outcome_query_service import (
+        AssistantOutcomeQueryService,
+    )
     from backend.app.services.assistant_trace_query_service import (
         AssistantTraceQueryService,
     )
@@ -337,6 +340,9 @@ def get_assistant_trace_query_service() -> "AssistantTraceQueryService":
         rag_execution_query_service=(
             get_rag_execution_persistent_query_service()
         ),
+        # Phase 3.12 Step 64：Assistant 终态读边界（ai_ops.assistant_outcome_record；
+        # 无记录 → outcome=null，**不推断**）。
+        outcome_query_service=AssistantOutcomeQueryService(),
     )
 
 
@@ -394,6 +400,30 @@ def get_tool_execution_persistent_query_service() -> (
     """
     return _TOOL_HISTORY_QUERY_SERVICE
 
+
+def _build_outcome_recorder() -> Any:
+    """Phase 3.12 Step 64：Assistant 终态持久化装配（**进程级单实例**）。
+
+    语义与 LLM Usage 生产接线（Step 56）一致：
+
+        * ``get_engine() is None``（DATABASE_URL 未配置）→ **None**
+          （不注入 → Orchestrator 零开销跳过持久化；**无告警噪声**）；
+        * DB 已配置 → recorder（终态写入 ``ai_ops.assistant_outcome_record``）。
+
+    边界：
+        * recorder 自身 best-effort（失败只 warning）→ 终态持久化
+          **绝不**变成 Assistant 业务失败，也不触发 retry；
+        * 不新增配置项 / 环境变量；本函数只装配，不写库 / 不查询；
+        * DB 可用性判断在 Service 层（组合根**只组合**，不接触
+          Engine / Session / DB —— 保持既有 Composition Root 静态约束）。
+    """
+    from backend.app.services.assistant_outcome_persistence_service import (
+        build_assistant_outcome_recorder,
+    )
+
+    return build_assistant_outcome_recorder()
+
+
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     router=AIRouterService(
         tool_capabilities=ToolRegistryCapabilityAdapter(_TOOL_REGISTRY),
@@ -406,6 +436,10 @@ _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     # 保持 test_api_module_does_not_import_forbidden_services 约束）。
     # 项目级 Orchestrator 经 ``base._rag`` 复用同一实例（Factory 不改）。
     rag_service=get_observed_rag_service(),
+    # Phase 3.12 Step 64：Assistant 终态（Outcome）持久化接线 ——
+    # 判定仍在 Orchestrator（Step 63），本参数只提供持久化边界
+    # （进程级单实例；无 DATABASE_URL → None，行为与 Step 63 之前一致）。
+    outcome_recorder=_build_outcome_recorder(),
 )
 
 

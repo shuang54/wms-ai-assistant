@@ -17,6 +17,7 @@ from __future__ import annotations
 
 # 顺序很关键：KnowledgeDocument 必须先于 KnowledgeChunk（虽然 SQLAlchemy 不强制，
 # 但 IDE / 类型检查友好）
+from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
@@ -29,6 +30,9 @@ _MODELS: tuple[type, ...] = (
     LLMUsageRecord,
     ToolExecutionRecordModel,
     RagExecutionRecordModel,
+    # Phase 3.12 Step 64：Assistant request-level terminal outcome
+    # （全新表 → 随 create_all 自动创建；既有库首次 init_db() 即补建）
+    AssistantOutcomeRecord,
 )
 
 
@@ -38,6 +42,7 @@ __all__ = [
     "LLMUsageRecord",
     "ToolExecutionRecordModel",
     "RagExecutionRecordModel",
+    "AssistantOutcomeRecord",
 ]
 
 

@@ -65,16 +65,21 @@ class TestHttpContractHasNoPagination:
         # 明确禁止 query 参数（limit / offset / page / cursor …）
         assert not [p for p in parameters if p["in"] == "query"]
 
-    def test_response_model_has_only_the_four_contract_fields(self) -> None:
+    def test_response_model_has_only_the_five_contract_fields(self) -> None:
+        """Step 64：contract 新增 additive 的 ``outcome``（分页字段仍不存在）。"""
         assert set(AssistantTraceResponse.model_fields) == {
             "assistant_request_id",
+            "outcome",                                   # Step 64（additive）
             "llm_usage",
             "tool_executions",
             "rag_executions",
         }
 
     def test_dto_field_sets_are_exact(self) -> None:
-        """字段集合逐字锁定（任何新增字段——包括分页字段——都会使本断言失败）。"""
+        """字段集合逐字锁定（新增分页字段会使本断言失败）。
+
+        （Step 64：顶层新增 additive 的 ``outcome`` —— 已同步；分页字段仍为 0。）
+        """
         assert set(LLMUsageTraceResponse.model_fields) == {
             "id",
             "assistant_request_id",

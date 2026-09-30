@@ -484,7 +484,7 @@ class TestAssistantTraceRagSection:
             assert f'"{absent}"' not in text, absent
 
     def test_trace_endpoint_returns_three_sections(self) -> None:
-        """Step 48：三个独立列表（不合并为 events；旧字段顺序不变）。"""
+        """Step 48/64：三个独立列表（不合并为 events）+ additive 字段。"""
         spec = app.openapi()
         path = "/api/observability/assistant-trace/{assistant_request_id}"
         properties = spec["components"]["schemas"][
@@ -492,8 +492,10 @@ class TestAssistantTraceRagSection:
         ]["properties"]
 
         assert list(properties) == [
-            "assistant_request_id", "llm_usage", "tool_executions",
-            "rag_executions",
+            "assistant_request_id",
+            "outcome",                                 # Step 64（additive）
+            "llm_usage", "tool_executions",
+            "rag_executions",                          # Step 48（additive）
         ]
         assert path in spec["paths"]
 

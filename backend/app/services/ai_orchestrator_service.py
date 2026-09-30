@@ -50,7 +50,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
-from backend.app.dto.assistant_outcome import determine_assistant_outcome
+from backend.app.dto.assistant_outcome import (
+    AssistantOutcome,
+    determine_assistant_outcome,
+)
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.context import DataSource, ProjectContext
 from backend.app.projects.knowledge_provider import ProjectKnowledgeScope
@@ -115,6 +118,7 @@ __all__ = [
     "AIOrchestratorExecutionError",
     "AIOrchestratorUnavailableError",
     "AIOrchestratorCapabilityError",
+    "AssistantOutcomeRecorder",
     "ProjectContextProvider",
     "DefaultProjectContextProvider",
     "get_default_orchestrator",
@@ -195,6 +199,29 @@ class AIOrchestratorCapabilityError(AIOrchestratorError):
 # ============================================================
 # 项目上下文提供器（Orchestrator 不直接创建 Engine）
 # ============================================================
+
+class AssistantOutcomeRecorder(Protocol):
+    """Assistant 终态（Outcome）记录器（Phase 3.12 Step 64）。
+
+    唯一职责：把 **Orchestrator 已判定**的 ``AssistantOutcome`` 交给
+    持久化边界（生产实现 = ``BestEffortAssistantOutcomeRecorder``）。
+
+    契约：
+
+        * ``arecord(assistant_request_id, outcome)`` 必须由调用方 await；
+        * 实现**必须**是 best-effort（失败收敛为 warning，绝不抛出业务异常）；
+          Orchestrator 侧仍有兜底 try/except，双保险；
+        * **不生成** ``assistant_request_id``（由 Orchestrator 传入）；
+        * **不判定** outcome（Step 63：``AIOrchestratorService`` 是唯一判定点）；
+        * 不接触 LLM / Router / RAG / Tool / SQL 执行。
+    """
+
+    async def arecord(
+        self,
+        assistant_request_id: str,
+        outcome: AssistantOutcome,
+    ) -> int | None: ...
+
 
 class ProjectContextProvider(Protocol):
     """提供 (ProjectContext, DatabaseSchema, ProjectSemantic) 三元组。
@@ -329,6 +356,7 @@ class AIOrchestratorService:
         tool_execution_observer: ToolExecutionObserver | None = None,
         tool_argument_extractor: ToolArgumentExtractor | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
+        outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
         """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。
 
@@ -495,6 +523,23 @@ class AIOrchestratorService:
             if tool_argument_extractor is not None
             else ToolArgumentExtractor()
         )
+        # Phase 3.12 Step 64：Assistant 终态（Outcome）持久化边界。
+        # * None（默认 / 旧行为）→ **不持久化**（单元测试 / 直连 Service 场景
+        #   不受影响；与 Step 63 之前完全一致）；
+        # * 生产由 Composition Root 注入 BestEffortAssistantOutcomeRecorder
+        #   （DB 已配置时写入 ai_ops.assistant_outcome_record）;
+        # * 本类只**判定**（Step 63）+ 调用记录器；不接触 Repository / Session /
+        #   SQLAlchemy（依赖方向不变）。
+        if outcome_recorder is not None and not callable(
+            getattr(outcome_recorder, "arecord", None)
+        ):
+            raise AIOrchestratorInputError(
+                "outcome_recorder 必须提供可调用的 arecord()"
+                f"（当前: {type(outcome_recorder).__name__}）"
+            )
+        self._outcome_recorder: AssistantOutcomeRecorder | None = (
+            outcome_recorder
+        )
 
     # ---------- 只读暴露（便于测试断言注入关系） ----------
 
@@ -539,35 +584,112 @@ class AIOrchestratorService:
                     question=normalized, context=context
                 )
             except AIRouterInputError as exc:
+                await self._record_assistant_outcome(
+                    request_id, AssistantOutcome.FAILED
+                )
                 raise AIOrchestratorInputError(str(exc)) from exc
             except AIRouterError as exc:
+                await self._record_assistant_outcome(
+                    request_id, AssistantOutcome.FAILED
+                )
                 raise AIOrchestratorRouteError(
                     f"Router 决策失败: {type(exc).__name__}"
                 ) from exc
 
             # ---- 2) 单次执行（无 Agent / 无 Loop / 无重规划） ----
+            result: AIOrchestrationResult | None = None
             try:
                 if decision.route == RouteType.RAG:
-                    return await self._run_rag(
+                    result = await self._run_rag(
                         decision, normalized, request_id=request_id
                     )
-                if decision.route == RouteType.TOOL:
-                    return await self._run_tool(
+                elif decision.route == RouteType.TOOL:
+                    result = await self._run_tool(
                         decision, normalized, request_id=request_id
                     )
-                if decision.route == RouteType.TEXT_TO_SQL:
-                    return await self._run_text_to_sql(
+                elif decision.route == RouteType.TEXT_TO_SQL:
+                    result = await self._run_text_to_sql(
                         decision, normalized, request_id=request_id
                     )
             except AIOrchestratorError:
+                # 失败路径（RAG / Tool / Text-to-SQL / 能力禁用 等）：
+                # 终态 = FAILED（**不**改异常语义 / 不改 error 响应结构）。
+                await self._record_assistant_outcome(
+                    request_id, AssistantOutcome.FAILED
+                )
                 raise
             except Exception as exc:
+                await self._record_assistant_outcome(
+                    request_id, AssistantOutcome.FAILED
+                )
                 raise AIOrchestratorExecutionError(
                     f"能力执行失败: {type(exc).__name__}"
                 ) from exc
 
-            raise AIOrchestratorRouteError(
-                f"未知 route: {decision.route!r}"
+            if result is None:
+                await self._record_assistant_outcome(
+                    request_id, AssistantOutcome.FAILED
+                )
+                raise AIOrchestratorRouteError(
+                    f"未知 route: {decision.route!r}"
+                )
+
+            # 成功路径：终态由 Step 63 的判定结果直接给出（**不重新推断**）。
+            outcome = self._outcome_of_result(result)
+            if outcome is not None:
+                await self._record_assistant_outcome(request_id, outcome)
+            return result
+
+    # ---------- Phase 3.12 Step 64：Assistant Outcome 持久化边界 ----------
+
+    @staticmethod
+    def _outcome_of_result(
+        result: AIOrchestrationResult,
+    ) -> AssistantOutcome | None:
+        """从 Result.metadata 取 Step 63 已判定的终态（**只读，不推断**）。
+
+        * metadata["outcome"] 是 ``AssistantOutcome``（由三条路径的设置点写入）
+          → 原样返回；
+        * 若缺失 / 类型非法（理论不可达：同一类内写入）→ 记 warning 并返回
+          ``None`` ⇒ **跳过持久化**（绝不猜一个 SUCCESS/FAILED 落库）。
+        """
+        value = result.metadata.get("outcome")
+        if isinstance(value, AssistantOutcome):
+            return value
+        if isinstance(value, str):
+            try:
+                return AssistantOutcome(value)
+            except ValueError:
+                pass
+        logger.warning(
+            "assistant outcome missing in orchestration result metadata"
+            "（跳过终态持久化）",
+            extra={"route": getattr(result.route, "value", None)},
+        )
+        return None
+
+    async def _record_assistant_outcome(
+        self,
+        assistant_request_id: str,
+        outcome: AssistantOutcome,
+    ) -> None:
+        """Best-effort 持久化 Assistant 终态（**绝不**影响业务结果）。
+
+        * 未注入 recorder（默认 / 测试）→ 直接返回（零开销）；
+        * 记录器自身已是 best-effort；本方法再兜一层 try/except，
+          保证任何实现都不会让 outcome 持久化变成 Assistant 业务失败；
+        * 无 retry / sleep / backoff / queue；不改变 request_id 生成。
+        """
+        recorder = self._outcome_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.arecord(assistant_request_id, outcome)
+        except Exception:  # noqa: BLE001 —— 终态持久化绝不穿透为业务失败
+            logger.warning(
+                "assistant outcome persistence failed（不影响业务结果）",
+                exc_info=True,
+                extra={"outcome": outcome.value},
             )
 
     # ---------- Phase 3.8.2：能力硬校验（Router 是分类器，不是安全边界） ----------

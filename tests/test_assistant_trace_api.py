@@ -192,6 +192,7 @@ class _DuckTraceView:
 
     def __init__(self) -> None:
         self.assistant_request_id = "A"
+        self.outcome = None               # Step 64：终态（无记录）
         self.llm_usage = (_DuckLlmRow(),)
         self.tool_executions = (_DuckToolRow(),)
         self.rag_executions = ()          # Step 48：RAG 段（空）
@@ -323,6 +324,7 @@ class TestTraceEndpoint:
         assert response.status_code == 200                 # 不是 404
         assert response.json() == {
             "assistant_request_id": "not-exist",
+            "outcome": None,                               # Step 64（additive；无终态记录）
             "llm_usage": [],
             "tool_executions": [],
             "rag_executions": [],                          # Step 48（additive）
@@ -552,7 +554,9 @@ class TestRegressionAndOpenAPI:
         ]["schema"] == {"$ref": "#/components/schemas/AssistantTraceResponse"}
         components = spec["components"]["schemas"]
         assert list(components["AssistantTraceResponse"]["properties"]) == [
-            "assistant_request_id", "llm_usage", "tool_executions",
+            "assistant_request_id",
+            "outcome",                                 # Step 64（additive）
+            "llm_usage", "tool_executions",
             "rag_executions",                          # Step 48（additive）
         ]
         assert list(components["LLMUsageTraceResponse"]["properties"]) == list(

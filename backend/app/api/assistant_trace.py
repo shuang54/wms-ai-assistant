@@ -44,6 +44,9 @@ from pydantic import BaseModel, Field
 from backend.app.api.orchestrator_chat import (
     get_assistant_trace_query_service,
 )
+from backend.app.db.assistant_outcome_repository import (
+    AssistantOutcomeRepositoryError,
+)
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
 from backend.app.db.rag_execution_repository import (
     RagExecutionRepositoryError,
@@ -51,6 +54,7 @@ from backend.app.db.rag_execution_repository import (
 from backend.app.db.tool_execution_repository import (
     ToolExecutionRepositoryError,
 )
+from backend.app.dto.assistant_outcome import AssistantOutcome
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,
@@ -168,6 +172,16 @@ class AssistantTraceResponse(BaseModel):
     """
 
     assistant_request_id: str
+    #: Phase 3.12 Step 64：Assistant request-level 终态（additive 字段）。
+    #: ``SUCCESS`` / ``EMPTY`` / ``REFUSED`` / ``FAILED``；
+    #: ``null`` = 该请求没有终态记录（历史 Trace）—— **不猜**。
+    outcome: AssistantOutcome | None = Field(
+        default=None,
+        description=(
+            "Assistant 请求级终态（SUCCESS / EMPTY / REFUSED / FAILED）；"
+            "无终态记录（历史 Trace）为 null"
+        ),
+    )
     llm_usage: list[LLMUsageTraceResponse] = Field(default_factory=list)
     tool_executions: list[ToolExecutionTraceResponse] = Field(
         default_factory=list
@@ -238,6 +252,7 @@ def _to_trace_response(trace: AssistantTraceView) -> AssistantTraceResponse:
     """``AssistantTraceView`` → API DTO（顺序保持，只做 tuple → list）。"""
     return AssistantTraceResponse(
         assistant_request_id=trace.assistant_request_id,
+        outcome=trace.outcome,
         llm_usage=[_llm_usage_response(v) for v in trace.llm_usage],
         tool_executions=[
             _tool_execution_response(s) for s in trace.tool_executions
@@ -328,6 +343,9 @@ async def get_assistant_trace(
         LLMUsageRepositoryError,
         ToolExecutionRepositoryError,
         RagExecutionRepositoryError,
+        # Phase 3.12 Step 64：终态读边界（ai_ops.assistant_outcome_record）
+        # 不可用时同样保持既有 502 语义（**不**降级为 outcome=null）。
+        AssistantOutcomeRepositoryError,
     ) as exc:
         logger.error(
             "assistant trace data source unavailable",

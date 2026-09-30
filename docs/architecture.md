@@ -4004,6 +4004,58 @@ Trace 数据量 / 分页（Phase 3.12 Step 54 审计 → `docs/evaluation/phase-
 
 ---
 
+## 8.69 Assistant Outcome Persistence（Phase 3.12 Step 64 — Implemented）
+
+> 前置：§8.68（Step 62 Outcome Contract · Step 63 `metadata.outcome`）
+
+```text
+POST /api/ai/chat
+    ↓
+AIOrchestratorService.execute()             ← **唯一** Outcome 判定点（Step 63）
+    │   成功：result.metadata["outcome"]（**只读，不重新推断**）
+    │   失败（Router / RAG / Tool / T2SQL / 能力禁用 / SQL 执行）→ FAILED
+    ↓ best-effort（失败只 warning；**绝不**变成业务失败，**不** retry）
+BestEffortAssistantOutcomeRecorder
+    ↓ AssistantOutcomePersistenceService（校验 + enum → str）
+AssistantOutcomeRepository  （INSERT … ON CONFLICT (assistant_request_id) DO NOTHING）
+    ↓
+ai_ops.assistant_outcome_record             ← 新增表（request-level 终态）
+    ↓ AssistantOutcomeQueryService（只读）
+GET /api/observability/assistant-trace/{assistant_request_id}
+    ↓
+{ assistant_request_id, outcome, llm_usage[], tool_executions[], rag_executions[] }
+```
+
+```text
+Schema（最小）：ai_ops.assistant_outcome_record
+    id BIGINT PK · assistant_request_id VARCHAR(128) NOT NULL **UNIQUE**
+    · outcome VARCHAR(16) NOT NULL · created_at TIMESTAMPTZ NOT NULL
+    无 route / status / error_class / error_message / content / prompt / SQL
+    全新表随 Base.metadata.create_all() 创建（无 Alembic / 无 backfill）
+
+语义：
+    Outcome is Assistant-level；LLM / Tool / RAG execution status remain independent
+    Idempotent + **first-write-wins**（重复写入 DO NOTHING → 不覆盖终态）
+    历史 Trace（无行）→ outcome = **null**（**不猜**：不看 llm_usage / Tool / RAG /
+        HTTP status / route 推断 SUCCESS）
+    终态四值：SUCCESS / EMPTY / REFUSED / FAILED（无 error_class）
+    Persistence failure does not affect business result
+        （recorder 收敛 warning + Orchestrator 兜底 try/except；
+          HTTP status / error body / Refusal 200 / Tool 200 failure / RAG empty 200 全不变）
+
+装配（Composition Root = api/orchestrator_chat.py）：
+    DB 已配置 → _build_outcome_recorder() → BestEffortAssistantOutcomeRecorder（进程级单实例）
+    无 DATABASE_URL → None（不注入 → 零开销跳过，行为与 Step 63 前一致）
+    Trace 侧：get_assistant_trace_query_service() 注入 AssistantOutcomeQueryService
+    读边界失败 → 既有 502 语义（**不**降级为 null）
+    测试：tests/test_assistant_outcome_persistence.py（22 离线 + 10 DB-gated）
+        · tests/conftest.py（Step 64 引入）：**任何** pytest 会话结束时，按 id 水位
+          清理「本次会话新增」的 outcome 行（测试专用残留守卫；不触碰既有数据）
+          —— 因为生产接线是真的：驱动真实 /api/ai/chat 的 E2E（含离线）都会写 1 行
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

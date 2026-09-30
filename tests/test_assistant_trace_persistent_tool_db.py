@@ -317,6 +317,7 @@ class TestPersistentToolTrace:
         assert response.status_code == 200
         assert response.json() == {
             "assistant_request_id": "step41-not-exist",
+            "outcome": None,        # Step 64（additive；无终态记录）
             "llm_usage": [],
             "tool_executions": [],
             "rag_executions": [],   # Step 48（additive）

@@ -73,11 +73,15 @@ _FORBIDDEN_FIELDS: Final[tuple[str, ...]] = (
 )
 
 #: 当前 HTTP 响应字段（不得改名 / 不得删除 / 不得改语义）
+#: Step 48/64 之前的字段顺序（三个 legacy 字段）。
 _CURRENT_RESPONSE_FIELDS: Final[tuple[str, ...]] = (
     "assistant_request_id",
     "llm_usage",
     "tool_executions",
 )
+
+#: Step 64：additive 的终态字段（位于 assistant_request_id 之后）。
+_RESPONSE_OUTCOME_FIELD: Final[str] = "outcome"
 
 _STARTED = datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
 
@@ -165,18 +169,23 @@ class _SpyRepository:
 
 class TestCurrentTraceContract:
     def test_response_model_fields(self) -> None:
-        """Step 48 实现后：三个旧字段不变 + additive 的 ``rag_executions``。"""
-        assert list(AssistantTraceResponse.model_fields)[
-            : len(_CURRENT_RESPONSE_FIELDS)
-        ] == list(_CURRENT_RESPONSE_FIELDS)
-        assert list(AssistantTraceResponse.model_fields) == [
-            *_CURRENT_RESPONSE_FIELDS, "rag_executions",
+        """Step 48/64 实现后：三个 legacy 字段 + additive 的 outcome / rag_executions。"""
+        fields = list(AssistantTraceResponse.model_fields)
+
+        assert fields == [
+            "assistant_request_id",
+            _RESPONSE_OUTCOME_FIELD,                 # Step 64（additive）
+            *_CURRENT_RESPONSE_FIELDS[1:],
+            "rag_executions",                        # Step 48（additive）
         ]
+        for name in _CURRENT_RESPONSE_FIELDS:
+            assert name in fields                    # legacy 字段未删除 / 未改名
 
     def test_read_model_is_frozen_and_three_sources(self) -> None:
         assert [f.name for f in fields(AssistantTraceView)] == [
             "assistant_request_id", "llm_usage", "tool_executions",
             "rag_executions",
+            _RESPONSE_OUTCOME_FIELD,                 # Step 64（末位带默认值）
         ]
         with pytest.raises(ValueError):
             AssistantTraceView(
@@ -219,9 +228,12 @@ class TestCurrentTraceContract:
         ]["properties"]
 
         assert "rag_executions" in schema
-        assert list(schema)[: len(_CURRENT_RESPONSE_FIELDS)] == list(
-            _CURRENT_RESPONSE_FIELDS
-        )
+        assert list(schema) == [
+            "assistant_request_id",
+            _RESPONSE_OUTCOME_FIELD,                 # Step 64（additive）
+            *_CURRENT_RESPONSE_FIELDS[1:],
+            "rag_executions",                        # Step 48（additive）
+        ]
 
     def test_trace_service_has_no_write_capability(self) -> None:
         for forbidden in ("execute", "record", "clear", "metrics", "persist"):
@@ -476,13 +488,14 @@ class TestRuntimeVsPersistentAndCompatibility:
                 assert forbidden not in imported, (relative, forbidden)
 
     def test_proposed_change_is_additive(self) -> None:
-        """Step 48 实现：新增字段是 additive（旧字段不改名 / 不删除 / 语义不变）。"""
+        """Step 48/64 实现：新增字段是 additive（旧字段不改名 / 不删除 / 语义不变）。"""
         current = list(_CURRENT_RESPONSE_FIELDS)
         implemented = list(AssistantTraceResponse.model_fields)
 
-        assert implemented[: len(current)] == current
-        assert set(current) <= set(implemented)
-        assert "rag_executions" in implemented
+        assert set(current) <= set(implemented)       # 旧字段全部保留
+        assert "rag_executions" in implemented        # Step 48（additive）
+        assert _RESPONSE_OUTCOME_FIELD in implemented  # Step 64（additive）
+        assert implemented[0] == current[0]           # 首字段未变
         # 旧客户端解析（忽略未知字段）仍可用
         payload = json.dumps(
             {"assistant_request_id": "A", "llm_usage": [], "tool_executions": [],

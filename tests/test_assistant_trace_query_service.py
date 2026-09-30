@@ -429,6 +429,7 @@ class TestSecurity:
         assert [f.name for f in fields(AssistantTraceView)] == [
             "assistant_request_id", "llm_usage", "tool_executions",
             "rag_executions",                       # Step 48（additive）
+            "outcome",                              # Step 64（additive；末位带默认值）
         ]
         assert [f.name for f in fields(RagExecutionTraceView)] == [
             "request_id", "started_at", "finished_at", "duration_ms",
@@ -574,6 +575,7 @@ class TestC43AssistantTraceReadModel:
             "llm_usage_query_service",
             "tool_observability_query_service",
             "rag_execution_query_service",          # Step 48（持久化读边界）
+            "outcome_query_service",                # Step 64（终态只读边界）
         }, public
 
     def test_c43_8_no_unexpected_http_endpoint(self) -> None:

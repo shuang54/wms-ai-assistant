@@ -540,9 +540,9 @@ class TestDeferredBoundaries:
             "AssistantTraceResponse"
         ]["properties"]
         assert "rag_executions" in trace
-        assert list(trace)[:3] == [
-            "assistant_request_id", "llm_usage", "tool_executions",
-        ]
+        assert list(trace)[0] == "assistant_request_id"
+        assert "llm_usage" in trace and "tool_executions" in trace
+        assert "outcome" in trace                      # Step 64（additive）
 
     def test_write_port_is_the_existing_observer_interface(self) -> None:
         """写侧复用既有 ``record()`` 端口；不新造生命周期。"""
@@ -559,13 +559,15 @@ class TestDeferredBoundaries:
         assert "def record(" in collector
 
     def test_assistant_trace_and_http_api_unchanged(self) -> None:
-        """Step 48：Trace 只**新增** rag_executions；旧字段与 RAG 端点集合不变。"""
+        """Step 48/64：Trace 只**新增**字段（rag_executions / outcome）；旧字段与端点集合不变。"""
         schema = app.openapi()["components"]["schemas"]["AssistantTraceResponse"]
 
-        assert list(schema["properties"])[:3] == [
-            "assistant_request_id", "llm_usage", "tool_executions",
-        ]
-        assert list(schema["properties"])[3:] == ["rag_executions"]
+        properties = list(schema["properties"])
+        assert properties[0] == "assistant_request_id"
+        assert "outcome" in properties                 # Step 64（additive）
+        for legacy in ("llm_usage", "tool_executions"):
+            assert legacy in properties
+        assert properties[-1] == "rag_executions"      # Step 48（additive）
         paths = sorted(app.openapi()["paths"])
         assert [p for p in paths if "rag" in p.lower()] == ["/api/rag/answer"]
 

@@ -69,8 +69,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from backend.app.dto.assistant_outcome import AssistantOutcome
 from backend.app.services.assistant_trace import (
     ASSISTANT_REQUEST_ID_MAX_LENGTH,
+)
+from backend.app.services.assistant_outcome_query_service import (
+    AssistantOutcomeQueryService,
 )
 from backend.app.services.llm_usage_query_service import (
     LLMUsageQueryService,
@@ -233,6 +237,17 @@ class AssistantTraceView:
     llm_usage: tuple[LLMUsageTraceRecordView, ...]
     tool_executions: tuple[ToolExecutionSnapshot, ...]
     rag_executions: tuple[RagExecutionTraceView, ...] = ()
+    #: Phase 3.12 Step 64：Assistant request-level 终态。
+    #:
+    #: * ``AssistantOutcome``（SUCCESS / EMPTY / REFUSED / FAILED）
+    #:   = 该请求在 ``/api/ai/chat`` 侧的实际业务结果（Step 63 判定 →
+    #:   ai_ops.assistant_outcome_record）；
+    #: * ``None`` = **该请求没有终态记录**（历史 Trace —— 本表上线前的请求，
+    #:   或旧链路 /api/chat）——**不猜**：绝不根据 llm_usage / Tool / RAG /
+    #:   HTTP status / route 推断 SUCCESS；
+    #: * 与三段 execution status 完全独立（LLM / Tool / RAG / Executor success
+    #:   ≠ Assistant outcome）。
+    outcome: AssistantOutcome | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.assistant_request_id, str):
@@ -242,6 +257,13 @@ class AssistantTraceView:
             )
         if not self.assistant_request_id.strip():
             raise ValueError("assistant_request_id 不能为空或纯空白")
+        if self.outcome is not None and not isinstance(
+            self.outcome, AssistantOutcome
+        ):
+            raise ValueError(
+                "outcome 必须是 AssistantOutcome | None"
+                f"（当前: {type(self.outcome).__name__}）"
+            )
         if not isinstance(self.llm_usage, tuple):
             raise ValueError("llm_usage 必须是 tuple（read-only snapshot）")
         if not isinstance(self.tool_executions, tuple):
@@ -307,6 +329,7 @@ class AssistantTraceQueryService:
         tool_observability_query_service: Any,
         llm_usage_query_service: Any = None,
         rag_execution_query_service: Any = None,
+        outcome_query_service: Any = None,
     ) -> None:
         self._llm_usage = (
             llm_usage_query_service
@@ -343,6 +366,20 @@ class AssistantTraceQueryService:
                 "Runtime 内存 Collector 不参与 Assistant Trace）"
                 f"（got {type(self._rag).__name__}）"
             )
+        self._outcome = (
+            outcome_query_service
+            if outcome_query_service is not None
+            else AssistantOutcomeQueryService()
+        )
+        if not callable(
+            getattr(self._outcome, "get_by_assistant_request_id", None)
+        ):
+            raise TypeError(
+                "outcome_query_service 必须提供可调用的 "
+                "get_by_assistant_request_id()（Assistant 终态读边界；"
+                "ai_ops.assistant_outcome_record）"
+                f"（got {type(self._outcome).__name__}）"
+            )
 
     @property
     def llm_usage_query_service(self) -> Any:
@@ -358,6 +395,11 @@ class AssistantTraceQueryService:
     def rag_execution_query_service(self) -> Any:
         """RAG 执行读边界（**Persistent** 读边界；只读引用）。"""
         return self._rag
+
+    @property
+    def outcome_query_service(self) -> Any:
+        """Assistant 终态读边界（只读引用；Step 64）。"""
+        return self._outcome
 
     def get_trace(self, assistant_request_id: str) -> AssistantTraceView:
         """按 Assistant request_id 组装只读 Trace Read Model。
@@ -411,9 +453,12 @@ class AssistantTraceQueryService:
             RagExecutionTraceView.from_row(row)
             for row in self._rag.list_by_request_id(validated)
         )
+        # Step 64：request-level 终态（无记录 → None；**不做任何推断**）
+        outcome = self._outcome.get_by_assistant_request_id(validated)
         return AssistantTraceView(
             assistant_request_id=validated,
             llm_usage=llm_usage,
             tool_executions=tool_executions,
             rag_executions=rag_executions,
+            outcome=outcome,
         )

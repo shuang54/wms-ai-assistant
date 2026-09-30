@@ -407,12 +407,16 @@ class TestCompositionAndRuntimeIsolation:
 
 class TestBackwardCompatibility:
     def test_legacy_fields_unchanged(self) -> None:
-        assert list(AssistantTraceResponse.model_fields)[:3] == [
+        """字段集合：三个 legacy 字段 + Step 48 / Step 64 的 additive 字段。"""
+        assert [
+            name
+            for name in AssistantTraceResponse.model_fields
+            if name not in {"outcome", "rag_executions"}
+        ] == [
             "assistant_request_id", "llm_usage", "tool_executions",
         ]
-        assert list(AssistantTraceResponse.model_fields)[3:] == [
-            "rag_executions",
-        ]
+        assert list(AssistantTraceResponse.model_fields)[1] == "outcome"   # Step 64
+        assert list(AssistantTraceResponse.model_fields)[-1] == "rag_executions"
 
     def test_view_accepts_three_sources(self) -> None:
         trace = AssistantTraceView(
