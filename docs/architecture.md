@@ -4182,6 +4182,34 @@ PostgreSQL E2E（Phase 3.12 Step 69；`tests/test_assistant_timeline_db_e2e.py`�
 
 ---
 
+## 8.74 Assistant Timeline 并发隔离与一致性（Phase 3.12 Step 70 — Audit / PASS）
+
+> 记录：`docs/evaluation/phase-3.12-step-70-timeline-concurrency-audit.md`
+> 测试：`tests/test_assistant_timeline_concurrency_db_e2e.py`（14 DB-gated；离线全 SKIP）
+
+```text
+并发模型：httpx.AsyncClient(ASGITransport) + asyncio.gather（真并发；非串行）
+         真实 PostgreSQL + 真实 persistence + 真实 API；Fake LLM 仅替换传输层
+规模：5 并发 + 10 并发（非压力测试）
+
+结论（隔离与一致性）：
+    Case A 5×RAG：每段 llm1/rag1/tool0/SUCCESS · 5 个互异 id ✅
+    Case B 混合：RAG↔Tool 的 source_id 集合两两不相交；无跨类型串线 ✅
+    Case C 并发 T2SQL retry：每请求 llm_events=2，组内 (created_at,id)；不声称 attempt ✅
+    Case D 并发 Refusal：llm1/REFUSED，Validator/Executor=0，互不包含 ✅
+    DB 级隔离：A∩B=∅ 对 LLM/Tool/RAG/Outcome 四表分别成立 ✅
+    Count consistency：DB 行数 == API 段长度（四类场景）✅
+    Read consistency：重复读取相等；读 B 不改变 A ✅
+    source_id：int 且 ∈ 本请求 DB PK（非 uuid / 下标 / sequence）✅
+    Ordering：仅组内顺序；**无**跨请求全局顺序（Contract 本就没有）✅
+    Security：并发全量 JSON 扫描无敏感内容；sentinel 跨请求不出现 ✅
+    Failure isolation：成功/失败并发时，失败请求不污染其它请求 Timeline ✅
+    Cleanup：step70 residue = 0（定向 DELETE，无 TRUNCATE）✅
+未发现生产 bug；未修改任何生产代码 / DB schema / persistence / API contract
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
