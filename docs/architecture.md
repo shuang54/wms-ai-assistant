@@ -4056,6 +4056,32 @@ Schema（最小）：ai_ops.assistant_outcome_record
 
 ---
 
+## 8.70 Unified Timeline 可行性（Phase 3.12 Step 65 — Audit Only / BLOCKED）
+
+> 记录：`docs/evaluation/phase-3.12-step-65-unified-timeline-audit.md`
+> 测试：`tests/test_assistant_timeline_audit.py`（30；离线 · 无 DB · 无网络）
+> **未实现 Timeline**：production code / DB schema / API / migration 变更 = 0。
+
+```text
+Correlation   ✅ 四源均可按 Assistant Request 关联
+                 LLM: assistant_request_id + request_id(Provider，两维度严格分离)
+                 Tool/RAG: request_id == Assistant Request ID（无独立 scope）
+                 Outcome: assistant_request_id UNIQUE（至多 1 条终态）
+组内排序       ✅ LLM (created_at,id) · Tool/RAG (id) · Outcome (至多 1 行)
+跨源排序       ⚠️ 仅同钟域可比：LLM↔Outcome 同 DB 钟（DERIVED，反映**落库**序）；
+                 Tool↔RAG 同 App 钟（DERIVED）；跨钟域 = UNSAFE_TO_DERIVE
+event_id       ❌ NOT_AVAILABLE（四表 / 四 DTO / View / Snapshot 均无；禁止生成）
+sequence       ❌ NOT_AVAILABLE（无列；读路径无 enumerate/sorted/merge）
+缺失事件       ❌ Router 决策 / Validator 判定 / Executor 执行 / Tool 参数提取
+缺时间字段     ❌ LLM·Outcome 无 started_at/finished_at/duration_ms；
+                 Tool·RAG 无 created_at；attempt/route/success（LLM 侧）不可得
+
+结论：**Assistant Timeline（按来源分组 + 组内有序 + 显式 not_available）= 可做**；
+      **Unified（单一全局有序事件流）= BLOCKED**（缺事件身份 / 统一时间 / 缺失事件）
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
