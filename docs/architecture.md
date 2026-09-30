@@ -4082,6 +4082,41 @@ sequence       ❌ NOT_AVAILABLE（无列；读路径无 enumerate/sorted/merge�
 
 ---
 
+## 8.71 Assistant Timeline 分组投影（Phase 3.12 Step 66 — Implemented / Read Model Only）
+
+> 前置：§8.70（Step 65 审计：Assistant Timeline = READY，Unified = **BLOCKED**）
+
+```text
+Assistant Trace（四段事实）
+    ↓ AssistantTimelineQueryService（只读投影；**不** merge / **不**跨组排序）
+AssistantTimeline（frozen）
+    ├── llm_events      LLM Usage       created_at ASC, id ASC
+    ├── tool_events     Tool Execution  id ASC
+    ├── rag_events      RAG Execution   id ASC
+    └── outcome_event   Outcome         0 或 1 条（UNIQUE）
+
+AssistantTimelineEvent（frozen；9 字段）
+    assistant_request_id · source · event_type · source_id
+    started_at · finished_at · duration_ms · created_at · status
+    source     ∈ {llm_usage, tool_execution, rag_execution, assistant_outcome}
+    event_type ∈ {LLM, TOOL, RAG, OUTCOME}（无 ROUTER / VALIDATOR / EXECUTOR）
+    source_id  = **真实数据库主键**（llm/tool/rag/outcome .id；禁止生成 / 伪造）
+    时间映射（Step 65 §十）：LLM·Outcome 只有 created_at（DB 钟）；
+                            Tool·RAG 只有 started/finished/duration（App 钟）—— **钟域互斥**
+    status     ：LLM·RAG = None（表中无 success，不推断）·
+                 Tool = success/failed · Outcome = SUCCESS/EMPTY/REFUSED/FAILED
+
+不做的（Step 65 结论未变）：
+    event_id · sequence · span_id · parent_event_id · 统一 started_at
+    · 跨钟域排序 · 合并为 events[] · Validator/Executor 事件 · HTTP 端点
+边界：只读（DB 只经既有 Query Service；无 create_engine / Session）·
+     未知 request → 空 Timeline（非 404）· 无终态记录 → outcome_event=None（不推断）·
+     跨请求严格隔离 · Assistant Trace API 与 LLM/Tool/RAG 持久化 schema 未改
+测试：tests/test_assistant_timeline_projection.py（33；离线 · Fake 读边界）
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。

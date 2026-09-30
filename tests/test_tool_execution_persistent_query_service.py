@@ -797,8 +797,14 @@ class TestPersistentQueryStaticBoundaries:
             if not name.startswith("_")
         }
         # Step 41：+ list_by_request_id（Assistant Trace 的只读 Tool 数据源）
+        # Step 66：+ list_rows_by_request_id（additive；行含主键 id，供
+        #          Assistant Timeline 分组投影的 source_id；Snapshot 契约不变）
         assert public == {
-            "list_recent", "list_by_request_id", "metrics", "repository",
+            "list_recent",
+            "list_by_request_id",
+            "list_rows_by_request_id",
+            "metrics",
+            "repository",
         }, public
         identifiers = {
             node.id.lower()

@@ -1312,6 +1312,9 @@ class TestC37PersistentHistoryPaginationBoundary:
         } == {
             "list_recent",          # History 分页
             "list_by_request_id",   # Step 41：Assistant Trace 的 Tool 数据源
+            # Step 66：additive —— 返回**行**（含主键 id），供 Assistant
+            #          Timeline 分组投影的 source_id；Snapshot 契约不变
+            "list_rows_by_request_id",
             "metrics",              # Step 33
             "repository",
         }
@@ -1728,6 +1731,9 @@ class TestC39PersistentMetricsBoundary:
         } == {
             "list_recent",          # History 分页
             "list_by_request_id",   # Step 41：Assistant Trace 的 Tool 数据源
+            # Step 66：additive —— 返回**行**（含主键 id），供 Assistant
+            #          Timeline 分组投影的 source_id；Snapshot 契约不变
+            "list_rows_by_request_id",
             "metrics",              # Step 33
             "repository",
         }

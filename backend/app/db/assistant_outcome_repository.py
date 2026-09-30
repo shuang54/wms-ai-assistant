@@ -57,7 +57,12 @@ __all__ = [
 ]
 
 #: 只读查询允许返回的字段（显式列，**不用** SELECT *）。
+#:
+#: ``id``（Phase 3.12 Step 66 additive）：Assistant Timeline 分组投影需要
+#: **真实数据库主键**作为 ``AssistantTimelineEvent.source_id``（Step 66 §九：
+#: 禁止生成 / 伪造 ID）。Assistant Trace 的 ``outcome`` 字段（枚举）语义不变。
 ASSISTANT_OUTCOME_READ_COLUMNS: Final[tuple[str, ...]] = (
+    "id",
     "assistant_request_id",
     "outcome",
     "created_at",
@@ -72,9 +77,14 @@ class AssistantOutcomeRow:
     """Repository 层内部只读记录（**不是** ORM 对象）。
 
     字段严格等于 :data:`ASSISTANT_OUTCOME_READ_COLUMNS`
-    （无 id / 无 prompt / 无 content / 无 route / 无 error 信息）。
+    （无 prompt / 无 content / 无 route / 无 error 信息）。
+
+    ``id``（Phase 3.12 Step 66 additive）：数据库主键，供 Assistant Timeline
+    的 ``source_id`` 使用（真实主键；**不生成 / 不伪造** ID）。
+    Assistant Trace 的 ``outcome`` 语义（枚举 / 无记录 → ``None``）不变。
     """
 
+    id: int
     assistant_request_id: str
     outcome: str
     created_at: datetime
@@ -241,6 +251,7 @@ class AssistantOutcomeRepository:
         if row is None:
             return None
         return AssistantOutcomeRow(
+            id=row.id,
             assistant_request_id=row.assistant_request_id,
             outcome=row.outcome,
             created_at=row.created_at,

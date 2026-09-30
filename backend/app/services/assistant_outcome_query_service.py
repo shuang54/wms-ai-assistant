@@ -78,3 +78,25 @@ class AssistantOutcomeQueryService:
             raise ValueError(
                 "assistant_outcome_record.outcome 值非法（非四态之一）"
             ) from exc
+
+    def get_row_by_assistant_request_id(
+        self,
+        assistant_request_id: str,
+    ) -> Any | None:
+        """读取该 Assistant 请求的终态**行**（含主键 ``id`` / ``created_at``）。
+
+        Phase 3.12 Step 66（**additive**；本服务原方法语义完全不变）：
+
+            * 供 Assistant Timeline 分组投影构造 ``OUTCOME`` 事件需要
+              ``source_id``（真实主键）与 ``created_at``；
+            * 返回 Repository 的内部行 ``AssistantOutcomeRow``
+              （**不是** ORM 对象）；无记录 → ``None``；
+            * 只读：无写入 / 无聚合 / 无缓存。
+
+        Raises:
+            ValueError:                      assistant_request_id 非法。
+            AssistantOutcomeRepositoryError: DB 未配置或查询失败。
+        """
+        return self._repository.get_by_assistant_request_id(
+            assistant_request_id
+        )

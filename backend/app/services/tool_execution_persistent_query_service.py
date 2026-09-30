@@ -184,6 +184,28 @@ class ToolExecutionPersistentQueryService:
 
     # ---------- 对外 Contract ----------
 
+    def list_rows_by_request_id(
+        self, request_id: str,
+    ) -> list[ToolExecutionRecordRow]:
+        """只读：取同一 request_id 的全部 Tool Execution **行**（含主键 ``id``）。
+
+        Phase 3.12 Step 66（**additive**，不改变 :meth:`list_by_request_id`）：
+
+            * 与 :meth:`list_by_request_id` **同一个数据源 / 同一排序**
+              （``ai_ops.tool_execution_record`` · ``ORDER BY id ASC``）；
+            * 差异仅在于：本方法返回 ``ToolExecutionRecordRow``（**含数据库主键
+              ``id``**），供 Assistant Timeline 分组投影使用 ``source_id``
+              （Step 66 §九：身份必须是**真实主键**，禁止生成 / 伪造）；
+            * ``ToolExecutionSnapshot``（11 字段）继续**不含**主键 ——
+              Assistant Trace / Runtime API 契约**完全不变**。
+
+        Raises:
+            ValueError:                   request_id 非法（触达 DB 之前）。
+            ToolExecutionRepositoryError: DB 未配置 / 查询失败（**不**降级为空列表）。
+        """
+        validated = _validate_required_request_id(request_id)
+        return list(self._repository.get_by_request_id(validated))
+
     @staticmethod
     def _to_snapshot(row: ToolExecutionRecordRow) -> ToolExecutionSnapshot:
         """``ToolExecutionRecordRow`` → ``ToolExecutionSnapshot``（显式映射）。

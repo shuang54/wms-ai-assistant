@@ -120,7 +120,9 @@ class _FakeOutcomeRepository:
         outcome = self.rows.get(assistant_request_id)
         if outcome is None:
             return None
+        # Step 66 additive：Row 新增 ``id``（真实主键，供 Timeline source_id）
         return AssistantOutcomeRow(
+            id=abs(hash(assistant_request_id)) % 100000,
             assistant_request_id=assistant_request_id,
             outcome=outcome,
             created_at=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),

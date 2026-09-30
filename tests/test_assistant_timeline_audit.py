@@ -174,7 +174,8 @@ _SOURCE_READ_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     "LLM_USAGE": LLM_USAGE_TRACE_READ_COLUMNS,
     "TOOL_EXECUTION": TOOL_EXECUTION_READ_COLUMNS,
     "RAG_EXECUTION": RAG_EXECUTION_READ_COLUMNS,
-    "ASSISTANT_OUTCOME": ("assistant_request_id", "outcome", "created_at"),
+    # Step 66 additive：``id`` 进入 Outcome 读白名单（真实主键 → Timeline source_id）
+    "ASSISTANT_OUTCOME": ("id", "assistant_request_id", "outcome", "created_at"),
 }
 
 #: DB 生成的列（``server_default``）—— 与 App 生成的时间戳**不同钟域**。
@@ -275,8 +276,8 @@ class TestCorrelationAudit:
         }
         for source, read_columns in expected.items():
             assert read_columns <= set(_SOURCE_COLUMNS[source]), source
-        # Outcome 主键不进入读边界（排序由 UNIQUE 键 + 至多 1 行保证）
-        assert "id" not in expected["ASSISTANT_OUTCOME"]
+        # Step 66 additive：Outcome 主键进入读白名单（Timeline 事件身份 = 真实主键）
+        assert "id" in expected["ASSISTANT_OUTCOME"]
 
     def test_1b_matrix_covers_all_audit_keys(self) -> None:
         for source, matrix in FIELD_MATRIX.items():
