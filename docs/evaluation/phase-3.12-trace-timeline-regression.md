@@ -251,6 +251,28 @@ registration execution coverage（**按文件**计数；不是 pass rate，不�
 OBSERVABILITY_HTTP_ALLOWLIST：files = 4 · offline = 4 · DB = 0 · missing = 0
 ```
 
+## 7.4 Offline Execution Summary Contract（Step 83）
+
+```text
+Offline Matrix  →  Execution（既有 _offline_suite，18 文件，会话内单次缓存）
+                →  Structured Summary（RegressionExecutionSummary，**in-memory**）
+
+Summary 字段：total · passed · skipped · failed · errors · exit_code
+              （+ duration_seconds 仅信息字段，compare=False，不参与 equality）
+
+语义：
+    PASS : exit_code == 0  AND  failed == 0  AND  errors == 0
+    FAIL : failed > 0  OR  errors > 0  OR  exit_code != 0
+    SKIP : skipped 只是统计量 —— **不等于失败**
+           （RUN_DB_TESTS 未开启导致的 DB-gated skip 属 SKIPPED，非 FAILED）
+
+算术：total == passed + skipped + failed + errors（构造时校验，违反 → ValueError）
+解析：只取 pytest terminal summary 的 4 个已建模桶；warnings 不计入；
+      xfail / xpass / deselected 不塞进 total，由 `_unexpected_outcome_tokens` 单独暴露
+      （本阶段实测为空）
+实现边界：无 pytest plugin / 无 conftest hook / 无 HTML·JSON·DB·Redis·Grafana 持久化
+```
+
 ## 8. 漂移检测
 
 ```text

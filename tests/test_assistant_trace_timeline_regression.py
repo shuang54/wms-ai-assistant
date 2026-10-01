@@ -35,7 +35,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -56,6 +56,25 @@ _COLLECT_TIMEOUT_SECONDS = 30
 
 #: 解析 pytest ``--collect-only -q`` 的 "N tests collected" 行。
 _COLLECT_COUNT_PATTERN = re.compile(r"(\d+)\s+tests?\s+collected")
+
+#: Step 83：pytest terminal summary 的 outcome 计数（值 → 需要的计数桶）。
+#: 只映射 4 个必需桶；``warnings`` 不计入（非 outcome），xfail/xpass/deselected
+#: 由 ``_unexpected_outcome_tokens`` 单独暴露，**不塞进 total**。
+_OUTCOME_BUCKETS: dict[str, str] = {
+    "passed": "passed",
+    "failed": "failed",
+    "error": "errors",
+    "errors": "errors",
+    "skipped": "skipped",
+}
+
+#: 任何 "N <outcome>" 计数 token（用于发现未建模的 outcome 类别）。
+_OUTCOME_TOKEN_PATTERN = re.compile(
+    r"(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)"
+)
+
+#: terminal summary 的耗时（"in 9.17s"）；仅用于信息字段，不参与 equality。
+_DURATION_PATTERN = re.compile(r"\bin\s+(\d+(?:\.\d+)?)s\b")
 
 #: Step 74 专属残留命名空间（定向清理；禁止 TRUNCATE / DELETE ALL）。
 _STEP74_PREFIX = "step74-"
@@ -470,6 +489,118 @@ def _category_suite_coverage() -> dict[str, dict[str, tuple[str, ...]]]:
             "missing": tuple(sorted((files & registered) - (offline | db))),
         }
     return coverage
+
+
+@dataclass(frozen=True)
+class RegressionExecutionSummary:
+    """Offline Regression Matrix 执行结果摘要（Phase 3.12 Step 83）。
+
+    语义（§六）：
+
+        PASS : ``exit_code == 0`` ∧ ``failed == 0`` ∧ ``errors == 0``
+        FAIL : ``failed > 0`` ∨ ``errors > 0`` ∨ ``exit_code != 0``
+        SKIP : ``skipped`` 只是统计量，**不等于**失败
+
+    只表达 Matrix 执行结果；**不含** DB 行数 / token / 网络调用等运行时指标。
+    ``duration_seconds`` 仅信息字段（``compare=False``，不参与 equality）。
+    """
+
+    total: int
+    passed: int
+    skipped: int
+    failed: int
+    errors: int
+    exit_code: int
+    duration_seconds: float | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in ("total", "passed", "skipped", "failed", "errors", "exit_code"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} 必须是 int（当前: {value!r}）")
+        for name in ("total", "passed", "skipped", "failed", "errors"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} 不能为负")
+        if self.total != self.passed + self.skipped + self.failed + self.errors:
+            raise ValueError(
+                "total 必须等于 passed + skipped + failed + errors"
+                f"（{self.total} != {self.passed}+{self.skipped}"
+                f"+{self.failed}+{self.errors}）"
+            )
+        if self.duration_seconds is not None and self.duration_seconds < 0:
+            raise ValueError("duration_seconds 不能为负")
+
+    @property
+    def status(self) -> str:
+        if self.exit_code != 0 or self.failed > 0 or self.errors > 0:
+            return "FAIL"
+        return "PASS"
+
+    @property
+    def is_pass(self) -> bool:
+        return self.status == "PASS"
+
+
+def _parse_pytest_summary(
+    stdout: str,
+    *,
+    exit_code: int,
+    duration_seconds: float | None = None,
+) -> RegressionExecutionSummary:
+    """解析 pytest terminal summary（"N passed, M skipped in Xs"）。
+
+    只取**已建模**的 4 个 outcome 桶；``warnings`` 不计入；
+    xfail/xpass/deselected 由 ``_unexpected_outcome_tokens`` 单独暴露。
+    """
+    counts = {"passed": 0, "skipped": 0, "failed": 0, "errors": 0}
+    for number, outcome in _OUTCOME_TOKEN_PATTERN.findall(stdout):
+        bucket = _OUTCOME_BUCKETS.get(outcome)
+        if bucket is not None:
+            counts[bucket] += int(number)
+
+    total = counts["passed"] + counts["skipped"] + counts["failed"] + counts["errors"]
+    return RegressionExecutionSummary(
+        total=total,
+        passed=counts["passed"],
+        skipped=counts["skipped"],
+        failed=counts["failed"],
+        errors=counts["errors"],
+        exit_code=exit_code,
+        duration_seconds=duration_seconds,
+    )
+
+
+def _unexpected_outcome_tokens(stdout: str) -> tuple[str, ...]:
+    """未建模的 outcome token（xfailed / xpassed / deselected …）；warnings 不算。"""
+    unexpected: list[str] = []
+    for _, outcome in _OUTCOME_TOKEN_PATTERN.findall(stdout):
+        if outcome in _OUTCOME_BUCKETS or outcome in {"warning", "warnings"}:
+            continue
+        if outcome not in unexpected:
+            unexpected.append(outcome)
+    return tuple(unexpected)
+
+
+def _parse_duration(stdout: str) -> float | None:
+    match = _DURATION_PATTERN.search(stdout)
+    return float(match.group(1)) if match else None
+
+
+@lru_cache(maxsize=1)
+def _offline_suite_execution() -> subprocess.CompletedProcess[str]:
+    """执行一次 offline suite（会话内缓存；供 gate 测试与 summary 共用）。"""
+    return _run_pytest(_offline_suite(), with_db=False)
+
+
+@lru_cache(maxsize=1)
+def _offline_execution_summary() -> RegressionExecutionSummary:
+    """真实 offline suite 执行 → 结构化 summary（in-memory；无持久化）。"""
+    result = _offline_suite_execution()
+    return _parse_pytest_summary(
+        result.stdout,
+        exit_code=result.returncode,
+        duration_seconds=_parse_duration(result.stdout),
+    )
 
 
 @dataclass(frozen=True)
@@ -966,6 +1097,104 @@ class TestRegressionMatrixExecutionCoverage:
 
 
 # ============================================================
+# Offline Execution Summary Contract（Phase 3.12 Step 83 · in-memory）
+#
+# Offline Matrix → 执行既有 offline suite → 结构化 summary（单一缓存执行）。
+# 只解析 pytest terminal summary；不写 HTML / JSON / DB；不引入 pytest plugin。
+# ============================================================
+
+class TestOfflineRegressionExecutionSummary:
+    def test_summary_dto_is_immutable(self) -> None:
+        summary = _parse_pytest_summary("10 passed in 0.5s\n", exit_code=0)
+
+        with pytest.raises(Exception) as excinfo:
+            summary.passed = 99  # type: ignore[misc]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+        # duration 不参与 equality（信息字段）
+        same = _parse_pytest_summary(
+            "10 passed in 9.9s\n", exit_code=0, duration_seconds=9.9
+        )
+        assert same == summary
+        assert same.duration_seconds != summary.duration_seconds
+
+    def test_all_pass_summary_is_pass(self) -> None:
+        summary = _parse_pytest_summary("10 passed in 0.5s\n", exit_code=0)
+
+        assert (summary.total, summary.passed, summary.skipped) == (10, 10, 0)
+        assert (summary.failed, summary.errors, summary.exit_code) == (0, 0, 0)
+        assert summary.status == "PASS" and summary.is_pass is True
+
+    def test_pass_with_skips_is_pass(self) -> None:
+        """skipped 只是统计（DB-gated skip 属 SKIPPED，不是 FAIL）。"""
+        summary = _parse_pytest_summary(
+            "356 passed, 19 skipped in 9.17s", exit_code=0
+        )
+
+        assert (summary.total, summary.passed, summary.skipped) == (375, 356, 19)
+        assert summary.status == "PASS"
+
+    def test_failed_summary_is_fail(self) -> None:
+        summary = _parse_pytest_summary(
+            "9 passed, 1 failed in 1.0s", exit_code=1
+        )
+
+        assert summary.failed == 1
+        assert summary.status == "FAIL" and summary.is_pass is False
+
+    def test_error_summary_is_fail(self) -> None:
+        summary = _parse_pytest_summary("1 error in 0.5s", exit_code=1)
+
+        assert summary.errors == 1
+        assert summary.status == "FAIL"
+
+    def test_non_zero_exit_code_is_fail(self) -> None:
+        """即使计数全绿，exit_code != 0 也是 FAIL（如 collection error / no tests）。"""
+        summary = _parse_pytest_summary("10 passed in 0.5s", exit_code=5)
+
+        assert summary.status == "FAIL"
+
+    def test_summary_arithmetic_consistency(self) -> None:
+        summary = _parse_pytest_summary(
+            "3 passed, 2 skipped, 1 failed in 1.0s", exit_code=1
+        )
+
+        assert summary.total == (
+            summary.passed + summary.skipped + summary.failed + summary.errors
+        )
+        # 算术不一致 → 拒绝构造（total 必须等于四项之和）
+        with pytest.raises(ValueError):
+            RegressionExecutionSummary(
+                total=8, passed=3, skipped=2, failed=1, errors=0, exit_code=1
+            )
+        # 非 int（bool）→ 拒绝
+        with pytest.raises(ValueError):
+            RegressionExecutionSummary(
+                total=6, passed=6, skipped=0, failed=0, errors=0,
+                exit_code=True,  # type: ignore[arg-type]
+            )
+        # 负数 exit_code（被信号终止）是**合法表达**，但必须是 FAIL
+        killed = _parse_pytest_summary("6 passed in 0.5s", exit_code=-9)
+
+        assert killed.status == "FAIL" and killed.is_pass is False
+
+    def test_real_offline_suite_execution_summary(self) -> None:
+        """真实执行 `_offline_suite`（18 文件）并断言 summary 契约。"""
+        summary = _offline_execution_summary()
+        result = _offline_suite_execution()
+
+        assert len(_offline_suite()) == EXPECTED_MATRIX_SCALE["offline_files"] == 18
+        assert summary.total > 0
+        assert summary.status == "PASS", result.stdout[-1500:]
+        assert summary.exit_code == 0
+        assert summary.failed == 0 and summary.errors == 0
+        assert summary.total == (
+            summary.passed + summary.skipped + summary.failed + summary.errors
+        )
+        # 未建模的 outcome 类别（xfail / xpass / deselected…）必须为空
+        assert _unexpected_outcome_tokens(result.stdout) == ()
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -1052,7 +1281,7 @@ class TestEntryHygiene:
 class TestRegressionSuite:
     def test_offline_gate_suite_is_green(self) -> None:
         """离线 suite（RUN_DB_TESTS 已清空）必须全绿。"""
-        result = _run_pytest(_offline_suite(), with_db=False)
+        result = _offline_suite_execution()
 
         assert result.returncode == 0, (
             "离线 Trace / Timeline 回归失败\n"
@@ -1095,7 +1324,9 @@ __all__ = [
     "REPRESENTATIVE_CONTRACT_NODES",
     "CollectReport",
     "FileSpec",
+    "RegressionExecutionSummary",
     "TestEntryHygiene",
+    "TestOfflineRegressionExecutionSummary",
     "TestRegressionMatrixCollectability",
     "TestRegressionMatrixContract",
     "TestRegressionMatrixExecutionCoverage",
