@@ -459,6 +459,37 @@ Matrix Scale remains 13 / 28 / 18 / 15
 Node-hosted Contract count is intentionally excluded
 ```
 
+## 7.9 Matrix Execution Summary（Step 89 · 实际执行）
+
+```text
+实际执行 → MatrixExecutionSummary（immutable）→ Contract 验证
+
+MatrixExecutionSummary
+    offline: RegressionExecutionSummary            （复用 Step 83/84 DTO，未新建类型）
+    db:      RegressionExecutionSummary | None     （仅由环境可用性决定）
+    db_skip_reason: str | None                     （db 未执行时必须给出原因，不得静默）
+
+契约
+    · PASS / FAIL 语义沿用 Step 84（exit_code / failed / errors）；skipped 不代表失败
+    · 算术：total == passed + skipped + failed + errors（每个已执行部分）
+    · Matrix 级：任一已执行部分 FAIL ⇒ Matrix FAIL；status = PASS 仅当全部通过
+    · total = 已执行部分之和（Node-hosted Contract **不**计入 execution count）
+    · Scale（注册结构 13/28/18/15）≠ Execution（实际执行结果）≠ Snapshot（375/356/19）
+    · Snapshot 不被更新：只报告 drift（复用 Step 85 classifier，无自动 baseline 更新）
+```
+
+实测（2026-10-01 · 本机测试 PG · 一次执行）：
+
+```text
+Offline : total 375 · passed 356 · skipped 19 · failed 0 · errors 0 · exit_code 0 · PASS
+DB      : total 180 · passed 180 · skipped   0 · failed 0 · errors 0 · exit_code 0 · PASS
+Matrix  : total 555 · status PASS · executed parts 2
+Drift   : current(offline) vs frozen snapshot → **NO_DRIFT**
+DB residue：llm_usage_record 0 · tool_execution_record 0 ·
+            rag_execution_record 0 · assistant_outcome_record 0
+（duration 仅信息字段，不进入 Contract）
+```
+
 ## 8. 漂移检测
 
 ```text

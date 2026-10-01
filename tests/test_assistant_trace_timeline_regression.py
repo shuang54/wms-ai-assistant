@@ -575,6 +575,57 @@ def _category_suite_coverage() -> dict[str, dict[str, tuple[str, ...]]]:
 
 
 @dataclass(frozen=True)
+class MatrixExecutionSummary:
+    """整张 Regression Matrix 的**实际执行**汇总（Phase 3.12 Step 89）。
+
+    * ``offline`` = offline suite 实际执行结果（复用 ``RegressionExecutionSummary``）；
+    * ``db`` = DB suite 实际执行结果；环境不满足 DB 条件时为 ``None``（并记录原因，
+      **不伪造 PASS**）；
+    * ``db_skip_reason`` = 仅在 ``db is None`` 时非空。
+
+    不含 Node-hosted Contract（它只是 Contract Audit，不参与 execution count）。
+    """
+
+    offline: RegressionExecutionSummary
+    db: RegressionExecutionSummary | None = None
+    db_skip_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.offline, RegressionExecutionSummary):
+            raise ValueError("offline 必须是 RegressionExecutionSummary")
+        if self.db is not None:
+            if not isinstance(self.db, RegressionExecutionSummary):
+                raise ValueError("db 必须是 RegressionExecutionSummary | None")
+            if self.db_skip_reason is not None:
+                raise ValueError("db 已执行时不得再记录 db_skip_reason")
+        elif not self.db_skip_reason:
+            raise ValueError("db 未执行时必须记录 db_skip_reason（不得静默）")
+
+    @property
+    def executed_parts(self) -> tuple[RegressionExecutionSummary, ...]:
+        return tuple(
+            part for part in (self.offline, self.db) if part is not None
+        )
+
+    @property
+    def total(self) -> int:
+        """已执行部分的用例总数（Node-hosted Contract 不计入）。"""
+        return sum(part.total for part in self.executed_parts)
+
+    @property
+    def status(self) -> str:
+        return (
+            "PASS"
+            if all(part.is_pass for part in self.executed_parts)
+            else "FAIL"
+        )
+
+    @property
+    def is_pass(self) -> bool:
+        return self.status == "PASS"
+
+
+@dataclass(frozen=True)
 class RegressionExecutionSummary:
     """Offline Regression Matrix 执行结果摘要（Phase 3.12 Step 83）。
 
@@ -683,6 +734,58 @@ def _offline_execution_summary() -> RegressionExecutionSummary:
         result.stdout,
         exit_code=result.returncode,
         duration_seconds=_parse_duration(result.stdout),
+    )
+
+
+@lru_cache(maxsize=1)
+def _db_execution_available() -> tuple[bool, str]:
+    """DB suite 是否可安全执行（只读探测；函数内延迟 import，避免模块级 DB 依赖）。"""
+    try:
+        from backend.app.db.session import get_engine
+    except Exception as exc:  # noqa: BLE001 —— 导入失败同样视为不可用
+        return False, f"DB 会话模块不可导入：{type(exc).__name__}"
+
+    try:
+        engine = get_engine()
+    except Exception as exc:  # noqa: BLE001
+        return False, f"get_engine() 失败：{type(exc).__name__}"
+    if engine is None:
+        return False, "DATABASE_URL 未配置（DB 功能禁用）"
+    return True, ""
+
+
+@lru_cache(maxsize=1)
+def _db_suite_execution() -> subprocess.CompletedProcess[str]:
+    """执行一次 DB suite（``RUN_DB_TESTS=1``；会话内缓存，只跑一次）。"""
+    return _run_pytest(_db_suite(), with_db=True)
+
+
+@lru_cache(maxsize=1)
+def _db_execution_summary() -> RegressionExecutionSummary | None:
+    """DB suite 实际执行结果；环境不满足 → ``None``（不伪造 PASS）。"""
+    available, _ = _db_execution_available()
+    if not available:
+        return None
+    result = _db_suite_execution()
+    return _parse_pytest_summary(
+        result.stdout,
+        exit_code=result.returncode,
+        duration_seconds=_parse_duration(result.stdout),
+    )
+
+
+@lru_cache(maxsize=1)
+def _matrix_execution_summary() -> MatrixExecutionSummary:
+    """整张 Matrix 的实际执行汇总（offline + DB；Node-hosted 不计入）。"""
+    available, reason = _db_execution_available()
+    db_summary = _db_execution_summary() if available else None
+    if db_summary is None:
+        return MatrixExecutionSummary(
+            offline=_offline_execution_summary(),
+            db_skip_reason=reason or "DB suite 未执行（环境不满足）",
+        )
+    return MatrixExecutionSummary(
+        offline=_offline_execution_summary(), db=db_summary
     )
 
 
@@ -1834,6 +1937,132 @@ class TestOfflineRegressionSnapshotDrift:
 
 
 # ============================================================
+# Matrix Execution Summary（Phase 3.12 Step 89 · 实际执行）
+#
+# 只汇总 offline suite + DB suite 的**实际**执行结果；不复用/不重复 Step 83～85
+# 的纯单元测试；不修改 Snapshot（只报告 drift）。
+# ============================================================
+
+class TestMatrixExecutionSummary:
+    def test_matrix_execution_summary_is_immutable(self) -> None:
+        summary = _matrix_execution_summary()
+
+        with pytest.raises(Exception) as excinfo:
+            summary.offline = None  # type: ignore[assignment]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+        assert not hasattr(summary, "node_hosted")
+        # db 未执行时必须给原因（不得静默）；已执行时不得再给原因
+        with pytest.raises(ValueError):
+            MatrixExecutionSummary(offline=_summary(1))
+        with pytest.raises(ValueError):
+            MatrixExecutionSummary(
+                offline=_summary(1), db=_summary(1), db_skip_reason="x"
+            )
+        skipped = MatrixExecutionSummary(offline=_summary(1), db_skip_reason="env")
+
+        assert skipped.db is None and skipped.status == "PASS"
+
+    def test_offline_summary_uses_real_execution_result(self) -> None:
+        summary = _matrix_execution_summary().offline
+        result = _offline_suite_execution()
+
+        assert len(_offline_suite()) == EXPECTED_MATRIX_SCALE["offline_files"] == 18
+        assert summary.total > 0
+        assert summary.exit_code == result.returncode
+        assert summary.duration_seconds == _parse_duration(result.stdout)
+        assert summary == _parse_pytest_summary(
+            result.stdout,
+            exit_code=result.returncode,
+            duration_seconds=_parse_duration(result.stdout),
+        )
+
+    def test_db_summary_uses_real_execution_result(self) -> None:
+        matrix = _matrix_execution_summary()
+        available, reason = _db_execution_available()
+
+        if not available:
+            assert matrix.db is None
+            assert matrix.db_skip_reason == reason and reason
+            pytest.skip(f"DB execution = SKIPPED（{reason}）")
+        assert matrix.db is not None
+        assert matrix.db_skip_reason is None
+        assert len(_db_suite()) == EXPECTED_MATRIX_SCALE["db_files"] == 15
+        assert matrix.db.total > 0
+        assert matrix.db.exit_code == _db_suite_execution().returncode
+
+    def test_node_hosted_contract_is_not_counted_in_execution(self) -> None:
+        """Node-hosted 只做 Contract Audit，不参与 execution count。"""
+        matrix = _matrix_execution_summary()
+        suite_files = set(_offline_suite()) | set(_db_suite())
+
+        assert NODE_HOSTED_CONTRACT_CATEGORIES  # 存在，但...
+        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
+        assert _SELF not in suite_files
+        # execution 总量只来自已执行的两套 suite
+        assert matrix.total == sum(part.total for part in matrix.executed_parts)
+        assert matrix.total >= matrix.offline.total
+
+    def test_scale_is_not_pass_count(self) -> None:
+        """Scale 表达注册结构，不等于 passed 数量（两维度不可混用）。"""
+        matrix = _matrix_execution_summary()
+
+        assert EXPECTED_MATRIX_SCALE == {
+            "categories": 13,
+            "registered_files": 28,
+            "offline_files": 18,
+            "db_files": 15,
+        }
+        assert matrix.offline.passed != EXPECTED_MATRIX_SCALE["offline_files"]
+        assert matrix.offline.passed > 18
+        if matrix.db is not None:
+            assert matrix.db.passed != EXPECTED_MATRIX_SCALE["db_files"]
+        for value in EXPECTED_MATRIX_SCALE.values():
+            assert value not in {375, 356, 19}, value
+
+    def test_execution_failure_propagates(self) -> None:
+        """任一 suite FAIL → MatrixExecutionSummary FAIL（合成传播验证）。"""
+        passing = _summary(3)
+        failing = _summary(2, failed=1, exit_code=1)
+
+        assert MatrixExecutionSummary(
+            offline=passing, db_skip_reason="env"
+        ).status == "PASS"
+        assert MatrixExecutionSummary(
+            offline=failing, db_skip_reason="env"
+        ).status == "FAIL"
+        assert MatrixExecutionSummary(
+            offline=passing, db=failing
+        ).status == "FAIL"
+        assert MatrixExecutionSummary(
+            offline=passing, db_skip_reason="env"
+        ).status == "PASS"
+        assert _matrix_execution_summary().status in {"PASS", "FAIL"}
+
+    def test_snapshot_drift_reuses_existing_classifier(self) -> None:
+        """复用 Step 85 classifier；Snapshot **不被更新**（只报告差异）。"""
+        matrix = _matrix_execution_summary()
+        frozen_before = dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT)
+
+        drift = classify_snapshot_drift(_frozen_snapshot(), matrix.offline)
+
+        assert drift and set(drift) <= set(_DRIFT_TYPES)
+        assert dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == frozen_before
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["total"] == 375
+
+    def test_summary_arithmetic_consistency(self) -> None:
+        matrix = _matrix_execution_summary()
+
+        for part in matrix.executed_parts:
+            assert part.total == (
+                part.passed + part.skipped + part.failed + part.errors
+            )
+        assert matrix.total == sum(part.total for part in matrix.executed_parts)
+        assert matrix.status == (
+            "PASS" if all(p.is_pass for p in matrix.executed_parts) else "FAIL"
+        )
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -1968,7 +2197,9 @@ __all__ = [
     "CollectReport",
     "FileSpec",
     "RegressionExecutionSummary",
+    "MatrixExecutionSummary",
     "TestEntryHygiene",
+    "TestMatrixExecutionSummary",
     "TestNodeHostedContractRegistration",
     "TestNodeHostedContractRegressionIntegration",
     "TestOfflineRegressionExecutionSummary",
