@@ -490,6 +490,49 @@ DB residue：llm_usage_record 0 · tool_execution_record 0 ·
 （duration 仅信息字段，不进入 Contract）
 ```
 
+## 7.10 Matrix Execution Baseline（Step 90 冻结）
+
+```text
+第三层基线（与 Snapshot / Scale **分离**）：
+
+    Registration Matrix（EXPECTED_MATRIX_SCALE：注册拓扑 13 / 28 / 18 / 15）
+            ↓
+    Actual Execution（Step 89 MatrixExecutionSummary）
+            ↓
+    **Frozen Matrix Execution Baseline**（MATRIX_EXECUTION_BASELINE）
+
+Matrix Execution Baseline = Offline Execution + DB Execution
+```
+
+```text
+冻结值（来源于 Step 89 **实际执行**结果；非手工构造）
+    Offline : total 375 · passed 356 · skipped 19 · failed 0 · errors 0 · exit_code 0 · PASS
+    DB      : total 180 · passed 180 · skipped  0 · failed 0 · errors 0 · exit_code 0 · PASS
+    Matrix  : total **555** · status PASS
+    DB residue : **0**
+```
+
+```text
+Contract
+    · immutable（frozen=True；baseline.offline = … / baseline.db = … 必须失败）
+    · matrix_total == offline.total + db.total（**不是** passed 之和：536 ≠ 555）
+    · matrix_status 由 offline.status ∧ db.status 推导（复用 Step 84 status，无第三套 classifier；
+      构造期校验：status 与部分状态不一致 → ValueError）
+    · db_residue 只保存整数（不含连接 / Session / Query / 表对象）
+    · duration **不**进入 Baseline（informational；compare=False）
+    · 不含 Node-hosted（1 个契约 / 2 条 node 不并入 555）
+
+Drift（不修改 Step 85 的 4 类）
+    compare_matrix_execution_baseline() → NO_BASELINE_DRIFT · OFFLINE_EXECUTION_DRIFT ·
+        DB_EXECUTION_DRIFT · MATRIX_TOTAL_DRIFT · MATRIX_STATUS_DRIFT · DB_RESIDUE_DRIFT
+    实测：MATRIX_EXECUTION_BASELINE == Step 89 实际执行 ⇒ **NO_BASELINE_DRIFT**
+
+边界（三层严格分离）
+    Step 84 Offline Snapshot：**不变**（375 / 356 / 19 / 0 / 0）
+    Matrix Scale：**不变**（13 / 28 / 18 / 15；不得写入 375 / 180 / 555）
+    Node-hosted：仍仅为 Contract Audit（不进入 execution，不进入 Baseline 计数）
+```
+
 ## 8. 漂移检测
 
 ```text

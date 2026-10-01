@@ -625,6 +625,104 @@ class MatrixExecutionSummary:
         return self.status == "PASS"
 
 
+#: Matrix Execution Baseline 的 Drift 分类（Step 90；**不修改** Step 85 的 4 类 Drift）。
+_MATRIX_BASELINE_DRIFT_TYPES: tuple[str, ...] = (
+    "NO_BASELINE_DRIFT",
+    "OFFLINE_EXECUTION_DRIFT",
+    "DB_EXECUTION_DRIFT",
+    "MATRIX_TOTAL_DRIFT",
+    "MATRIX_STATUS_DRIFT",
+    "DB_RESIDUE_DRIFT",
+)
+
+
+@dataclass(frozen=True)
+class MatrixExecutionBaseline:
+    """Phase 3.12 **Matrix Execution Baseline**（Step 90 冻结）。
+
+    第三层基线（与 Step 84 Offline Snapshot / Step 80 Matrix Scale **分离**）：
+
+        Registration Matrix（Scale：注册结构）
+                ↓
+        Actual Execution（Step 89 MatrixExecutionSummary）
+                ↓
+        Frozen Matrix Execution Baseline（本 DTO）
+
+    边界：
+
+        * ``matrix_total`` **必须** = ``offline.total + db.total``（不是 passed 之和）；
+        * ``matrix_status`` 复用 ``RegressionExecutionSummary.status``（**不**新建第三套 classifier）；
+        * ``db_residue`` 只是**整数**（不含连接 / Session / Query 等运行时对象）；
+        * **不含** ``duration``（informational，compare=False）；
+        * 不含 Node-hosted Contract（它只是 Contract Audit，不进入执行计数）。
+    """
+
+    offline: RegressionExecutionSummary
+    db: RegressionExecutionSummary
+    matrix_total: int
+    matrix_status: str
+    db_residue: int
+
+    def __post_init__(self) -> None:
+        for name in ("offline", "db"):
+            if not isinstance(getattr(self, name), RegressionExecutionSummary):
+                raise ValueError(f"{name} 必须是 RegressionExecutionSummary")
+        if not isinstance(self.matrix_total, int) or isinstance(
+            self.matrix_total, bool
+        ):
+            raise ValueError("matrix_total 必须是 int")
+        if self.matrix_total != self.offline.total + self.db.total:
+            raise ValueError(
+                "matrix_total 必须等于 offline.total + db.total"
+                f"（{self.matrix_total} != {self.offline.total}"
+                f" + {self.db.total}）"
+            )
+        expected_status = (
+            "PASS"
+            if self.offline.is_pass and self.db.is_pass
+            else "FAIL"
+        )
+        if self.matrix_status != expected_status:
+            raise ValueError(
+                f"matrix_status 必须由 offline/db status 推导（{expected_status}）"
+            )
+        if not isinstance(self.db_residue, int) or isinstance(
+            self.db_residue, bool
+        ):
+            raise ValueError("db_residue 必须是 int")
+        if self.db_residue < 0:
+            raise ValueError("db_residue 不能为负")
+
+    @property
+    def parts(self) -> tuple[RegressionExecutionSummary, ...]:
+        return (self.offline, self.db)
+
+
+def compare_matrix_execution_baseline(
+    baseline: MatrixExecutionBaseline,
+    current: MatrixExecutionBaseline,
+) -> tuple[str, ...]:
+    """比较 Baseline 与当前执行结果（纯函数；分类属于 ``_MATRIX_BASELINE_DRIFT_TYPES``）。
+
+    只比较：offline · db · matrix_total · matrix_status · db_residue。
+    **不**扩展 Step 85 的 snapshot classifier。
+    """
+    drift: list[str] = []
+
+    if current.offline != baseline.offline:
+        drift.append("OFFLINE_EXECUTION_DRIFT")
+    if current.db != baseline.db:
+        drift.append("DB_EXECUTION_DRIFT")
+    if current.matrix_total != baseline.matrix_total:
+        drift.append("MATRIX_TOTAL_DRIFT")
+    if current.matrix_status != baseline.matrix_status:
+        drift.append("MATRIX_STATUS_DRIFT")
+    if current.db_residue != baseline.db_residue:
+        drift.append("DB_RESIDUE_DRIFT")
+
+    return tuple(drift) if drift else ("NO_BASELINE_DRIFT",)
+
+
 @dataclass(frozen=True)
 class RegressionExecutionSummary:
     """Offline Regression Matrix 执行结果摘要（Phase 3.12 Step 83）。
@@ -673,6 +771,21 @@ class RegressionExecutionSummary:
     @property
     def is_pass(self) -> bool:
         return self.status == "PASS"
+
+
+#: **冻结的 Matrix Execution Baseline**（来源于 Step 89 **实际执行**结果；
+#: duration 有意不记录 —— informational only）。
+MATRIX_EXECUTION_BASELINE: MatrixExecutionBaseline = MatrixExecutionBaseline(
+    offline=RegressionExecutionSummary(
+        total=375, passed=356, skipped=19, failed=0, errors=0, exit_code=0
+    ),
+    db=RegressionExecutionSummary(
+        total=180, passed=180, skipped=0, failed=0, errors=0, exit_code=0
+    ),
+    matrix_total=555,
+    matrix_status="PASS",
+    db_residue=0,
+)
 
 
 def _parse_pytest_summary(
@@ -734,6 +847,58 @@ def _offline_execution_summary() -> RegressionExecutionSummary:
         result.stdout,
         exit_code=result.returncode,
         duration_seconds=_parse_duration(result.stdout),
+    )
+
+
+#: 四张观测表（与各表 request 关联列）—— 只读残留计数使用。
+_RESIDUE_TABLES: tuple[tuple[str, str], ...] = (
+    ("llm_usage_record", "assistant_request_id"),
+    ("tool_execution_record", "request_id"),
+    ("rag_execution_record", "request_id"),
+    ("assistant_outcome_record", "assistant_request_id"),
+)
+
+
+@lru_cache(maxsize=1)
+def _db_residue_total() -> int | None:
+    """四张观测表总行数（只读）；DB 不可用 → ``None``（不猜测）。
+
+    函数内延迟 import（模块顶层保持无 DB 依赖）；不保存任何连接 / Session。
+    """
+    available, _ = _db_execution_available()
+    if not available:
+        return None
+
+    from sqlalchemy import text
+
+    from backend.app.db.session import get_engine
+
+    engine = get_engine()
+    if engine is None:                      # pragma: no cover - 与 available 一致
+        return None
+    with engine.connect() as conn:
+        return sum(
+            int(
+                conn.execute(
+                    text(f"SELECT COUNT(*) FROM ai_ops.{table}")
+                ).scalar_one()
+            )
+            for table, _ in _RESIDUE_TABLES
+        )
+
+
+def _current_matrix_baseline() -> MatrixExecutionBaseline | None:
+    """当前实际执行对应的 Baseline 视图（复用 Step 89 summary；DB 不可用 → None）。"""
+    matrix = _matrix_execution_summary()
+    residue = _db_residue_total()
+    if matrix.db is None or residue is None:
+        return None
+    return MatrixExecutionBaseline(
+        offline=matrix.offline,
+        db=matrix.db,
+        matrix_total=matrix.total,
+        matrix_status=matrix.status,
+        db_residue=residue,
     )
 
 
@@ -982,6 +1147,7 @@ class TestRegistry:
             "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
             "NODE_HOSTED_CONTRACT_CATEGORIES",
             "NODE_HOSTED_REPRESENTATIVE_NODES",
+            "MATRIX_EXECUTION_BASELINE",
         )
         offenders: list[tuple[str, str]] = []
         for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
@@ -2063,6 +2229,250 @@ class TestMatrixExecutionSummary:
 
 
 # ============================================================
+# Matrix Execution Baseline（Phase 3.12 Step 90 · 冻结 Step 89 实际执行结果）
+#
+# Baseline（执行基线） ≠ Snapshot（离线快照） ≠ Scale（注册拓扑）。
+# 不重跑 Matrix（复用 Step 89 execution helper）；duration 不入 Contract。
+# ============================================================
+
+class TestMatrixExecutionBaseline:
+    def test_baseline_dto_is_immutable(self) -> None:
+        baseline = MATRIX_EXECUTION_BASELINE
+
+        for field_name in ("offline", "db", "matrix_total", "matrix_status"):
+            with pytest.raises(Exception) as excinfo:
+                setattr(baseline, field_name, None)
+            assert "frozen" in type(excinfo.value).__name__.lower()
+        assert not hasattr(baseline, "duration")
+
+    def test_baseline_matches_step89_actual_execution(self) -> None:
+        """Baseline 必须等于 Step 89 **实际执行**结果（不得手工构造 PASS）。"""
+        current = _current_matrix_baseline()
+
+        if current is None:
+            pytest.skip(f"DB 不可用（{_db_execution_available()[1]}）")
+        assert MATRIX_EXECUTION_BASELINE == current
+        assert compare_matrix_execution_baseline(
+            MATRIX_EXECUTION_BASELINE, current
+        ) == ("NO_BASELINE_DRIFT",)
+        # 逐字段等价（offline / db / total / status / residue）
+        assert MATRIX_EXECUTION_BASELINE.offline == current.offline
+        assert MATRIX_EXECUTION_BASELINE.db == current.db
+        assert MATRIX_EXECUTION_BASELINE.matrix_total == current.matrix_total == (
+            current.offline.total + current.db.total
+        )
+
+    def test_matrix_total_equals_offline_plus_db(self) -> None:
+        baseline = MATRIX_EXECUTION_BASELINE
+
+        assert baseline.matrix_total == (
+            baseline.offline.total + baseline.db.total
+        ) == 375 + 180 == 555
+        # 明确**不是** passed 之和
+        assert baseline.offline.passed + baseline.db.passed == 536 != (
+            baseline.matrix_total
+        )
+        with pytest.raises(ValueError):
+            MatrixExecutionBaseline(
+                offline=baseline.offline,
+                db=baseline.db,
+                matrix_total=536,
+                matrix_status="PASS",
+                db_residue=0,
+            )
+
+    def test_matrix_status_derives_from_part_statuses(self) -> None:
+        """status 由 offline/db 的 Step 84 status 推导（**不**新建 classifier）。"""
+        baseline = MATRIX_EXECUTION_BASELINE
+
+        assert baseline.matrix_status == "PASS"
+        assert baseline.offline.status == "PASS" and baseline.db.status == "PASS"
+        failing = RegressionExecutionSummary(
+            total=1, passed=0, skipped=0, failed=1, errors=0, exit_code=1
+        )
+        with pytest.raises(ValueError):          # status 与部分状态不一致 → 拒绝构造
+            MatrixExecutionBaseline(
+                offline=failing,
+                db=baseline.db,
+                matrix_total=1 + baseline.db.total,
+                matrix_status="PASS",
+                db_residue=0,
+            )
+        assert MatrixExecutionBaseline(
+            offline=failing,
+            db=baseline.db,
+            matrix_total=1 + baseline.db.total,
+            matrix_status="FAIL",
+            db_residue=0,
+        ).matrix_status == "FAIL"
+
+    def test_db_residue_is_zero(self) -> None:
+        residue = _db_residue_total()
+
+        if residue is None:
+            pytest.skip(f"DB 不可用（{_db_execution_available()[1]}）")
+        assert residue == 0
+        assert MATRIX_EXECUTION_BASELINE.db_residue == residue
+        assert isinstance(MATRIX_EXECUTION_BASELINE.db_residue, int)
+
+    def test_baseline_does_not_modify_offline_snapshot(self) -> None:
+        """Step 84 的 Offline Snapshot 必须保持原值（375 / 356 / 19）。"""
+        before = dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT)
+
+        _ = compare_matrix_execution_baseline(
+            MATRIX_EXECUTION_BASELINE, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == before
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["total"] == 375
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["passed"] == 356
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["skipped"] == 19
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT is not MATRIX_EXECUTION_BASELINE
+
+    def test_baseline_does_not_modify_matrix_scale(self) -> None:
+        """Scale = 注册拓扑（13/28/18/15）；不得写入执行结果（375 / 180 / 555）。"""
+        assert EXPECTED_MATRIX_SCALE == {
+            "categories": 13,
+            "registered_files": 28,
+            "offline_files": 18,
+            "db_files": 15,
+        }
+        for value in EXPECTED_MATRIX_SCALE.values():
+            assert value not in {375, 180, 555}, value
+        assert len(CATEGORIES) == 13  # Node-hosted 不并入 categories
+
+    def test_baseline_excludes_node_hosted_execution(self) -> None:
+        """Node-hosted（1 个契约 / 2 条 node）不进入执行计数。"""
+        baseline = MATRIX_EXECUTION_BASELINE
+        baseline_fields = {item.name for item in fields(MatrixExecutionBaseline)}
+
+        assert not any("node_hosted" in name for name in baseline_fields)
+        assert baseline.matrix_total == (
+            baseline.offline.total + baseline.db.total
+        )
+        assert baseline.matrix_total not in {
+            555 + 1,
+            555 + 2,
+            555 + len(NODE_HOSTED_CONTRACT_CATEGORIES),
+            555 + len(NODE_HOSTED_REPRESENTATIVE_NODES),
+        }
+        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
+
+    def test_baseline_excludes_duration(self) -> None:
+        baseline = MATRIX_EXECUTION_BASELINE
+
+        assert "duration" not in {item.name for item in fields(baseline)}
+        assert baseline.offline.duration_seconds is None
+        assert baseline.db.duration_seconds is None
+        # duration 变化不影响 Baseline equality（compare=False）
+        dated = RegressionExecutionSummary(
+            total=375, passed=356, skipped=19, failed=0, errors=0,
+            exit_code=0, duration_seconds=99.0,
+        )
+        assert dated == baseline.offline
+
+    def test_synthetic_execution_drift_is_detected(self) -> None:
+        baseline = MATRIX_EXECUTION_BASELINE
+        grown_offline = RegressionExecutionSummary(
+            total=380, passed=361, skipped=19, failed=0, errors=0, exit_code=0
+        )
+        grown = MatrixExecutionBaseline(
+            offline=grown_offline,
+            db=baseline.db,
+            matrix_total=grown_offline.total + baseline.db.total,
+            matrix_status="PASS",
+            db_residue=0,
+        )
+        failed_db = RegressionExecutionSummary(
+            total=180, passed=179, skipped=0, failed=1, errors=0, exit_code=1
+        )
+        failing = MatrixExecutionBaseline(
+            offline=baseline.offline,
+            db=failed_db,
+            matrix_total=baseline.offline.total + failed_db.total,
+            matrix_status="FAIL",
+            db_residue=1,
+        )
+
+        assert compare_matrix_execution_baseline(baseline, baseline) == (
+            "NO_BASELINE_DRIFT",
+        )
+        assert set(compare_matrix_execution_baseline(baseline, grown)) == {
+            "OFFLINE_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+        }
+        assert set(compare_matrix_execution_baseline(baseline, failing)) == {
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_STATUS_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        }
+        for drift in (
+            ("NO_BASELINE_DRIFT",),
+            *(
+                compare_matrix_execution_baseline(baseline, grown),
+                compare_matrix_execution_baseline(baseline, failing),
+            ),
+        ):
+            assert set(drift) <= set(_MATRIX_BASELINE_DRIFT_TYPES)
+        # Step 85 的 4 类 Drift 未被扩展
+        assert _DRIFT_TYPES == (
+            "NO_DRIFT",
+            "COUNT_DRIFT",
+            "EXIT_CODE_DRIFT",
+            "STATUS_DRIFT",
+        )
+
+    def test_baseline_comparison_is_deterministic(self) -> None:
+        baseline = MATRIX_EXECUTION_BASELINE
+
+        first = compare_matrix_execution_baseline(baseline, baseline)
+        second = compare_matrix_execution_baseline(baseline, baseline)
+
+        assert first == second == ("NO_BASELINE_DRIFT",)
+        assert MATRIX_EXECUTION_BASELINE == MatrixExecutionBaseline(
+            offline=MATRIX_EXECUTION_BASELINE.offline,
+            db=MATRIX_EXECUTION_BASELINE.db,
+            matrix_total=555,
+            matrix_status="PASS",
+            db_residue=0,
+        )
+
+    def test_baseline_logic_has_no_db_or_network_dependency(self) -> None:
+        """Baseline 比较逻辑为纯函数；DB 读只发生在 residue helper（延迟 import）。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "compare_matrix_execution_baseline"
+            ):
+                body = ast.unparse(node)
+
+        assert body, "未找到 compare_matrix_execution_baseline 实现"
+        for forbidden in (
+            "subprocess",
+            "get_engine",
+            "sqlalchemy",
+            "_run_pytest",
+            "_offline_suite_execution",
+            "_matrix_execution_summary",
+        ):
+            assert forbidden not in body, forbidden
+        module_level = {
+            node.module
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module
+        } | {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        for module in module_level:
+            for prefix in ("backend.app.db", "sqlalchemy", "httpx", "requests"):
+                assert not module.startswith(prefix), module
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -2197,9 +2607,13 @@ __all__ = [
     "CollectReport",
     "FileSpec",
     "RegressionExecutionSummary",
+    "MATRIX_EXECUTION_BASELINE",
+    "MatrixExecutionBaseline",
     "MatrixExecutionSummary",
     "TestEntryHygiene",
+    "TestMatrixExecutionBaseline",
     "TestMatrixExecutionSummary",
+    "compare_matrix_execution_baseline",
     "TestNodeHostedContractRegistration",
     "TestNodeHostedContractRegressionIntegration",
     "TestOfflineRegressionExecutionSummary",
