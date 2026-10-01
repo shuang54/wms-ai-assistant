@@ -435,6 +435,43 @@ def _cleanup_step74_rows() -> int:
     return deleted
 
 
+def _file_categories() -> dict[str, tuple[str, ...]]:
+    """file → categories（拓扑映射；只读）。"""
+    mapping: dict[str, list[str]] = {}
+    for category, paths in CATEGORIES.items():
+        for path in paths:
+            mapping.setdefault(path, []).append(category)
+    return {path: tuple(sorted(categories)) for path, categories in mapping.items()}
+
+
+def _suite_topology() -> dict[str, tuple[str, ...]]:
+    """suite → files + 未被任何 suite 覆盖的注册文件（拓扑审计）。"""
+    offline, db = set(_offline_suite()), set(_db_suite())
+    registered = {spec.path for spec in FILES}
+
+    return {
+        "offline": tuple(sorted(offline)),
+        "db": tuple(sorted(db)),
+        "uncovered": tuple(sorted(registered - (offline | db))),
+    }
+
+
+def _category_suite_coverage() -> dict[str, dict[str, tuple[str, ...]]]:
+    """category → {offline, db, missing}（该 category 的文件在 suite 中的落位）。"""
+    offline, db = set(_offline_suite()), set(_db_suite())
+    registered = {spec.path for spec in FILES}
+    coverage: dict[str, dict[str, tuple[str, ...]]] = {}
+
+    for category, paths in CATEGORIES.items():
+        files = set(paths)
+        coverage[category] = {
+            "offline": tuple(sorted(files & offline)),
+            "db": tuple(sorted(files & db)),
+            "missing": tuple(sorted((files & registered) - (offline | db))),
+        }
+    return coverage
+
+
 @dataclass(frozen=True)
 class CollectReport:
     """单文件 ``--collect-only`` 结果（Step 81；**审计结果，不写入 FileSpec**）。"""
@@ -844,6 +881,91 @@ class TestRegressionMatrixCollectability:
 
 
 # ============================================================
+# 执行注册覆盖闭环（Phase 3.12 Step 82 · 离线 · 纯拓扑）
+#
+# 只审计 FILES → CATEGORIES → suite 的注册拓扑，**不执行**任何 suite。
+# coverage 语义 = registration execution coverage（按**文件**计数），
+# **不是** pass rate，也不统计 collected nodes。
+# ============================================================
+
+class TestRegressionMatrixExecutionCoverage:
+    def test_all_registered_files_are_in_at_least_one_category(self) -> None:
+        mapping = _file_categories()
+        registered = {spec.path for spec in FILES}
+
+        orphans = sorted(registered - set(mapping))
+        assert orphans == [], orphans
+        assert len(registered) == len(mapping) == (
+            EXPECTED_MATRIX_SCALE["registered_files"]
+        )
+
+    def test_all_offline_suite_files_are_registered(self) -> None:
+        registered = {spec.path for spec in FILES}
+        dangling = sorted(set(_suite_topology()["offline"]) - registered)
+
+        assert dangling == [], dangling
+
+    def test_all_db_suite_files_are_registered(self) -> None:
+        registered = {spec.path for spec in FILES}
+        dangling = sorted(set(_suite_topology()["db"]) - registered)
+
+        assert dangling == [], dangling
+
+    def test_all_registered_files_are_in_a_suite(self) -> None:
+        """注册 → suite 闭环：uncovered = 0 ⇒ suite-covered 28 / 28 = 100%（按文件）。"""
+        topology = _suite_topology()
+        covered = set(topology["offline"]) | set(topology["db"])
+
+        assert topology["uncovered"] == (), topology["uncovered"]
+        assert covered == {spec.path for spec in FILES}
+        assert len(covered) == EXPECTED_MATRIX_SCALE["registered_files"] == 28
+
+    def test_category_files_are_suite_covered(self) -> None:
+        coverage = _category_suite_coverage()
+
+        assert set(coverage) == set(_REQUIRED_CATEGORIES)
+        for category, buckets in coverage.items():
+            assert CATEGORIES[category], category
+            assert buckets["missing"] == (), (category, buckets["missing"])
+            assert buckets["offline"] or buckets["db"], (category, buckets)
+
+    def test_observability_allowlist_category_is_suite_covered(self) -> None:
+        """Step 79 语义保持不变：4 files · db=no · 全部落在 offline suite。"""
+        files = CATEGORIES["OBSERVABILITY_HTTP_ALLOWLIST"]
+        buckets = _category_suite_coverage()["OBSERVABILITY_HTTP_ALLOWLIST"]
+        offline = set(_offline_suite())
+        db = set(_db_suite())
+
+        assert len(files) == 4
+        assert set(buckets["offline"]) == set(files)
+        assert buckets["db"] == ()
+        assert buckets["missing"] == ()
+        for path in files:
+            spec = _file_specs()[path]
+            assert spec.db == "no", path
+            assert path in offline and path not in db, path
+
+    def test_suite_partition_matches_existing_db_semantics(self) -> None:
+        """只审计**现有**语义（不重新定义 partial）：no→offline；yes→DB；partial→两者。"""
+        offline, db = set(_offline_suite()), set(_db_suite())
+        partial = {spec.path for spec in FILES if spec.db == "partial"}
+
+        for spec in FILES:
+            if spec.db == "no":
+                assert spec.path in offline and spec.path not in db, spec.path
+            elif spec.db == "yes":
+                assert spec.path in db and spec.path not in offline, spec.path
+            else:
+                assert spec.path in offline and spec.path in db, spec.path
+
+        # overlap 显式登记：offline + DB ≠ registered（partial 双跑）
+        assert (offline & db) == partial
+        assert len(offline) + len(db) == (
+            EXPECTED_MATRIX_SCALE["registered_files"] + len(partial)
+        ) == 28 + 5
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -976,6 +1098,7 @@ __all__ = [
     "TestEntryHygiene",
     "TestRegressionMatrixCollectability",
     "TestRegressionMatrixContract",
+    "TestRegressionMatrixExecutionCoverage",
     "TestRegressionSuite",
     "TestRegistry",
 ]

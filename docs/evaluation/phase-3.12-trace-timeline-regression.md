@@ -223,6 +223,34 @@ TestRegressionMatrixCollectability（5 项；只收集不执行，不开启 RUN_
 结果性质：**审计信息**，不写入 FileSpec（FileSpec 结构未变）
 ```
 
+## 7.3 Execution Registration Coverage（Step 82 · 纯拓扑审计）
+
+```text
+TestRegressionMatrixExecutionCoverage（7 项；不执行任何 suite）
+    all_registered_files_are_in_at_least_one_category · all_offline_suite_files_are_registered ·
+    all_db_suite_files_are_registered · all_registered_files_are_in_a_suite ·
+    category_files_are_suite_covered · observability_allowlist_category_is_suite_covered ·
+    suite_partition_matches_existing_db_semantics
+
+registration execution coverage（**按文件**计数；不是 pass rate，不统计 collected nodes）
+    registered files     = 28
+    category-covered     = 28   （orphan = 0）
+    suite-covered        = 28   （uncovered = 0）→ **coverage = 100 %**
+    offline = 18 · DB = 15
+
+⚠ offline + DB ≠ registered（partial 文件双跑）：
+    offline + DB = 18 + 15 = 33 = registered(28) + partial(5)
+    partial（同时进入两套 suite；沿用既有语义，未重新定义）：
+        tests/test_assistant_trace_multi_path_e2e.py
+        tests/test_assistant_outcome_persistence.py
+        tests/test_assistant_trace_pagination_audit.py
+        tests/test_assistant_trace_outcome_audit.py
+        tests/test_assistant_outcome_contract_audit.py
+    dangling suite entries = 0（suite ⊆ FILES）
+
+OBSERVABILITY_HTTP_ALLOWLIST：files = 4 · offline = 4 · DB = 0 · missing = 0
+```
+
 ## 8. 漂移检测
 
 ```text
