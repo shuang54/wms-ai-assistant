@@ -306,6 +306,51 @@ Snapshot（2026-10-01 记录，数量会随时增长）
 
 （本阶段不记录机器路径 / 用户名 / 环境变量 / 凭据等环境信息。）
 
+## 7.5 Offline Snapshot Drift Audit（Step 85）
+
+```text
+Contract（Step 84）
+    → 定义“什么叫 PASS / FAIL”
+Snapshot（Step 84 记录）
+    → 记录“最近一次已验证的数量是多少”
+Drift Audit（Step 85）
+    → 发现“当前执行结果是否偏离 Snapshot”
+
+三者不得混淆：Drift 只描述**与 Snapshot 的差异**，
+最终 PASS / FAIL 仍由 Step 84 Execution Summary Contract 决定。
+```
+
+```text
+Drift 分类（最小集合；组合式，非互斥）
+    NO_DRIFT          当前计数 / exit_code / status 全部等于 Snapshot
+    COUNT_DRIFT       total · passed · skipped · failed · errors 任一不同
+    EXIT_CODE_DRIFT   exit_code 不同
+    STATUS_DRIFT      status 不同
+
+Drift ≠ 失败（**关键规则**）
+    375/356/19（snapshot） vs 380/361/19（current）
+        → Drift = COUNT_DRIFT，Contract Status = PASS（新增测试不是系统故障）
+    failed 0 → 1 或 errors 0 → 1
+        → Drift = COUNT_DRIFT(+EXIT_CODE/STATUS)，Contract Status = FAIL
+
+实现与边界
+    纯函数 classify_snapshot_drift(snapshot, current) → tuple[str, ...]（无副作用）
+    Snapshot 以只读视图（MappingProxyType）参与比较 → **无自动更新 / 无 self-healing baseline**
+    Drift 审计**不执行** suite（合成 summary + frozen snapshot；Step 83 已证明真实执行链路）
+    Drift detected → 人工复核 → **未来步骤显式更新 Snapshot**（数量变化不构成 Contract 回归）
+```
+
+实测（合成数据，无执行）：
+
+```text
+snapshot 本身      → NO_DRIFT                        status=PASS
+380 / 361 / 19     → COUNT_DRIFT                     status=PASS
+skipped 19 → 20    → COUNT_DRIFT                     status=PASS
+failed 0 → 1       → COUNT_DRIFT+EXIT_CODE+STATUS    status=FAIL
+exit_code 0 → 1    → EXIT_CODE_DRIFT+STATUS_DRIFT    status=FAIL
+snapshot 审计后不变 = True（total 仍 375）
+```
+
 ## 8. 漂移检测
 
 ```text

@@ -38,7 +38,8 @@ import sys
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 import pytest
 
@@ -1229,6 +1230,60 @@ class TestOfflineRegressionExecutionSummary:
 # Contract（语义，长期稳定）与 Snapshot（当前数量）严格区分。
 # ============================================================
 
+#: Snapshot Drift 的最小分类（Step 85 §五；不新增更复杂分类）。
+_DRIFT_TYPES: tuple[str, ...] = (
+    "NO_DRIFT",
+    "COUNT_DRIFT",
+    "EXIT_CODE_DRIFT",
+    "STATUS_DRIFT",
+)
+
+#: 计数维度（Drift 比较的字段）。
+_DRIFT_COUNT_FIELDS: tuple[str, ...] = (
+    "total",
+    "passed",
+    "skipped",
+    "failed",
+    "errors",
+)
+
+
+def _frozen_snapshot() -> MappingProxyType[str, int | str]:
+    """Snapshot 的**只读视图**（Drift 审计物理上无法改写 Snapshot；§九 无自动更新）。"""
+    return MappingProxyType(dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT))
+
+
+def classify_snapshot_drift(
+    snapshot: Mapping[str, int | str],
+    current: RegressionExecutionSummary,
+) -> tuple[str, ...]:
+    """比较当前执行结果与 Snapshot，返回 Drift 分类（可组合；纯函数、无副作用）。
+
+    语义：
+
+        NO_DRIFT        当前计数 / exit_code / status 全部等于 Snapshot
+        COUNT_DRIFT     total / passed / skipped / failed / errors 任一不同
+        EXIT_CODE_DRIFT exit_code 不同
+        STATUS_DRIFT    status 不同
+
+    **Drift ≠ 失败**：最终 PASS / FAIL 由 Step 84 Summary Contract 决定
+    （``current.status``）；本函数只指出"与 Snapshot 是否一致"。
+    """
+    drift: list[str] = []
+
+    if any(
+        getattr(current, name) != int(snapshot[name])
+        for name in _DRIFT_COUNT_FIELDS
+    ):
+        drift.append("COUNT_DRIFT")
+    if current.exit_code != int(snapshot["exit_code"]):
+        drift.append("EXIT_CODE_DRIFT")
+    if current.status != str(snapshot["status"]):
+        drift.append("STATUS_DRIFT")
+
+    return tuple(drift) if drift else ("NO_DRIFT",)
+
+
 def _summary_from_snapshot(snapshot: dict[str, int | str]) -> RegressionExecutionSummary:
     return RegressionExecutionSummary(
         total=int(snapshot["total"]),
@@ -1358,6 +1413,113 @@ class TestOfflineRegressionExecutionSummaryContract:
         assert status_source.count("self.exit_code") >= 1
         assert status_source.count("self.failed") >= 1
         assert status_source.count("self.errors") >= 1
+
+
+# ============================================================
+# Offline Snapshot Drift Audit（Phase 3.12 Step 85 · synthetic only）
+#
+# Contract（PASS/FAIL 语义） ≠ Snapshot（数量记录） ≠ Drift（与 Snapshot 的差异）。
+# Drift ≠ 失败；**不**自动更新 Snapshot；**不**重跑 18 个文件。
+# ============================================================
+
+class TestOfflineRegressionSnapshotDrift:
+    def test_no_drift_when_current_matches_snapshot(self) -> None:
+        snapshot = _frozen_snapshot()
+        current = _summary_from_snapshot(dict(snapshot))
+
+        assert classify_snapshot_drift(snapshot, current) == ("NO_DRIFT",)
+        assert current.status == "PASS"
+
+    def test_count_drift_on_passed_increase(self) -> None:
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=361, skipped=19)
+
+        assert classify_snapshot_drift(snapshot, current) == ("COUNT_DRIFT",)
+        assert current.status == "PASS"        # Drift ≠ 失败
+
+    def test_count_drift_on_skipped_increase(self) -> None:
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=356, skipped=20)
+
+        assert classify_snapshot_drift(snapshot, current) == ("COUNT_DRIFT",)
+        assert current.status == "PASS"
+
+    def test_count_drift_with_failed_is_contract_fail(self) -> None:
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=355, failed=1, exit_code=1)
+
+        drift = classify_snapshot_drift(snapshot, current)
+        assert "COUNT_DRIFT" in drift
+        assert current.status == "FAIL"        # 最终判定仍由 Step 84 Contract 决定
+
+    def test_count_drift_with_errors_is_contract_fail(self) -> None:
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=356, skipped=19, errors=1, exit_code=1)
+
+        drift = classify_snapshot_drift(snapshot, current)
+        assert "COUNT_DRIFT" in drift
+        assert current.status == "FAIL"
+
+    def test_exit_code_drift(self) -> None:
+        """计数不变但 exit_code 0 → 1：EXIT_CODE_DRIFT（并伴随 STATUS_DRIFT）+ FAIL。"""
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=356, skipped=19, exit_code=1)
+
+        assert set(classify_snapshot_drift(snapshot, current)) == {
+            "EXIT_CODE_DRIFT",
+            "STATUS_DRIFT",
+        }
+        assert current.status == "FAIL"
+
+    def test_status_drift(self) -> None:
+        """status 变化与计数 / exit_code 变化共现（分类是组合式，非互斥）。"""
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=355, skipped=19, failed=1, exit_code=1)
+
+        drift = classify_snapshot_drift(snapshot, current)
+        assert set(drift) == {"COUNT_DRIFT", "EXIT_CODE_DRIFT", "STATUS_DRIFT"}
+        assert current.status == "FAIL"
+
+    def test_future_count_independence(self) -> None:
+        """380 / 361 / 19 / 0 / 0 → COUNT_DRIFT 且 Contract = PASS。"""
+        snapshot = _frozen_snapshot()
+        current = _summary(passed=361, skipped=19)
+
+        assert (current.total, current.passed, current.skipped) == (380, 361, 19)
+        assert classify_snapshot_drift(snapshot, current) == ("COUNT_DRIFT",)
+        assert current.status == "PASS"
+
+    def test_snapshot_is_immutable_during_drift_audit(self) -> None:
+        """审计后 Snapshot 不变；只读视图拒绝写入（无 self-healing baseline）。"""
+        snapshot = _frozen_snapshot()
+        before = dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT)
+
+        classify_snapshot_drift(snapshot, _summary(passed=361, skipped=19))
+        with pytest.raises(TypeError):
+            snapshot["total"] = 999  # type: ignore[index]
+
+        assert dict(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == before
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["total"] == 375
+
+    def test_drift_audit_does_not_execute_suite(self) -> None:
+        """Drift 分类是纯函数：不得引用 suite 执行器 / subprocess（不重跑 18 文件）。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "classify_snapshot_drift"
+            ):
+                body = ast.unparse(node)
+
+        assert body, "未找到 classify_snapshot_drift 实现"
+        for forbidden in (
+            "_offline_suite_execution",
+            "_offline_execution_summary",
+            "_run_pytest",
+            "subprocess",
+            "_collect_one",
+        ):
+            assert forbidden not in body, forbidden
 
 
 # ============================================================
@@ -1496,6 +1658,8 @@ __all__ = [
     "TestEntryHygiene",
     "TestOfflineRegressionExecutionSummary",
     "TestOfflineRegressionExecutionSummaryContract",
+    "TestOfflineRegressionSnapshotDrift",
+    "classify_snapshot_drift",
     "TestRegressionMatrixCollectability",
     "TestRegressionMatrixContract",
     "TestRegressionMatrixExecutionCoverage",
