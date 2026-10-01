@@ -296,6 +296,46 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: **Node-hosted Contract Category**（Phase 3.12 Step 86）。
+#:
+#: 该契约（Offline Execution Summary + Snapshot Drift）由 collector **自身**的测试类承载，
+#: 因此**不**放进 ``CATEGORIES``（file-mapped）：
+#: ``CATEGORIES`` 的每个条目必须指向 **FILES 已注册**的文件（Step 80 §七 / Step 82），
+#: 而把 collector 自身登记为 category file 会同时违反 "no self registration"（Step 80 §九）。
+#: 故以**并行注册表**表达：保留 13 个 file-hosted category 不变，新增 1 个 node-hosted category。
+NODE_HOSTED_CONTRACT_CATEGORIES: dict[str, dict[str, object]] = {
+    "OFFLINE_EXECUTION_CONTRACT": {
+        "host": _SELF,
+        "classes": (
+            "TestOfflineRegressionExecutionSummary",
+            "TestOfflineRegressionExecutionSummaryContract",
+            "TestOfflineRegressionSnapshotDrift",
+        ),
+        "scope": (
+            "OFFLINE_EXECUTION_SUMMARY_CONTRACT / "
+            "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT / classify_snapshot_drift()"
+        ),
+        "db_required": False,
+        "network_required": False,
+        "llm_required": False,
+        "production_code_required": False,
+    },
+}
+
+#: Node-hosted category 的代表性 node（Step 86 §八；真实存在、可 collect、属当前 Matrix）。
+NODE_HOSTED_REPRESENTATIVE_NODES: tuple[tuple[str, str], ...] = (
+    (
+        "OFFLINE_EXECUTION_CONTRACT",
+        f"{_SELF}::TestOfflineRegressionSnapshotDrift"
+        "::test_snapshot_is_immutable_during_drift_audit",
+    ),
+    (
+        "OFFLINE_EXECUTION_CONTRACT",
+        f"{_SELF}::TestOfflineRegressionExecutionSummaryContract"
+        "::test_current_snapshot_matches_recorded_baseline",
+    ),
+)
+
 #: 代表性契约 node（Step 79 §八）：**只登记 node id**，不复制断言逻辑。
 #: 完整契约仍由各自测试文件覆盖；此处仅提供"矩阵 → 代表性入口"。
 REPRESENTATIVE_CONTRACT_NODES: tuple[tuple[str, str], ...] = (
@@ -801,6 +841,8 @@ class TestRegistry:
             "EXPECTED_MATRIX_SCALE",
             "OFFLINE_EXECUTION_SUMMARY_CONTRACT",
             "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
+            "NODE_HOSTED_CONTRACT_CATEGORIES",
+            "NODE_HOSTED_REPRESENTATIVE_NODES",
         )
         offenders: list[tuple[str, str]] = []
         for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
@@ -966,6 +1008,112 @@ class TestRegressionMatrixContract:
             assert file_path in registered, node_id
             assert file_path in CATEGORIES[category], node_id
             assert node_id.partition("::")[1], node_id   # 必须带 class/function
+
+    def test_node_hosted_contract_category_is_registered(self) -> None:
+        """Step 86：OFFLINE_EXECUTION_CONTRACT 已注册（node-hosted；唯一）。"""
+        assert "OFFLINE_EXECUTION_CONTRACT" in NODE_HOSTED_CONTRACT_CATEGORIES
+        tree = ast.parse(_source(_SELF))
+        declarations = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "NODE_HOSTED_CONTRACT_CATEGORIES"
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+        ]
+        assert len(declarations) == 1
+        entry = NODE_HOSTED_CONTRACT_CATEGORIES["OFFLINE_EXECUTION_CONTRACT"]
+        assert entry["host"] == _SELF
+        assert set(entry["classes"]) == {
+            "TestOfflineRegressionExecutionSummary",
+            "TestOfflineRegressionExecutionSummaryContract",
+            "TestOfflineRegressionSnapshotDrift",
+        }
+        assert "classify_snapshot_drift" in str(entry["scope"])
+        # 不进入 file-mapped CATEGORIES（避免 self registration）
+        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
+        assert _SELF not in {spec.path for spec in FILES}
+
+    def test_node_hosted_contract_category_metadata_is_all_false(self) -> None:
+        for category, entry in NODE_HOSTED_CONTRACT_CATEGORIES.items():
+            for flag in (
+                "db_required",
+                "network_required",
+                "llm_required",
+                "production_code_required",
+            ):
+                assert entry[flag] is False, (category, flag)
+
+    def test_node_hosted_contract_artifacts_exist(self) -> None:
+        """契约三要素存在：summary contract / snapshot / drift 分类器。"""
+        assert set(OFFLINE_EXECUTION_SUMMARY_CONTRACT) >= {
+            "pass",
+            "fail",
+            "skip",
+            "arithmetic",
+        }
+        assert set(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == {
+            "total",
+            "passed",
+            "skipped",
+            "failed",
+            "errors",
+            "exit_code",
+            "status",
+        }
+        assert callable(classify_snapshot_drift)
+        assert _DRIFT_TYPES == (
+            "NO_DRIFT",
+            "COUNT_DRIFT",
+            "EXIT_CODE_DRIFT",
+            "STATUS_DRIFT",
+        )
+
+    def test_node_hosted_contract_nodes_are_collectable(self) -> None:
+        """代表性 node 真实可 collect（`--collect-only`；不执行）。"""
+        result = _run_pytest(
+            (_SELF,), with_db=False, collect_only=True, timeout=60
+        )
+
+        assert result.returncode == 0, result.stdout[-800:]
+        assert len(NODE_HOSTED_REPRESENTATIVE_NODES) == 2
+        for category, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
+            assert category in NODE_HOSTED_CONTRACT_CATEGORIES, node_id
+            assert node_id in result.stdout, node_id
+
+    def test_snapshot_is_not_part_of_matrix_scale(self) -> None:
+        """Matrix Scale ≠ Execution Snapshot：数量快照不得写入 EXPECTED_MATRIX_SCALE。"""
+        assert set(EXPECTED_MATRIX_SCALE) == {
+            "categories",
+            "registered_files",
+            "offline_files",
+            "db_files",
+        }
+        assert EXPECTED_MATRIX_SCALE == {
+            "categories": 13,          # file-hosted（node-hosted 另计 1）
+            "registered_files": 28,
+            "offline_files": 18,
+            "db_files": 15,
+        }
+        for value in EXPECTED_MATRIX_SCALE.values():
+            assert value not in {375, 356, 19}, value
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT is not EXPECTED_MATRIX_SCALE
+        assert "375" not in str(EXPECTED_MATRIX_SCALE)
+
+    def test_future_count_independence_remains_pass(self) -> None:
+        """Matrix 注册后语义不变：380/361/19 ⇒ COUNT_DRIFT 且 Contract = PASS。"""
+        owner = NODE_HOSTED_CONTRACT_CATEGORIES["OFFLINE_EXECUTION_CONTRACT"]
+        assert "TestOfflineRegressionSnapshotDrift" in owner["classes"]
+
+        current = _summary(passed=361, skipped=19)
+        assert classify_snapshot_drift(_frozen_snapshot(), current) == (
+            "COUNT_DRIFT",
+        )
+        assert current.status == "PASS"
 
     def test_representative_nodes_are_collectable(self) -> None:
         """node id 必须真实可被 ``--collect-only`` 收集（**不执行**）。"""
@@ -1649,6 +1797,8 @@ __all__ = [
     "EXPECTED_MATRIX_SCALE",
     "FILES",
     "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
+    "NODE_HOSTED_CONTRACT_CATEGORIES",
+    "NODE_HOSTED_REPRESENTATIVE_NODES",
     "OFFLINE_EXECUTION_SUMMARY_CONTRACT",
     "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
     "REPRESENTATIVE_CONTRACT_NODES",

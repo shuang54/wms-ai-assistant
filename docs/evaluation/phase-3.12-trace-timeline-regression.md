@@ -351,6 +351,52 @@ exit_code 0 → 1    → EXIT_CODE_DRIFT+STATUS_DRIFT    status=FAIL
 snapshot 审计后不变 = True（total 仍 375）
 ```
 
+## 7.6 Snapshot Drift Contract Registration（Step 86）
+
+```text
+Regression Matrix（当前维度链）
+    ├── Registration           （FILES：28 文件）
+    ├── Collectability         （--collect-only：28/28）
+    ├── Execution Coverage     （file → category → suite：100%）
+    ├── Execution Summary      （RegressionExecutionSummary + Contract）
+    └── Snapshot Drift         （classify_snapshot_drift：4 类 Drift）
+```
+
+```text
+新增 category：OFFLINE_EXECUTION_CONTRACT（**node-hosted**）
+    host      = tests/test_assistant_trace_timeline_regression.py
+    classes   = TestOfflineRegressionExecutionSummary ·
+                TestOfflineRegressionExecutionSummaryContract ·
+                TestOfflineRegressionSnapshotDrift
+    scope     = OFFLINE_EXECUTION_SUMMARY_CONTRACT ·
+                OFFLINE_EXECUTION_SUMMARY_SNAPSHOT · classify_snapshot_drift()
+    metadata  = db_required false · network_required false ·
+                llm_required false · production_code_required false
+    代表性 node（2 条，真实可 collect）
+        ..._regression.py::TestOfflineRegressionSnapshotDrift
+            ::test_snapshot_is_immutable_during_drift_audit
+        ..._regression.py::TestOfflineRegressionExecutionSummaryContract
+            ::test_current_snapshot_matches_recorded_baseline
+```
+
+```text
+为什么是 "node-hosted" 而不是写进 CATEGORIES（file-mapped）：
+    CATEGORIES 的每个条目必须是 **FILES 已注册**的文件（Step 80 §七 / Step 82 双向无断链），
+    而把 collector 自身登记为 category file 会同时违反 "no self registration"（Step 80 §九）。
+    为保持 Step 79～82 Contract 不变，本步骤以**并行注册表**表达：
+        NODE_HOSTED_CONTRACT_CATEGORIES / NODE_HOSTED_REPRESENTATIVE_NODES
+        → file-hosted categories 仍为 13（CATEGORIES 未变）；node-hosted category = 1
+        → registered files 仍为 28；offline 18 / DB 15 / partial 5 均未变
+```
+
+```text
+语义边界（不因注册而改变）
+    Contract ≠ Snapshot ≠ Drift
+    Snapshot Drift **≠** Test Failure（380/361/19 ⇒ COUNT_DRIFT 且 Contract = PASS）
+    Matrix Scale ≠ Execution Snapshot：375/356/19 **不写入** EXPECTED_MATRIX_SCALE
+        （Matrix Scale 仍为 categories 13 / registered 28 / offline 18 / DB 15）
+```
+
 ## 8. 漂移检测
 
 ```text
