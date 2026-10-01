@@ -533,6 +533,9 @@ Drift（不修改 Step 85 的 4 类）
     Node-hosted：仍仅为 Contract Audit（不进入 execution，不进入 Baseline 计数）
 ```
 
+> Step 91（Baseline Gate）见独立记录：`docs/evaluation/phase-3.12-step-91-matrix-baseline-gate.md`
+> —— `evaluate_matrix_baseline_gate(current, baseline)` → PASS / DRIFT（无容差、无 baseline 更新）。
+
 ## 8. 漂移检测
 
 ```text

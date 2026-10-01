@@ -698,6 +698,71 @@ class MatrixExecutionBaseline:
         return (self.offline, self.db)
 
 
+@dataclass(frozen=True)
+class MatrixBaselineGateResult:
+    """Matrix Baseline Gate 结果（Phase 3.12 Step 91；immutable）。
+
+    只承载：执行摘要（current / baseline）· drift 类型 · status。
+    **不含**任何凭据 / prompt / SQL / RAG chunk / tool args / raw response。
+    """
+
+    status: str
+    drifts: tuple[str, ...]
+    current: MatrixExecutionBaseline
+    baseline: MatrixExecutionBaseline
+
+    def __post_init__(self) -> None:
+        if self.status not in {"PASS", "DRIFT"}:
+            raise ValueError(f"status 必须是 PASS | DRIFT（当前: {self.status!r}）")
+        for name in ("current", "baseline"):
+            if not isinstance(getattr(self, name), MatrixExecutionBaseline):
+                raise ValueError(f"{name} 必须是 MatrixExecutionBaseline")
+        if not isinstance(self.drifts, tuple) or not self.drifts:
+            raise ValueError("drifts 必须是非空 tuple")
+        for drift in self.drifts:
+            if drift not in _MATRIX_BASELINE_DRIFT_TYPES:
+                raise ValueError(f"未知 drift 类型: {drift!r}")
+        expected = "PASS" if self.drifts == ("NO_BASELINE_DRIFT",) else "DRIFT"
+        if self.status != expected:
+            raise ValueError(
+                f"status 必须由 drifts 推导（期望 {expected}，当前 {self.status}）"
+            )
+
+    @property
+    def is_pass(self) -> bool:
+        return self.status == "PASS"
+
+
+def evaluate_matrix_baseline_gate(
+    current: MatrixExecutionBaseline,
+    baseline: MatrixExecutionBaseline,
+) -> MatrixBaselineGateResult:
+    """Frozen Regression Gate（Step 91）：current vs baseline → PASS / DRIFT。
+
+    规则（无"基本一致" / 无容差 / 无自动更新）：
+
+        PASS ⇔ offline == baseline.offline ∧ db == baseline.db
+                ∧ matrix_total 相同 ∧ matrix_status 相同
+                ∧ db_residue 相同 ∧ **current.db_residue == 0**
+
+        duration_seconds **不参与**（RegressionExecutionSummary compare=False）。
+
+    复用 Step 90 的 ``compare_matrix_execution_baseline``（不重复 drift 逻辑）；
+    额外保证 ``current.db_residue != 0`` 一定导致 DRIFT。
+    """
+    drifts = list(compare_matrix_execution_baseline(baseline, current))
+    if current.db_residue != 0 and "DB_RESIDUE_DRIFT" not in drifts:
+        drifts.append("DB_RESIDUE_DRIFT")
+
+    resolved = tuple(drifts) if drifts else ("NO_BASELINE_DRIFT",)
+    return MatrixBaselineGateResult(
+        status="PASS" if resolved == ("NO_BASELINE_DRIFT",) else "DRIFT",
+        drifts=resolved,
+        current=current,
+        baseline=baseline,
+    )
+
+
 def compare_matrix_execution_baseline(
     baseline: MatrixExecutionBaseline,
     current: MatrixExecutionBaseline,
@@ -1149,6 +1214,7 @@ class TestRegistry:
             "NODE_HOSTED_REPRESENTATIVE_NODES",
             "MATRIX_EXECUTION_BASELINE",
         )
+    # 备注：Step 91 的 Gate 复用既有 DTO，未引入新的 collector 结构名。
         offenders: list[tuple[str, str]] = []
         for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
             relative = f"tests/{path.name}"
@@ -2473,6 +2539,236 @@ class TestMatrixExecutionBaseline:
 
 
 # ============================================================
+# Matrix Baseline Gate（Phase 3.12 Step 91 · 纯函数 · 无执行）
+#
+# current vs frozen baseline → PASS / DRIFT；无容差、无自动更新 baseline。
+# ============================================================
+
+class TestMatrixBaselineGate:
+    @staticmethod
+    def _baseline_with(
+        *,
+        offline: RegressionExecutionSummary | None = None,
+        db: RegressionExecutionSummary | None = None,
+        residue: int = 0,
+    ) -> MatrixExecutionBaseline:
+        base = MATRIX_EXECUTION_BASELINE
+        offline_part = offline or base.offline
+        db_part = db or base.db
+        return MatrixExecutionBaseline(
+            offline=offline_part,
+            db=db_part,
+            matrix_total=offline_part.total + db_part.total,
+            matrix_status=(
+                "PASS" if offline_part.is_pass and db_part.is_pass else "FAIL"
+            ),
+            db_residue=residue,
+        )
+
+    def test_gate_passes_when_current_matches_baseline(self) -> None:
+        """真实数据（复用 Step 89 helper，**不**重跑）：current == baseline ⇒ PASS。"""
+        current = _current_matrix_baseline()
+
+        if current is None:
+            pytest.skip(f"DB 不可用（{_db_execution_available()[1]}）")
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "PASS" and result.is_pass is True
+        assert result.drifts == ("NO_BASELINE_DRIFT",)
+
+    def test_gate_detects_offline_execution_drift(self) -> None:
+        """Case B：offline 结果变化（passed 356→355 / skipped 19→20，total 不变）。"""
+        current = self._baseline_with(
+            offline=RegressionExecutionSummary(
+                total=375, passed=355, skipped=20, failed=0, errors=0, exit_code=0
+            )
+        )
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert result.drifts == ("OFFLINE_EXECUTION_DRIFT",)
+
+    def test_gate_detects_db_execution_drift(self) -> None:
+        """Case C：DB 结果变化（skipped 0→1 / passed 180→179，total 与 status 不变）。"""
+        current = self._baseline_with(
+            db=RegressionExecutionSummary(
+                total=180, passed=179, skipped=1, failed=0, errors=0, exit_code=0
+            )
+        )
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert result.drifts == ("DB_EXECUTION_DRIFT",)
+
+    def test_gate_detects_matrix_total_drift(self) -> None:
+        """Case D：total 变化必然伴随某个 part 变化（组合式，TOTAL 必在其中）。"""
+        current = self._baseline_with(
+            db=RegressionExecutionSummary(
+                total=181, passed=181, skipped=0, failed=0, errors=0, exit_code=0
+            )
+        )
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert "MATRIX_TOTAL_DRIFT" in result.drifts
+        assert set(result.drifts) == {
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+        }
+
+    def test_gate_detects_matrix_status_drift(self) -> None:
+        """Case E：status PASS→FAIL（必然伴随对应 part 变化）。"""
+        current = self._baseline_with(
+            db=RegressionExecutionSummary(
+                total=180, passed=179, skipped=0, failed=1, errors=0, exit_code=1
+            )
+        )
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert "MATRIX_STATUS_DRIFT" in result.drifts
+        assert set(result.drifts) == {
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_STATUS_DRIFT",
+        }
+
+    def test_gate_detects_db_residue_drift(self) -> None:
+        """Case F：residue 0→1 ⇒ DB_RESIDUE_DRIFT + DRIFT（其余字段完全一致）。"""
+        current = self._baseline_with(residue=1)
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert result.drifts == ("DB_RESIDUE_DRIFT",)
+
+    def test_gate_ignores_duration_changes(self) -> None:
+        """Case G：仅 duration 变化（9.15→20.0）不得产生 DRIFT。"""
+        base = MATRIX_EXECUTION_BASELINE
+        current = MatrixExecutionBaseline(
+            offline=RegressionExecutionSummary(
+                total=375, passed=356, skipped=19, failed=0, errors=0,
+                exit_code=0, duration_seconds=20.0,
+            ),
+            db=RegressionExecutionSummary(
+                total=180, passed=180, skipped=0, failed=0, errors=0,
+                exit_code=0, duration_seconds=20.0,
+            ),
+            matrix_total=base.matrix_total,
+            matrix_status=base.matrix_status,
+            db_residue=base.db_residue,
+        )
+        result = evaluate_matrix_baseline_gate(current, base)
+
+        assert result.status == "PASS"
+        assert result.drifts == ("NO_BASELINE_DRIFT",)
+
+    def test_gate_detects_multiple_drifts_compositionally(self) -> None:
+        """Case H：offline / db / residue 同时变化 ⇒ 全部 drift 类型均出现。"""
+        current = self._baseline_with(
+            offline=RegressionExecutionSummary(
+                total=380, passed=361, skipped=19, failed=0, errors=0, exit_code=0
+            ),
+            db=RegressionExecutionSummary(
+                total=180, passed=179, skipped=1, failed=0, errors=0, exit_code=0
+            ),
+            residue=2,
+        )
+        result = evaluate_matrix_baseline_gate(
+            current, MATRIX_EXECUTION_BASELINE
+        )
+
+        assert result.status == "DRIFT"
+        assert set(result.drifts) == {
+            "OFFLINE_EXECUTION_DRIFT",
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        }
+
+    def test_gate_result_is_immutable_and_inputs_untouched(self) -> None:
+        base_before = MATRIX_EXECUTION_BASELINE
+        current = self._baseline_with(residue=1)
+        current_before = current
+
+        result = evaluate_matrix_baseline_gate(current, base_before)
+
+        with pytest.raises(Exception) as excinfo:
+            result.status = "PASS"  # type: ignore[misc]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+        assert MATRIX_EXECUTION_BASELINE == base_before
+        assert current == current_before
+        assert isinstance(result.drifts, tuple)
+        assert OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["total"] == 375
+
+    def test_gate_is_deterministic(self) -> None:
+        current = self._baseline_with(residue=1)
+
+        first = evaluate_matrix_baseline_gate(current, MATRIX_EXECUTION_BASELINE)
+        second = evaluate_matrix_baseline_gate(current, MATRIX_EXECUTION_BASELINE)
+
+        assert first == second
+        assert first.drifts == second.drifts == ("DB_RESIDUE_DRIFT",)
+
+    def test_gate_result_has_no_sensitive_data(self) -> None:
+        """Gate Result 只含执行摘要 / baseline / drift / status（无凭据类字段）。"""
+        result = evaluate_matrix_baseline_gate(
+            MATRIX_EXECUTION_BASELINE, MATRIX_EXECUTION_BASELINE
+        )
+        field_names = {item.name for item in fields(MatrixBaselineGateResult)}
+        blob = repr(result)
+
+        assert field_names == {"status", "drifts", "current", "baseline"}
+        for forbidden in (
+            "api_key",
+            "password",
+            "database_url",
+            "authorization",
+            "prompt",
+            "sql",
+            "rag_chunk",
+            "tool_args",
+            "raw_response",
+        ):
+            assert forbidden not in field_names
+            assert forbidden not in blob
+        for sentinel in ("postgresql://", "sk-", "Bearer"):
+            assert sentinel not in blob
+
+    def test_gate_has_no_execution_or_db_dependency(self) -> None:
+        """Gate 是纯函数：不执行 pytest / 不读 DB / 不访问网络。"""
+        tree = ast.parse(_source(_SELF))
+        gate_body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "evaluate_matrix_baseline_gate"
+            ):
+                gate_body = ast.unparse(node)
+
+        assert gate_body, "未找到 evaluate_matrix_baseline_gate 实现"
+        for forbidden in (
+            "subprocess",
+            "_run_pytest",
+            "get_engine",
+            "sqlalchemy",
+            "_matrix_execution_summary",
+            "_current_matrix_baseline",
+            "_db_residue_total",
+        ):
+            assert forbidden not in gate_body, forbidden
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -2608,9 +2904,11 @@ __all__ = [
     "FileSpec",
     "RegressionExecutionSummary",
     "MATRIX_EXECUTION_BASELINE",
+    "MatrixBaselineGateResult",
     "MatrixExecutionBaseline",
     "MatrixExecutionSummary",
     "TestEntryHygiene",
+    "TestMatrixBaselineGate",
     "TestMatrixExecutionBaseline",
     "TestMatrixExecutionSummary",
     "compare_matrix_execution_baseline",
