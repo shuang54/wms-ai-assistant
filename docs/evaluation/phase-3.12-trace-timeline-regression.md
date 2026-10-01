@@ -432,6 +432,33 @@ Node-hosted Contract（契约维度；**并行注册表**）
     Drift 语义（Step 85）保持不变：380/361/19 ⇒ COUNT_DRIFT 且 Contract = PASS
 ```
 
+## 7.8 Node-hosted Contract Regression Integration（Step 88）
+
+```text
+Node-hosted Contract
+        ↓
+Contract Audit            ✅（Step 88 证明：由本 collector 的可收集测试类承载）
+        ↓
+Execution Matrix          ❌（刻意不进入：FILES / CATEGORIES / offline·DB suite 均不含之）
+```
+
+```text
+集成审计（TestNodeHostedContractRegressionIntegration，6 项；不重复 Step 87 自检）
+    · 审计覆盖面：每个 node-hosted 契约的 classes 都能在 `_SELF` 的 collect-only 结果中
+      找到 `host::Class::` 前缀 node（审计真实存在，而非纸面声明）
+    · 不进 FILES：OFFLINE_EXECUTION_CONTRACT 与 host 均不在 registered paths（28 未变）
+    · 不进 suite：offline 18 / DB 15 未变，且 suite 成员 ⊆ FILES（node-hosted 无法泄漏进执行）
+    · 代表 node：nodeid 唯一 ∧ 归属 host/class 正确 ∧ 可从 collect-only 结果中找到
+    · 不影响 Scale：EXPECTED_MATRIX_SCALE 仍 13 / 28 / 18 / 15；node-hosted 计数有意排除；
+      Snapshot 数量（375 / 356 / 19）不参与 Scale 判断
+    · 双向边界：FileSpec 字段固定为 path·db·coverage·network·llm·production_code
+      （不得混入 node-hosted 字段），node-hosted entry 亦不得引用任何 FileSpec 字段名
+      —— 防止未来"为了统一"把 Node-hosted 强行塞进 FileSpec
+
+Matrix Scale remains 13 / 28 / 18 / 15
+Node-hosted Contract count is intentionally excluded
+```
+
 ## 8. 漂移检测
 
 ```text

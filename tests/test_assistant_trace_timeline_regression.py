@@ -35,7 +35,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -686,6 +686,26 @@ def _offline_execution_summary() -> RegressionExecutionSummary:
     )
 
 
+@lru_cache(maxsize=1)
+def _self_collection_result() -> subprocess.CompletedProcess[str]:
+    """本 collector 自身的 ``--collect-only`` 结果（只收集、不执行；会话内缓存）。"""
+    return _run_pytest((_SELF,), with_db=False, collect_only=True, timeout=60)
+
+
+@lru_cache(maxsize=1)
+def _self_collected_nodes() -> tuple[str, ...]:
+    """本 collector 收集到的 node id 集合（Contract Audit 覆盖面证据）。"""
+    return tuple(
+        sorted(
+            {
+                line.strip()
+                for line in _self_collection_result().stdout.splitlines()
+                if "::" in line
+            }
+        )
+    )
+
+
 @dataclass(frozen=True)
 class CollectReport:
     """单文件 ``--collect-only`` 结果（Step 81；**审计结果，不写入 FileSpec**）。"""
@@ -1009,11 +1029,109 @@ class TestNodeHostedContractRegistration:
 
     def test_node_hosted_representative_nodes_are_collectable(self) -> None:
         """`--collect-only`（只收集、不执行）验证 node 真实存在。"""
-        result = _run_pytest((_SELF,), with_db=False, collect_only=True, timeout=60)
+        result = _self_collection_result()
 
         assert result.returncode == 0, result.stdout[-800:]
         for _, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
             assert node_id in result.stdout, node_id
+
+
+# ============================================================
+# Node-hosted Contract **Regression Integration**（Phase 3.12 Step 88 · 离线 · 静态）
+#
+# 只证明"Node-hosted Contract 被 Contract Audit 覆盖，且**不**进入执行 Matrix"。
+# 不重复 Step 87 的注册自检（唯一性 / metadata / scope / self-registration）。
+# ============================================================
+
+class TestNodeHostedContractRegressionIntegration:
+    def test_node_hosted_contract_is_covered_by_contract_audit(self) -> None:
+        """每个 node-hosted 契约都由本 collector 的**可收集测试类**承载（审计真实存在）。"""
+        collected = _self_collected_nodes()
+
+        assert NODE_HOSTED_CONTRACT_CATEGORIES, "node-hosted 注册表不得为空"
+        assert collected, "本 collector 未收集到任何 node（审计失效）"
+        for category, entry in NODE_HOSTED_CONTRACT_CATEGORIES.items():
+            assert entry["host"] == _SELF, category
+            for class_name in entry["classes"]:
+                prefix = f"{entry['host']}::{class_name}::"
+                assert any(node.startswith(prefix) for node in collected), (
+                    category,
+                    class_name,
+                )
+
+    def test_node_hosted_contract_is_not_a_registered_file(self) -> None:
+        """Node-hosted 契约不进入 FILES（也不得因 host 而被登记）。"""
+        registered = {spec.path for spec in FILES}
+
+        assert "OFFLINE_EXECUTION_CONTRACT" not in registered
+        assert _SELF not in registered
+        for entry in NODE_HOSTED_CONTRACT_CATEGORIES.values():
+            assert entry["host"] not in registered, entry["host"]
+        assert len(registered) == EXPECTED_MATRIX_SCALE["registered_files"]
+
+    def test_node_hosted_contract_adds_no_execution_suite_entries(self) -> None:
+        """Node-hosted 不改变执行套件规模；suite 成员只能来自 FILES。"""
+        registered = {spec.path for spec in FILES}
+        offline, db = set(_offline_suite()), set(_db_suite())
+
+        assert len(offline) == EXPECTED_MATRIX_SCALE["offline_files"] == 18
+        assert len(db) == EXPECTED_MATRIX_SCALE["db_files"] == 15
+        assert offline <= registered and db <= registered
+        for entry in NODE_HOSTED_CONTRACT_CATEGORIES.values():
+            assert entry["host"] not in offline, entry["host"]
+            assert entry["host"] not in db, entry["host"]
+
+    def test_representative_nodes_align_with_node_hosted_contract(self) -> None:
+        """代表 node = 审计入口：可 collect ∧ 归属正确 host/class ∧ node id 唯一。"""
+        collected = set(_self_collected_nodes())
+        node_ids = [node_id for _, node_id in NODE_HOSTED_REPRESENTATIVE_NODES]
+
+        assert len(set(node_ids)) == len(node_ids)
+        for category, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
+            entry = NODE_HOSTED_CONTRACT_CATEGORIES[category]
+            file_part, _, rest = node_id.partition("::")
+            class_part, _, function_part = rest.partition("::")
+            assert file_part == entry["host"], node_id
+            assert class_part in entry["classes"], node_id
+            assert function_part, node_id
+            assert node_id in collected, node_id
+
+    def test_node_hosted_contract_does_not_affect_matrix_scale(self) -> None:
+        """Matrix Scale 保持 13/28/18/15；node-hosted 计数**有意排除**在外。"""
+        assert EXPECTED_MATRIX_SCALE == {
+            "categories": 13,
+            "registered_files": 28,
+            "offline_files": 18,
+            "db_files": 15,
+        }
+        assert len(CATEGORIES) == EXPECTED_MATRIX_SCALE["categories"]
+        assert len(FILES) == EXPECTED_MATRIX_SCALE["registered_files"]
+        # Node-hosted 概念不得进入 Scale 键集；Snapshot 数量也不得参与
+        assert not any("node_hosted" in key for key in EXPECTED_MATRIX_SCALE)
+        for value in EXPECTED_MATRIX_SCALE.values():
+            assert value not in {375, 356, 19}, value
+        assert len(NODE_HOSTED_CONTRACT_CATEGORIES) == 1  # 有意不并入 categories 计数
+
+    def test_file_hosted_and_node_hosted_boundaries_are_disjoint(self) -> None:
+        """双向边界：FileSpec 不得混入 node-hosted 字段；node-hosted 不得引用 FileSpec 字段。"""
+        file_spec_fields = [item.name for item in fields(FileSpec)]
+
+        assert file_spec_fields == [
+            "path",
+            "db",
+            "coverage",
+            "network",
+            "llm",
+            "production_code",
+        ]
+        assert not any("node_hosted" in name for name in file_spec_fields)
+        for category, entry in NODE_HOSTED_CONTRACT_CATEGORIES.items():
+            assert not (set(entry) & set(file_spec_fields)), (category, set(entry))
+            assert not isinstance(entry, FileSpec), category
+        # 反向：FileSpec 也不携带任何 node-hosted 注册信息
+        for spec in FILES:
+            assert not hasattr(spec, "classes") and not hasattr(spec, "scope")
+            assert spec.path != _SELF
 
 
 class TestRegressionMatrixContract:
@@ -1852,6 +1970,7 @@ __all__ = [
     "RegressionExecutionSummary",
     "TestEntryHygiene",
     "TestNodeHostedContractRegistration",
+    "TestNodeHostedContractRegressionIntegration",
     "TestOfflineRegressionExecutionSummary",
     "TestOfflineRegressionExecutionSummaryContract",
     "TestOfflineRegressionSnapshotDrift",
