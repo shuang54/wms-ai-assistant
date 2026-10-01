@@ -750,8 +750,14 @@ def evaluate_matrix_baseline_gate(
     复用 Step 90 的 ``compare_matrix_execution_baseline``（不重复 drift 逻辑）；
     额外保证 ``current.db_residue != 0`` 一定导致 DRIFT。
     """
-    drifts = list(compare_matrix_execution_baseline(baseline, current))
+    drifts = [
+        drift
+        for drift in compare_matrix_execution_baseline(baseline, current)
+        if drift != "NO_BASELINE_DRIFT"
+    ]
     if current.db_residue != 0 and "DB_RESIDUE_DRIFT" not in drifts:
+        # 安全边界：即使 current == baseline，非零 residue 也必须 DRIFT
+        # （此处不再保留 NO_BASELINE_DRIFT —— drifts 只表达"为何不是 PASS"；且不重复登记）
         drifts.append("DB_RESIDUE_DRIFT")
 
     resolved = tuple(drifts) if drifts else ("NO_BASELINE_DRIFT",)
@@ -2769,6 +2775,326 @@ class TestMatrixBaselineGate:
 
 
 # ============================================================
+# Matrix Baseline Gate Contract 冻结（Phase 3.12 Step 92 · 全合成 · 零执行）
+#
+# 只冻结 Step 91 Gate 的**语义契约**；不调用 Step 89 execution helper、
+# 不读 PostgreSQL、不触发执行缓存、不修改 Step 90 Baseline。
+# ============================================================
+
+def _synthetic_baseline(
+    *,
+    offline: RegressionExecutionSummary,
+    db: RegressionExecutionSummary,
+    residue: int,
+) -> MatrixExecutionBaseline:
+    """合成 MatrixExecutionBaseline（供 Step 92 契约测试；无任何真实执行）。"""
+    return MatrixExecutionBaseline(
+        offline=offline,
+        db=db,
+        matrix_total=offline.total + db.total,
+        matrix_status="PASS" if offline.is_pass and db.is_pass else "FAIL",
+        db_residue=residue,
+    )
+
+
+def _synthetic_offline(
+    *, total: int = 375, passed: int = 356, skipped: int = 19
+) -> RegressionExecutionSummary:
+    return RegressionExecutionSummary(
+        total=total, passed=passed, skipped=skipped, failed=0, errors=0,
+        exit_code=0,
+    )
+
+
+def _synthetic_db(
+    *, total: int = 180, passed: int = 180, skipped: int = 0
+) -> RegressionExecutionSummary:
+    return RegressionExecutionSummary(
+        total=total, passed=passed, skipped=skipped, failed=0, errors=0,
+        exit_code=0,
+    )
+
+
+class TestMatrixBaselineGateContract:
+    @staticmethod
+    def _frozen_pair() -> tuple[MatrixExecutionBaseline, MatrixExecutionBaseline]:
+        baseline = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=0
+        )
+        return baseline, baseline
+
+    def test_gate_status_contract_is_frozen(self) -> None:
+        """status 只有 PASS / DRIFT；其它状态一律拒绝（无 WARNING/UNKNOWN/…）。"""
+        baseline, current = self._frozen_pair()
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        assert result.status in {"PASS", "DRIFT"}
+        for forbidden in ("WARNING", "UNKNOWN", "PARTIAL", "SKIPPED", "STALE"):
+            with pytest.raises(ValueError):
+                MatrixBaselineGateResult(
+                    status=forbidden,
+                    drifts=("NO_BASELINE_DRIFT",),
+                    current=current,
+                    baseline=baseline,
+                )
+
+    def test_drift_type_set_is_frozen(self) -> None:
+        assert _MATRIX_BASELINE_DRIFT_TYPES == (
+            "NO_BASELINE_DRIFT",
+            "OFFLINE_EXECUTION_DRIFT",
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+            "MATRIX_STATUS_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        )
+        for forbidden in (
+            "PERFORMANCE_DRIFT",
+            "DURATION_DRIFT",
+            "COLLECTABILITY_DRIFT",
+            "NETWORK_DRIFT",
+            "LLM_DRIFT",
+        ):
+            assert forbidden not in _MATRIX_BASELINE_DRIFT_TYPES
+        # 未知 drift 类型不得进入 Gate Result
+        baseline, current = self._frozen_pair()
+        with pytest.raises(ValueError):
+            MatrixBaselineGateResult(
+                status="DRIFT",
+                drifts=("DURATION_DRIFT",),
+                current=current,
+                baseline=baseline,
+            )
+
+    def test_pass_contract_is_exact_equality(self) -> None:
+        """PASS ⇔ 五项精确相等 ∧ residue == 0；任一字段微差即 DRIFT（无容差）。"""
+        baseline, _ = self._frozen_pair()
+        cases = {
+            "identical": (baseline, "PASS"),
+            "offline-skip+1": (
+                _synthetic_baseline(
+                    offline=_synthetic_offline(skipped=20, passed=355),
+                    db=_synthetic_db(),
+                    residue=0,
+                ),
+                "DRIFT",
+            ),
+            "db-passed-1": (
+                _synthetic_baseline(
+                    offline=_synthetic_offline(),
+                    db=_synthetic_db(passed=179, skipped=1),
+                    residue=0,
+                ),
+                "DRIFT",
+            ),
+            "db-total+1": (
+                _synthetic_baseline(
+                    offline=_synthetic_offline(),
+                    db=_synthetic_db(total=181, passed=181),
+                    residue=0,
+                ),
+                "DRIFT",
+            ),
+            "residue-1": (
+                _synthetic_baseline(
+                    offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+                ),
+                "DRIFT",
+            ),
+        }
+        for name, (current, expected) in cases.items():
+            assert evaluate_matrix_baseline_gate(
+                current, baseline
+            ).status == expected, name
+
+    def test_gate_uses_only_equality_no_tolerance_semantics(self) -> None:
+        """Gate 不得出现 >= / <= / > / < 或 tolerance / threshold 语义。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "evaluate_matrix_baseline_gate"
+            ):
+                body = ast.unparse(node)
+
+        assert body, "未找到 evaluate_matrix_baseline_gate 实现"
+        for forbidden in (">=", "<=", ">", "<"):
+            assert f" {forbidden} " not in body, forbidden
+        for forbidden in ("tolerance", "threshold", "percent", "rate"):
+            assert forbidden not in body, forbidden
+
+    def test_duration_contract_is_excluded(self) -> None:
+        """duration 不进入 Baseline 字段 / equality / drift / gate status。"""
+        baseline, _ = self._frozen_pair()
+        current = _synthetic_baseline(
+            offline=RegressionExecutionSummary(
+                total=375, passed=356, skipped=19, failed=0, errors=0,
+                exit_code=0, duration_seconds=20.0,
+            ),
+            db=RegressionExecutionSummary(
+                total=180, passed=180, skipped=0, failed=0, errors=0,
+                exit_code=0, duration_seconds=30.0,
+            ),
+            residue=0,
+        )
+
+        assert "duration" not in {
+            item.name for item in fields(MatrixExecutionBaseline)
+        }
+        assert "duration" not in _MATRIX_BASELINE_DRIFT_TYPES
+        assert evaluate_matrix_baseline_gate(current, baseline).status == "PASS"
+        assert MATRIX_EXECUTION_BASELINE.offline.duration_seconds is None
+
+    def test_node_hosted_boundary_is_frozen_for_gate(self) -> None:
+        """Node-hosted 仅是 Contract Audit：不进入 execution / summary / baseline / gate。"""
+        summary_fields = {item.name for item in fields(MatrixExecutionSummary)}
+        baseline_fields = {item.name for item in fields(MatrixExecutionBaseline)}
+
+        assert NODE_HOSTED_CONTRACT_CATEGORIES  # 契约审计仍在
+        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
+        for names in (summary_fields, baseline_fields):
+            assert not any("node_hosted" in name for name in names)
+        assert _SELF not in _offline_suite() and _SELF not in _db_suite()
+
+    def test_baseline_is_read_only_across_gate_evaluation(self) -> None:
+        baseline, _ = self._frozen_pair()
+        before = (baseline, repr(baseline), baseline.matrix_total)
+
+        for _ in range(3):
+            evaluate_matrix_baseline_gate(baseline, baseline)
+
+        assert (baseline, repr(baseline), baseline.matrix_total) == before
+        with pytest.raises(Exception) as excinfo:
+            baseline.matrix_total = 0  # type: ignore[misc]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+        assert MATRIX_EXECUTION_BASELINE.matrix_total == 555   # Step 90 未被触碰
+
+    def test_current_is_read_only_across_gate_evaluation(self) -> None:
+        baseline, _ = self._frozen_pair()
+        current = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+        )
+        before = (current, current.offline, current.db, current.db_residue)
+
+        evaluate_matrix_baseline_gate(current, baseline)
+
+        assert (current, current.offline, current.db, current.db_residue) == before
+        with pytest.raises(Exception) as excinfo:
+            current.offline.total = 0  # type: ignore[misc]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+
+    def test_drift_is_deterministic(self) -> None:
+        baseline, _ = self._frozen_pair()
+        current = _synthetic_baseline(
+            offline=_synthetic_offline(total=380, passed=361),
+            db=_synthetic_db(),
+            residue=0,
+        )
+
+        results = [evaluate_matrix_baseline_gate(current, baseline) for _ in range(3)]
+
+        assert results[0] == results[1] == results[2]
+        assert all(
+            item.drifts == results[0].drifts
+            and item.status == results[0].status
+            and item.current == current
+            and item.baseline == baseline
+            for item in results
+        )
+
+    def test_composite_drift_returns_all_types(self) -> None:
+        """复合 drift 必须返回**全部**类型（不得只返回第一个错误）。"""
+        baseline, _ = self._frozen_pair()
+        current = _synthetic_baseline(
+            offline=_synthetic_offline(total=380, passed=361),
+            db=_synthetic_db(passed=179, skipped=1),
+            residue=2,
+        )
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        assert result.status == "DRIFT"
+        assert set(result.drifts) == {
+            "OFFLINE_EXECUTION_DRIFT",
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        }
+        assert len(result.drifts) == 4
+
+    def test_no_drift_contract(self) -> None:
+        baseline, current = self._frozen_pair()
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        assert result.status == "PASS"
+        assert result.drifts == ("NO_BASELINE_DRIFT",)
+        assert result.is_pass is True
+
+    def test_residue_safety_when_baseline_residue_is_nonzero(self) -> None:
+        """安全边界：即使 current == baseline，residue != 0 也必须 DRIFT。"""
+        baseline = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+        )
+        current = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+        )
+
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        assert current == baseline
+        assert result.status == "DRIFT"
+        assert result.drifts == ("DB_RESIDUE_DRIFT",)
+
+    def test_gate_result_security_contract(self) -> None:
+        """复用 Step 91 的 security 断言风格（不重新设计 scanner）；drift 结果同样干净。"""
+        baseline, _ = self._frozen_pair()
+        current = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+        )
+        result = evaluate_matrix_baseline_gate(current, baseline)
+        field_names = {item.name for item in fields(MatrixBaselineGateResult)}
+        blob = repr(result)
+
+        assert field_names == {"status", "drifts", "current", "baseline"}
+        for forbidden in (
+            "api_key",
+            "password",
+            "database_url",
+            "authorization",
+            "prompt",
+            "messages",
+            "sql",
+            "rag_chunk",
+            "tool_args",
+            "raw_response",
+        ):
+            assert forbidden not in field_names
+            assert forbidden not in blob
+        for sentinel in ("postgresql://", "sk-", "Bearer"):
+            assert sentinel not in blob
+
+    def test_contract_tests_use_no_execution_or_db_helper(self) -> None:
+        """§十七 自审：本契约类**不**调用 Step 89 execution helper / DB 读取。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == (
+                "TestMatrixBaselineGateContract"
+            ):
+                body = ast.unparse(node)
+
+        assert body, "未找到 TestMatrixBaselineGateContract"
+        # needle 动态拼接：避免断言自身文本被误判为违规
+        for forbidden in (
+            "_matrix_" + "execution_summary",
+            "_current_matrix_" + "baseline",
+            "_db_" + "residue_total",
+            "_offline_suite_" + "execution",
+            "_db_suite_" + "execution",
+            "_run_" + "pytest",
+        ):
+            assert forbidden not in body, forbidden
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -2909,6 +3235,7 @@ __all__ = [
     "MatrixExecutionSummary",
     "TestEntryHygiene",
     "TestMatrixBaselineGate",
+    "TestMatrixBaselineGateContract",
     "TestMatrixExecutionBaseline",
     "TestMatrixExecutionSummary",
     "compare_matrix_execution_baseline",

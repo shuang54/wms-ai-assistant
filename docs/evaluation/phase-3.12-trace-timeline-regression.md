@@ -535,6 +535,9 @@ Drift（不修改 Step 85 的 4 类）
 
 > Step 91（Baseline Gate）见独立记录：`docs/evaluation/phase-3.12-step-91-matrix-baseline-gate.md`
 > —— `evaluate_matrix_baseline_gate(current, baseline)` → PASS / DRIFT（无容差、无 baseline 更新）。
+> Step 92（Gate Contract Freeze）：`docs/evaluation/phase-3.12-step-92-matrix-baseline-gate-contract.md`
+> —— status ∈ {PASS, DRIFT} · 6 类 Drift 冻结 · duration / node-hosted 排除 ·
+> baseline 与 current 只读 · 无自动刷新 · residue != 0 恒 DRIFT。
 
 ## 8. 漂移检测
 
