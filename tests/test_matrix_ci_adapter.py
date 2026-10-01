@@ -267,10 +267,17 @@ class TestModuleDependencies:
             assert forbidden not in names, forbidden
         assert names == ["adapt_gate_result_to_exit_code"], names
 
-    def test_project_has_no_ci_workflow_or_cli(self) -> None:
+    def test_project_has_no_ci_workflow(self) -> None:
+        """Step 96 授权本地 CLI 脚本存在；GitHub Actions 与其它 CLI 入口仍禁止。"""
         assert not (_REPO_ROOT / ".github").exists()
-        for path in ("scripts/run_matrix_gate.py", "scripts/check_baseline.py"):
-            assert not (_REPO_ROOT / path).exists(), path
+        assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
+
+        cli = _REPO_ROOT / "scripts" / "run_matrix_gate.py"
+
+        assert cli.is_file()
+        source = cli.read_text(encoding="utf-8")
+        for forbidden in ("argparse", "click", "typer", "sys.argv"):
+            assert forbidden not in source, forbidden
 
     def test_synthetic_helpers_are_pure(self) -> None:
         """本文件使用的合成 helper 不触发执行（断言其构造无副作用）。"""

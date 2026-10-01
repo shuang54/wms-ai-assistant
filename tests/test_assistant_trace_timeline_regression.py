@@ -1228,6 +1228,7 @@ class TestRegistry:
             "MATRIX_EXECUTION_BASELINE",
             "CI_ADAPTER_EXIT_CODES",
             "CI_ADAPTER_IMPLEMENTATION",
+            "CI_GATE_CLI",
         )
     # 备注：Step 91 的 Gate 复用既有 DTO，未引入新的 collector 结构名。
         offenders: list[tuple[str, str]] = []
@@ -3427,11 +3428,9 @@ class TestMatrixBaselineGateCiReadiness:
     def test_ci_adapter_boundary_is_not_implemented(self) -> None:
         """CI Adapter / workflow / CLI 均未实现（本阶段只冻结前三层）。"""
         assert not (_REPO_ROOT / ".github").exists()
-        for path in (
-            "scripts/run_matrix_gate.py",
-            "scripts/check_baseline.py",
-        ):
-            assert not (_REPO_ROOT / path).exists(), path
+        assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
+        # Step 96 授权的本地 CLI（orchestration only：无参数 / 无 baseline 写入）
+        assert (_REPO_ROOT / "scripts/run_matrix_gate.py").is_file()
         module_level = {
             node.module
             for node in ast.parse(_source(_SELF)).body
@@ -3461,6 +3460,9 @@ CI_ADAPTER_EXIT_CODES: Mapping[str, int] = _PROD_CI_ADAPTER_EXIT_CODES
 #: Step 95：Adapter **唯一实现**（作为现有 Matrix Contract 的一个节点登记；
 #: 不建立第二套 Contract Registry）。
 CI_ADAPTER_IMPLEMENTATION = adapt_gate_result_to_exit_code
+
+#: Step 96：本地 Matrix Gate CLI（orchestration layer；只编排，不重新判断）。
+CI_GATE_CLI = "scripts/run_matrix_gate.py"
 
 #: Adapter 唯一允许的输入 / 输出（仅 Contract 文本；**不**实现函数）。
 CI_ADAPTER_INPUT_TYPE: str = "MatrixBaselineGateResult"
@@ -3682,8 +3684,12 @@ class TestCiAdapterContract:
         ):
             assert forbidden not in names, forbidden
         assert not (_REPO_ROOT / ".github").exists()
-        for path in ("scripts/run_matrix_gate.py", "scripts/check_baseline.py"):
-            assert not (_REPO_ROOT / path).exists(), path
+        assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
+        # Step 96 **授权**的本地 CLI（仅编排：无参数 / 无 argparse / 不刷新 baseline）
+        assert (_REPO_ROOT / CI_GATE_CLI).is_file()
+        cli_source = (_REPO_ROOT / CI_GATE_CLI).read_text(encoding="utf-8")
+        for forbidden in ("argparse", "click", "typer", "sys.argv"):
+            assert forbidden not in cli_source, forbidden
 
 
 # ============================================================
