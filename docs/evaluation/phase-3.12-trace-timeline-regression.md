@@ -185,6 +185,29 @@ Real LLM（DeepSeek）   = 0 次（全部沿用既有 Fake / Stub；未改 API K
 生产 / 开发数据库      = 未使用（仅项目既有测试 PostgreSQL）
 ```
 
+## 7.1 Matrix Contract（Step 80 冻结）
+
+```text
+规模快照 EXPECTED_MATRIX_SCALE（任何增减需显式授权）
+    categories        = 13
+    registered_files  = 28
+    offline_files     = 18   （db == "no" | "partial"）
+    db_files          = 15   （db == "yes" | "partial"）
+    自洽：offline + DB = registered + partial
+
+冻结检查（tests/test_assistant_trace_timeline_regression.py::TestRegressionMatrixContract，12 项）
+    matrix_scale_is_frozen · required_categories_match_actual_exactly ·
+    required_categories_have_no_duplicates · registered_file_paths_are_unique ·
+    filespec_metadata_is_valid（path/coverage 非空 · db ∈ no|partial|yes · 三个开关 bool）·
+    observability_allowlist_category_metadata_is_all_false ·
+    db_and_offline_suite_partition · category_to_file_completeness（无 dangling）·
+    file_to_category_completeness（无 orphan）· no_self_registration ·
+    representative_nodes_are_unique_and_registered · representative_nodes_are_collectable
+        （`--collect-only` 只收集不执行）
+
+FileSpec.db 语义：db_required = (db != "no")；coverage = scope
+```
+
 ## 8. 漂移检测
 
 ```text

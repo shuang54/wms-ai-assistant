@@ -78,6 +78,17 @@ _REQUIRED_CATEGORIES: tuple[str, ...] = (
     "OBSERVABILITY_HTTP_ALLOWLIST",
 )
 
+#: **Matrix Contract 规模快照**（Phase 3.12 Step 80 冻结；任何增减都需显式授权）。
+EXPECTED_MATRIX_SCALE: dict[str, int] = {
+    "categories": 13,          # Step 74 的 12 类 + Step 79 的 OBSERVABILITY_HTTP_ALLOWLIST
+    "registered_files": 28,
+    "offline_files": 18,       # db == "no" | "partial"
+    "db_files": 15,            # db == "yes" | "partial"
+}
+
+#: FileSpec.db 的合法取值（= db_required 的映射：no→False；yes/partial→True）。
+_DB_MODES: tuple[str, ...] = ("no", "partial", "yes")
+
 #: Step 79 新增类别的 Purpose（写进回归矩阵元数据）。
 OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE = (
     "确保 Observability HTTP API 的实际 route、Frozen Contract、C25 Allowlist "
@@ -448,7 +459,7 @@ class TestRegistry:
         for spec in FILES:
             assert (_REPO_ROOT / spec.path).is_file(), spec.path
 
-    def test_twelve_required_categories_are_covered(self) -> None:
+    def test_required_categories_are_covered(self) -> None:
         assert set(CATEGORIES) == set(_REQUIRED_CATEGORIES)
         for category, paths in CATEGORIES.items():
             assert paths, category
@@ -511,20 +522,6 @@ class TestRegistry:
             assert file_path in known_files, node_id
             assert file_path in CATEGORIES[category], node_id
 
-    def test_representative_contract_nodes_exist(self) -> None:
-        """node id 必须真实存在（防重命名 / 删除造成的静默失效）。"""
-        files = tuple(
-            dict.fromkeys(
-                node_id.partition("::")[0]
-                for _, node_id in REPRESENTATIVE_CONTRACT_NODES
-            )
-        )
-        result = _run_pytest(files, with_db=False, collect_only=True)
-
-        assert result.returncode == 0, result.stdout[-1500:]
-        for _, node_id in REPRESENTATIVE_CONTRACT_NODES:
-            assert node_id in result.stdout, node_id
-
     def test_no_duplicate_regression_framework(self) -> None:
         """collector 结构名只能出现在本文件（禁止第二套回归框架）。"""
         structure_names = (
@@ -535,6 +532,7 @@ class TestRegistry:
             "_db_suite",
             "REPRESENTATIVE_CONTRACT_NODES",
             "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
+            "EXPECTED_MATRIX_SCALE",
         )
         offenders: list[tuple[str, str]] = []
         for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
@@ -578,6 +576,142 @@ class TestRegistry:
             assert "RUN_DB_TESTS" not in _code_string_constants(spec.path), (
                 spec.path
             )
+
+
+# ============================================================
+# Matrix Contract 冻结（Phase 3.12 Step 80 · 离线 · 静态）
+#
+# 只冻结/验证**矩阵自身**（category / FileSpec / 注册表 / 代表性 node），
+# 不新增业务断言、不复制 FILES / CATEGORIES、不建立第二套框架。
+# ============================================================
+
+class TestRegressionMatrixContract:
+    def test_matrix_scale_is_frozen(self) -> None:
+        """规模快照：categories / registered files / offline / DB 四项精确匹配。"""
+        actual = {
+            "categories": len(CATEGORIES),
+            "registered_files": len(FILES),
+            "offline_files": len(_offline_suite()),
+            "db_files": len(_db_suite()),
+        }
+
+        assert actual == EXPECTED_MATRIX_SCALE, actual
+        # 分区自洽：offline + DB = registered + partial（partial 双跑）
+        partial = sum(1 for spec in FILES if spec.db == "partial")
+        assert (
+            actual["offline_files"] + actual["db_files"]
+            == actual["registered_files"] + partial
+        )
+
+    def test_required_categories_match_actual_exactly(self) -> None:
+        assert set(_REQUIRED_CATEGORIES) == set(CATEGORIES)
+        assert len(_REQUIRED_CATEGORIES) == len(CATEGORIES) == (
+            EXPECTED_MATRIX_SCALE["categories"]
+        )
+
+    def test_required_categories_have_no_duplicates(self) -> None:
+        assert len(set(_REQUIRED_CATEGORIES)) == len(_REQUIRED_CATEGORIES)
+        assert all(category.strip() for category in _REQUIRED_CATEGORIES)
+
+    def test_registered_file_paths_are_unique(self) -> None:
+        paths = [spec.path for spec in FILES]
+
+        assert len(set(paths)) == len(paths), sorted(
+            path for path in set(paths) if paths.count(path) > 1
+        )
+        assert all(path.startswith("tests/") for path in paths)
+
+    def test_filespec_metadata_is_valid(self) -> None:
+        """FileSpec：path/coverage 非空；db ∈ 合法取值；三个开关必须是 bool。
+
+        （``db`` 的取值域是 ``no | partial | yes``；映射：
+          db_required = (db != "no")。结构未被本阶段修改。）
+        """
+        for spec in FILES:
+            assert spec.path and spec.path.strip(), spec
+            assert spec.coverage and spec.coverage.strip(), spec
+            assert spec.db in _DB_MODES, spec
+            for flag in (spec.network, spec.llm, spec.production_code):
+                assert isinstance(flag, bool), spec
+
+    def test_observability_allowlist_category_metadata_is_all_false(self) -> None:
+        """Step 79 语义保持不变：allowlist 契约族必须全离线。"""
+        for path in CATEGORIES["OBSERVABILITY_HTTP_ALLOWLIST"]:
+            spec = _file_specs()[path]
+
+            assert spec.db == "no", path
+            assert spec.network is False, path
+            assert spec.llm is False, path
+            assert spec.production_code is False, path
+
+    def test_db_and_offline_suite_partition(self) -> None:
+        """注册 → suite 的分区语义（只验证登记，不执行 DB）。"""
+        offline, db = set(_offline_suite()), set(_db_suite())
+
+        for spec in FILES:
+            if spec.db == "no":
+                assert spec.path in offline and spec.path not in db, spec.path
+            elif spec.db == "yes":
+                assert spec.path in db and spec.path not in offline, spec.path
+            else:  # partial：两套 suite 都跑（离线段 + DB 段）
+                assert spec.path in offline and spec.path in db, spec.path
+
+    def test_category_to_file_completeness(self) -> None:
+        """category → file：至少 1 个、全部已登记、无 dangling。"""
+        registered = {spec.path for spec in FILES}
+
+        for category, paths in CATEGORIES.items():
+            assert paths, category
+            assert len(set(paths)) == len(paths), category
+            for path in paths:
+                assert path in registered, (category, path)
+                assert (_REPO_ROOT / path).is_file(), (category, path)
+
+    def test_file_to_category_completeness(self) -> None:
+        """file → category：无 orphan（每个注册文件至少属一个已登记类别）。"""
+        mapping: dict[str, list[str]] = {}
+        for category, paths in CATEGORIES.items():
+            assert category in _REQUIRED_CATEGORIES, category
+            for path in paths:
+                mapping.setdefault(path, []).append(category)
+
+        orphans = sorted({spec.path for spec in FILES} - set(mapping))
+        assert orphans == [], orphans
+        for path, categories in mapping.items():
+            assert categories, path
+
+    def test_no_self_registration(self) -> None:
+        """collector 自身不得作为 Matrix entry / category 成员 / suite 成员。"""
+        assert _SELF not in {spec.path for spec in FILES}
+        assert _SELF not in {path for paths in CATEGORIES.values() for path in paths}
+        assert _SELF not in _offline_suite() and _SELF not in _db_suite()
+        assert not (_REPO_ROOT / _SELF).name.startswith("test_assistant_regression")
+
+    def test_representative_nodes_are_unique_and_registered(self) -> None:
+        registered = {spec.path for spec in FILES}
+        node_ids = [node_id for _, node_id in REPRESENTATIVE_CONTRACT_NODES]
+
+        assert len(set(node_ids)) == len(node_ids), sorted(node_ids)
+        for category, node_id in REPRESENTATIVE_CONTRACT_NODES:
+            file_path = node_id.partition("::")[0]
+            assert category in _REQUIRED_CATEGORIES, (category, node_id)
+            assert file_path in registered, node_id
+            assert file_path in CATEGORIES[category], node_id
+            assert node_id.partition("::")[1], node_id   # 必须带 class/function
+
+    def test_representative_nodes_are_collectable(self) -> None:
+        """node id 必须真实可被 ``--collect-only`` 收集（**不执行**）。"""
+        files = tuple(
+            dict.fromkeys(
+                node_id.partition("::")[0]
+                for _, node_id in REPRESENTATIVE_CONTRACT_NODES
+            )
+        )
+        result = _run_pytest(files, with_db=False, collect_only=True)
+
+        assert result.returncode == 0, result.stdout[-1500:]
+        for _, node_id in REPRESENTATIVE_CONTRACT_NODES:
+            assert node_id in result.stdout, node_id
 
 
 # ============================================================
@@ -704,9 +838,13 @@ class TestRegressionSuite:
 
 __all__ = [
     "CATEGORIES",
+    "EXPECTED_MATRIX_SCALE",
     "FILES",
+    "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
+    "REPRESENTATIVE_CONTRACT_NODES",
     "FileSpec",
     "TestEntryHygiene",
+    "TestRegressionMatrixContract",
     "TestRegressionSuite",
     "TestRegistry",
 ]
