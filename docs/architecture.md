@@ -4234,6 +4234,37 @@ source_id：Trace.outcome 无 source_id；Timeline.outcome_event.source_id = 真
 
 ---
 
+## 8.76 Trace / Timeline 写入中读取一致性（Phase 3.12 Step 72 — Audit / PASS）
+
+> 记录：`docs/evaluation/phase-3.12-step-72-read-during-write-audit.md`
+> 测试：`tests/test_assistant_trace_timeline_read_during_write.py`（15 DB-gated；离线全 SKIP）
+
+```text
+构造：真实 Repository 分阶段写入（LLM → RAG → Tool → Outcome）+ 真实两个 Read API；
+      另有"后台线程写入 + 前台 20ms 轮询"用例（threading.Thread）。
+      未改生产代码 / 未加 test seam / 未读 Session 事务 / 未改 isolation level。
+
+结论（partial state 合法，Contract 始终成立）：
+    A LLM only / B LLM+RAG / C Tool only → 两视图数量与身份一致；outcome = null
+        （**不**推断 SUCCESS / FAILED / REFUSED）
+    D SUCCESS / E FAILED / F REFUSED / G EMPTY → Trace.outcome ≡
+        Timeline.outcome_event.status；source_id == 真实 outcome PK
+    H 三个 request 处于**不同持久化阶段**同时读取 → 无跨 request、source_id 两两不相交
+    实时交错（写入中轮询 40 次）：每次读取都 Contract 合法；累计事件数单调不减；
+        最终稳定状态完整（llm1 + rag1 + tool1 + SUCCESS）
+    稳定阶段连续两次读取相等；写入进行中**不**要求 equality（无快照语义）
+    source_id：int · ∈ 本 request DB PK · 组内无重复（Trace LLM id == Timeline source_id）
+    安全：写入中读取的响应同样无敏感字段 / 哨兵；未知 request → 200 + 四段空
+
+Contract 要点（写入中读取的语义边界）：
+    当前系统**没有** event_id / sequence / transaction_id / 全局排序 / 统一 started_at
+    ⇒ 读取可能看到 partial state；只要不跨 request、source_id 真实存在且不重复、
+       outcome ∈ {已写入值, null}，即为合法。
+未发现生产 bug；backend/ 改动 = 0
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
