@@ -53,17 +53,22 @@ _SUPPORTED_METHODS: frozenset[str] = frozenset(
     {"get", "post", "put", "patch", "delete", "head", "options"}
 )
 
-#: §三 声明的六路由基线（**不信任列表本身**：与真实发现结果双向比对）。
-_EXPECTED_BASELINE: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("GET", "/observability/tools"),
-        ("GET", "/observability/tools/metrics"),
-        ("GET", "/observability/tools/history"),
-        ("GET", "/observability/tools/metrics/persistent"),
-        ("GET", "/observability/assistant-trace/{assistant_request_id}"),
-        ("GET", "/observability/assistant-timeline/{assistant_request_id}"),
-    }
-)
+def _expected_baseline() -> frozenset[tuple[str, str]]:
+    """六路由基线 —— **引用冻结契约**（唯一事实来源，Phase 3.12 Step 77）。
+
+    This set mirrors the frozen contract:
+    ``tests/test_observability_http_allowlist_regression.py
+    ::EXPECTED_OBSERVABILITY_ROUTES``（本文件不再持有第二份字面量，
+    避免两个可互相漂移的基线）。
+
+    函数内延迟 import：冻结回归模块在模块级引用本文件的发现器，
+    此处延迟引用以规避循环 import。
+    """
+    from tests.test_observability_http_allowlist_regression import (  # noqa: PLC2701
+        EXPECTED_OBSERVABILITY_ROUTES,
+    )
+
+    return EXPECTED_OBSERVABILITY_ROUTES
 
 #: §十一 安全扫描禁止标识符（只扫可执行标识符 / 形参；**不扫 docstring**）。
 _FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
@@ -443,7 +448,7 @@ class TestBaseline:
     def test_10_six_route_baseline_is_exact(self) -> None:
         discovered = frozenset(route.identity for route in observability_routes())
 
-        assert discovered == _EXPECTED_BASELINE
+        assert discovered == _expected_baseline()
         assert len(discovered) == 6
 
     def test_10b_baseline_classification_is_complete(self) -> None:
