@@ -208,6 +208,21 @@ Real LLM（DeepSeek）   = 0 次（全部沿用既有 Fake / Stub；未改 API K
 FileSpec.db 语义：db_required = (db != "no")；coverage = scope
 ```
 
+## 7.2 Matrix 可执行性审计（Step 81 · `--collect-only`）
+
+```text
+TestRegressionMatrixCollectability（5 项；只收集不执行，不开启 RUN_DB_TESTS）
+    collectability_report_covers_every_registered_file · all_registered_files_are_collectable ·
+    offline_registered_files_are_collectable · db_registered_files_are_collectable ·
+    collectability_does_not_require_db_gate
+
+实测（每题一次单文件 `python -m pytest --collect-only -q <file>`，30s 超时，无 retry）
+    registered 28 → collect ok **28 / 28** · failed 0 · timeout 0 · 零用例文件 0
+    offline 18 / 18 · DB 15 / 15（**未启动 PostgreSQL**：仅收集）
+    合计收集 node = **467**
+结果性质：**审计信息**，不写入 FileSpec（FileSpec 结构未变）
+```
+
 ## 8. 漂移检测
 
 ```text

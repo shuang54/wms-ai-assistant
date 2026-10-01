@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -48,6 +50,12 @@ _CONTRACT_GATE = "tests/test_assistant_trace_timeline_contract.py"
 
 #: 嵌套 suite 的墙钟上限（避免 CI 挂死）。
 _SUITE_TIMEOUT_SECONDS = 1800
+
+#: 单文件 ``--collect-only`` 的超时（Step 81 §十二；超时 = FAIL，不 retry）。
+_COLLECT_TIMEOUT_SECONDS = 30
+
+#: 解析 pytest ``--collect-only -q`` 的 "N tests collected" 行。
+_COLLECT_COUNT_PATTERN = re.compile(r"(\d+)\s+tests?\s+collected")
 
 #: Step 74 专属残留命名空间（定向清理；禁止 TRUNCATE / DELETE ALL）。
 _STEP74_PREFIX = "step74-"
@@ -353,19 +361,28 @@ def _db_mode() -> bool:
     }
 
 
-def _run_pytest(
-    paths: tuple[str, ...], *, with_db: bool, collect_only: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """嵌套执行既有 suite（**不复制**任何测试逻辑）。
-
-    ``collect_only`` = True 时只收集 node（用于校验代表性 node 真实存在）。
-    """
+def _pytest_env(with_db: bool) -> dict[str, str]:
+    """子进程环境：``with_db=False`` 时**强制移除** ``RUN_DB_TESTS``（离线语义）。"""
     env = dict(os.environ)
     if with_db:
         env["RUN_DB_TESTS"] = "1"
     else:
-        env.pop("RUN_DB_TESTS", None)   # 离线模式：强制无 DB 门控
+        env.pop("RUN_DB_TESTS", None)
+    return env
 
+
+def _run_pytest(
+    paths: tuple[str, ...],
+    *,
+    with_db: bool,
+    collect_only: bool = False,
+    timeout: int = _SUITE_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """嵌套执行既有 suite（**不复制**任何测试逻辑）。
+
+    ``collect_only`` = True 时只收集 node（``--collect-only``：收集但不执行）。
+    """
+    env = _pytest_env(with_db)
     extra = ["--collect-only"] if collect_only else []
     return subprocess.run(
         [
@@ -383,7 +400,7 @@ def _run_pytest(
         env=env,
         capture_output=True,
         text=True,
-        timeout=_SUITE_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
 
@@ -416,6 +433,60 @@ def _cleanup_step74_rows() -> int:
                 {"p": f"{_STEP74_PREFIX}%"},
             ).rowcount
     return deleted
+
+
+@dataclass(frozen=True)
+class CollectReport:
+    """单文件 ``--collect-only`` 结果（Step 81；**审计结果，不写入 FileSpec**）。"""
+
+    path: str
+    returncode: int
+    collected: int
+    tail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and self.collected > 0
+
+
+def _collect_one(path: str) -> CollectReport:
+    """单文件 collection audit（复用 ``_run_pytest``；超时 = FAIL，无 retry）。"""
+    try:
+        result = _run_pytest(
+            (path,),
+            with_db=False,
+            collect_only=True,
+            timeout=_COLLECT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return CollectReport(
+            path=path,
+            returncode=124,
+            collected=0,
+            tail=f"TIMEOUT after {_COLLECT_TIMEOUT_SECONDS}s",
+        )
+
+    match = _COLLECT_COUNT_PATTERN.search(result.stdout)
+    return CollectReport(
+        path=path,
+        returncode=result.returncode,
+        collected=int(match.group(1)) if match else 0,
+        tail=(result.stdout + result.stderr)[-600:],
+    )
+
+
+@lru_cache(maxsize=1)
+def _collectability_report() -> tuple[CollectReport, ...]:
+    """对 FILES 中每个注册文件做一次 collection audit（会话内缓存）。"""
+    return tuple(_collect_one(spec.path) for spec in FILES)
+
+
+def _failures(reports: tuple[CollectReport, ...]) -> list[str]:
+    return [
+        f"{report.path} (rc={report.returncode}, collected={report.collected})"
+        for report in reports
+        if not report.ok
+    ]
 
 
 def _step74_residue() -> dict[str, int]:
@@ -715,6 +786,64 @@ class TestRegressionMatrixContract:
 
 
 # ============================================================
+# Matrix 可执行性审计（Phase 3.12 Step 81 · `--collect-only`）
+#
+# 只收集，**不执行**测试；不开启 RUN_DB_TESTS；结果仅作审计，不写入 FileSpec。
+# ============================================================
+
+class TestRegressionMatrixCollectability:
+    def test_collectability_report_covers_every_registered_file(self) -> None:
+        reports = _collectability_report()
+
+        assert [report.path for report in reports] == [spec.path for spec in FILES]
+        assert len(reports) == EXPECTED_MATRIX_SCALE["registered_files"] == 28
+
+    def test_all_registered_files_are_collectable(self) -> None:
+        reports = _collectability_report()
+        failures = _failures(reports)
+
+        assert failures == [], failures
+        assert len(reports) == 28
+        assert sum(report.collected for report in reports) > 0
+
+    def test_offline_registered_files_are_collectable(self) -> None:
+        offline = set(_offline_suite())
+        reports = tuple(
+            report
+            for report in _collectability_report()
+            if report.path in offline
+        )
+
+        assert len(reports) == EXPECTED_MATRIX_SCALE["offline_files"] == 18
+        assert _failures(reports) == [], _failures(reports)
+
+    def test_db_registered_files_are_collectable(self) -> None:
+        db_files = set(_db_suite())
+        reports = tuple(
+            report
+            for report in _collectability_report()
+            if report.path in db_files
+        )
+
+        assert len(reports) == EXPECTED_MATRIX_SCALE["db_files"] == 15
+        assert _failures(reports) == [], _failures(reports)
+
+    def test_collectability_does_not_require_db_gate(self) -> None:
+        """未开启 RUN_DB_TESTS 时，DB 门控文件同样可被收集（不启动 PostgreSQL）。"""
+        assert "RUN_DB_TESTS" not in _pytest_env(with_db=False)
+        assert _pytest_env(with_db=True)["RUN_DB_TESTS"] == "1"
+
+        db_files = set(_db_suite())
+        assert db_files, "DB suite 不应为空"
+        unreachable = [
+            report.path
+            for report in _collectability_report()
+            if report.path in db_files and report.collected <= 0
+        ]
+        assert unreachable == [], unreachable
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -842,8 +971,10 @@ __all__ = [
     "FILES",
     "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
     "REPRESENTATIVE_CONTRACT_NODES",
+    "CollectReport",
     "FileSpec",
     "TestEntryHygiene",
+    "TestRegressionMatrixCollectability",
     "TestRegressionMatrixContract",
     "TestRegressionSuite",
     "TestRegistry",
