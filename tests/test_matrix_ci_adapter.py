@@ -267,9 +267,17 @@ class TestModuleDependencies:
             assert forbidden not in names, forbidden
         assert names == ["adapt_gate_result_to_exit_code"], names
 
-    def test_project_has_no_ci_workflow(self) -> None:
-        """Step 96 授权本地 CLI 脚本存在；GitHub Actions 与其它 CLI 入口仍禁止。"""
-        assert not (_REPO_ROOT / ".github").exists()
+    def test_project_ci_surface_is_minimal(self) -> None:
+        """Step 96 授权本地 CLI；Step 97 授权**一个** workflow；其它入口仍禁止。"""
+        github_dir = _REPO_ROOT / ".github"
+
+        assert github_dir.is_dir()
+        workflows = sorted(
+            path.name
+            for path in (github_dir / "workflows").iterdir()
+            if path.is_file()
+        )
+        assert workflows == ["observability-matrix-gate.yml"], workflows
         assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
 
         cli = _REPO_ROOT / "scripts" / "run_matrix_gate.py"

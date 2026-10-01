@@ -1,0 +1,55 @@
+name: Observability Matrix Gate
+
+# Phase 3.12 Step 97：最小 CI 接入。
+# 唯一职责：执行既有 Matrix Gate CLI，由 shell exit code 决定 CI 成败
+# （PASS → 0 → success · DRIFT → 1 → failure）。
+# 不在 YAML 中重新实现 PASS/DRIFT 判断、baseline 比较或 exit code 映射。
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  observability-matrix-gate:
+    name: Observability Matrix Gate
+    runs-on: ubuntu-latest
+
+    services:
+      # 与本地 docker-compose 一致（PostgreSQL 16 + pgvector），仅用于 CI 的临时实例。
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: wms_ai
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d wms_ai"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # 指向 CI 临时 PostgreSQL（localhost）；不配置任何 LLM / Embedding 凭据。
+      DATABASE_URL: postgresql+psycopg://postgres@localhost:5432/wms_ai
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Initialize database schema
+        run: python -m backend.app.db.init_db
+
+      - name: Run observability matrix gate
+        run: python scripts/run_matrix_gate.py

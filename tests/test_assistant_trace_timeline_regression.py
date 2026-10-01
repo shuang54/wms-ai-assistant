@@ -3427,7 +3427,16 @@ class TestMatrixBaselineGateCiReadiness:
 
     def test_ci_adapter_boundary_is_not_implemented(self) -> None:
         """CI Adapter / workflow / CLI 均未实现（本阶段只冻结前三层）。"""
-        assert not (_REPO_ROOT / ".github").exists()
+        # Step 97 授权：`.github/` 下**仅**一个 workflow（observability-matrix-gate）
+        github_dir = _REPO_ROOT / ".github"
+
+        assert github_dir.is_dir()
+        workflows = sorted(
+            path.name
+            for path in (github_dir / "workflows").iterdir()
+            if path.is_file()
+        )
+        assert workflows == ["observability-matrix-gate.yml"], workflows
         assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
         # Step 96 授权的本地 CLI（orchestration only：无参数 / 无 baseline 写入）
         assert (_REPO_ROOT / "scripts/run_matrix_gate.py").is_file()
@@ -3683,7 +3692,16 @@ class TestCiAdapterContract:
             "MatrixCiAdapter",
         ):
             assert forbidden not in names, forbidden
-        assert not (_REPO_ROOT / ".github").exists()
+        # Step 97 授权：`.github/workflows/` 下**仅**一个 workflow
+        github_dir = _REPO_ROOT / ".github"
+
+        assert github_dir.is_dir()
+        workflows = sorted(
+            path.name
+            for path in (github_dir / "workflows").iterdir()
+            if path.is_file()
+        )
+        assert workflows == ["observability-matrix-gate.yml"], workflows
         assert not (_REPO_ROOT / "scripts/check_baseline.py").exists()
         # Step 96 **授权**的本地 CLI（仅编排：无参数 / 无 argparse / 不刷新 baseline）
         assert (_REPO_ROOT / CI_GATE_CLI).is_file()
