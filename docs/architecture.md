@@ -4270,6 +4270,18 @@ Contract 要点（写入中读取的语义边界）：
 > 基线文档：`docs/evaluation/phase-3.12-trace-timeline-contract-baseline.md`
 > 回归守卫：`tests/test_assistant_trace_timeline_contract.py`（19 项；offline · DB=0 · network=0）
 > 固化来源：Step 64 → 72 已实测行为（**未新增任何生产逻辑**）
+> 回归汇总：`docs/evaluation/phase-3.12-step-74-trace-timeline-e2e-regression-summary.md`
+> （Step 74：Trace / Timeline E2E 20 文件 → 离线 143 + DB 124 用例全绿；
+>  全量套件 1 项既存测试侧白名单漂移待批准同步，生产代码 0 改动）
+> 回归入口（Step 74）：`tests/test_assistant_trace_timeline_regression.py`
+> + `docs/evaluation/phase-3.12-trace-timeline-regression.md`（Regression Matrix / 12 类别）
+> ```text
+> offline   : python -m pytest -q tests/test_assistant_trace_timeline_regression.py
+>             → 注册表校验 + 离线 suite（14 文件 · 289 passed · 19 skipped）
+> DB-gated  : $env:RUN_DB_TESTS="1"; 同一命令
+>             → 叠加 DB suite（15 文件 · 180 passed）
+> 入口只收口、不复制 E2E；仅 `step74-` 命名空间定向清理（无 TRUNCATE / DELETE ALL）
+> ```
 
 ```text
 字段契约（锁定）：
