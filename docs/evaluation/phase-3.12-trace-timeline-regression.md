@@ -538,6 +538,9 @@ Drift（不修改 Step 85 的 4 类）
 > Step 92（Gate Contract Freeze）：`docs/evaluation/phase-3.12-step-92-matrix-baseline-gate-contract.md`
 > —— status ∈ {PASS, DRIFT} · 6 类 Drift 冻结 · duration / node-hosted 排除 ·
 > baseline 与 current 只读 · 无自动刷新 · residue != 0 恒 DRIFT。
+> Step 93（CI-Ready Audit）：`docs/evaluation/phase-3.12-step-93-ci-ready-audit.md`
+> —— Gate 输入/输出/确定性/不可变/安全/依赖边界已审计为 **READY**；
+> CI integration / workflow / CLI / baseline refresh = **均未实现**（需未来显式授权）。
 
 ## 8. 漂移检测
 

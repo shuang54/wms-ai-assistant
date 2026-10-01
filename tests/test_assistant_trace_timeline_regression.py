@@ -31,6 +31,7 @@ group ordering（LLM created_at,id / Tool·RAG id / Outcome ≤1）· request is
 from __future__ import annotations
 
 import ast
+import inspect
 import os
 import re
 import subprocess
@@ -3095,6 +3096,349 @@ class TestMatrixBaselineGateContract:
 
 
 # ============================================================
+# Matrix Baseline Gate CI-Ready Audit（Phase 3.12 Step 93 · 全合成 · 零执行）
+#
+# CI-ready audit ≠ CI integration：本类只回答"Gate 是否具备被 CI 调用的清晰边界"。
+# 不建 CI / 不建 workflow / 不建 CLI / 不改 Gate API / 不刷新 Baseline。
+# ============================================================
+
+#: 未来 CI 需要的稳定映射（**只在测试内验证语义**；不修改 Gate API，不产生 exit code）。
+_CI_EXIT_MAPPING: dict[str, int] = {"PASS": 0, "DRIFT": 1}
+
+
+class TestMatrixBaselineGateCiReadiness:
+    @staticmethod
+    def _pair(
+        *,
+        offline: RegressionExecutionSummary | None = None,
+        db: RegressionExecutionSummary | None = None,
+        residue: int = 0,
+    ) -> tuple[MatrixExecutionBaseline, MatrixExecutionBaseline]:
+        baseline = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=0
+        )
+        current = _synthetic_baseline(
+            offline=offline or baseline.offline,
+            db=db or baseline.db,
+            residue=residue,
+        )
+        return current, baseline
+
+    def test_input_contract_shape_is_explicit(self) -> None:
+        """输入签名显式、无默认值、无 *args/**kwargs；未知输入被拒绝。"""
+        signature = inspect.signature(evaluate_matrix_baseline_gate)
+        parameters = list(signature.parameters.values())
+
+        assert [item.name for item in parameters] == ["current", "baseline"]
+        for item in parameters:
+            assert item.default is inspect.Parameter.empty
+            assert item.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            assert "MatrixExecutionBaseline" in str(item.annotation)
+
+        current, baseline = self._pair()
+        for bad in (None, {"offline": 1}, "PASS", (1, 2), object()):
+            with pytest.raises(Exception):
+                evaluate_matrix_baseline_gate(bad, baseline)  # type: ignore[arg-type]
+            with pytest.raises(Exception):
+                evaluate_matrix_baseline_gate(current, bad)  # type: ignore[arg-type]
+
+    def test_input_contract_rejects_bare_execution_summary(self) -> None:
+        """裸 MatrixExecutionSummary（缺 residue / total / status 视图）不得被静默接受。"""
+        current, baseline = self._pair()
+        summary = MatrixExecutionSummary(
+            offline=current.offline, db=current.db
+        )
+
+        with pytest.raises(Exception):
+            evaluate_matrix_baseline_gate(summary, baseline)  # type: ignore[arg-type]
+
+    def test_output_contract_status_is_sufficient_for_ci(self) -> None:
+        current, baseline = self._pair()
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        assert set(fields(MatrixBaselineGateResult)[i].name for i in range(4)) == {
+            "status",
+            "drifts",
+            "current",
+            "baseline",
+        }
+        assert result.status in _CI_EXIT_MAPPING
+        assert result.is_pass is (result.status == "PASS")
+
+    def test_exit_semantics_are_stable(self) -> None:
+        """PASS → 成功 / DRIFT → 失败（语义稳定；**不**在 Gate API 内 sys.exit）。"""
+        passing, baseline = self._pair()
+        drifting, _ = self._pair(residue=1)
+        mapping: dict[str, int] = {}
+
+        for current in (passing, drifting):
+            status = evaluate_matrix_baseline_gate(current, baseline).status
+            mapping[status] = _CI_EXIT_MAPPING[status]
+
+        assert mapping == {"PASS": 0, "DRIFT": 1}
+        # Gate API 本身不产生 exit code（无 sys.exit / 无 exit_code 字段或方法）
+        gate_source = inspect.getsource(evaluate_matrix_baseline_gate)
+        assert "sys.exit" not in gate_source
+        assert "exit_code" not in gate_source
+        assert not hasattr(MatrixBaselineGateResult, "exit_code")
+        assert not hasattr(MatrixBaselineGateResult, "to_exit_code")
+
+    def test_determinism_over_ten_consecutive_calls(self) -> None:
+        current, baseline = self._pair(
+            offline=_synthetic_offline(total=380, passed=361)
+        )
+        results = [
+            evaluate_matrix_baseline_gate(current, baseline) for _ in range(10)
+        ]
+
+        assert all(item == results[0] for item in results)
+        assert results[0].status == "DRIFT"
+
+    def test_input_immutability_before_and_after_gate(self) -> None:
+        current, baseline = self._pair(residue=1)
+        before = (
+            current.offline, current.db, current.matrix_total,
+            current.matrix_status, current.db_residue,
+            baseline.offline, baseline.db, baseline.matrix_total,
+            baseline.matrix_status, baseline.db_residue,
+        )
+
+        evaluate_matrix_baseline_gate(current, baseline)
+
+        after = (
+            current.offline, current.db, current.matrix_total,
+            current.matrix_status, current.db_residue,
+            baseline.offline, baseline.db, baseline.matrix_total,
+            baseline.matrix_status, baseline.db_residue,
+        )
+        assert before == after
+
+    def test_output_immutability_fields_are_frozen(self) -> None:
+        current, baseline = self._pair()
+        result = evaluate_matrix_baseline_gate(current, baseline)
+
+        for field_name in ("status", "drifts", "current", "baseline"):
+            with pytest.raises(Exception) as excinfo:
+                setattr(result, field_name, None)
+            assert "frozen" in type(excinfo.value).__name__.lower()
+
+    def test_drift_completeness_covers_every_axis(self) -> None:
+        """每个轴都能进入 drifts（无静默丢弃）；组合时返回全部类型。"""
+        _, baseline = self._pair()
+        axes = {
+            "OFFLINE_EXECUTION_DRIFT": self._pair(
+                offline=_synthetic_offline(skipped=20, passed=355)
+            )[0],
+            "DB_EXECUTION_DRIFT": self._pair(
+                db=_synthetic_db(passed=179, skipped=1)
+            )[0],
+            "DB_RESIDUE_DRIFT": self._pair(residue=1)[0],
+        }
+        for expected, current in axes.items():
+            drifts = evaluate_matrix_baseline_gate(current, baseline).drifts
+            assert expected in drifts, (expected, drifts)
+            assert "NO_BASELINE_DRIFT" not in drifts
+
+        composite, _ = self._pair(
+            offline=_synthetic_offline(total=380, passed=361),
+            db=_synthetic_db(passed=179, skipped=1),
+            residue=2,
+        )
+        composite_drifts = set(
+            evaluate_matrix_baseline_gate(composite, baseline).drifts
+        )
+        assert composite_drifts == {
+            "OFFLINE_EXECUTION_DRIFT",
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        }
+
+    def test_no_false_no_baseline_drift(self) -> None:
+        """有真实 drift 时不得附带 NO_BASELINE_DRIFT；完全一致才返回它。"""
+        identical, baseline = self._pair()
+        residue_only, _ = self._pair(residue=1)
+        drifted, _ = self._pair(offline=_synthetic_offline(passed=355, skipped=20))
+
+        assert evaluate_matrix_baseline_gate(
+            identical, baseline
+        ).drifts == ("NO_BASELINE_DRIFT",)
+        assert evaluate_matrix_baseline_gate(
+            residue_only, baseline
+        ).drifts == ("DB_RESIDUE_DRIFT",)
+        assert "NO_BASELINE_DRIFT" not in evaluate_matrix_baseline_gate(
+            drifted, baseline
+        ).drifts
+
+    def test_duration_isolation_for_ci(self) -> None:
+        _, baseline = self._pair()
+        results = []
+        for duration in (1.0, 100.0, 9999.0):
+            current = _synthetic_baseline(
+                offline=RegressionExecutionSummary(
+                    total=375, passed=356, skipped=19, failed=0, errors=0,
+                    exit_code=0, duration_seconds=duration,
+                ),
+                db=RegressionExecutionSummary(
+                    total=180, passed=180, skipped=0, failed=0, errors=0,
+                    exit_code=0, duration_seconds=duration,
+                ),
+                residue=0,
+            )
+            results.append(evaluate_matrix_baseline_gate(current, baseline))
+
+        assert all(item.status == "PASS" for item in results)
+        assert all(item.drifts == ("NO_BASELINE_DRIFT",) for item in results)
+        assert all(item == results[0] for item in results)
+
+    def test_node_hosted_isolation_for_ci(self) -> None:
+        """CI-Ready Gate 不含 node_hosted 输入 / 输出 / 依赖。"""
+        gate_source = inspect.getsource(evaluate_matrix_baseline_gate)
+
+        assert "node_hosted" not in gate_source
+        assert "OFFLINE_EXECUTION_CONTRACT" not in gate_source
+        for dto in (MatrixBaselineGateResult, MatrixExecutionBaseline):
+            assert not any(
+                "node_hosted" in item.name for item in fields(dto)
+            )
+        assert NODE_HOSTED_CONTRACT_CATEGORIES  # 契约审计仍在（但不参与 Gate）
+
+    def test_ci_output_security(self) -> None:
+        """复用既有 security 断言风格；drift 结果 repr 同样干净。"""
+        current, baseline = self._pair(residue=1)
+        result = evaluate_matrix_baseline_gate(current, baseline)
+        blob = repr(result)
+        field_names = {item.name for item in fields(MatrixBaselineGateResult)}
+
+        for forbidden in (
+            "api_key",
+            "password",
+            "database_url",
+            "authorization",
+            "prompt",
+            "messages",
+            "sql",
+            "rag_chunk",
+            "tool_args",
+            "raw_response",
+        ):
+            assert forbidden not in field_names
+            assert forbidden not in blob
+        for sentinel in ("postgresql://", "sk-", "Bearer"):
+            assert sentinel not in blob
+
+    def test_dependency_boundary_of_ci_path(self) -> None:
+        """CI 相关路径（summary → gate → result）不依赖 DB / HTTP / LLM / Redis / Kafka。"""
+        gate_source = inspect.getsource(evaluate_matrix_baseline_gate)
+
+        for forbidden in (
+            "sqlalchemy",
+            "psycopg",
+            "httpx",
+            "requests",
+            "openai",
+            "redis",
+            "kafka",
+            "subprocess",
+            "get_engine",
+        ):
+            assert forbidden not in gate_source, forbidden
+        module_level = {
+            node.module
+            for node in ast.parse(_source(_SELF)).body
+            if isinstance(node, ast.ImportFrom) and node.module
+        } | {
+            alias.name
+            for node in ast.parse(_source(_SELF)).body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        for module in module_level:
+            for prefix in (
+                "sqlalchemy",
+                "psycopg",
+                "httpx",
+                "requests",
+                "openai",
+                "redis",
+                "kafka",
+                "backend.app.db",
+            ):
+                assert not module.startswith(prefix), module
+
+    def test_no_hidden_execution_in_gate_call_graph(self) -> None:
+        """Gate 的模块内调用图 = {compare_matrix_execution_baseline}（无执行 / 无 DB）。"""
+        tree = ast.parse(_source(_SELF))
+        body: ast.FunctionDef | None = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "evaluate_matrix_baseline_gate"
+            ):
+                body = node
+        assert body is not None
+        called = {
+            call.func.id
+            for call in ast.walk(body)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+
+        # 冻结的模块内调用图（构造器 + 复用比较 + tuple() 归一化；**无**执行器 / DB）
+        assert called == {
+            "compare_matrix_execution_baseline",
+            "MatrixBaselineGateResult",
+            "tuple",
+        }, sorted(called)
+        # needle 动态拼接：避免断言自身文本被误判为违规
+        for forbidden in (
+            "_run_" + "pytest",
+            "_offline_suite_" + "execution",
+            "_db_suite_" + "execution",
+            "_db_" + "residue_total",
+            "get_" + "engine",
+            "open",
+            "eval",
+            "exec",
+        ):
+            assert forbidden not in called, forbidden
+        # 本契约类同样不调用执行 / DB helper
+        class_body = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and node.name == "TestMatrixBaselineGateCiReadiness"
+        )
+        class_source = ast.unparse(class_body)
+        for forbidden in (
+            "_matrix_" + "execution_summary",
+            "_current_matrix_" + "baseline",
+            "_db_" + "residue_total",
+            "_run_" + "pytest",
+        ):
+            assert forbidden not in class_source, forbidden
+
+    def test_ci_adapter_boundary_is_not_implemented(self) -> None:
+        """CI Adapter / workflow / CLI 均未实现（本阶段只冻结前三层）。"""
+        assert not (_REPO_ROOT / ".github").exists()
+        for path in (
+            "scripts/run_matrix_gate.py",
+            "scripts/check_baseline.py",
+        ):
+            assert not (_REPO_ROOT / path).exists(), path
+        module_level = {
+            node.module
+            for node in ast.parse(_source(_SELF)).body
+            if isinstance(node, ast.ImportFrom) and node.module
+        } | {
+            alias.name
+            for node in ast.parse(_source(_SELF)).body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        for cli in ("argparse", "click", "typer"):
+            assert cli not in module_level, cli
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -3235,6 +3579,7 @@ __all__ = [
     "MatrixExecutionSummary",
     "TestEntryHygiene",
     "TestMatrixBaselineGate",
+    "TestMatrixBaselineGateCiReadiness",
     "TestMatrixBaselineGateContract",
     "TestMatrixExecutionBaseline",
     "TestMatrixExecutionSummary",
