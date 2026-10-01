@@ -273,6 +273,39 @@ Summary 字段：total · passed · skipped · failed · errors · exit_code
 实现边界：无 pytest plugin / 无 conftest hook / 无 HTML·JSON·DB·Redis·Grafana 持久化
 ```
 
+### Step 83 Offline Execution Snapshot（Step 84 冻结为 Snapshot，非 Contract）
+
+```text
+total:      375
+passed:     356
+skipped:     19
+failed:       0
+errors:       0
+exit_code:    0
+status:    PASS
+
+duration_seconds: informational only（compare=False；不进入 Contract / baseline / equality）
+```
+
+```text
+Contract（Step 84 冻结，长期稳定 —— 只描述语义）
+    PASS : exit_code == 0 AND failed == 0 AND errors == 0
+    FAIL : exit_code != 0 OR failed > 0 OR errors > 0
+    SKIP : skipped >= 0（仅 outcome count，不单独导致 FAIL）
+    Arithmetic : total == passed + skipped + failed + errors
+    Exit code  : 0 = 成功；非 0（含信号负值）= FAIL
+    Immutability : frozen=True
+    Duration   : informational only
+    Extra outcomes : xfail / xpass / deselected / warnings 不并入 total
+
+Snapshot（2026-10-01 记录，数量会随时增长）
+    375 / 356 / 19 / 0 / 0 / exit_code 0 / PASS
+    → 用例数增长（如 380 total / 361 passed / 19 skipped / 0 failed / 0 errors）
+      **不构成 Contract 回归**：数量只属 snapshot，需显式更新快照
+```
+
+（本阶段不记录机器路径 / 用户名 / 环境变量 / 凭据等环境信息。）
+
 ## 8. 漂移检测
 
 ```text

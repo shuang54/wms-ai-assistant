@@ -116,6 +116,32 @@ EXPECTED_MATRIX_SCALE: dict[str, int] = {
 #: FileSpec.db 的合法取值（= db_required 的映射：no→False；yes/partial→True）。
 _DB_MODES: tuple[str, ...] = ("no", "partial", "yes")
 
+#: **Offline Execution Summary Contract**（Phase 3.12 Step 84 冻结）。
+#: 只描述**语义**（PASS / FAIL / SKIP / arithmetic / exit_code / immutability），
+#: **不绑定任何具体用例数量** —— 数量属于 snapshot（见下），不属 Contract。
+OFFLINE_EXECUTION_SUMMARY_CONTRACT: dict[str, str] = {
+    "pass": "exit_code == 0 AND failed == 0 AND errors == 0",
+    "fail": "exit_code != 0 OR failed > 0 OR errors > 0",
+    "skip": "skipped >= 0（仅 outcome count；不单独导致 FAIL）",
+    "arithmetic": "total == passed + skipped + failed + errors",
+    "exit_code": "0 = 成功；非 0（含信号导致的负值）= FAIL",
+    "immutability": "frozen=True（禁止 summary.passed = ...）",
+    "duration": "informational only（compare=False；不进入 Contract / baseline / equality）",
+    "extra_outcomes": "xfail / xpass / deselected / warnings 不并入 total",
+}
+
+#: **Step 83 离线执行快照**（snapshot ≠ contract：用例数增长不构成 Contract 回归；
+#: offline suite 规模变化时应**显式更新本快照**，而不是修改 Contract）。
+OFFLINE_EXECUTION_SUMMARY_SNAPSHOT: dict[str, int | str] = {
+    "total": 375,
+    "passed": 356,
+    "skipped": 19,
+    "failed": 0,
+    "errors": 0,
+    "exit_code": 0,
+    "status": "PASS",
+}
+
 #: Step 79 新增类别的 Purpose（写进回归矩阵元数据）。
 OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE = (
     "确保 Observability HTTP API 的实际 route、Frozen Contract、C25 Allowlist "
@@ -772,6 +798,8 @@ class TestRegistry:
             "REPRESENTATIVE_CONTRACT_NODES",
             "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
             "EXPECTED_MATRIX_SCALE",
+            "OFFLINE_EXECUTION_SUMMARY_CONTRACT",
+            "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
         )
         offenders: list[tuple[str, str]] = []
         for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
@@ -1195,6 +1223,144 @@ class TestOfflineRegressionExecutionSummary:
 
 
 # ============================================================
+# Offline Execution Summary Contract 冻结（Phase 3.12 Step 84）
+#
+# 只冻结 Step 83 的语义（synthsummary + 已知 snapshot）；**不**重跑 18 个文件。
+# Contract（语义，长期稳定）与 Snapshot（当前数量）严格区分。
+# ============================================================
+
+def _summary_from_snapshot(snapshot: dict[str, int | str]) -> RegressionExecutionSummary:
+    return RegressionExecutionSummary(
+        total=int(snapshot["total"]),
+        passed=int(snapshot["passed"]),
+        skipped=int(snapshot["skipped"]),
+        failed=int(snapshot["failed"]),
+        errors=int(snapshot["errors"]),
+        exit_code=int(snapshot["exit_code"]),
+    )
+
+
+def _summary(
+    passed: int, skipped: int = 0, failed: int = 0, errors: int = 0, exit_code: int = 0
+) -> RegressionExecutionSummary:
+    return RegressionExecutionSummary(
+        total=passed + skipped + failed + errors,
+        passed=passed,
+        skipped=skipped,
+        failed=failed,
+        errors=errors,
+        exit_code=exit_code,
+    )
+
+
+class TestOfflineRegressionExecutionSummaryContract:
+    def test_contract_declares_semantics_not_counts(self) -> None:
+        """Contract 只声明语义；数量只出现在 snapshot（两者不得混用）。"""
+        assert set(OFFLINE_EXECUTION_SUMMARY_CONTRACT) == {
+            "pass",
+            "fail",
+            "skip",
+            "arithmetic",
+            "exit_code",
+            "immutability",
+            "duration",
+            "extra_outcomes",
+        }
+        assert set(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == {
+            "total",
+            "passed",
+            "skipped",
+            "failed",
+            "errors",
+            "exit_code",
+            "status",
+        }
+        # Contract 文本中不得出现 snapshot 的具体数量（防把快照写进契约）
+        assert "375" not in " ".join(OFFLINE_EXECUTION_SUMMARY_CONTRACT.values())
+        assert "356" not in " ".join(OFFLINE_EXECUTION_SUMMARY_CONTRACT.values())
+
+    def test_current_snapshot_matches_recorded_baseline(self) -> None:
+        summary = _summary_from_snapshot(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT)
+
+        assert summary.total == 375
+        assert summary.passed == 356
+        assert summary.skipped == 19
+        assert (summary.failed, summary.errors) == (0, 0)
+        assert summary.exit_code == 0
+        assert summary.status == OFFLINE_EXECUTION_SUMMARY_SNAPSHOT["status"] == "PASS"
+
+    def test_pass_semantics(self) -> None:
+        for summary in (_summary(10), _summary(10, skipped=2), _summary(0, skipped=5)):
+            assert summary.status == "PASS", summary
+
+    def test_fail_semantics(self) -> None:
+        assert _summary(9, failed=1, exit_code=1).status == "FAIL"
+        assert _summary(1, errors=1, exit_code=1).status == "FAIL"
+        assert _summary(10, exit_code=1).status == "FAIL"
+        assert _summary(10, exit_code=5).status == "FAIL"     # no tests ran / collection error
+        assert _summary(10, exit_code=-9).status == "FAIL"    # 信号终止
+
+    def test_skip_does_not_cause_failure(self) -> None:
+        """skipped 只是 outcome count：DB-gated skip 属 SKIPPED，不是 FAILED。"""
+        summary = _summary(10, skipped=1000)
+
+        assert summary.skipped == 1000
+        assert summary.status == "PASS"
+        assert "skipped" not in OFFLINE_EXECUTION_SUMMARY_CONTRACT["fail"]
+
+    def test_arithmetic_contract(self) -> None:
+        summary = _summary(3, skipped=2, failed=1, exit_code=1)
+
+        assert summary.total == (
+            summary.passed + summary.skipped + summary.failed + summary.errors
+        )
+        assert "total == passed + skipped + failed + errors" == (
+            OFFLINE_EXECUTION_SUMMARY_CONTRACT["arithmetic"]
+        )
+        for invalid in (
+            dict(total=8, passed=3, skipped=2, failed=1, errors=0, exit_code=1),
+            dict(total=7, passed=3, skipped=2, failed=1, errors=0, exit_code=1),
+        ):
+            with pytest.raises(ValueError):
+                RegressionExecutionSummary(**invalid)
+
+    def test_immutability_contract(self) -> None:
+        summary = _summary(4)
+
+        with pytest.raises(Exception) as excinfo:
+            summary.total = 0  # type: ignore[misc]
+        assert "frozen" in type(excinfo.value).__name__.lower()
+        # duration 为信息字段：不参与 equality / baseline
+        assert _summary(4) == RegressionExecutionSummary(
+            total=4, passed=4, skipped=0, failed=0, errors=0,
+            exit_code=0, duration_seconds=42.0,
+        )
+
+    def test_future_count_independence(self) -> None:
+        """Contract 不绑定 375：数量变化但语义相同 → 仍 PASS。"""
+        grown = _summary(passed=361, skipped=19)
+
+        assert grown.total == 380
+        assert grown.status == "PASS"
+        # 语义判定只依赖字段，不读取 snapshot（AST 校验 status 属性体）
+        tree = ast.parse(_source(_SELF))
+        status_source = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == (
+                "RegressionExecutionSummary"
+            ):
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == "status":
+                        status_source = ast.unparse(child)
+        assert status_source, "未找到 status 属性实现"
+        assert "SNAPSHOT" not in status_source
+        assert "CONTRACT" not in status_source
+        assert status_source.count("self.exit_code") >= 1
+        assert status_source.count("self.failed") >= 1
+        assert status_source.count("self.errors") >= 1
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -1321,12 +1487,15 @@ __all__ = [
     "EXPECTED_MATRIX_SCALE",
     "FILES",
     "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
+    "OFFLINE_EXECUTION_SUMMARY_CONTRACT",
+    "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
     "REPRESENTATIVE_CONTRACT_NODES",
     "CollectReport",
     "FileSpec",
     "RegressionExecutionSummary",
     "TestEntryHygiene",
     "TestOfflineRegressionExecutionSummary",
+    "TestOfflineRegressionExecutionSummaryContract",
     "TestRegressionMatrixCollectability",
     "TestRegressionMatrixContract",
     "TestRegressionMatrixExecutionCoverage",
