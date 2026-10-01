@@ -44,6 +44,12 @@ from typing import Literal, Mapping
 
 import pytest
 
+# Step 95：生产 CI Adapter（**唯一**实现）+ 唯一退出码映射；测试侧复用，不复制。
+from backend.app.services.matrix_ci_adapter import (  # noqa: E402
+    CI_ADAPTER_EXIT_CODES as _PROD_CI_ADAPTER_EXIT_CODES,
+    adapt_gate_result_to_exit_code,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SELF = "tests/test_assistant_trace_timeline_regression.py"
 
@@ -1221,6 +1227,7 @@ class TestRegistry:
             "NODE_HOSTED_REPRESENTATIVE_NODES",
             "MATRIX_EXECUTION_BASELINE",
             "CI_ADAPTER_EXIT_CODES",
+            "CI_ADAPTER_IMPLEMENTATION",
         )
     # 备注：Step 91 的 Gate 复用既有 DTO，未引入新的 collector 结构名。
         offenders: list[tuple[str, str]] = []
@@ -3103,8 +3110,8 @@ class TestMatrixBaselineGateContract:
 # 不建 CI / 不建 workflow / 不建 CLI / 不改 Gate API / 不刷新 Baseline。
 # ============================================================
 
-#: 未来 CI 需要的稳定映射（**只在测试内验证语义**；不修改 Gate API，不产生 exit code）。
-_CI_EXIT_MAPPING: dict[str, int] = {"PASS": 0, "DRIFT": 1}
+#: 未来 CI 需要的稳定映射 —— **复用生产 Adapter 的唯一映射**（不创建第二份）。
+_CI_EXIT_MAPPING: Mapping[str, int] = _PROD_CI_ADAPTER_EXIT_CODES
 
 
 class TestMatrixBaselineGateCiReadiness:
@@ -3447,10 +3454,13 @@ class TestMatrixBaselineGateCiReadiness:
 # 不得：执行 Matrix · 读 DB · 重算 drift · 读 baseline · 刷新 baseline · 任何输出持久化。
 # ============================================================
 
-#: **冻结的 CI Adapter 退出码契约**（只读映射；复用 Step 93 的语义表，避免第二份定义）。
-CI_ADAPTER_EXIT_CODES: MappingProxyType[str, int] = MappingProxyType(
-    dict(_CI_EXIT_MAPPING)
-)
+#: **冻结的 CI Adapter 退出码契约**（只读映射；**同一个对象**复用生产 Adapter，
+#: 不创建第二份定义）。
+CI_ADAPTER_EXIT_CODES: Mapping[str, int] = _PROD_CI_ADAPTER_EXIT_CODES
+
+#: Step 95：Adapter **唯一实现**（作为现有 Matrix Contract 的一个节点登记；
+#: 不建立第二套 Contract Registry）。
+CI_ADAPTER_IMPLEMENTATION = adapt_gate_result_to_exit_code
 
 #: Adapter 唯一允许的输入 / 输出（仅 Contract 文本；**不**实现函数）。
 CI_ADAPTER_INPUT_TYPE: str = "MatrixBaselineGateResult"
@@ -3612,6 +3622,17 @@ class TestCiAdapterContract:
             assert "frozen" in type(excinfo.value).__name__.lower()
         for mutator in ("set_status", "update", "refresh", "recompute"):
             assert not hasattr(MatrixBaselineGateResult, mutator)
+
+    def test_ci_adapter_implementation_is_registered(self) -> None:
+        """Step 95：Adapter 唯一实现登记在 Matrix Contract，并复用同一映射对象。"""
+        assert CI_ADAPTER_IMPLEMENTATION is adapt_gate_result_to_exit_code
+        assert CI_ADAPTER_EXIT_CODES is _PROD_CI_ADAPTER_EXIT_CODES
+        assert CI_ADAPTER_IMPLEMENTATION(
+            self._result("PASS", ("NO_BASELINE_DRIFT",))
+        ) == 0
+        assert CI_ADAPTER_IMPLEMENTATION(
+            self._result("DRIFT", ("DB_RESIDUE_DRIFT",))
+        ) == 1
 
     def test_adapter_contract_has_no_db_network_or_llm_dependency(self) -> None:
         """静态审计（仅 Step 94 契约范围）：无 sys.exit / subprocess / DB / LLM / HTTP。"""
@@ -3801,6 +3822,7 @@ __all__ = [
     "FileSpec",
     "RegressionExecutionSummary",
     "CI_ADAPTER_EXIT_CODES",
+    "CI_ADAPTER_IMPLEMENTATION",
     "MATRIX_EXECUTION_BASELINE",
     "MatrixBaselineGateResult",
     "TestCiAdapterContract",
