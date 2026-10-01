@@ -1220,6 +1220,7 @@ class TestRegistry:
             "NODE_HOSTED_CONTRACT_CATEGORIES",
             "NODE_HOSTED_REPRESENTATIVE_NODES",
             "MATRIX_EXECUTION_BASELINE",
+            "CI_ADAPTER_EXIT_CODES",
         )
     # 备注：Step 91 的 Gate 复用既有 DTO，未引入新的 collector 结构名。
         offenders: list[tuple[str, str]] = []
@@ -3439,6 +3440,232 @@ class TestMatrixBaselineGateCiReadiness:
 
 
 # ============================================================
+# CI Adapter Contract Freeze（Phase 3.12 Step 94 · **不实现** Adapter）
+#
+# 冻结最后两层之间：`MatrixBaselineGateResult → CI Adapter → exit code`。
+# Adapter 唯一职责：读取 `status` 并映射为 process exit code（0 / 1）。
+# 不得：执行 Matrix · 读 DB · 重算 drift · 读 baseline · 刷新 baseline · 任何输出持久化。
+# ============================================================
+
+#: **冻结的 CI Adapter 退出码契约**（只读映射；复用 Step 93 的语义表，避免第二份定义）。
+CI_ADAPTER_EXIT_CODES: MappingProxyType[str, int] = MappingProxyType(
+    dict(_CI_EXIT_MAPPING)
+)
+
+#: Adapter 唯一允许的输入 / 输出（仅 Contract 文本；**不**实现函数）。
+CI_ADAPTER_INPUT_TYPE: str = "MatrixBaselineGateResult"
+CI_ADAPTER_OUTPUT: str = "process exit code"
+
+#: Adapter **不得**出现的职责（Contract 黑名单；仅作为断言依据）。
+CI_ADAPTER_FORBIDDEN_RESPONSIBILITIES: tuple[str, ...] = (
+    "execute regression matrix",
+    "read postgresql",
+    "recompute drift",
+    "read baseline",
+    "refresh baseline",
+    "call llm",
+    "network request",
+    "persist output",
+)
+
+
+class TestCiAdapterContract:
+    @staticmethod
+    def _result(status: str, drifts: tuple[str, ...]) -> MatrixBaselineGateResult:
+        baseline = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=0
+        )
+        return MatrixBaselineGateResult(
+            status=status, drifts=drifts, current=baseline, baseline=baseline
+        )
+
+    def test_exit_code_contract_is_exactly_zero_and_one(self) -> None:
+        assert dict(CI_ADAPTER_EXIT_CODES) == {"PASS": 0, "DRIFT": 1}
+        assert set(CI_ADAPTER_EXIT_CODES.values()) == {0, 1}
+        for extra in (2, 3, 4, 10, 99):
+            assert extra not in CI_ADAPTER_EXIT_CODES.values()
+        # 只读：映射不得被改写（无自动 refresh / 无新增业务退出码）
+        with pytest.raises(TypeError):
+            CI_ADAPTER_EXIT_CODES["DRIFT"] = 0  # type: ignore[index]
+
+    def test_pass_maps_to_exit_code_zero(self) -> None:
+        result = self._result("PASS", ("NO_BASELINE_DRIFT",))
+
+        assert result.status == "PASS"
+        assert CI_ADAPTER_EXIT_CODES[result.status] == 0
+
+    def test_drift_maps_to_exit_code_one(self) -> None:
+        result = self._result("DRIFT", ("DB_RESIDUE_DRIFT",))
+
+        assert CI_ADAPTER_EXIT_CODES[result.status] == 1
+
+    def test_all_drift_types_map_to_exit_code_one(self) -> None:
+        """Adapter 不得按 drift 类型选择不同退出码 —— 一律 1。"""
+        for drift in (
+            "OFFLINE_EXECUTION_DRIFT",
+            "DB_EXECUTION_DRIFT",
+            "MATRIX_TOTAL_DRIFT",
+            "MATRIX_STATUS_DRIFT",
+            "DB_RESIDUE_DRIFT",
+        ):
+            assert drift not in CI_ADAPTER_EXIT_CODES
+            result = self._result("DRIFT", (drift,))
+            assert CI_ADAPTER_EXIT_CODES[result.status] == 1
+
+    def test_illegal_statuses_are_rejected_by_gate_result_contract(self) -> None:
+        """非法 status 由 Gate Result Contract 拒绝；Adapter 不需要处理它们。"""
+        for illegal in ("WARNING", "UNKNOWN", "PARTIAL", "SKIPPED", "STALE"):
+            with pytest.raises(ValueError):
+                self._result(illegal, ("NO_BASELINE_DRIFT",))
+            assert illegal not in CI_ADAPTER_EXIT_CODES
+
+    def test_adapter_status_domain_is_exhaustive(self) -> None:
+        """Gate 只能产出 PASS / DRIFT；Adapter 映射域必须恰好覆盖两者。"""
+        baseline = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=0
+        )
+        drifted = _synthetic_baseline(
+            offline=_synthetic_offline(), db=_synthetic_db(), residue=1
+        )
+        observed = {
+            evaluate_matrix_baseline_gate(baseline, baseline).status,
+            evaluate_matrix_baseline_gate(drifted, baseline).status,
+        }
+
+        assert observed == {"PASS", "DRIFT"} == set(CI_ADAPTER_EXIT_CODES)
+        assert CI_ADAPTER_INPUT_TYPE == "MatrixBaselineGateResult"
+        assert CI_ADAPTER_OUTPUT == "process exit code"
+
+    def test_adapter_contract_does_not_read_baseline_or_current(self) -> None:
+        """Adapter 只接受 Gate Result：不得再读取 baseline / current 字段。"""
+        tree = ast.parse(_source(_SELF))
+        scope = ""
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if any(
+                    isinstance(target, ast.Name)
+                    and target.id.startswith("CI_ADAPTER_")
+                    for target in targets
+                ):
+                    scope += ast.unparse(node)
+
+        assert scope, "未找到 CI_ADAPTER_* 契约常量"
+        # needle 动态拼接：避免断言自身文本被误判为违规
+        for forbidden in (
+            "MATRIX_" + "EXECUTION_BASELINE",
+            ".offline",
+            ".db",
+            "matrix_" + "total",
+            "db_" + "residue",
+        ):
+            assert forbidden not in scope, forbidden
+        for key in CI_ADAPTER_EXIT_CODES:
+            assert key in {"PASS", "DRIFT"}
+
+    def test_adapter_contract_does_not_recalculate_drift(self) -> None:
+        """映射只由 status 决定；契约里不得存在 drift 计算或比较逻辑。"""
+        assert set(CI_ADAPTER_EXIT_CODES) == {"PASS", "DRIFT"}
+        assert not any(
+            drift in CI_ADAPTER_EXIT_CODES
+            for drift in _MATRIX_BASELINE_DRIFT_TYPES
+            if drift != "NO_BASELINE_DRIFT"
+        )
+        assert (
+            "compare_" + "matrix_execution_baseline"
+            not in str(CI_ADAPTER_EXIT_CODES)
+        )
+        assert "evaluate_" + "matrix_baseline_gate" not in str(
+            CI_ADAPTER_EXIT_CODES
+        )
+
+    def test_baseline_ownership_stays_with_gate(self) -> None:
+        """Baseline 所有权只在 Gate；Adapter 侧不持有、不刷新。"""
+        before = MATRIX_EXECUTION_BASELINE
+
+        for _ in range(3):
+            evaluate_matrix_baseline_gate(before, before)
+
+        assert MATRIX_EXECUTION_BASELINE == before
+        assert MATRIX_EXECUTION_BASELINE.matrix_total == 555
+        assert "baseline" not in CI_ADAPTER_EXIT_CODES
+        for responsibility in CI_ADAPTER_FORBIDDEN_RESPONSIBILITIES:
+            assert responsibility in {
+                "execute regression matrix",
+                "read postgresql",
+                "recompute drift",
+                "read baseline",
+                "refresh baseline",
+                "call llm",
+                "network request",
+                "persist output",
+            }, responsibility
+
+    def test_adapter_treats_gate_result_as_read_only(self) -> None:
+        result = self._result("DRIFT", ("DB_RESIDUE_DRIFT",))
+
+        for field_name in ("status", "drifts", "current", "baseline"):
+            with pytest.raises(Exception) as excinfo:
+                setattr(result, field_name, None)
+            assert "frozen" in type(excinfo.value).__name__.lower()
+        for mutator in ("set_status", "update", "refresh", "recompute"):
+            assert not hasattr(MatrixBaselineGateResult, mutator)
+
+    def test_adapter_contract_has_no_db_network_or_llm_dependency(self) -> None:
+        """静态审计（仅 Step 94 契约范围）：无 sys.exit / subprocess / DB / LLM / HTTP。"""
+        tree = ast.parse(_source(_SELF))
+        contract_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "TestCiAdapterContract"
+        )
+        # 只扫描方法体（**排除 docstring**），避免契约说明文本被误判为违规
+        scope = "".join(
+            ast.unparse(statement)
+            for member in contract_class.body
+            if isinstance(member, ast.FunctionDef)
+            for statement in member.body[1:]
+        )
+        for forbidden in (
+            "sys" + ".exit",
+            "sub" + "process",
+            "sql" + "alchemy",
+            "psyc" + "opg",
+            "get_" + "engine",
+            "Open" + "AI",
+            "Deep" + "Seek",
+            "htt" + "px",
+        ):
+            assert forbidden not in scope, forbidden
+
+    def test_adapter_implementation_still_absent(self) -> None:
+        """本阶段**未**实现 Adapter：无 .github / 无 CLI / 无注入式入口函数。"""
+        tree = ast.parse(_source(_SELF))
+        names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ] + [
+            node.name for node in tree.body if isinstance(node, ast.ClassDef)
+        ]
+
+        for forbidden in (
+            "adapt_gate_to_exit_code",
+            "main",
+            "cli",
+            "run_gate",
+            "MatrixCiAdapter",
+        ):
+            assert forbidden not in names, forbidden
+        assert not (_REPO_ROOT / ".github").exists()
+        for path in ("scripts/run_matrix_gate.py", "scripts/check_baseline.py"):
+            assert not (_REPO_ROOT / path).exists(), path
+
+
+# ============================================================
 # 入口自身卫生（离线 · 静态）—— 确保"不复制 E2E 逻辑"
 # ============================================================
 
@@ -3573,8 +3800,10 @@ __all__ = [
     "CollectReport",
     "FileSpec",
     "RegressionExecutionSummary",
+    "CI_ADAPTER_EXIT_CODES",
     "MATRIX_EXECUTION_BASELINE",
     "MatrixBaselineGateResult",
+    "TestCiAdapterContract",
     "MatrixExecutionBaseline",
     "MatrixExecutionSummary",
     "TestEntryHygiene",

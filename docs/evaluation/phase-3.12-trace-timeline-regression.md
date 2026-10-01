@@ -541,6 +541,9 @@ Drift（不修改 Step 85 的 4 类）
 > Step 93（CI-Ready Audit）：`docs/evaluation/phase-3.12-step-93-ci-ready-audit.md`
 > —— Gate 输入/输出/确定性/不可变/安全/依赖边界已审计为 **READY**；
 > CI integration / workflow / CLI / baseline refresh = **均未实现**（需未来显式授权）。
+> Step 94（CI Adapter Contract）：`docs/evaluation/phase-3.12-step-94-ci-adapter-contract.md`
+> —— `MatrixBaselineGateResult → CI Adapter → exit code`：PASS→0 · DRIFT→1；
+> Adapter 只读 status（不执行 / 不读 DB / 不重算 drift / 不读或刷新 baseline / 无持久化输出）。
 
 ## 8. 漂移检测
 
