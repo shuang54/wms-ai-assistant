@@ -397,6 +397,41 @@ Regression Matrix（当前维度链）
         （Matrix Scale 仍为 categories 13 / registered 28 / offline 18 / DB 15）
 ```
 
+## 7.7 Node-hosted Contract Registration（Step 87 冻结）
+
+```text
+两种注册体系**严格分离**：
+
+File-hosted Contract（执行维度）
+    FILES → CATEGORIES → _offline_suite / _db_suite → 实际执行
+        · 28 registered files · 13 file-hosted categories · offline 18 · DB 15 · partial 5
+        · orphan 0 · dangling 0 · registration execution coverage 100%
+
+Node-hosted Contract（契约维度；**并行注册表**）
+    NODE_HOSTED_CONTRACT_CATEGORIES
+        └── OFFLINE_EXECUTION_CONTRACT
+              host = tests/test_assistant_trace_timeline_regression.py
+              classes = TestOfflineRegressionExecutionSummary ·
+                        TestOfflineRegressionExecutionSummaryContract ·
+                        TestOfflineRegressionSnapshotDrift
+              scope = OFFLINE_EXECUTION_SUMMARY_CONTRACT ·
+                      OFFLINE_EXECUTION_SUMMARY_SNAPSHOT · classify_snapshot_drift()
+              metadata = db_required false · network_required false ·
+                         llm_required false · production_code_required false
+    NODE_HOSTED_REPRESENTATIVE_NODES
+        └── 2 条真实 node → `--collect-only` 校验（**只收集、不执行**）
+```
+
+```text
+边界（冻结）
+    Node-hosted ≠ File-hosted —— 不进入 FILES / CATEGORIES / _offline_suite / _db_suite
+    Node-hosted ≠ Execution Suite —— 不产生执行套件；只做 registration + collect-only 校验
+    Self-registration 禁止 —— collector 因 host 该类别而**不得**被登记为 Matrix entry
+    Matrix Scale ≠ Node-hosted Contract Count ≠ Execution Snapshot
+        （EXPECTED_MATRIX_SCALE 不含 OFFLINE_EXECUTION_CONTRACT，也不含 375 / 356 / 19）
+    Drift 语义（Step 85）保持不变：380/361/19 ⇒ COUNT_DRIFT 且 Contract = PASS
+```
+
 ## 8. 漂移检测
 
 ```text

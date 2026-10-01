@@ -375,6 +375,22 @@ def _source(relative: str) -> str:
     return (_REPO_ROOT / relative).read_text(encoding="utf-8-sig")
 
 
+def _module_level_assignments(name: str) -> tuple[str, ...]:
+    """模块级 ``name = ...`` 的**声明位置**（本 collector 内；声明唯一性校验用）。"""
+    tree = ast.parse(_source(_SELF))
+    declared = False
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in targets
+        ):
+            declared = True
+    return (_SELF,) if declared else ()
+
+
 def _code_string_constants(relative: str) -> set[str]:
     """文件中的**非 docstring** 字符串常量（供"是否真的门控 DB"判定）。"""
     tree = ast.parse(_source(relative))
@@ -895,6 +911,111 @@ class TestRegistry:
 # 不新增业务断言、不复制 FILES / CATEGORIES、不建立第二套框架。
 # ============================================================
 
+# ============================================================
+# Node-hosted Contract Registration 冻结（Phase 3.12 Step 87 · 离线 · 静态）
+#
+# Node-hosted（NODE_HOSTED_CONTRACT_CATEGORIES → NODE_HOSTED_REPRESENTATIVE_NODES
+# → collect-only 校验）与 File-hosted（FILES → CATEGORIES → suites）**严格分离**。
+# ============================================================
+
+class TestNodeHostedContractRegistration:
+    def test_node_hosted_category_is_unique(self) -> None:
+        assert set(NODE_HOSTED_CONTRACT_CATEGORIES) == {
+            "OFFLINE_EXECUTION_CONTRACT"
+        }
+        # 声明唯一（模块级仅一处）
+        assert _module_level_assignments("NODE_HOSTED_CONTRACT_CATEGORIES") == (
+            _SELF,
+        )
+
+    def test_node_hosted_category_has_exactly_one_host(self) -> None:
+        hosts = {entry["host"] for entry in NODE_HOSTED_CONTRACT_CATEGORIES.values()}
+
+        assert hosts == {_SELF}
+        assert (_REPO_ROOT / _SELF).is_file()
+        for entry in NODE_HOSTED_CONTRACT_CATEGORIES.values():
+            assert isinstance(entry["host"], str) and entry["host"]
+            assert len(entry["classes"]) == 3
+
+    def test_node_hosted_representative_nodes_are_unique_and_well_formed(
+        self,
+    ) -> None:
+        node_ids = [node_id for _, node_id in NODE_HOSTED_REPRESENTATIVE_NODES]
+
+        assert node_ids and len(set(node_ids)) == len(node_ids)
+        for category, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
+            entry = NODE_HOSTED_CONTRACT_CATEGORIES[category]
+            file_part, _, rest = node_id.partition("::")
+            class_part, _, function_part = rest.partition("::")
+            assert file_part == entry["host"], node_id
+            assert class_part in entry["classes"], node_id
+            assert function_part, node_id
+
+    def test_node_hosted_category_stays_out_of_file_hosted_matrix(self) -> None:
+        """Node-hosted 不得进入 FILES / CATEGORIES / suites（否则违反 Step 80 no self-registration）。"""
+        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
+        assert _SELF not in {spec.path for spec in FILES}
+        assert _SELF not in {
+            path for paths in CATEGORIES.values() for path in paths
+        }
+        assert _SELF not in _offline_suite()
+        assert _SELF not in _db_suite()
+
+    def test_node_hosted_category_metadata_matches_convention(self) -> None:
+        """元数据沿用既有约定（``*_required`` 布尔键；**不**新建第二套 FileSpec）。"""
+        required_keys = {
+            "host",
+            "classes",
+            "scope",
+            "db_required",
+            "network_required",
+            "llm_required",
+            "production_code_required",
+        }
+        for category, entry in NODE_HOSTED_CONTRACT_CATEGORIES.items():
+            assert set(entry) == required_keys, category
+            assert isinstance(entry, dict) and not isinstance(entry, FileSpec)
+            for flag in (
+                "db_required",
+                "network_required",
+                "llm_required",
+                "production_code_required",
+            ):
+                assert entry[flag] is False, (category, flag)
+
+    def test_node_hosted_scope_is_unique_and_artifacts_exist(self) -> None:
+        scopes = [str(entry["scope"]) for entry in NODE_HOSTED_CONTRACT_CATEGORIES.values()]
+
+        assert len(set(scopes)) == len(scopes)
+        scope = NODE_HOSTED_CONTRACT_CATEGORIES["OFFLINE_EXECUTION_CONTRACT"][
+            "scope"
+        ]
+        for artifact in (
+            "OFFLINE_EXECUTION_SUMMARY_CONTRACT",
+            "OFFLINE_EXECUTION_SUMMARY_SNAPSHOT",
+            "classify_snapshot_drift()",
+        ):
+            assert artifact in str(scope), artifact
+        # 契约三要素在模块内真实存在
+        assert isinstance(OFFLINE_EXECUTION_SUMMARY_CONTRACT, dict)
+        assert isinstance(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT, dict)
+        assert callable(classify_snapshot_drift)
+        assert _DRIFT_TYPES == (
+            "NO_DRIFT",
+            "COUNT_DRIFT",
+            "EXIT_CODE_DRIFT",
+            "STATUS_DRIFT",
+        )
+
+    def test_node_hosted_representative_nodes_are_collectable(self) -> None:
+        """`--collect-only`（只收集、不执行）验证 node 真实存在。"""
+        result = _run_pytest((_SELF,), with_db=False, collect_only=True, timeout=60)
+
+        assert result.returncode == 0, result.stdout[-800:]
+        for _, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
+            assert node_id in result.stdout, node_id
+
+
 class TestRegressionMatrixContract:
     def test_matrix_scale_is_frozen(self) -> None:
         """规模快照：categories / registered files / offline / DB 四项精确匹配。"""
@@ -1008,82 +1129,6 @@ class TestRegressionMatrixContract:
             assert file_path in registered, node_id
             assert file_path in CATEGORIES[category], node_id
             assert node_id.partition("::")[1], node_id   # 必须带 class/function
-
-    def test_node_hosted_contract_category_is_registered(self) -> None:
-        """Step 86：OFFLINE_EXECUTION_CONTRACT 已注册（node-hosted；唯一）。"""
-        assert "OFFLINE_EXECUTION_CONTRACT" in NODE_HOSTED_CONTRACT_CATEGORIES
-        tree = ast.parse(_source(_SELF))
-        declarations = [
-            node
-            for node in tree.body
-            if isinstance(node, (ast.Assign, ast.AnnAssign))
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "NODE_HOSTED_CONTRACT_CATEGORIES"
-                for target in (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-            )
-        ]
-        assert len(declarations) == 1
-        entry = NODE_HOSTED_CONTRACT_CATEGORIES["OFFLINE_EXECUTION_CONTRACT"]
-        assert entry["host"] == _SELF
-        assert set(entry["classes"]) == {
-            "TestOfflineRegressionExecutionSummary",
-            "TestOfflineRegressionExecutionSummaryContract",
-            "TestOfflineRegressionSnapshotDrift",
-        }
-        assert "classify_snapshot_drift" in str(entry["scope"])
-        # 不进入 file-mapped CATEGORIES（避免 self registration）
-        assert "OFFLINE_EXECUTION_CONTRACT" not in CATEGORIES
-        assert _SELF not in {spec.path for spec in FILES}
-
-    def test_node_hosted_contract_category_metadata_is_all_false(self) -> None:
-        for category, entry in NODE_HOSTED_CONTRACT_CATEGORIES.items():
-            for flag in (
-                "db_required",
-                "network_required",
-                "llm_required",
-                "production_code_required",
-            ):
-                assert entry[flag] is False, (category, flag)
-
-    def test_node_hosted_contract_artifacts_exist(self) -> None:
-        """契约三要素存在：summary contract / snapshot / drift 分类器。"""
-        assert set(OFFLINE_EXECUTION_SUMMARY_CONTRACT) >= {
-            "pass",
-            "fail",
-            "skip",
-            "arithmetic",
-        }
-        assert set(OFFLINE_EXECUTION_SUMMARY_SNAPSHOT) == {
-            "total",
-            "passed",
-            "skipped",
-            "failed",
-            "errors",
-            "exit_code",
-            "status",
-        }
-        assert callable(classify_snapshot_drift)
-        assert _DRIFT_TYPES == (
-            "NO_DRIFT",
-            "COUNT_DRIFT",
-            "EXIT_CODE_DRIFT",
-            "STATUS_DRIFT",
-        )
-
-    def test_node_hosted_contract_nodes_are_collectable(self) -> None:
-        """代表性 node 真实可 collect（`--collect-only`；不执行）。"""
-        result = _run_pytest(
-            (_SELF,), with_db=False, collect_only=True, timeout=60
-        )
-
-        assert result.returncode == 0, result.stdout[-800:]
-        assert len(NODE_HOSTED_REPRESENTATIVE_NODES) == 2
-        for category, node_id in NODE_HOSTED_REPRESENTATIVE_NODES:
-            assert category in NODE_HOSTED_CONTRACT_CATEGORIES, node_id
-            assert node_id in result.stdout, node_id
 
     def test_snapshot_is_not_part_of_matrix_scale(self) -> None:
         """Matrix Scale ≠ Execution Snapshot：数量快照不得写入 EXPECTED_MATRIX_SCALE。"""
@@ -1806,6 +1851,7 @@ __all__ = [
     "FileSpec",
     "RegressionExecutionSummary",
     "TestEntryHygiene",
+    "TestNodeHostedContractRegistration",
     "TestOfflineRegressionExecutionSummary",
     "TestOfflineRegressionExecutionSummaryContract",
     "TestOfflineRegressionSnapshotDrift",
