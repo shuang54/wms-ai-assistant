@@ -4265,6 +4265,38 @@ Contract 要点（写入中读取的语义边界）：
 
 ---
 
+## 8.77 Trace / Timeline Contract Baseline（Phase 3.12 Step 73 — Frozen）
+
+> 基线文档：`docs/evaluation/phase-3.12-trace-timeline-contract-baseline.md`
+> 回归守卫：`tests/test_assistant_trace_timeline_contract.py`（19 项；offline · DB=0 · network=0）
+> 固化来源：Step 64 → 72 已实测行为（**未新增任何生产逻辑**）
+
+```text
+字段契约（锁定）：
+    AssistantTraceResponse         5 字段：assistant_request_id · outcome ·
+                                          llm_usage · tool_executions · rag_executions
+    AssistantTimelineResponse      5 字段：assistant_request_id · llm_events ·
+                                          tool_events · rag_events · outcome_event
+    AssistantTimelineEventResponse 9 字段：assistant_request_id · source · event_type ·
+                                          source_id · started_at · finished_at ·
+                                          duration_ms · created_at · status
+
+ID 语义（三个概念，禁止合并）：
+    ① Assistant Request ID（LLM 表 assistant_request_id / Tool·RAG 表 request_id / Outcome UNIQUE）
+    ② Provider Request ID（仅 llm_usage_record.request_id；Trace LLM 段暴露，Timeline 不暴露）
+    ③ source_id（仅 Timeline）= 来源表 DB 主键（非 event_id / 非 sequence / 非下标 / 非 UUID）
+
+Contract Matrix（摘要；完整表见基线文档）：
+    Unknown Trace / Timeline request → 200 + 空段（Trace outcome=null）
+    Partial state = 合法（HTTP 200 ≠ 完整快照）· Missing outcome = null（不推断）
+    Outcome 四值仅由 assistant_outcome_record 表达 · first-write-wins
+    Cross-request isolation 必需 · Group ordering（LLM created_at,id / Tool·RAG id）
+    Global ordering / event_id / sequence / span_id / pagination / snapshot = NOT PROVIDED
+    写入中读取：只保证 isolation · source_id correctness · contract validity
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
