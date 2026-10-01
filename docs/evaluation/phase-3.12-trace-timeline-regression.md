@@ -74,13 +74,53 @@ python -m pytest -q tests/test_assistant_trace_timeline_read_during_write.py # S
 | Ordering | `tests/test_assistant_timeline_db_e2e.py` | yes | no | LLM `created_at,id` / Tool·RAG `id`（Step 69） |
 | Ordering | `tests/test_assistant_timeline_projection.py` | no | no | 组内顺序稳定（Step 66） |
 | Ordering | `tests/test_assistant_trace_timeline_contract.py` | no | no | 无全局顺序 / 无 sequence（Step 73） |
+| Observability HTTP Allowlist | `tests/test_observability_http_allowlist_audit.py` | no | no | 真实 route 发现 + 白名单双向比对（Step 76） |
+| Observability HTTP Allowlist | `tests/test_observability_http_allowlist_regression.py` | no | no | Frozen Contract 六路由精确集合（Step 77） |
+| Observability HTTP Allowlist | `tests/test_observability_http_allowlist_architecture_audit.py` | no | no | 测试架构自审（单一来源 / 单一 scanner）（Step 78） |
+| Observability HTTP Allowlist | `tests/test_tool_observability_architecture_audit.py` | no | no | C25 Allowlist consumer（只读端点漂移闸门） |
 
-## 3. 覆盖类别（12 项，全部可追溯）
+## 2.1 Observability HTTP Allowlist（Step 79 注册）
+
+```text
+Purpose:
+    确保 Observability HTTP API 的实际 route、Frozen Contract、C25 Allowlist 三者保持一致。
+
+覆盖：route discovery · allowlist completeness · frozen contract ·
+      single source of truth · scanner uniqueness · security
+
+条目（file-level registration；矩阵**不重复**断言逻辑）：
+    Step 76  tests/test_observability_http_allowlist_audit.py
+    Step 77  tests/test_observability_http_allowlist_regression.py
+    Step 78  tests/test_observability_http_allowlist_architecture_audit.py
+    C25      tests/test_tool_observability_architecture_audit.py
+
+元数据（每条目）：
+    category = OBSERVABILITY_HTTP_ALLOWLIST
+    db_required = false · network_required = false
+    llm_required = false · production_code_required = false
+
+代表性 node（REPRESENTATIVE_CONTRACT_NODES；只登记 node id，不复制断言）：
+    Step 76  ..._audit.py::TestBaseline::test_10_six_route_baseline_is_exact
+    Step 77  ..._regression.py::TestFrozenRouteContract::test_exact_observability_route_set
+    Step 78  ..._architecture_audit.py::TestFrozenContractUniqueness
+             ::test_frozen_route_contract_has_single_declaration
+    Step 78  ..._architecture_audit.py::TestScannerUniqueness
+             ::test_api_route_scanner_has_single_implementation
+    C25      tests/test_tool_observability_architecture_audit.py::TestC25QuerySnapshotApi
+             ::test_c25_13_only_allowlisted_tool_observability_http_api
+
+入口结构名（禁止第二套回归框架）：仅 `test_assistant_trace_timeline_regression.py` 持有
+    FILES · CATEGORIES · _REQUIRED_CATEGORIES · _offline_suite · _db_suite ·
+    REPRESENTATIVE_CONTRACT_NODES（由 test_no_duplicate_regression_framework 强制）
+```
+
+## 3. 覆盖类别（13 项，全部可追溯）
 
 ```text
 API Contract · Trace Contract · Timeline Contract · Outcome · Partial State ·
 Read During Write · Cross-request Isolation · Concurrency ·
-Trace ↔ Timeline Consistency · Security · Source ID · Ordering
+Trace ↔ Timeline Consistency · Security · Source ID · Ordering ·
+OBSERVABILITY_HTTP_ALLOWLIST（Step 79 新增）
 ```
 
 入口内置 `_REQUIRED_CATEGORIES` 常量 + 注册表一致性断言：类别缺失、文件被删、
@@ -104,16 +144,21 @@ security                    Trace / Timeline / Outcome 无 prompt·SQL·argument
 ## 5. 实测结果（2026-10-01 · 本机 PG 16 · 单进程 · `-p no:randomly`）
 
 ```text
-离线 suite（14 文件）          → 289 passed · 19 skipped（partial 文件的 DB 段）· 0 failed
-DB suite（15 文件 · RUN_DB_TESTS=1）→ 180 passed · 0 skipped · 0 failed
+离线 suite（18 文件 · Step 79 后）  → 356 passed · 19 skipped（partial 文件的 DB 段）· 0 failed
+    （Step 74 基线 14 文件 289 passed；+4 文件 +67 用例 = Step 76/77/78 + C25）
+DB suite（15 文件 · RUN_DB_TESTS=1）→ 180 passed · 0 skipped · 0 failed（未变）
 
 入口自身
-    python -m pytest -q tests/test_assistant_trace_timeline_regression.py          → 12 passed · 2 skipped
-    $env:RUN_DB_TESTS="1"; python -m pytest -q tests/test_assistant_trace_timeline_regression.py
-                                                                                    → 14 passed
+    python -m pytest -q tests/test_assistant_trace_timeline_regression.py          → 16 passed · 2 skipped
+    $env:RUN_DB_TESTS="1"; …（Step 74 实测 14 passed；Step 79 新增 4 个注册用例 ⇒ 预期 18 passed；
+                              本阶段按规约未开启 RUN_DB_TESTS，故未复测）
 单独闸门
     tests/test_assistant_trace_timeline_contract.py                                 → 19 passed
     tests/test_assistant_trace_timeline_read_during_write.py（离线 / DB）           → 15 skipped / 15 passed
+    tests/test_observability_http_allowlist_audit.py                                → 19 passed
+    tests/test_observability_http_allowlist_regression.py                           → 10 passed
+    tests/test_observability_http_allowlist_architecture_audit.py                   → 18 passed
+    tests/test_tool_observability_architecture_audit.py                             → 20 passed
 ```
 
 ## 6. DB 残留与清理

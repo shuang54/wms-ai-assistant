@@ -60,7 +60,7 @@ _SQL_COUNT_STEP74 = (
     "SELECT COUNT(*) FROM {table} WHERE {column} LIKE :p"
 )
 
-#: 必须覆盖的 12 个回归类别（Step 74 §五）。
+#: 必须覆盖的回归类别：Step 74 §五 的 12 类 + Step 79 新增 1 类。
 _REQUIRED_CATEGORIES: tuple[str, ...] = (
     "API Contract",
     "Trace Contract",
@@ -74,6 +74,15 @@ _REQUIRED_CATEGORIES: tuple[str, ...] = (
     "Security",
     "Source ID",
     "Ordering",
+    # Phase 3.12 Step 79：Observability HTTP Allowlist 契约族
+    "OBSERVABILITY_HTTP_ALLOWLIST",
+)
+
+#: Step 79 新增类别的 Purpose（写进回归矩阵元数据）。
+OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE = (
+    "确保 Observability HTTP API 的实际 route、Frozen Contract、C25 Allowlist "
+    "三者保持一致（route discovery / allowlist completeness / frozen contract / "
+    "single source of truth / scanner uniqueness / security）"
 )
 
 DbMode = Literal["no", "partial", "yes"]
@@ -81,11 +90,18 @@ DbMode = Literal["no", "partial", "yes"]
 
 @dataclass(frozen=True)
 class FileSpec:
-    """一个既有测试文件在回归入口中的定位（**只登记，不改写**）。"""
+    """一个既有测试文件在回归入口中的定位（**只登记，不改写**）。
+
+    元数据（Step 79 §九）：``db`` = DB 依赖方式；``network`` / ``llm`` /
+    ``production_code`` = 该入口是否需要网络 / 真实 LLM / 生产代码改动。
+    """
 
     path: str
     db: DbMode
     coverage: str
+    network: bool = False
+    llm: bool = False
+    production_code: bool = False
 
 
 #: 既有测试文件登记表（真实文件名；`db` 表示该文件的 DB 依赖方式）。
@@ -106,6 +122,27 @@ FILES: tuple[FileSpec, ...] = (
     FileSpec("tests/test_assistant_trace_pagination_audit.py", "partial", "无分页（Step 59）"),
     FileSpec("tests/test_assistant_trace_outcome_audit.py", "partial", "Outcome × Trace 审计（Step 61）"),
     FileSpec("tests/test_assistant_outcome_contract_audit.py", "partial", "Outcome 契约审计（Step 62）"),
+    # ---- Observability HTTP Allowlist 契约族（Step 79；全部离线）----
+    FileSpec(
+        "tests/test_observability_http_allowlist_audit.py",
+        "no",
+        "真实 route 发现 + 白名单双向比对 + 安全（Step 76）",
+    ),
+    FileSpec(
+        "tests/test_observability_http_allowlist_regression.py",
+        "no",
+        "Frozen Contract（六路由精确集合；唯一事实来源）（Step 77）",
+    ),
+    FileSpec(
+        "tests/test_observability_http_allowlist_architecture_audit.py",
+        "no",
+        "测试架构自审：单一来源 / 单一 scanner / 无循环 import（Step 78）",
+    ),
+    FileSpec(
+        "tests/test_tool_observability_architecture_audit.py",
+        "no",
+        "C25 Allowlist consumer（只读端点漂移闸门）",
+    ),
     # ---- DB 门控 ----
     FileSpec("tests/test_assistant_trace_api_db.py", "yes", "Trace HTTP + 真实读边界（Step 39）"),
     FileSpec("tests/test_assistant_trace_query_service_db.py", "yes", "Trace QueryService 真实读（Step 38）"),
@@ -185,11 +222,79 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
         _CONTRACT_GATE,
         "tests/test_assistant_timeline_projection.py",
     ),
+    # Phase 3.12 Step 79：Observability HTTP Allowlist 契约族
+    "OBSERVABILITY_HTTP_ALLOWLIST": (
+        "tests/test_observability_http_allowlist_audit.py",
+        "tests/test_observability_http_allowlist_regression.py",
+        "tests/test_observability_http_allowlist_architecture_audit.py",
+        "tests/test_tool_observability_architecture_audit.py",
+    ),
 }
+
+#: 代表性契约 node（Step 79 §八）：**只登记 node id**，不复制断言逻辑。
+#: 完整契约仍由各自测试文件覆盖；此处仅提供"矩阵 → 代表性入口"。
+REPRESENTATIVE_CONTRACT_NODES: tuple[tuple[str, str], ...] = (
+    (
+        "OBSERVABILITY_HTTP_ALLOWLIST",
+        "tests/test_observability_http_allowlist_audit.py"
+        "::TestBaseline::test_10_six_route_baseline_is_exact",
+    ),
+    (
+        "OBSERVABILITY_HTTP_ALLOWLIST",
+        "tests/test_observability_http_allowlist_regression.py"
+        "::TestFrozenRouteContract::test_exact_observability_route_set",
+    ),
+    (
+        "OBSERVABILITY_HTTP_ALLOWLIST",
+        "tests/test_observability_http_allowlist_architecture_audit.py"
+        "::TestFrozenContractUniqueness"
+        "::test_frozen_route_contract_has_single_declaration",
+    ),
+    (
+        "OBSERVABILITY_HTTP_ALLOWLIST",
+        "tests/test_observability_http_allowlist_architecture_audit.py"
+        "::TestScannerUniqueness"
+        "::test_api_route_scanner_has_single_implementation",
+    ),
+    (
+        "OBSERVABILITY_HTTP_ALLOWLIST",
+        "tests/test_tool_observability_architecture_audit.py"
+        "::TestC25QuerySnapshotApi"
+        "::test_c25_13_only_allowlisted_tool_observability_http_api",
+    ),
+)
 
 
 def _source(relative: str) -> str:
-    return (_REPO_ROOT / relative).read_text(encoding="utf-8")
+    # utf-8-sig：容忍个别历史测试文件的 BOM（不改变内容语义）
+    return (_REPO_ROOT / relative).read_text(encoding="utf-8-sig")
+
+
+def _code_string_constants(relative: str) -> set[str]:
+    """文件中的**非 docstring** 字符串常量（供"是否真的门控 DB"判定）。"""
+    tree = ast.parse(_source(relative))
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", [])
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            docstrings.add(id(body[0].value))
+
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
 
 
 def _file_specs() -> dict[str, FileSpec]:
@@ -238,15 +343,19 @@ def _db_mode() -> bool:
 
 
 def _run_pytest(
-    paths: tuple[str, ...], *, with_db: bool
+    paths: tuple[str, ...], *, with_db: bool, collect_only: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    """嵌套执行既有 suite（**不复制**任何测试逻辑）。"""
+    """嵌套执行既有 suite（**不复制**任何测试逻辑）。
+
+    ``collect_only`` = True 时只收集 node（用于校验代表性 node 真实存在）。
+    """
     env = dict(os.environ)
     if with_db:
         env["RUN_DB_TESTS"] = "1"
     else:
         env.pop("RUN_DB_TESTS", None)   # 离线模式：强制无 DB 门控
 
+    extra = ["--collect-only"] if collect_only else []
     return subprocess.run(
         [
             sys.executable,
@@ -256,6 +365,7 @@ def _run_pytest(
             "-p",
             "no:randomly",
             "--tb=line",
+            *extra,
             *paths,
         ],
         cwd=str(_REPO_ROOT),
@@ -371,17 +481,103 @@ class TestRegistry:
                 continue
             assert "RUN_DB_TESTS" in _source(spec.path), spec.path
 
+    def test_observability_allowlist_category_is_registered(self) -> None:
+        """Step 79：新类别已登记，且**只**由 4 个离线契约文件构成。"""
+        assert "OBSERVABILITY_HTTP_ALLOWLIST" in _REQUIRED_CATEGORIES
+        files = CATEGORIES["OBSERVABILITY_HTTP_ALLOWLIST"]
+
+        assert files == (
+            "tests/test_observability_http_allowlist_audit.py",        # Step 76
+            "tests/test_observability_http_allowlist_regression.py",   # Step 77
+            "tests/test_observability_http_allowlist_architecture_audit.py",  # Step 78
+            "tests/test_tool_observability_architecture_audit.py",     # C25 consumer
+        )
+        assert OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE
+        for path in files:
+            spec = _file_specs()[path]
+            assert spec.db == "no", path
+            assert spec.network is False, path
+            assert spec.llm is False, path
+            assert spec.production_code is False, path
+
+    def test_representative_contract_nodes_are_registered(self) -> None:
+        """代表性 node 必须属于已登记类别/文件（第 5 项为 C25-13 漂移闸门）。"""
+        known_files = {spec.path for spec in FILES}
+
+        assert len(REPRESENTATIVE_CONTRACT_NODES) == 5
+        for category, node_id in REPRESENTATIVE_CONTRACT_NODES:
+            file_path = node_id.partition("::")[0]
+            assert category in _REQUIRED_CATEGORIES, (category, node_id)
+            assert file_path in known_files, node_id
+            assert file_path in CATEGORIES[category], node_id
+
+    def test_representative_contract_nodes_exist(self) -> None:
+        """node id 必须真实存在（防重命名 / 删除造成的静默失效）。"""
+        files = tuple(
+            dict.fromkeys(
+                node_id.partition("::")[0]
+                for _, node_id in REPRESENTATIVE_CONTRACT_NODES
+            )
+        )
+        result = _run_pytest(files, with_db=False, collect_only=True)
+
+        assert result.returncode == 0, result.stdout[-1500:]
+        for _, node_id in REPRESENTATIVE_CONTRACT_NODES:
+            assert node_id in result.stdout, node_id
+
+    def test_no_duplicate_regression_framework(self) -> None:
+        """collector 结构名只能出现在本文件（禁止第二套回归框架）。"""
+        structure_names = (
+            "FILES",
+            "CATEGORIES",
+            "_REQUIRED_CATEGORIES",
+            "_offline_suite",
+            "_db_suite",
+            "REPRESENTATIVE_CONTRACT_NODES",
+            "OBSERVABILITY_HTTP_ALLOWLIST_PURPOSE",
+        )
+        offenders: list[tuple[str, str]] = []
+        for path in sorted((_REPO_ROOT / "tests").glob("test_*.py")):
+            relative = f"tests/{path.name}"
+            if relative == _SELF:
+                continue
+            tree = ast.parse(_source(relative))
+            for node in tree.body:
+                assignments = (
+                    list(node.targets)
+                    if isinstance(node, ast.Assign)
+                    else [node.target]
+                    if isinstance(node, ast.AnnAssign)
+                    else []
+                )
+                for target in assignments:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id in structure_names
+                    ):
+                        offenders.append((relative, target.id))
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                ) and node.name in structure_names:
+                    offenders.append((relative, node.name))
+
+        assert offenders == [], offenders
+
     def test_pure_offline_files_have_no_db_skip_guard(self) -> None:
         """纯离线文件**不得**因 DB 而 skip（其 DB 无关性由离线 suite 实跑证明）。
 
         注：静态 DB 无关性的**强**保证只施加于 Step 73 契约闸门
         （见 ``test_contract_gate_stays_db_and_network_free``）；其余离线文件允许
         静态引用 DB 层模块做列白名单 / 依赖方向的**审计断言**。
+
+        判定基于**非 docstring** 字符串常量（docstring 中提到 RUN_DB_TESTS 不算门控）。
         """
         for spec in FILES:
             if spec.db != "no":
                 continue
-            assert "RUN_DB_TESTS" not in _source(spec.path), spec.path
+            assert "RUN_DB_TESTS" not in _code_string_constants(spec.path), (
+                spec.path
+            )
 
 
 # ============================================================
