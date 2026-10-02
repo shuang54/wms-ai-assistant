@@ -407,12 +407,53 @@ def _track(state: dict[str, Any], results: list[tuple[int, Any]]) -> list[str]:
 
 
 def _assert_isolation(payload: dict[str, Any], request_id: str) -> None:
+    """**跨请求隔离的唯一判据**：Timeline 内所有 event 的 ``assistant_request_id``。"""
     assert payload["assistant_request_id"] == request_id
     for group in ("llm_events", "tool_events", "rag_events"):
         for event in payload[group]:
             assert event["assistant_request_id"] == request_id, group
     if payload["outcome_event"] is not None:
         assert payload["outcome_event"]["assistant_request_id"] == request_id
+
+
+def _source_keys(payload: dict[str, Any]) -> set[tuple[str, int]]:
+    """Timeline event 的**来源身份** = ``(source, source_id)``。
+
+    Step 73 §八（Source ID Contract）：``source_id`` 只是**对应 source table 的 PK**——
+    不是 event_id / 不是全局唯一时间线 ID / 不是排序号 / 不是下标 / 不是 UUID。
+
+    因此：
+
+    ```text
+    ("llm_usage", 1) · ("tool_execution", 1) · ("rag_execution", 1)
+    ```
+
+    是**不同**的持久化记录；只有 ``(source, source_id)`` 才能定位一条 source record
+    （Phase 3.12 Step 99）。
+    """
+    keys: set[tuple[str, int]] = set()
+    for group in ("llm_events", "tool_events", "rag_events"):
+        for event in payload[group]:
+            keys.add((event["source"], event["source_id"]))
+    outcome = payload.get("outcome_event")
+    if outcome is not None:
+        keys.add((outcome["source"], outcome["source_id"]))
+    return keys
+
+
+def _cross_request_duplicates(
+    owners: dict[tuple[str, int], set[str]],
+) -> dict[tuple[str, int], set[str]]:
+    """同一 ``(source, source_id)`` 出现在 **2 个以上 request** → 跨请求污染。
+
+    反向契约（Step 99）：不同 ``source`` 之间 ``source_id`` 数值相同**不算**污染
+    —— 见 :func:`_source_keys` 与 ``test_case_e`` 的反例守卫。
+    """
+    return {
+        key: request_ids
+        for key, request_ids in owners.items()
+        if len(request_ids) > 1
+    }
 
 
 # ============================================================
@@ -470,22 +511,21 @@ class TestTimelineConcurrency:
             assert len(payload["tool_events"]) == 1
             assert payload["outcome_event"]["status"] == "SUCCESS"
 
-        # 绝不存在跨类型串线
-        tool_source_ids = {
-            event["source_id"]
-            for request_id in tool_ids
-            for event in by_id[request_id]["tool_events"]
-        }
-        rag_source_ids = {
-            event["source_id"]
-            for request_id in rag_ids
-            for event in by_id[request_id]["rag_events"]
-        }
-        assert tool_source_ids.isdisjoint(rag_source_ids)
+        # 绝不存在跨类型串线：rag 请求的 tool 组为空，tool 请求的 rag 组为空
         for request_id in rag_ids:
             assert by_id[request_id]["tool_events"] == []
         for request_id in tool_ids:
             assert by_id[request_id]["rag_events"] == []
+
+        # 同一 **source** 内 PK 不跨请求复用（PK 在各自表内唯一）。
+        # Step 99：**不**要求 tool_execution.id 与 rag_execution.id 互不相同
+        # （不同表的序列各自从 1 开始，数值重叠合法）。
+        for group, ids in (("tool_events", tool_ids), ("rag_events", rag_ids)):
+            owners: dict[int, str] = {}
+            for request_id in ids:
+                for event in by_id[request_id][group]:
+                    previous = owners.setdefault(event["source_id"], request_id)
+                    assert previous == request_id, (group, event["source_id"])
 
     def test_case_c_concurrent_t2sql_retry(self, conc_db, monkeypatch) -> None:
         _install_t2sql_route(monkeypatch, _retry_llm_client())
@@ -550,16 +590,33 @@ class TestTimelineConcurrency:
 
         assert len(set(request_ids)) == 10
         timelines = _run(_get_timelines(request_ids))
-        all_source_ids: set[int] = set()
+
+        # ① 跨请求隔离判据 = assistant_request_id（**不是** source_id 数值）
+        # ② source record 身份 = (source, source_id)：同一身份不得归属两个 request
+        owners: dict[tuple[str, int], set[str]] = {}
         for request_id, payload in zip(request_ids, timelines, strict=True):
             _assert_isolation(payload, request_id)
-            source_ids = {
-                event["source_id"]
-                for group in ("llm_events", "tool_events", "rag_events")
-                for event in payload[group]
-            } | {payload["outcome_event"]["source_id"]}
-            assert source_ids.isdisjoint(all_source_ids)   # 无跨请求 PK 复用
-            all_source_ids |= source_ids
+            for key in _source_keys(payload):
+                owners.setdefault(key, set()).add(request_id)
+        assert _cross_request_duplicates(owners) == {}
+
+        # ③ 反例守卫（Step 99）：不同 source table 之间 source_id 数值重叠**合法**，
+        #    绝不能据此判定"跨请求污染"（Step 98 的真实失败根因）。
+        per_source: dict[str, set[int]] = {}
+        for source, source_id in owners:
+            per_source.setdefault(source, set()).add(source_id)
+        assert len(per_source) >= 2          # 本次覆盖 ≥2 个 source（LLM + RAG/Tool/Outcome）
+        #    合成反例：llm id=1 属 A、tool id=1 属 B ⇒ **不得**判为污染
+        assert (
+            _cross_request_duplicates(
+                {("llm_usage", 1): {"A"}, ("tool_execution", 1): {"B"}}
+            )
+            == {}
+        )
+        #    合成正例：同一 (source, source_id) 出现在 A 与 B ⇒ 必须判为污染
+        assert _cross_request_duplicates({("llm_usage", 1): {"A", "B"}}) == {
+            ("llm_usage", 1): {"A", "B"}
+        }
 
     def test_cross_request_isolation(self, conc_db) -> None:
         results = _run(
