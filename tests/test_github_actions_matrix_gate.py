@@ -1,8 +1,13 @@
 """Phase 3.12 Step 97 — GitHub Actions workflow **静态审计**（不访问 GitHub）。
 
 覆盖 §十八 1～10 + §十九/§二十/§二十二/§二十三 边界：
-文件存在 · 触发条件 · checkout/setup-python · 核心命令 · 不吞失败 · 无刷新参数 ·
-无 LLM 凭据 · 无外部调用 · 无 secrets · baseline 只读 · 无 GitHub API · 单一 gate。
+文件唯一 · 单一 job · 触发条件 · checkout/setup-python · 核心命令 · 不吞失败 ·
+无刷新参数 · 无 LLM 凭据 · 无外部调用 · 无 secrets · baseline 只读 ·
+无 GitHub API · 单一 gate · 无 permissions / cache / retry / matrix 分层。
+
+Step 98 增补（**只审计 Workflow，不修改 Gate / baseline / 生产代码**）：
+真实 Run 结果属于外部事实，本文件只锁定"Workflow 形状"与"审计文档已记录"，
+不联网、不读取 GitHub API。
 
 本文件为纯文件解析（PyYAML 为项目既有依赖），无网络、无 DB、无 LLM。
 """
@@ -264,3 +269,89 @@ class TestSecurityBoundary:
             pytest.fail(f"workflow YAML 不可解析: {exc}")
 
         assert isinstance(document, dict)
+
+
+# ============================================================
+# Phase 3.12 Step 98 — 首次真实运行审计（**不联网**，只锁形状 / 记录）
+# ============================================================
+
+#: Step 98 观察到的真实 GitHub Actions Run（**外部事实快照，只读**）。
+#: 用途：文档漂移守卫 —— 防止审计记录被静默删除；**不**用于自动修复或改写结论。
+STEP98_REAL_RUN: dict[str, str] = {
+    "run_id": "36859788376",
+    "run_number": "1",
+    "commit": "559ce63876c8f9b21a71ff4eba610227a74d25a2",
+    "trigger": "push",
+    "workflow": "Observability Matrix Gate",
+    "job": "Observability Matrix Gate",
+}
+
+#: Step 98 审计文档（真实 Run 记录落点）。
+_STEP98_DOC = "docs/evaluation/phase-3.12-step-98-github-actions-run-audit.md"
+
+
+class TestStep98WorkflowUniqueness:
+    """§十六：唯一 workflow / 唯一 job / 无额外触发与权限。"""
+
+    def test_workflow_is_the_only_workflow_file(self) -> None:
+        directory = _REPO_ROOT / ".github" / "workflows"
+
+        assert directory.is_dir()
+        files = sorted(
+            path.name
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix in {".yml", ".yaml"}
+        )
+        assert files == ["observability-matrix-gate.yml"], files
+
+    def test_workflow_declares_no_permissions(self) -> None:
+        """§十三：不为本阶段引入权限体系（保持默认最小权限）。"""
+        document = _workflow()
+
+        assert "permissions" not in document, "不得新增 permissions 配置"
+        assert "permissions" not in _job(), "job 级 permissions 同样禁止"
+
+    def test_workflow_uses_no_secrets_context(self) -> None:
+        assert "secrets." not in _workflow_text()
+
+    def test_no_cache_retry_or_matrix_strategy(self) -> None:
+        """§十四：不做性能优化（无 cache / 无 retry / 无 matrix 分层）。"""
+        text = _workflow_text().lower()
+
+        for forbidden in (
+            "actions/cache",
+            "strategy:",
+            "matrix:",
+            "timeout-minutes",
+            "retry",
+        ):
+            assert forbidden not in text, forbidden
+
+
+class TestStep98RunAuditRecord:
+    """真实 Run 属于外部事实：只保证**记录存在且未被静默删除**（离线）。"""
+
+    def test_step98_audit_document_exists(self) -> None:
+        document = _REPO_ROOT / _STEP98_DOC
+
+        assert document.is_file(), document
+
+    def test_step98_audit_document_records_the_real_run(self) -> None:
+        content = (_REPO_ROOT / _STEP98_DOC).read_text(encoding="utf-8")
+
+        assert STEP98_REAL_RUN["run_id"] in content
+        assert STEP98_REAL_RUN["commit"] in content
+        assert STEP98_REAL_RUN["run_number"] in content
+
+    def test_step98_real_run_snapshot_is_stable(self) -> None:
+        """快照键集固定（新增字段需显式授权）。"""
+        assert set(STEP98_REAL_RUN) == {
+            "run_id",
+            "run_number",
+            "commit",
+            "trigger",
+            "workflow",
+            "job",
+        }
+        assert STEP98_REAL_RUN["workflow"] == _workflow()["name"]
+        assert STEP98_REAL_RUN["job"] == _job()["name"]
