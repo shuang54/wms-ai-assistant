@@ -125,7 +125,30 @@ Workflow:           unchanged（配合 §十：提交后由 push 触发真实 CI
 
 ---
 
-## 7. 结论
+## 7. 真实 GitHub Actions（Step 99 提交后由 push 触发）
+
+```text
+Run:        #2 · run_id 36949287263 · commit 73b3c71eacaeaff4d432453f39e73c7a75b8ef2b
+Trigger:    push（main）· Workflow/Job：Observability Matrix Gate
+Result:     **SUCCESS**（job conclusion = success · 01:05:58 → 01:06:57 ≈ 59s）
+
+Step 1 Set up job                     success
+Step 2 Initialize containers          success   （pgvector/pgvector:pg16）
+Step 3 Checkout                       success
+Step 4 Setup Python                   success   （3.13）
+Step 5 Install dependencies           success
+Step 6 Initialize database schema     success   （backend.app.db.init_db）
+Step 7 Run observability matrix gate  **success**（23s → exit 0）
+
+⇒ 全新库上的 DB suite = 180 passed / 0 failed（等于冻结 baseline）
+⇒ Gate = PASS · Adapter exit 0 · job SUCCESS
+（对比 Run #1：Step 7 failure / exit 1）
+URL: https://github.com/shuang54/wms-ai-assistant/actions/runs/36949287263
+```
+
+---
+
+## 8. 结论
 
 ```text
 问题：      Step 98 真实 CI 在全新 PostgreSQL 上发现 concurrency test failure
