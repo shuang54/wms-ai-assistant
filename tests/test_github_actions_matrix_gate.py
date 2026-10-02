@@ -926,3 +926,64 @@ class TestStep110CommitBoundary:
         labels = {classify_ci_governance_change(path) for path in known}
         assert "OTHER" not in labels, labels
         assert labels <= {"STEP_108_109", "TASK_COPY", "HISTORICAL"}
+
+
+def merge_queue_state_is_consistent(
+    *, merge_queue_enabled: bool, merge_group_trigger: bool
+) -> bool:
+    """Step 115：Merge Queue 状态自洽判据（纯函数）。
+
+    GitHub 要求：Merge Queue 中的 Required Check 需由响应 ``merge_group`` 的 workflow 提供
+    ⇒ 一旦启用 Merge Queue，就必须存在 ``merge_group`` 触发。
+    未启用 Merge Queue 时**不要求**该触发（当前状态即合法）。
+    """
+    return (not merge_queue_enabled) or merge_group_trigger
+
+
+def merge_queue_enablement_is_ready(*, merge_group_trigger: bool) -> bool:
+    """启用 Merge Queue 的前置条件：workflow 已声明 ``merge_group`` 触发。"""
+    return merge_group_trigger
+
+
+class TestStep115MergeQueueReadiness:
+    """Step 115：Merge Queue Readiness（只读；不启用 MQ / 不加 merge_group）。"""
+
+    def test_merge_queue_is_currently_disabled(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["merge_queue_enabled"] is False
+        assert MERGE_QUEUE_DECISION_CONTRACT["current_enabled"] is False
+        assert MERGE_QUEUE_READINESS_CONTRACT["merge_queue"] == "NOT ENABLED"
+
+    def test_merge_group_trigger_is_absent(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+        assert MERGE_QUEUE_DECISION_CONTRACT["current_workflow_merge_group"] is False
+        assert "merge_group" not in _workflow_text()
+
+    def test_current_decision_is_defer(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["decision"] == "DEFER"
+        assert MERGE_QUEUE_DECISION_CONTRACT["decision"] == "DEFER"
+        assert MERGE_QUEUE_READINESS_CONTRACT["readiness"] == (
+            "NOT READY FOR MERGE_QUEUE"
+        )
+
+    def test_future_enablement_requires_merge_group_trigger(self) -> None:
+        """若未来启用 Merge Queue（True），则 merge_group 触发必须存在，否则不自洽。"""
+        assert merge_queue_state_is_consistent(
+            merge_queue_enabled=False, merge_group_trigger=False
+        )  # 当前状态合法
+        assert merge_queue_state_is_consistent(
+            merge_queue_enabled=True, merge_group_trigger=True
+        )
+        assert not merge_queue_state_is_consistent(
+            merge_queue_enabled=True, merge_group_trigger=False
+        )  # 启用但无触发 ⇒ 违规
+        # 启用前置条件
+        assert not merge_queue_enablement_is_ready(merge_group_trigger=False)
+        assert merge_queue_enablement_is_ready(merge_group_trigger=True)
+
+    def test_required_check_identity_is_unchanged(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["required_check"] == (
+            "Observability Matrix Gate"
+        )
+        assert _job()["name"] == "Observability Matrix Gate"
+        assert STEP103_REQUIRED_CHECK_NAME == "Observability Matrix Gate"
+        assert len(_workflow()["jobs"]) == 1
