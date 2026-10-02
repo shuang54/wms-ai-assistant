@@ -461,3 +461,110 @@ class TestStep101GovernanceReadiness:
         assert "if" not in _job(), "job 级条件跳过禁止"
         for step in _steps():
             assert "if" not in step, step.get("name", step)
+
+
+#: Step 103 §三：治理审计目标（只读；不得用于任何写操作）。
+GOVERNANCE_TARGET: dict[str, str] = {
+    "owner": "shuang54",
+    "repo": "wms-ai-assistant",
+    "branch": "main",
+}
+
+#: Step 103 §九：未来若被配置为 Required Check，其 check 名必须等于 job name。
+STEP103_REQUIRED_CHECK_NAME = "Observability Matrix Gate"
+
+
+class TestStep103GovernanceIdentity:
+    """Step 103 §九：check 名 / 目标分支身份（**不创建** mock governance system）。"""
+
+    def test_governance_target_is_frozen(self) -> None:
+        assert GOVERNANCE_TARGET == {
+            "owner": "shuang54",
+            "repo": "wms-ai-assistant",
+            "branch": "main",
+        }
+        assert GOVERNANCE_TARGET["branch"] == "main"
+
+    def test_required_check_name_equals_the_job_name(self) -> None:
+        """Required Check 名来自 job name ⇒ 必须与 workflow 中声明一致且唯一。"""
+        assert STEP103_REQUIRED_CHECK_NAME == _job()["name"]
+        assert STEP103_REQUIRED_CHECK_NAME == "Observability Matrix Gate"
+        assert len(_workflow()["jobs"]) == 1
+
+
+#: Step 106：Merge Queue 就绪契约（**只读快照**；不代表代码失败）。
+MERGE_QUEUE_READINESS_CONTRACT: dict[str, str] = {
+    "merge_queue": "NOT ENABLED",           # Ruleset 24348464 无 merge_queue 规则
+    "workflow_merge_group": "absent",       # 当前 workflow 未声明 merge_group
+    "required_check": STEP103_REQUIRED_CHECK_NAME,
+    "readiness": "NOT READY FOR MERGE_QUEUE",
+}
+
+
+class TestStep106MergeQueueReadiness:
+    """Step 106 §九/§十：Merge Queue 触发就绪只读审计（不修改 Workflow）。"""
+
+    def test_workflow_triggers_are_push_and_pull_request_only(self) -> None:
+        document = _workflow()
+        triggers = document.get("on", document.get(True))
+
+        assert set(triggers) == {"push", "pull_request"}, set(triggers)
+        assert "merge_group" not in triggers
+
+    def test_merge_queue_readiness_contract_is_frozen(self) -> None:
+        assert MERGE_QUEUE_READINESS_CONTRACT == {
+            "merge_queue": "NOT ENABLED",
+            "workflow_merge_group": "absent",
+            "required_check": "Observability Matrix Gate",
+            "readiness": "NOT READY FOR MERGE_QUEUE",
+        }
+        # 契约必须与真实 workflow 一致（无 merge_group ⇒ 不满足 Merge Queue 触发要求）
+        assert (
+            "merge_group" not in _workflow_text()
+        ), "未启用 Merge Queue 前不得添加 merge_group 触发"
+
+
+#: Step 107：Merge Queue **决策契约**（只读；**不**表达"未来一定启用"）。
+MERGE_QUEUE_DECISION_CONTRACT: dict[str, object] = {
+    "current_enabled": False,               # Ruleset 无 merge_queue 规则
+    "current_workflow_merge_group": False,  # Workflow 未声明 merge_group
+    "required_check": STEP103_REQUIRED_CHECK_NAME,
+    "future_required_change": "add merge_group trigger",
+    "decision": "DEFER",                    # 无事实证据表明当前需要 Merge Queue
+}
+#: 决策依据缺失的维度（**无真实数据** ⇒ UNKNOWN，不猜测）。
+MERGE_QUEUE_UNKNOWN_DIMENSIONS: tuple[str, ...] = (
+    "concurrent_pull_requests",
+    "merge_conflicts",
+    "post_merge_main_instability",
+)
+
+
+class TestStep107MergeQueueDecision:
+    """Step 107 §九：Merge Queue 启用决策契约（只读；不改 Workflow / Ruleset）。"""
+
+    def test_decision_contract_is_frozen(self) -> None:
+        assert MERGE_QUEUE_DECISION_CONTRACT["current_enabled"] is False
+        assert MERGE_QUEUE_DECISION_CONTRACT["current_workflow_merge_group"] is False
+        assert MERGE_QUEUE_DECISION_CONTRACT["required_check"] == (
+            STEP103_REQUIRED_CHECK_NAME
+        )
+        assert MERGE_QUEUE_DECISION_CONTRACT["future_required_change"] == (
+            "add merge_group trigger"
+        )
+        assert MERGE_QUEUE_DECISION_CONTRACT["decision"] == "DEFER"
+        # 决策必须与真实 workflow / Ruleset 事实一致
+        assert "merge_group" not in _workflow_text()
+        assert len(_workflow()["jobs"]) == 1
+
+    def test_decision_does_not_promise_future_enablement(self) -> None:
+        """契约不得写死"未来一定启用"（只记录决策 = DEFER 与最小改动方向）。"""
+        text = " ".join(str(value) for value in MERGE_QUEUE_DECISION_CONTRACT.values())
+
+        for forbidden in ("ENABLE", "WILL ENABLE", "MUST ENABLE"):
+            assert forbidden not in text, forbidden
+        assert MERGE_QUEUE_UNKNOWN_DIMENSIONS == (
+            "concurrent_pull_requests",
+            "merge_conflicts",
+            "post_merge_main_instability",
+        )
