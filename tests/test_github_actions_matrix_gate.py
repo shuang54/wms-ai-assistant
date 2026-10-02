@@ -568,3 +568,108 @@ class TestStep107MergeQueueDecision:
             "merge_conflicts",
             "post_merge_main_instability",
         )
+
+
+#: Step 108：**CI Governance Contract**（只读冻结：谁负责 / 叫什么 / 保护什么 / 是否启用）。
+CI_GOVERNANCE_CONTRACT: dict[str, object] = {
+    "workflow_name": "Observability Matrix Gate",
+    "job_name": "observability-matrix-gate",
+    "required_check": "Observability Matrix Gate",
+    "required_branch": "main",
+    "merge_queue_enabled": False,
+    "merge_group_trigger": False,
+    "decision": "DEFER",
+}
+
+#: 未来启用 Merge Queue 的**前置条件**（本阶段不执行，仅冻结语义）。
+FUTURE_MERGE_QUEUE_REQUIRES_SEPARATE_ENABLEMENT = True
+
+#: 禁止出现的"第二套 check 名"（避免歧义 / 与 GitHub required check 名不一致）。
+_FORBIDDEN_SECOND_CHECK_NAMES: tuple[str, ...] = (
+    "CI Gate",
+    "Merge Gate",
+    "Observability Gate",
+    "Merge Queue Gate",
+)
+
+#: Workflow 只允许承担的步骤（职责边界，§十）。
+_EXPECTED_STEP_NAMES: tuple[str, ...] = (
+    "Checkout",
+    "Setup Python",
+    "Install dependencies",
+    "Initialize database schema",
+    "Run observability matrix gate",
+)
+
+
+class TestStep108CIGovernanceContract:
+    """Step 108：冻结 CI Governance（Ruleset → Required Check → Workflow 边界）。"""
+
+    def test_ci_governance_contract_is_frozen(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT == {
+            "workflow_name": "Observability Matrix Gate",
+            "job_name": "observability-matrix-gate",
+            "required_check": "Observability Matrix Gate",
+            "required_branch": "main",
+            "merge_queue_enabled": False,
+            "merge_group_trigger": False,
+            "decision": "DEFER",
+        }
+        # 与真实 workflow 事实一致
+        assert CI_GOVERNANCE_CONTRACT["workflow_name"] == _workflow()["name"]
+        assert list(_workflow()["jobs"]) == [CI_GOVERNANCE_CONTRACT["job_name"]]
+
+    def test_decision_does_not_promise_future_merge_queue(self) -> None:
+        text = " ".join(str(value) for value in CI_GOVERNANCE_CONTRACT.values()).lower()
+
+        for forbidden in ("will_enable", "must_enable", "enable_next"):
+            assert forbidden not in text, forbidden
+        assert CI_GOVERNANCE_CONTRACT["decision"] == "DEFER"
+        assert FUTURE_MERGE_QUEUE_REQUIRES_SEPARATE_ENABLEMENT is True
+
+    def test_required_check_identity_is_a_single_name(self) -> None:
+        names = [job.get("name") for job in _workflow()["jobs"].values()]
+
+        assert names == [CI_GOVERNANCE_CONTRACT["required_check"]]
+        assert STEP103_REQUIRED_CHECK_NAME == CI_GOVERNANCE_CONTRACT["required_check"]
+        for forbidden in _FORBIDDEN_SECOND_CHECK_NAMES:
+            assert forbidden not in _workflow_text(), forbidden
+
+    def test_branch_scope_is_main_only(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["required_branch"] == GOVERNANCE_TARGET["branch"]
+        assert CI_GOVERNANCE_CONTRACT["required_branch"] == "main"
+        # 不得扩大为通配 / 全分支
+        for value in CI_GOVERNANCE_CONTRACT.values():
+            assert value not in ("*", "all branches", "refs/heads/*"), value
+
+    def test_merge_queue_boundary_is_frozen(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["merge_queue_enabled"] is False
+        assert CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+        assert "merge_group" not in _workflow_text()
+        # 当前 CI 在没有 merge_group 的情况下依然有效
+        document = _workflow()
+        triggers = document.get("on", document.get(True))
+        assert set(triggers) == {"push", "pull_request"}
+
+    def test_governance_contract_does_not_duplicate_gate_logic(self) -> None:
+        """治理契约只描述归属，不复制 PASS / DRIFT / exit code / baseline 逻辑。"""
+        text = " ".join(str(value) for value in CI_GOVERNANCE_CONTRACT.values())
+
+        for forbidden in ("PASS", "DRIFT", "exit_code", "baseline", "residue"):
+            assert forbidden not in text, forbidden
+
+    def test_workflow_ownership_is_boundary_only(self) -> None:
+        """Workflow 只做 checkout → setup → install → init_db → CLI（不判断 PASS/DRIFT）。"""
+        assert tuple(step.get("name") for step in _steps()) == _EXPECTED_STEP_NAMES
+        bodies = _run_bodies()
+
+        assert "backend.app.db.init_db" in bodies
+        assert "scripts/run_matrix_gate.py" in bodies
+        for forbidden in (
+            "evaluate_matrix_baseline_gate",
+            "adapt_gate_result_to_exit_code",
+            "MATRIX_EXECUTION_BASELINE",
+            "PASS",
+            "DRIFT",
+        ):
+            assert forbidden not in bodies, forbidden
