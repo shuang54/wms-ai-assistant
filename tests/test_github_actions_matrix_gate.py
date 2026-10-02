@@ -461,3 +461,32 @@ class TestStep101GovernanceReadiness:
         assert "if" not in _job(), "job 级条件跳过禁止"
         for step in _steps():
             assert "if" not in step, step.get("name", step)
+
+
+#: Step 103 §三：治理审计目标（只读；不得用于任何写操作）。
+GOVERNANCE_TARGET: dict[str, str] = {
+    "owner": "shuang54",
+    "repo": "wms-ai-assistant",
+    "branch": "main",
+}
+
+#: Step 103 §九：未来若被配置为 Required Check，其 check 名必须等于 job name。
+STEP103_REQUIRED_CHECK_NAME = "Observability Matrix Gate"
+
+
+class TestStep103GovernanceIdentity:
+    """Step 103 §九：check 名 / 目标分支身份（**不创建** mock governance system）。"""
+
+    def test_governance_target_is_frozen(self) -> None:
+        assert GOVERNANCE_TARGET == {
+            "owner": "shuang54",
+            "repo": "wms-ai-assistant",
+            "branch": "main",
+        }
+        assert GOVERNANCE_TARGET["branch"] == "main"
+
+    def test_required_check_name_equals_the_job_name(self) -> None:
+        """Required Check 名来自 job name ⇒ 必须与 workflow 中声明一致且唯一。"""
+        assert STEP103_REQUIRED_CHECK_NAME == _job()["name"]
+        assert STEP103_REQUIRED_CHECK_NAME == "Observability Matrix Gate"
+        assert len(_workflow()["jobs"]) == 1
