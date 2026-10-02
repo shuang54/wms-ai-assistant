@@ -568,3 +568,361 @@ class TestStep107MergeQueueDecision:
             "merge_conflicts",
             "post_merge_main_instability",
         )
+
+
+#: Step 108：**CI Governance Contract**（只读冻结：谁负责 / 叫什么 / 保护什么 / 是否启用）。
+CI_GOVERNANCE_CONTRACT: dict[str, object] = {
+    "workflow_name": "Observability Matrix Gate",
+    "job_name": "observability-matrix-gate",
+    "required_check": "Observability Matrix Gate",
+    "required_branch": "main",
+    "merge_queue_enabled": False,
+    "merge_group_trigger": False,
+    "decision": "DEFER",
+}
+
+#: 未来启用 Merge Queue 的**前置条件**（本阶段不执行，仅冻结语义）。
+FUTURE_MERGE_QUEUE_REQUIRES_SEPARATE_ENABLEMENT = True
+
+#: 禁止出现的"第二套 check 名"（避免歧义 / 与 GitHub required check 名不一致）。
+_FORBIDDEN_SECOND_CHECK_NAMES: tuple[str, ...] = (
+    "CI Gate",
+    "Merge Gate",
+    "Observability Gate",
+    "Merge Queue Gate",
+)
+
+#: Workflow 只允许承担的步骤（职责边界，§十）。
+_EXPECTED_STEP_NAMES: tuple[str, ...] = (
+    "Checkout",
+    "Setup Python",
+    "Install dependencies",
+    "Initialize database schema",
+    "Run observability matrix gate",
+)
+
+
+class TestStep108CIGovernanceContract:
+    """Step 108：冻结 CI Governance（Ruleset → Required Check → Workflow 边界）。"""
+
+    def test_ci_governance_contract_is_frozen(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT == {
+            "workflow_name": "Observability Matrix Gate",
+            "job_name": "observability-matrix-gate",
+            "required_check": "Observability Matrix Gate",
+            "required_branch": "main",
+            "merge_queue_enabled": False,
+            "merge_group_trigger": False,
+            "decision": "DEFER",
+        }
+        # 与真实 workflow 事实一致
+        assert CI_GOVERNANCE_CONTRACT["workflow_name"] == _workflow()["name"]
+        assert list(_workflow()["jobs"]) == [CI_GOVERNANCE_CONTRACT["job_name"]]
+
+    def test_decision_does_not_promise_future_merge_queue(self) -> None:
+        text = " ".join(str(value) for value in CI_GOVERNANCE_CONTRACT.values()).lower()
+
+        for forbidden in ("will_enable", "must_enable", "enable_next"):
+            assert forbidden not in text, forbidden
+        assert CI_GOVERNANCE_CONTRACT["decision"] == "DEFER"
+        assert FUTURE_MERGE_QUEUE_REQUIRES_SEPARATE_ENABLEMENT is True
+
+    def test_required_check_identity_is_a_single_name(self) -> None:
+        names = [job.get("name") for job in _workflow()["jobs"].values()]
+
+        assert names == [CI_GOVERNANCE_CONTRACT["required_check"]]
+        assert STEP103_REQUIRED_CHECK_NAME == CI_GOVERNANCE_CONTRACT["required_check"]
+        for forbidden in _FORBIDDEN_SECOND_CHECK_NAMES:
+            assert forbidden not in _workflow_text(), forbidden
+
+    def test_branch_scope_is_main_only(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["required_branch"] == GOVERNANCE_TARGET["branch"]
+        assert CI_GOVERNANCE_CONTRACT["required_branch"] == "main"
+        # 不得扩大为通配 / 全分支
+        for value in CI_GOVERNANCE_CONTRACT.values():
+            assert value not in ("*", "all branches", "refs/heads/*"), value
+
+    def test_merge_queue_boundary_is_frozen(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["merge_queue_enabled"] is False
+        assert CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+        assert "merge_group" not in _workflow_text()
+        # 当前 CI 在没有 merge_group 的情况下依然有效
+        document = _workflow()
+        triggers = document.get("on", document.get(True))
+        assert set(triggers) == {"push", "pull_request"}
+
+    def test_governance_contract_does_not_duplicate_gate_logic(self) -> None:
+        """治理契约只描述归属，不复制 PASS / DRIFT / exit code / baseline 逻辑。"""
+        text = " ".join(str(value) for value in CI_GOVERNANCE_CONTRACT.values())
+
+        for forbidden in ("PASS", "DRIFT", "exit_code", "baseline", "residue"):
+            assert forbidden not in text, forbidden
+
+    def test_workflow_ownership_is_boundary_only(self) -> None:
+        """Workflow 只做 checkout → setup → install → init_db → CLI（不判断 PASS/DRIFT）。"""
+        assert tuple(step.get("name") for step in _steps()) == _EXPECTED_STEP_NAMES
+        bodies = _run_bodies()
+
+        assert "backend.app.db.init_db" in bodies
+        assert "scripts/run_matrix_gate.py" in bodies
+        for forbidden in (
+            "evaluate_matrix_baseline_gate",
+            "adapt_gate_result_to_exit_code",
+            "MATRIX_EXECUTION_BASELINE",
+            "PASS",
+            "DRIFT",
+        ):
+            assert forbidden not in bodies, forbidden
+
+
+#: Step 109：Self-Consistency Audit 的**禁用依赖**（离线可运行的要求）。
+_FORBIDDEN_AUDIT_DEPENDENCIES: tuple[str, ...] = (
+    "requests",
+    "httpx",
+    "urllib",
+    "aiohttp",
+    "github",
+    "PyGithub",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+)
+
+#: Governance Contract 不得承载的 Gate / Adapter 语义 token。
+_FORBIDDEN_GOVERNANCE_TOKENS: tuple[str, ...] = (
+    "PASS",
+    "DRIFT",
+    "exit_code",
+    "MATRIX_EXECUTION_BASELINE",
+    "evaluate_matrix_baseline_gate",
+    "adapt_gate_result_to_exit_code",
+)
+
+
+def run_governance_self_consistency_audit() -> dict[str, bool]:
+    """**离线**自洽审计（Step 109）：Contract ↔ 本地 Workflow ↔ 测试契约。
+
+    不访问 GitHub API、不读环境变量、不做任何写操作；返回逐项结论（不修改契约）。
+    """
+    document = _workflow()
+    triggers = document.get("on", document.get(True))
+    bodies = _run_bodies()
+    contract_text = " ".join(str(value) for value in CI_GOVERNANCE_CONTRACT.values())
+
+    return {
+        "workflow_name": (
+            CI_GOVERNANCE_CONTRACT["workflow_name"] == document["name"]
+        ),
+        "job_id": list(document["jobs"]) == [CI_GOVERNANCE_CONTRACT["job_name"]],
+        "job_name": (
+            _job()["name"] == CI_GOVERNANCE_CONTRACT["required_check"]
+        ),
+        "triggers": (
+            "push" in triggers
+            and "pull_request" in triggers
+            and "merge_group" not in triggers
+        ),
+        "required_check_single_name": all(
+            forbidden not in _workflow_text()
+            for forbidden in _FORBIDDEN_SECOND_CHECK_NAMES
+        ),
+        "branch_scope": CI_GOVERNANCE_CONTRACT["required_branch"] == "main",
+        "merge_queue_boundary": (
+            CI_GOVERNANCE_CONTRACT["merge_queue_enabled"] is False
+            and CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+            and CI_GOVERNANCE_CONTRACT["decision"] == "DEFER"
+            and "merge_group" not in _workflow_text()
+        ),
+        "governance_boundary": (
+            all(token not in contract_text for token in _FORBIDDEN_GOVERNANCE_TOKENS)
+            and all(token not in bodies for token in _FORBIDDEN_GOVERNANCE_TOKENS)
+        ),
+    }
+
+
+class TestStep109SelfConsistency:
+    """Step 109：CI Governance Self-Consistency Audit（离线 · 无 GitHub API 依赖）。"""
+
+    def test_workflow_and_job_identity_match_contract(self) -> None:
+        document = _workflow()
+
+        assert CI_GOVERNANCE_CONTRACT["workflow_name"] == document["name"]
+        assert list(document["jobs"]) == [CI_GOVERNANCE_CONTRACT["job_name"]]
+        assert _job()["name"] == CI_GOVERNANCE_CONTRACT["required_check"]
+
+    def test_trigger_identity_matches_contract(self) -> None:
+        document = _workflow()
+        triggers = document.get("on", document.get(True))
+
+        assert "push" in triggers and "pull_request" in triggers
+        assert "merge_group" not in triggers
+        assert CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+        # 不得把"未来 merge_group 支持"误判为当前 trigger
+        assert "merge_group" not in _workflow_text()
+
+    def test_branch_scope_is_not_expanded(self) -> None:
+        """Ruleset 作用域（main）与 Workflow 触发（分支无关）是两个概念，不得混淆。"""
+        assert CI_GOVERNANCE_CONTRACT["required_branch"] == "main"
+        assert GOVERNANCE_TARGET["branch"] == "main"
+        # Workflow 侧本就不声明分支范围（无 branches 过滤）—— 不因此扩大 Ruleset 作用域
+        for step in _steps():
+            assert "branches" not in step, step.get("name", step)
+        for value in CI_GOVERNANCE_CONTRACT.values():
+            assert value not in ("*", "all branches", "refs/heads/*"), value
+
+    def test_ownership_boundary_has_no_gate_semantics(self) -> None:
+        contract_text = " ".join(
+            str(value) for value in CI_GOVERNANCE_CONTRACT.values()
+        )
+        bodies = _run_bodies()
+
+        for token in _FORBIDDEN_GOVERNANCE_TOKENS:
+            assert token not in contract_text, token
+            assert token not in bodies, token
+
+    def test_merge_queue_boundary_is_self_consistent(self) -> None:
+        assert CI_GOVERNANCE_CONTRACT["merge_queue_enabled"] is False
+        assert CI_GOVERNANCE_CONTRACT["merge_group_trigger"] is False
+        assert CI_GOVERNANCE_CONTRACT["decision"] == "DEFER"
+        # 不得由 DEFER 推导出 future enablement
+        for key in ("future_enablement", "will_enable", "must_enable"):
+            assert key not in CI_GOVERNANCE_CONTRACT, key
+
+    def test_audit_has_no_dynamic_github_dependency(self) -> None:
+        """本审计必须完全离线：**AST 级**检查（不做全文字符串扫描）。
+
+        允许文本中出现 "requests" / "httpx" 这类**被禁止 token 的清单**（见
+        ``test_10_no_outbound_network_tools``）；判据是"是否真的 import / 调用"。
+        """
+        import ast  # 局部 import：仅用于本审计的静态检查
+
+        source_path = _REPO_ROOT / "tests" / "test_github_actions_matrix_gate.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        modules: set[str] = set()
+        attributes: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Attribute):
+                attributes.add(node.attr)
+
+        for forbidden in _FORBIDDEN_AUDIT_DEPENDENCIES:
+            root = forbidden.split(".")[0]
+            if forbidden.isupper():                      # Token 常量名（非模块）
+                assert forbidden not in attributes, forbidden
+                continue
+            assert root not in modules, (root, sorted(modules))
+        # 离线要求：不读环境变量（不做 token / 凭据探测）
+        assert "os" not in modules
+        assert "environ" not in attributes
+        assert "getenv" not in attributes
+
+    def test_contract_is_immutable_across_audit(self) -> None:
+        before = dict(CI_GOVERNANCE_CONTRACT)
+
+        findings = run_governance_self_consistency_audit()
+        run_governance_self_consistency_audit()  # 幂等：重复执行结果一致
+
+        assert dict(CI_GOVERNANCE_CONTRACT) == before
+        assert all(findings.values()), findings
+        assert run_governance_self_consistency_audit() == findings
+
+
+#: Step 109 / 110：CI Governance 交付物（**candidate commit set**，Step 110 只分类不提交）。
+STEP_108_109_PATHS: frozenset[str] = frozenset(
+    {
+        "tests/test_github_actions_matrix_gate.py",
+        "docs/evaluation/phase-3.12-ci-governance-contract.md",
+        "docs/evaluation/phase-3.12-ci-governance-self-consistency.md",
+    }
+)
+#: 任务说明副本所在目录（TASK_COPY；不自动纳入 candidate commit set）。
+_TASK_COPY_PREFIX = "docs/decisions/"
+#: 历史步骤（已合入 origin/main）的 evaluation 文档前缀。
+_HISTORICAL_EVALUATION_PREFIX = "docs/evaluation/phase-3.12-step-"
+
+
+def classify_ci_governance_change(path: str) -> str:
+    """按**路径**分类工作区变更（Step 110 §九）。
+
+    只允许四种取值：``STEP_108_109`` · ``HISTORICAL`` · ``TASK_COPY`` · ``OTHER``。
+
+    **不依据 commit message / git 历史**（纯路径判定，无 subprocess / 无 git 调用），
+    以免"猜"历史归属。
+    """
+    normalized = path.replace("\\", "/").strip().strip('"')
+
+    if normalized in STEP_108_109_PATHS:
+        return "STEP_108_109"
+    if normalized.startswith(_TASK_COPY_PREFIX):
+        return "TASK_COPY"
+    if normalized.startswith(_HISTORICAL_EVALUATION_PREFIX):
+        return "HISTORICAL"
+    return "OTHER"
+
+
+class TestStep110CommitBoundary:
+    """Step 110：Commit Boundary Audit（**只分类，不 commit / 不 push**）。"""
+
+    def test_candidate_commit_set_is_exactly_three_paths(self) -> None:
+        assert STEP_108_109_PATHS == {
+            "tests/test_github_actions_matrix_gate.py",
+            "docs/evaluation/phase-3.12-ci-governance-contract.md",
+            "docs/evaluation/phase-3.12-ci-governance-self-consistency.md",
+        }
+
+    def test_classifier_maps_known_artifacts(self) -> None:
+        cases = {
+            "tests/test_github_actions_matrix_gate.py": "STEP_108_109",
+            "docs/evaluation/phase-3.12-ci-governance-contract.md": "STEP_108_109",
+            "docs/evaluation/phase-3.12-ci-governance-self-consistency.md": (
+                "STEP_108_109"
+            ),
+            "docs/decisions/Phase/Phase 3.12 Step 109 — CI Governance Self-Consistency Audit.md": (
+                "TASK_COPY"
+            ),
+            "docs/decisions/Phase/Phase 3.12 Step 110 — CI Governance Commit Boundary Audit.md": (
+                "TASK_COPY"
+            ),
+            "docs/evaluation/phase-3.12-step-104-required-check.md": "HISTORICAL",
+            "docs/evaluation/phase-3.12-step-107-merge-queue-decision.md": "HISTORICAL",
+            ".github/workflows/observability-matrix-gate.yml": "OTHER",
+            "backend/app/main.py": "OTHER",
+        }
+        for path, expected in cases.items():
+            assert classify_ci_governance_change(path) == expected, (path, expected)
+
+    def test_classifier_is_path_based_only(self) -> None:
+        """分类器不得依赖 git / commit message（AST 检查函数体内无进程调用）。"""
+        import ast  # 局部 import：仅用于本审计
+
+        source = (_REPO_ROOT / "tests" / "test_github_actions_matrix_gate.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        target = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "classify_ci_governance_change"
+        )
+        used = {
+            node.id for node in ast.walk(target) if isinstance(node, ast.Name)
+        } | {
+            node.attr for node in ast.walk(target) if isinstance(node, ast.Attribute)
+        }
+
+        for forbidden in ("subprocess", "os", "git", "check_output", "commit_message"):
+            assert forbidden not in used, forbidden
+
+    def test_known_artifacts_never_classify_as_other(self) -> None:
+        """§十：若出现 OTHER ⇒ COMMIT BLOCKED（此处覆盖已知交付物，必须无 OTHER）。"""
+        known = tuple(STEP_108_109_PATHS) + (
+            "docs/decisions/Phase/Phase 3.12 Step 109 — CI Governance Self-Consistency Audit.md",
+            "docs/decisions/Phase/Phase 3.12 Step 110 — CI Governance Commit Boundary Audit.md",
+        )
+
+        labels = {classify_ci_governance_change(path) for path in known}
+        assert "OTHER" not in labels, labels
+        assert labels <= {"STEP_108_109", "TASK_COPY", "HISTORICAL"}
