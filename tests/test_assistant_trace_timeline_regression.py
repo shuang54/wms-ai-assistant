@@ -194,6 +194,12 @@ FILES: tuple[FileSpec, ...] = (
     FileSpec("tests/test_assistant_trace_pagination_audit.py", "partial", "无分页（Step 59）"),
     FileSpec("tests/test_assistant_trace_outcome_audit.py", "partial", "Outcome × Trace 审计（Step 61）"),
     FileSpec("tests/test_assistant_outcome_contract_audit.py", "partial", "Outcome 契约审计（Step 62）"),
+    # ---- Step 105 临时 failure probe（**仅临时验证分支**；禁止合并）----
+    FileSpec(
+        "tests/test_step_105_ci_failure_probe.py",
+        "no",
+        "Step 105 确定性失败探针（临时分支专用）",
+    ),
     # ---- Observability HTTP Allowlist 契约族（Step 79；全部离线）----
     FileSpec(
         "tests/test_observability_http_allowlist_audit.py",
@@ -278,6 +284,7 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
         "tests/test_assistant_trace_timeline_outcome_consistency.py",
     ),
     "Security": (
+        "tests/test_step_105_ci_failure_probe.py",
         "tests/test_assistant_trace_timeline_outcome_consistency.py",
         "tests/test_assistant_trace_correlation_e2e.py",
         "tests/test_assistant_timeline_api.py",
