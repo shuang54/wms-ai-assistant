@@ -431,3 +431,33 @@ class TestStep100GateContractFreeze:
             "MATRIX_EXECUTION_BASELINE",
         ):
             assert forbidden not in bodies, forbidden
+
+
+class TestStep101GovernanceReadiness:
+    """Step 101 §八/§十/§十一：**只读**审计 Required Check 就绪条件。"""
+
+    def test_required_check_name_is_stable_and_unique(self) -> None:
+        """§八：Required Check 名称来自 job name ⇒ 必须唯一且稳定。"""
+        jobs = _workflow()["jobs"]
+
+        assert list(jobs) == ["observability-matrix-gate"], list(jobs)
+        names = [job.get("name", key) for key, job in jobs.items()]
+        assert names == ["Observability Matrix Gate"], names
+        assert len(set(names)) == 1                     # 无同名 job（结果歧义）
+
+    def test_triggers_support_push_and_pull_request(self) -> None:
+        """§十：PR Required Check 需要 push / pull_request；不得只有手动/定时触发。"""
+        document = _workflow()
+        triggers = document.get("on", document.get(True))
+
+        assert {"push", "pull_request"} <= set(triggers), triggers
+        for forbidden in ("schedule", "workflow_dispatch", "merge_group"):
+            assert forbidden not in triggers, forbidden
+
+    def test_workflow_has_no_conditional_bypass(self) -> None:
+        """§十三：不得存在条件跳过（gate 必须无条件执行）。"""
+        document = _workflow()
+
+        assert "if" not in _job(), "job 级条件跳过禁止"
+        for step in _steps():
+            assert "if" not in step, step.get("name", step)
