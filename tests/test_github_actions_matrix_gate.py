@@ -289,6 +289,27 @@ STEP98_REAL_RUN: dict[str, str] = {
 #: Step 98 审计文档（真实 Run 记录落点）。
 _STEP98_DOC = "docs/evaluation/phase-3.12-step-98-github-actions-run-audit.md"
 
+#: Step 100 冻结的 **真实 GitHub Evidence**（只读快照；Run ≠ Baseline）。
+#:    Run #2 = Step 99 代码修复 · Run #3 = Step 99 文档补录（均 success）
+STEP100_REAL_RUNS: dict[str, dict[str, str]] = {
+    "2": {
+        "run_id": "36949287263",
+        "commit": "73b3c71eacaeaff4d432453f39e73c7a75b8ef2b",
+        "result": "success",
+    },
+    "3": {
+        "run_id": "36949724371",
+        "commit": "510ab81caf4d56152bbaa4f71be54702b94a99cc",
+        "result": "success",
+    },
+}
+
+#: Step 100 冻结文档。
+_STEP100_DOC = "docs/evaluation/phase-3.12-step-100-ci-gate-contract.md"
+
+#: 生产代码目录（**Run ID 不得出现**；Evidence 只属于 docs / tests）。
+_PRODUCTION_CODE_DIRS: tuple[str, ...] = ("backend", "scripts", ".github")
+
 
 class TestStep98WorkflowUniqueness:
     """§十六：唯一 workflow / 唯一 job / 无额外触发与权限。"""
@@ -355,3 +376,58 @@ class TestStep98RunAuditRecord:
         }
         assert STEP98_REAL_RUN["workflow"] == _workflow()["name"]
         assert STEP98_REAL_RUN["job"] == _job()["name"]
+
+
+class TestStep100GateContractFreeze:
+    """§四～§十四：冻结 CI Gate Contract（**不新增** Gate / Adapter / Workflow）。"""
+
+    def test_step100_evidence_snapshot_is_stable(self) -> None:
+        """Run #2 / #3 冻结为 Evidence（键集固定；新增需显式授权）。"""
+        assert set(STEP100_REAL_RUNS) == {"2", "3"}
+        for snapshot in STEP100_REAL_RUNS.values():
+            assert set(snapshot) == {"run_id", "commit", "result"}
+            assert snapshot["result"] == "success"
+
+    def test_run_ids_never_enter_production_code(self) -> None:
+        """§九：Run ID 只写 Evaluation 文档 —— 生产代码 / Workflow 中不得出现。"""
+        run_ids = [snapshot["run_id"] for snapshot in STEP100_REAL_RUNS.values()]
+        run_ids.append(STEP98_REAL_RUN["run_id"])
+
+        offenders: list[str] = []
+        for directory in _PRODUCTION_CODE_DIRS:
+            root = _REPO_ROOT / directory
+            for path in root.rglob("*"):
+                if not path.is_file() or path.suffix not in {".py", ".yml", ".yaml"}:
+                    continue
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                for run_id in run_ids:
+                    if run_id in content:
+                        offenders.append(f"{path.as_posix()}:{run_id}")
+        assert offenders == [], offenders
+
+    def test_workflow_path_and_job_are_frozen(self) -> None:
+        """§八：workflow 路径 / 唯一 job 名冻结。"""
+        assert (_REPO_ROOT / _WORKFLOW).is_file()
+        assert list(_workflow()["jobs"]) == ["observability-matrix-gate"]
+        assert _job()["name"] == "Observability Matrix Gate"
+
+    def test_step100_document_records_the_evidence(self) -> None:
+        """冻结文档存在且记录 Run #2 / #3（防文档被静默删除）。"""
+        content = (_REPO_ROOT / _STEP100_DOC).read_text(encoding="utf-8")
+
+        for snapshot in STEP100_REAL_RUNS.values():
+            assert snapshot["run_id"] in content
+            # 文档使用短 SHA（与 git log 一致）
+            assert snapshot["commit"][:7] in content
+
+    def test_gate_chain_is_not_reimplemented_in_workflow(self) -> None:
+        """§四：Workflow 只调用既有 CLI，不重新实现 Gate / Adapter / baseline。"""
+        bodies = _run_bodies()
+
+        assert bodies.count("python scripts/run_matrix_gate.py") == 1
+        for forbidden in (
+            "evaluate_matrix_baseline_gate",
+            "adapt_gate_result_to_exit_code",
+            "MATRIX_EXECUTION_BASELINE",
+        ):
+            assert forbidden not in bodies, forbidden

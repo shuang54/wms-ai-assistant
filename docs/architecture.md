@@ -4309,6 +4309,61 @@ Contract Matrix（摘要；完整表见基线文档）：
 
 ---
 
+## 8.78 CI Gate Contract（Phase 3.12 Step 100 — Frozen / READY）
+
+> 冻结文档：`docs/evaluation/phase-3.12-step-100-ci-gate-contract.md`
+> 回归守卫：`tests/test_github_actions_matrix_gate.py` · `tests/test_matrix_ci_adapter.py`
+> · `tests/test_matrix_gate_cli.py` · `tests/test_assistant_trace_timeline_regression.py`
+> （Step 100 **不新增** Contract 测试文件：既有测试已覆盖 PASS→0 / DRIFT→1 /
+>  baseline 冻结 / workflow 路径）
+
+```text
+CI Gate 链路（冻结，禁止在其中新增判断）：
+    MatrixExecutionBaseline            （冻结期望）
+        ↓
+    evaluate_matrix_baseline_gate()    （Gate 拥有判断）
+        ↓
+    MatrixBaselineGateResult           （status · drifts）
+        ↓
+    adapt_gate_result_to_exit_code()   （Adapter 只做 status → 0/1）
+        ↓
+    scripts/run_matrix_gate.py         （CLI：raise SystemExit；不重新判断）
+        ↓
+    GitHub Actions job                  （exit code 决定 success / failure）
+
+PASS ⇔ offline == baseline.offline ∧ db == baseline.db ∧ matrix_total 相同
+       ∧ matrix_status 相同 ∧ db_residue 相同 ∧ db_residue == 0
+       ∧ drifts == ("NO_BASELINE_DRIFT",)
+DRIFT ⇔ OFFLINE / DB / MATRIX_TOTAL / MATRIX_STATUS / DB_RESIDUE 任一真实漂移
+       → status = DRIFT → CI exit code = 1（不得 warning / continue / skip / success）
+
+冻结 Baseline（Expected Contract，**不是** GitHub Run）：
+    offline 375 total · 356 passed · 19 skipped · 0 failed · 0 errors · exit 0
+    db      180 total · 180 passed ·  0 skipped · 0 failed · 0 errors · exit 0
+    matrix_total = 555 · matrix_status = PASS · db_residue = 0
+    变更必须进入新的明确 Phase（禁止由 CI Run 结果自动覆写）
+
+Workflow（冻结）：
+    .github/workflows/observability-matrix-gate.yml · 唯一 job observability-matrix-gate
+    trigger = push + pull_request · runner ubuntu-latest · python 3.13
+    service = pgvector/pgvector:pg16（临时 CI 实例）· secrets = 0 · LLM = 0
+    步骤：python -m backend.app.db.init_db → python scripts/run_matrix_gate.py
+    无 continue-on-error / || true / exit 0 / retry / cache / matrix 分层
+
+GitHub Evidence（只写 Evaluation 文档，**禁止写入生产代码**）：
+    Run #1 36859788376（559ce63）= failure —— Step 98 首次运行（测试断言缺陷）
+    Run #2 36949287263（73b3c71）= success —— Step 99 代码修复
+    Run #3 36949724371（510ab81）= success —— Step 99 文档补录
+    Run ≠ Baseline：Run 只证明"当前执行 == 冻结 baseline"
+
+Concurrency Source Identity（Step 99 修复后冻结）：
+    request identity = assistant_request_id
+    source identity  = (source, source_id)
+    禁止要求 source_id 跨表全局唯一
+```
+
+---
+
 # 9. Prompt Architecture
 
 Prompt 不应该散落在 Python 代码中。
