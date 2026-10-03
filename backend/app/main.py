@@ -16,6 +16,7 @@ from backend.app.api import (
     assistant_timeline,
     assistant_trace,
     chat,
+    conversations,
     health,
     orchestrator_chat,
     rag,
@@ -54,6 +55,11 @@ def create_app() -> FastAPI:
     # （Grouped Timeline Projection；与 Trace 端点并列，互不影响）。
     app.include_router(
         assistant_timeline.router, prefix="/api", tags=["observability"]
+    )
+    # Phase 4.1 Step 8：Conversation Management HTTP 边界
+    # （4 个端点；不含 message POST —— Chat/Application Layer 属后续阶段）。
+    app.include_router(
+        conversations.router, prefix="/api", tags=["conversations"]
     )
     return app
 

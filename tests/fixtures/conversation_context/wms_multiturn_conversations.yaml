@@ -1,0 +1,235 @@
+# WMS Conversation Selection Evidence Dataset（Phase 4.1 Step 21）
+#
+# 性质（严格）：
+#   * synthetic but WMS-realistic —— **非生产数据**；
+#   * **不**包含真实客户 / 供应商 / 订单号 / 真实库存数量 / 生产数据；
+#   * 仅用于 offline selection evidence（**不是** database seed）；
+#   * schema 极简：`id` / `project_id` / `turns[{role, content}]`；
+#   * role 仅允许 `user` / `assistant`（本阶段不研究 system / tool）；
+#   * 禁止派生字段：token_count / embedding / relevance_score / expected_sql / model；
+#   * 约定：每个 case 的**最后一个 turn 是当前问题（user）**；
+#     candidate history = turns[:-1]。
+
+# ============================================================
+# Group A：连续追问（库存 → 仓库 → 具体物料/单据）
+# ============================================================
+
+- id: inventory_followup_001
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "查询越南一厂当前库存"
+    - role: assistant
+      content: "越南一厂当前库存约为 1000 件（示例值）。"
+    - role: user
+      content: "其中 A01 仓库有多少？"
+    - role: assistant
+      content: "A01 仓库约有 320 件（示例值）。"
+    - role: user
+      content: "那 B01 呢？"
+
+- id: inbound_followup_002
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "采购入库单里有哪些待处理？"
+    - role: assistant
+      content: "目前有 12 张采购入库单待处理（示例值）。"
+    - role: user
+      content: "其中供应商甲的有几张？"
+    - role: assistant
+      content: "供应商甲有 4 张（示例值）。"
+    - role: user
+      content: "那今天到货的呢？"
+
+# ============================================================
+# Group B：早期业务约束（后续问题依赖早期约束）
+# ============================================================
+
+- id: constraint_factory_003
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "只查询越南一厂库存"
+    - role: assistant
+      content: "好的，仅统计越南一厂。"
+    - role: user
+      content: "查询当前库存"
+    - role: assistant
+      content: "越南一厂当前库存约为 1000 件（示例值）。"
+    - role: user
+      content: "再看 A01 仓库的明细"
+
+- id: constraint_domestic_004
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "只看国产原材料"
+    - role: assistant
+      content: "已限定为国产原材料。"
+    - role: user
+      content: "当前库存是多少"
+    - role: assistant
+      content: "国产原材料库存约为 500 件（示例值）。"
+    - role: user
+      content: "A01 仓库占多少"
+
+# ============================================================
+# Group C：中间决策（先宽 → 再限定 → 再继续追问）
+# ============================================================
+
+- id: middle_scope_005
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "查询库存"
+    - role: assistant
+      content: "库存约为 1000 件（示例值）。"
+    - role: user
+      content: "按仓库统计"
+    - role: assistant
+      content: "A01 约 320 件 / B01 约 280 件 / 其它约 400 件（示例值）。"
+    - role: user
+      content: "只看 A01 和 A02"
+    - role: assistant
+      content: "A01 约 320 件 / A02 约 180 件（示例值）。"
+    - role: user
+      content: "继续看两者的差异"
+    - role: assistant
+      content: "两者的差异主要集中在出库频次上（示例结论）。"
+    - role: user
+      content: "继续看差异的原因"
+
+- id: middle_period_006
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "查询销售出库"
+    - role: assistant
+      content: "近期销售出库记录已汇总。"
+    - role: user
+      content: "限定本月"
+    - role: assistant
+      content: "本月销售出库约 260 单（示例值）。"
+    - role: user
+      content: "只看出库量前 10 的物料"
+    - role: assistant
+      content: "出库量前 10 的物料已列出。"
+    - role: user
+      content: "继续看它们的趋势"
+    - role: assistant
+      content: "前 10 物料的出库趋势已汇总（示例结论）。"
+    - role: user
+      content: "继续看趋势的变化"
+
+# ============================================================
+# Group D：长 Turn（一个长业务问题 + 多个短问题）
+# ============================================================
+
+- id: long_turn_007
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: |-
+        我需要做一次跨仓库的库存健康度分析（示例需求，不含真实数据）：请按越南一厂、越南二厂、仓储中心三
+        个区域，分别统计原材料、半成品、成品三类物料的当前库存件数、近 30 天入库总量、近 30 天出库总量、
+        库存周转天数，并按仓库维度给出排名；同时标记连续 14 天没有出库记录的呆滞物料，以及低于安全库存
+        的缺料物料；最后请把结果按"区域 → 仓库 → 物料类别"三层结构组织，给出每一层的汇总值与明细行数，
+        并说明哪些仓库存在结构性积压风险，哪些仓库存在缺料风险。
+    - role: assistant
+      content: |-
+        已按区域 → 仓库 → 物料类别完成三层汇总（示例结果）：原材料在三个区域均为库存高位，半成品集中在
+        仓储中心，成品在越南一厂占比最高；呆滞物料主要集中在仓储中心的半成品类别；缺料物料主要出现在
+        越南二厂的原材料类别。排名与明细行数已按三层结构给出，结构性积压风险集中在仓储中心，缺料风险
+        集中在越南二厂。
+    - role: user
+      content: "那 A01 呢？"
+    - role: assistant
+      content: "A01 仓库约为 320 件（示例值）。"
+    - role: user
+      content: "再按物料类别细分"
+
+- id: long_turn_008
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: |-
+        请按未来 30 天做一次 PMC 排产缺口分析（示例需求，不含真实数据）：以销售订单的交期为主线，结合
+        现有库存、在途采购、产线产能三个约束，计算每一周的物料缺口与产能缺口；对存在缺口的周，给出
+        候选补货建议优先级；同时标注哪些物料受单一供应商约束（示例性标记），哪些工序已经接近产能上限；
+        最后请说明如果交期整体提前 5 天，缺口会如何变化，并指出最先需要干预的三个环节。
+    - role: assistant
+      content: |-
+        已完成未来 30 天的排产缺口分析（示例结果）：库存与在途采购可以覆盖前两周，第三周开始出现原材料
+        缺口；产能缺口主要集中在装配工序的后两周；受影响最明显的物料带有单一供应商标记；总体来看，
+        仓库在一周内先补原材料，产线在两周内先做产能平衡，采购在两周内先处理单一供应商约束。
+    - role: user
+      content: "只看未来 7 天"
+    - role: assistant
+      content: "未来 7 天排产已汇总（示例值）。"
+    - role: user
+      content: "再看瓶颈工序"
+
+# ============================================================
+# Group E：回到旧主题（主题 A → B → C → 回到 A）
+# ============================================================
+
+- id: topic_return_009
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "我们讨论采购入库流程"
+    - role: assistant
+      content: "采购入库流程包含收货、质检、上架三个环节。"
+    - role: user
+      content: "先看销售出库"
+    - role: assistant
+      content: "销售出库包含拣货、复核、发运三个环节。"
+    - role: user
+      content: "再看库存盘点"
+    - role: assistant
+      content: "库存盘点包含冻结、清点、差异处理三个环节。"
+    - role: user
+      content: "回到刚才采购入库的问题"
+
+- id: topic_return_010
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "我们讨论批次追溯"
+    - role: assistant
+      content: "批次追溯依赖批次号贯穿收货、上架、出库三个环节。"
+    - role: user
+      content: "先看调拨单"
+    - role: assistant
+      content: "调拨单包含申请、审批、执行三个环节。"
+    - role: user
+      content: "再看退货单"
+    - role: assistant
+      content: "退货单包含验收、上架、结算三个环节。"
+    - role: user
+      content: "回到批次追溯的问题"
+
+# ============================================================
+# Group F：无历史依赖（当前问题本身已经完整）
+# ============================================================
+
+- id: standalone_011
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "查询越南一厂 A01 仓库当前库存"
+    - role: assistant
+      content: "A01 仓库当前库存约为 320 件（示例值）。"
+    - role: user
+      content: "查询越南一厂 B01 仓库当前库存是多少？"
+
+- id: standalone_012
+  project_id: vietnam-wms
+  turns:
+    - role: user
+      content: "统计本月采购入库单数量"
+    - role: assistant
+      content: "本月采购入库单约为 30 张（示例值）。"
+    - role: user
+      content: "统计本月销售出库单数量是多少？"

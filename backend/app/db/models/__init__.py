@@ -18,6 +18,8 @@ from __future__ import annotations
 # 顺序很关键：KnowledgeDocument 必须先于 KnowledgeChunk（虽然 SQLAlchemy 不强制，
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
+from backend.app.db.models.conversation import Conversation
+from backend.app.db.models.conversation_turn import ConversationTurn
 from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
@@ -33,16 +35,22 @@ _MODELS: tuple[type, ...] = (
     # Phase 3.12 Step 64：Assistant request-level terminal outcome
     # （全新表 → 随 create_all 自动创建；既有库首次 init_db() 即补建）
     AssistantOutcomeRecord,
+    # Phase 4.1 Step 5：Conversation 持久化层（ai_ops schema；非 public）。
+    # Conversation 必须先于 ConversationTurn（后者有指向前者的 FK）。
+    Conversation,
+    ConversationTurn,
 )
 
 
 __all__ = [
+    "AssistantOutcomeRecord",
+    "Conversation",
+    "ConversationTurn",
     "KnowledgeDocument",
     "KnowledgeChunk",
     "LLMUsageRecord",
-    "ToolExecutionRecordModel",
     "RagExecutionRecordModel",
-    "AssistantOutcomeRecord",
+    "ToolExecutionRecordModel",
 ]
 
 

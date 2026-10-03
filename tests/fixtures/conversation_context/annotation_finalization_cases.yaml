@@ -1,0 +1,187 @@
+# WMS Annotation Finalization Cases（Phase 4.1 Step 30）
+#
+# 性质（严格）：
+#   * synthetic **finalization scenario fixture** —— **非生产数据**；
+#   * **不**包含真实客户 / 供应商 / 订单 / 库存 / 员工 / 生产数据；
+#   * 仅用于 annotation finalization integrity 契约测试（**不是** database seed）；
+#   * **不是** raw evidence artifact（不含 conversation content）；
+#   * evidence-level 约定（测试常量）：dataset_version = wms-conversation-v1，
+#     source_type = SYNTHETIC_ONLY（synthetic procedure validation）。
+#
+# 记录格式（flat record；每个 `- scenario:` 开始一条新记录，后续 `key: value` 归属它）：
+#   scenario / case_id / dataset_version / annotation_version / review_status /
+#   dependency / reference_type / impact / business_outcome /
+#   disagreement / domain_review_completed / annotator_1 / annotator_2 / forbidden_field
+#
+# 值约定：
+#   dependency:   early_constraint | standalone | none
+#   impact:       四值下划线连接（business_outcome_changed_critical_constraint_lost_
+#                 entity_changed_intent_changed）| none
+#   forbidden_field: none | sql
+#   默认值：disagreement=false · domain_review_completed=false ·
+#           annotator_1=annotator-a · annotator_2=annotator-b · forbidden_field=none
+#
+# 覆盖场景（12）：pass / draft_blocked / disputed_blocked / dataset_mismatch /
+#   duplicate_reviewed_version / missing_dependency / missing_impact /
+#   invalid_reference / invalid_outcome / domain_review_required /
+#   domain_review_completed / forbidden_field
+
+records:
+  # 1. 全部 REVIEWED + dataset_version 一致 → PASS
+  - scenario: pass
+    case_id: fin_pass_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 2. 存在 DRAFT → BLOCKED
+  - scenario: draft_blocked
+    case_id: fin_draft_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: DRAFT
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 3. 存在 DISPUTED → BLOCKED
+  - scenario: disputed_blocked
+    case_id: fin_disputed_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: DISPUTED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 4. dataset_version mismatch（evidence=v1；case B=v2）→ BLOCKED
+  - scenario: dataset_mismatch
+    case_id: fin_mismatch_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  - scenario: dataset_mismatch
+    case_id: fin_mismatch_b
+    dataset_version: wms-conversation-v2
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: recent_context
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 5. 同 case 两个 REVIEWED annotation_version → BLOCKED（禁止 max() 选 winner）
+  - scenario: duplicate_reviewed_version
+    case_id: fin_dup_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v2
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  - scenario: duplicate_reviewed_version
+    case_id: fin_dup_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v3
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 6. 缺 dependency → BLOCKED
+  - scenario: missing_dependency
+    case_id: fin_missing_dep_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: none
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 7. 缺 impact → BLOCKED
+  - scenario: missing_impact
+    case_id: fin_missing_impact_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: standalone
+    reference_type: FULL_HISTORY
+    impact: none
+    business_outcome: ANSWER_CONTENT
+
+  # 8. 非法 reference → BLOCKED
+  - scenario: invalid_reference
+    case_id: fin_bad_ref_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: LLM_GENERATED
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+
+  # 9. 非法 business outcome → BLOCKED
+  - scenario: invalid_outcome
+    case_id: fin_bad_outcome_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SUCCESS
+
+  # 10. DISAGREEMENT 但没有最终 Domain Review → BLOCKED
+  - scenario: domain_review_required
+    case_id: fin_domain_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+    disagreement: true
+    domain_review_completed: false
+
+  # 11. DISAGREEMENT + Domain Review + FINAL_REVIEW + REVIEWED → PASS
+  - scenario: domain_review_completed
+    case_id: fin_domain_done_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v2
+    review_status: REVIEWED
+    dependency: old_topic
+    reference_type: DOMAIN_EXPERT_VALIDATED
+    impact: true_false_unknown_false
+    business_outcome: TOOL_SELECTION
+    disagreement: true
+    domain_review_completed: true
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+
+  # 12. 包含 forbidden field → BLOCKED
+  - scenario: forbidden_field
+    case_id: fin_forbidden_a
+    dataset_version: wms-conversation-v1
+    annotation_version: context-annotation-v1
+    review_status: REVIEWED
+    dependency: early_constraint
+    reference_type: FULL_HISTORY
+    impact: false_false_false_false
+    business_outcome: SQL_SEMANTICS
+    forbidden_field: sql
