@@ -38,6 +38,147 @@ from backend.app.services.tool_observability_query_service import (
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: 无法静态确定 schema 字面值（保守：视为**未证明**在 ai_ops）。
+_SCHEMA_UNKNOWN = object()
+
+
+def _module_string_constant(tree: ast.AST, name: str) -> object:
+    """在模块级查找字符串常量赋值。
+
+    支持项目现有两种写法：
+
+        NAME: Final[str] = "ai_ops"     （AnnAssign）
+        NAME = "ai_ops"                 （Assign）
+    """
+    for node in getattr(tree, "body", []):
+        target_name: str | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target_name, value = node.target.id, node.value
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            target_name, value = node.targets[0].id, node.value
+        if (
+            target_name == name
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            return value.value
+    return _SCHEMA_UNKNOWN
+
+
+def _tablename_of(class_node: ast.ClassDef, tree: ast.AST) -> str:
+    """解析类体内 ``__tablename__`` 的字面值（支持常量引用）。"""
+    for statement in class_node.body:
+        value: ast.expr | None = None
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == "__tablename__"
+        ):
+            value = statement.value
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == "__tablename__"
+        ):
+            value = statement.value
+        if value is None:
+            continue
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+        if isinstance(value, ast.Name):
+            resolved = _module_string_constant(tree, value.id)
+            return resolved if isinstance(resolved, str) else ""
+    return ""
+
+
+def _schema_of(class_node: ast.ClassDef, tree: ast.AST) -> object:
+    """解析类体内 ``__table_args__`` 的 ``schema``。
+
+    Returns:
+        str:            解析出的 schema 字面值；
+        None:            **未声明** schema → 默认 public（业务 schema）；
+        _SCHEMA_UNKNOWN: 声明了但无法静态确定字面值（保守视为未证明）。
+    """
+    for statement in class_node.body:
+        value: ast.expr | None = None
+        matched = False
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == "__table_args__"
+        ):
+            value, matched = statement.value, True
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == "__table_args__"
+        ):
+            value, matched = statement.value, True
+        if not matched:
+            continue
+
+        dict_node: ast.Dict | None = None
+        if isinstance(value, ast.Dict):
+            dict_node = value
+        elif isinstance(value, (ast.Tuple, ast.List)):
+            for element in value.elts:
+                if isinstance(element, ast.Dict):
+                    dict_node = element
+                    break
+        if dict_node is None:
+            return None
+        for key, schema_value in zip(dict_node.keys, dict_node.values):
+            if isinstance(key, ast.Constant) and key.value == "schema":
+                if isinstance(schema_value, ast.Constant) and isinstance(
+                    schema_value.value, str
+                ):
+                    return schema_value.value
+                if isinstance(schema_value, ast.Name):
+                    return _module_string_constant(tree, schema_value.id)
+                return _SCHEMA_UNKNOWN
+        return None
+    return None
+
+
+def _tool_execution_orm_offenders(source: str) -> list[str]:
+    """**AST 级**判定：source 中实际定义但**不在 ai_ops** 的 Tool Execution ORM。
+
+    判定的是**可执行结构**（不是源码字符串）：
+
+        * ``ClassDef`` 名称含 ``ToolExecution``；或
+        * 类体内 ``__tablename__`` 解析值为 ``tool_execution*``
+          → 视为 Tool Execution ORM 定义；
+        * 再校验其 ``__table_args__`` schema 必须 == ``"ai_ops"``。
+
+    因此 docstring / comment 里提及 ``tool_execution_record`` **不会**被判为
+    违规（Step 8.1：修掉对 Conversation ORM 的误报），而真正定义了
+    Tool Execution Model/Table 却不在 ai_ops 的代码仍会被发现。
+    """
+    tree = ast.parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        name_hit = "toolexecution" in node.name.lower()
+        table_hit = _tablename_of(node, tree).startswith("tool_execution")
+        if not (name_hit or table_hit):
+            continue
+        if _schema_of(node, tree) != "ai_ops":
+            offenders.append(node.name)
+    return offenders
+
+
+def _read(relative: str) -> str:
+    with open(os.path.join(REPO_ROOT, relative), encoding="utf-8") as handle:
+        return handle.read()
+
 _MODULES = {
     "execution_service": "backend/app/services/tool_execution_service.py",
     "record": "backend/app/services/tool_execution_record.py",
@@ -277,7 +418,13 @@ class TestPersistenceSurveyFacts:
     def test_tool_execution_orm_model_is_confined_to_ai_ops(self) -> None:
         """Step 26 时点：无 Tool Execution Model。
         Step 27：新增且**只能**是 `ai_ops.tool_execution_record`
-        （不得出现在 public，也不得散落在其它 Model 文件）。"""
+        （不得出现在 public，也不得散落在其它 Model 文件）。
+
+        判定方式：**AST / 可执行结构**（``ClassDef`` + ``__tablename__`` +
+        ``__table_args__`` schema），而不是源码子串匹配 ——
+        docstring / comment 中提到 ``tool_execution*`` 不构成 ORM 定义
+        （Step 8.1：修复对 Conversation ORM 的误报）。
+        """
         from backend.app.db.models.tool_execution_record import (
             TOOL_EXECUTION_SCHEMA,
             TOOL_EXECUTION_TABLE,
@@ -289,19 +436,100 @@ class TestPersistenceSurveyFacts:
         assert ToolExecutionRecordModel.__table__.schema == "ai_ops"
 
         models_dir = os.path.join(REPO_ROOT, "backend", "app", "db", "models")
-        offenders = []
+        offenders: list[str] = []
         for filename in sorted(os.listdir(models_dir)):
             if not filename.endswith(".py"):
+                continue
+            if filename in {"__init__.py", "tool_execution_record.py"}:
                 continue
             with open(
                 os.path.join(models_dir, filename), encoding="utf-8"
             ) as handle:
                 source = handle.read()
-            if "tool_execution" in source and filename != (
-                "tool_execution_record.py"
-            ) and filename != "__init__.py":
-                offenders.append(filename)
+            offenders.extend(
+                f"{filename}:{name}"
+                for name in _tool_execution_orm_offenders(source)
+            )
         assert offenders == [], offenders
+
+    # ---------- Step 8.1：AST 守卫回归（不降低原约束） ----------
+
+    def test_guard_ignores_docstring_mention(self) -> None:
+        """docstring 提到 tool_execution_record 但未定义 ORM → 不是 offender。"""
+        source = (
+            '"""\n'
+            "This document mentions tool_execution_record\n"
+            "but does not define a model.\n"
+            '"""\n'
+            "\n"
+            "class Conversation(Base):\n"
+            '    __tablename__ = "conversation"\n'
+        )
+        assert _tool_execution_orm_offenders(source) == []
+
+    def test_guard_ignores_comment_mention(self) -> None:
+        """comment 提到 tool_execution_record → 不是 offender。"""
+        source = (
+            "# tool_execution_record lives in ai_ops\n"
+            "class ConversationTurn(Base):\n"
+            '    __tablename__ = "conversation_turn"\n'
+        )
+        assert _tool_execution_orm_offenders(source) == []
+
+    def test_guard_detects_synthetic_violation(self) -> None:
+        """合成违规：定义了 Tool Execution Model 但不在 ai_ops → 必须 offender。"""
+        source = (
+            "class FakeToolExecutionRecord(Base):\n"
+            '    __tablename__ = "tool_execution_record"\n'
+        )
+        assert _tool_execution_orm_offenders(source) == [
+            "FakeToolExecutionRecord"
+        ]
+
+    def test_guard_detects_violation_by_tablename_only(self) -> None:
+        """仅凭 ``__tablename__ = tool_execution_*`` 也应识别（类名不含关键字）。"""
+        source = (
+            "class MysteryModel(Base):\n"
+            '    __tablename__ = "tool_execution_record"\n'
+            '    __table_args__ = ({"schema": "public"},)\n'
+        )
+        assert _tool_execution_orm_offenders(source) == ["MysteryModel"]
+
+    def test_guard_accepts_synthetic_compliant_model(self) -> None:
+        """合成合规：显式 ``{"schema": <常量 "ai_ops">}`` → 不是 offender。"""
+        source = (
+            'TOOL_EXECUTION_SCHEMA = "ai_ops"\n'
+            "\n"
+            "class FakeToolExecutionRecord(Base):\n"
+            '    __tablename__ = "tool_execution_record"\n'
+            "    __table_args__ = (Index('x'), {\"schema\": TOOL_EXECUTION_SCHEMA})\n"
+        )
+        assert _tool_execution_orm_offenders(source) == []
+
+    def test_guard_treats_unknown_schema_as_violation(self) -> None:
+        """schema 声明为无法静态解析的属性 → 保守视为违规（不降低约束）。"""
+        source = (
+            "class FakeToolExecutionRecord(Base):\n"
+            '    __tablename__ = "tool_execution_record"\n'
+            "    __table_args__ = ({\"schema\": settings.schema_name},)\n"
+        )
+        assert _tool_execution_orm_offenders(source) == [
+            "FakeToolExecutionRecord"
+        ]
+
+    def test_real_tool_execution_model_is_not_offender(self) -> None:
+        """真实 Tool ORM（`ai_ops.tool_execution_record`）本身不违规。"""
+        source = _read("backend/app/db/models/tool_execution_record.py")
+        assert _tool_execution_orm_offenders(source) == []
+
+    def test_conversation_orm_files_are_not_offenders(self) -> None:
+        """Conversation ORM 只在其 docstring/comment 提及 tool_execution
+        （用于说明 assistant_request_id **不建** FK）→ 不得误报。"""
+        for relative in (
+            "backend/app/db/models/conversation.py",
+            "backend/app/db/models/conversation_turn.py",
+        ):
+            assert _tool_execution_orm_offenders(_read(relative)) == [], relative
 
     def test_no_persistence_adapter_implemented(self) -> None:
         """未实现 PersistenceAdapter / Repository / 后台持久化。"""
