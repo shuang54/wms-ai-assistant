@@ -513,8 +513,19 @@ class TestNoFastApiDependency:
             assert marker in doc, marker
 
     def test_3b_conversation_production_modules_do_not_import_fastapi(self) -> None:
-        """Step 5 起存在生产模块：AST 守卫 —— 不得 import FastAPI。"""
-        modules = sorted((_REPO_ROOT / _APP_DIR).rglob("conversation*.py"))
+        """Service / Repository / ORM / DTO 层不得 import FastAPI。
+
+        Step 8 起 Conversation API（``api/conversations.py``）是 FastAPI
+        路由模块、必然 import fastapi —— 因此本守卫范围收窄为"非 api
+        目录的 conversation 生产模块"；API 层由 architecture contract 的
+        "唯一属主 + 冻结路径"守卫负责。
+        """
+        modules = sorted(
+            path
+            for path in (_REPO_ROOT / _APP_DIR).rglob("conversation*.py")
+            if path.parent.name != "api"
+        )
+        assert modules, "AST 未解析到模块（审计失效）"
         for path in modules:
             tree = ast.parse(path.read_text(encoding="utf-8-sig"))
             for node in ast.walk(tree):
@@ -896,10 +907,13 @@ class TestExistingBoundaryUnchanged:
         assert route.dependant.path_params[0].name == "assistant_request_id"
         assert "conversation_id" not in _source(_TIMELINE_API)
 
-    def test_13c_no_conversation_routes_registered(self) -> None:
+    def test_13c_conversation_routes_only_in_declared_module(self) -> None:
+        """Step 8 起路由已注册：只有 conversations.py 可以持有 /conversations。"""
         api_root = _REPO_ROOT / _API_DIR
         for path in sorted(api_root.glob("*.py")):
-            assert "/conversations" not in path.read_text(encoding="utf-8"), path.name
+            source = path.read_text(encoding="utf-8")
+            if "/conversations" in source:
+                assert path.name == "conversations.py", path.name
 
     def test_13d_no_unimplemented_conversation_artifacts(self) -> None:
         """Step 5 允许 ORM / Repository / Service；**未实现**的组件不得出现。"""

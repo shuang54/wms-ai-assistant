@@ -7,21 +7,23 @@
 
     * **纯离线**：DB reads = 0 · DB writes = 0 · network = 0 · LLM = 0
       （不连接 PostgreSQL / 不启动 ASGI app / 不发起任何真实请求）；
-    * **Audit Only**：Phase 4.1 Step 1 **不实现** Conversation —— 本文件
-      锁定「Conversation 容器 ≠ Assistant Request」的设计边界，以及
-      现有 /api/ai/chat · Trace API · Timeline API · Outcome contract
-      的现状行为不被改变；
+    * **Audit Only → 范围守卫**：Phase 4.1 Step 1 本文件登记
+      「Conversation 容器 ≠ Assistant Request」的设计边界（当时
+      Conversation 尚未实现）；Step 5~8 实现后，同一防漂移意图升级为
+      「恰好等于冻结的已声明集合」（见 ``_DECLARED_CONVERSATION_MODULES``
+      与 ``_DECLARED_CONVERSATION_ROUTE_PATHS``），现有 /api/ai/chat ·
+      Trace API · Timeline API · Outcome contract 的现状行为仍不被改变；
     * 设计 DTO 只存在于本文件内部（``_`` 前缀；**不进入** production
       ``backend/app``）—— 对应任务 §十九「这只是设计 DTO」的约束；
-    * 任何"注册 conversation 路由 / 给现有 ID 体系塞第二个 ID /
-      把敏感字段写进 conversation metadata"的漂移都会使本文件失败
-      —— 这是**有意的漂移报警**。
+    * 任何"未声明的 conversation 生产模块 / 路由散落到 conversations.py
+      之外 / 给现有 ID 体系塞第二个 ID / 把敏感字段写进 conversation
+      metadata"的漂移都会使本文件失败 —— 这是**有意的漂移报警**。
 
 边界（与 Phase 3.12 既有 contract 测试同风格）：
     * 本文件自身 executable import 不得出现
       ``sqlalchemy`` / ``psycopg`` / ``backend.app.db`` / 网络库
       （由 ``TestSelfAudit`` 用 AST 校验）；
-    * 未来 API 只作设计记录，不实际注册（由 API 源码扫描校验）。
+    * Step 8 起 Conversation API 已注册：由「唯一属主 + 冻结路径集合」校验。
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ from backend.app.api.assistant_trace import (
     AssistantTraceResponse,
     router as trace_router,
 )
+from backend.app.api.conversations import router as conversations_router
 from backend.app.api.orchestrator_chat import (
     ChatRequest,
     ChatResponse,
@@ -66,11 +69,31 @@ _TRACE_PATH = "/observability/assistant-trace/{assistant_request_id}"
 _TIMELINE_PATH = "/observability/assistant-timeline/{assistant_request_id}"
 _CHAT_PATH = "/ai/chat"
 
-#: 设计记录的未来 API（§13：只设计、不注册）。
+#: 设计记录的未来 API（§13；Step 8 已在 conversations.py 落地）。
 PROPOSED_API_PATHS: tuple[str, ...] = (
     "/api/conversations",
     "/api/conversations/{conversation_id}",
     "/api/conversations/{conversation_id}/messages",
+)
+
+#: Step 5~8 已实现并冻结的 Conversation 生产模块（范围守卫；未声明 = 漂移）。
+_DECLARED_CONVERSATION_MODULES: tuple[str, ...] = (
+    "backend/app/api/conversations.py",
+    "backend/app/db/conversation_repository.py",
+    "backend/app/db/models/conversation.py",
+    "backend/app/db/models/conversation_turn.py",
+    "backend/app/dto/conversation_api.py",
+    "backend/app/services/conversation_context_builder.py",
+    "backend/app/services/conversation_service.py",
+)
+
+#: Step 8 已注册的 Conversation 路由路径（conversations.py router 内；
+#: main.py 统一挂载 /api 前缀）。
+_DECLARED_CONVERSATION_ROUTE_PATHS: tuple[str, ...] = (
+    "/conversations",
+    "/conversations/{conversation_id}",
+    "/conversations/{conversation_id}/archive",
+    "/conversations/{conversation_id}/messages",
 )
 
 #: Conversation metadata 中**禁止**出现的敏感键（§10 Security）。
@@ -366,13 +389,19 @@ class TestOutcomeContractUnchanged:
 
 
 class TestConversationRuntimeBoundaries:
-    def test_5a_no_conversation_production_module_exists(self) -> None:
+    def test_5a_conversation_production_modules_are_declared(self) -> None:
+        """Step 5~8 起 Conversation 已实现：防漂移守卫 = 冻结范围。
+
+        设计阶段（Step 1）断言"不存在 production 模块"；实现冻结后，
+        同一意图由"恰好等于已声明集合"承担 —— 任何未登记的新
+        conversation 模块（例如未评审的拆分 Service）仍会使本测试失败。
+        """
         app_root = _REPO_ROOT / "backend" / "app"
         modules = sorted(
-            str(path.relative_to(_REPO_ROOT))
+            str(path.relative_to(_REPO_ROOT)).replace("\\", "/")
             for path in app_root.rglob("conversation*.py")
         )
-        assert modules == []
+        assert modules == sorted(_DECLARED_CONVERSATION_MODULES)
 
     def test_5b_no_conversation_package_directory_exists(self) -> None:
         app_root = _REPO_ROOT / "backend" / "app"
@@ -443,13 +472,28 @@ class TestNoNetworkOrLlmDependency:
 
 
 class TestProposedApisAreDesignOnly:
-    def test_7a_no_conversation_routes_in_api_sources(self) -> None:
+    """Step 1 记录的未来 API 已在 Step 8 注册：守卫 = 唯一属主 + 冻结路径。
+
+    设计阶段断言"路由尚未注册"；实现后防漂移意图由"只有 conversations.py
+    可以持有 /conversations、且路径集合精确等于冻结清单"承担 —— 路由散落
+    到其他模块或新增未登记路径仍会使本文件失败。
+    """
+
+    def test_7a_conversation_routes_only_in_declared_module(self) -> None:
         api_root = _REPO_ROOT / _API_DIR
         sources = sorted(api_root.glob("*.py"))
         assert sources, "api 目录为空（审计失效）"
         for path in sources:
             source = path.read_text(encoding="utf-8")
-            assert "/conversations" not in source, path.name
+            if "/conversations" in source:
+                assert path.name == "conversations.py", path.name
+
+        paths = {
+            route.path
+            for route in conversations_router.routes
+            if getattr(route, "path", "")
+        }
+        assert paths == set(_DECLARED_CONVERSATION_ROUTE_PATHS)
 
     def test_7b_ai_chat_endpoint_unchanged(self) -> None:
         route = _find_route(orchestrator_router, _CHAT_PATH)

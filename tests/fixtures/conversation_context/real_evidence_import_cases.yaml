@@ -1,0 +1,157 @@
+# WMS Real Evidence Import Cases（Phase 4.1 Step 31）
+#
+# 性质（严格）：
+#   * synthetic **import contract fixture** —— **非生产数据**；
+#   * **不**包含真实客户 / 供应商 / 订单 / 库存 / 员工 / 个人信息；
+#   * 仅用于 real evidence import 契约测试（**不是** database seed）；
+#   * 所有"真实"标签均为契约模拟（REAL_DEIDENTIFIED 结构模拟），
+#     不代表任何真实 WMS 证据可用。
+#
+# 记录格式（flat record；每个 `- scenario:` 开始一条新记录，后续 `key: value` 归属它）：
+#   scenario / source_type / dataset_version / dataset_version_marker /
+#   attestation / turns / case_id / conversation_extra / turn_extra / payload_field
+#
+# 值约定：
+#   turns:            role 序列（逗号分隔；USER / ASSISTANT 规范枚举）
+#   attestation:      true | false | missing
+#   dataset_version_marker: missing（表示顶层不提供 dataset_version）
+#   conversation_extra: 额外 conversation 字段名（如 conversation_id / unknown_field / dataset_version）
+#   turn_extra:       额外 turn 字段名（如 turn_id）
+#   payload_field:    非法 payload 字段名（如 sql / prompt / api_key）
+#   默认值：source_type=REAL_DEIDENTIFIED · dataset_version=wms-v1 · attestation=true ·
+#           turns=USER,ASSISTANT,USER · case_id=import_case_001
+#
+# 覆盖场景（12）：valid_real / synthetic_only / missing_dataset_version /
+#   missing_attestation / duplicate_case_id / system_role / production_correlation_id /
+#   forbidden_payload（sql/prompt/api_key）/ mixed_dataset_version / user_only /
+#   assistant_only / unknown_field
+
+records:
+  # 1. valid REAL_DEIDENTIFIED + attestation=true → PASS
+  - scenario: valid_real
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+
+  # 2. SYNTHETIC_ONLY 作为 Real Import → BLOCKED
+  - scenario: synthetic_only
+    source_type: SYNTHETIC_ONLY
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+
+  # 3. missing dataset_version → BLOCKED
+  - scenario: missing_dataset_version
+    source_type: REAL_DEIDENTIFIED
+    dataset_version_marker: missing
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+
+  # 4. missing attestation → BLOCKED
+  - scenario: missing_attestation
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: false
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+
+  # 5. duplicate case_id → BLOCKED（不自动去重 / 不 first-wins）
+  - scenario: duplicate_case_id
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_dup_001
+
+  - scenario: duplicate_case_id
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER
+    case_id: import_dup_001
+
+  # 6. SYSTEM role → BLOCKED
+  - scenario: system_role
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: SYSTEM,USER
+    case_id: import_case_001
+
+  # 7. production correlation ID → BLOCKED
+  - scenario: production_correlation_id
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+    conversation_extra: conversation_id
+
+  # 8. SQL / prompt / API key payload → BLOCKED
+  - scenario: forbidden_payload
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+    payload_field: sql
+
+  - scenario: forbidden_payload
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+    payload_field: prompt
+
+  - scenario: forbidden_payload
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+    payload_field: api_key
+
+  # 9. mixed dataset versions → BLOCKED（batch 一致性）
+  - scenario: mixed_dataset_version
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+
+  - scenario: mixed_dataset_version
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v2
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_002
+
+  # 10. USER-only conversation → PASS
+  - scenario: user_only
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,USER
+    case_id: import_case_001
+
+  # 11. assistant-only conversation → BLOCKED
+  - scenario: assistant_only
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: ASSISTANT,ASSISTANT
+    case_id: import_case_001
+
+  # 12. extra unknown field → BLOCKED（不 silently ignore）
+  - scenario: unknown_field
+    source_type: REAL_DEIDENTIFIED
+    dataset_version: wms-v1
+    attestation: true
+    turns: USER,ASSISTANT,USER
+    case_id: import_case_001
+    conversation_extra: unknown_field

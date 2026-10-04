@@ -300,7 +300,7 @@ class TestTestLocalContract:
         ):
             assert statement in doc, statement
 
-    def test_3e_fixture_set_is_exactly_three_files(self) -> None:
+    def test_3e_fixture_set_is_exactly_five_files(self) -> None:
         files = sorted(
             path.name
             for path in (
@@ -311,6 +311,8 @@ class TestTestLocalContract:
         assert files == [
             "annotation_finalization_cases.yaml",
             "annotation_review_cases.yaml",
+            "real_annotation_execution_cases.yaml",
+            "real_evidence_import_cases.yaml",
             "wms_multiturn_conversations.yaml",
         ], files
 

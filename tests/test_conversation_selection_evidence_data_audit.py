@@ -46,6 +46,14 @@ _ANNOTATION_REVIEW_FIXTURE = (
 _ANNOTATION_FINALIZATION_FIXTURE = (
     "tests/fixtures/conversation_context/annotation_finalization_cases.yaml"
 )
+#: Step 31 新增 fixture（real evidence import contract；同为 synthetic / 非生产）。
+_REAL_EVIDENCE_IMPORT_FIXTURE = (
+    "tests/fixtures/conversation_context/real_evidence_import_cases.yaml"
+)
+#: Step 32 新增 fixture（real annotation execution；同为 synthetic / 非生产）。
+_REAL_ANNOTATION_EXECUTION_FIXTURE = (
+    "tests/fixtures/conversation_context/real_annotation_execution_cases.yaml"
+)
 _STEP21_DOC = "docs/evaluation/Phase 4.1 Step 21 — WMS Conversation Selection Evidence.md"
 _STEP22_DOC = "docs/evaluation/Phase 4.1 Step 22 — Selection Strategy Decision Gate.md"
 
@@ -119,6 +127,8 @@ _CHECKED_FILES: tuple[str, ...] = (
     _SYNTHETIC_DATASET,
     _ANNOTATION_REVIEW_FIXTURE,
     _ANNOTATION_FINALIZATION_FIXTURE,
+    _REAL_EVIDENCE_IMPORT_FIXTURE,
+    _REAL_ANNOTATION_EXECUTION_FIXTURE,
     _STEP21_DOC,
     _STEP22_DOC,
     _AUDIT_DOC,
@@ -443,11 +453,13 @@ class TestLeakageAndPrivacy:
             hits = _scan_secret_patterns(_source(relative))
             assert hits == [], f"{relative}: {hits}"
 
-    def test_18_conversation_fixture_set_is_exactly_three_files(self) -> None:
-        """Step 21 dataset + Step 29 review + Step 30 finalization（均 synthetic/非生产）。"""
+    def test_18_conversation_fixture_set_is_exactly_five_files(self) -> None:
+        """Step 21 dataset + Step 29/30/31/32 fixtures（均 synthetic/非生产）。"""
         assert _conversation_fixture_files() == [
             _ANNOTATION_FINALIZATION_FIXTURE,
             _ANNOTATION_REVIEW_FIXTURE,
+            _REAL_ANNOTATION_EXECUTION_FIXTURE,
+            _REAL_EVIDENCE_IMPORT_FIXTURE,
             _SYNTHETIC_DATASET,
         ]
 

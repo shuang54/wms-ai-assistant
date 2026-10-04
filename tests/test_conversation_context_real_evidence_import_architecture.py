@@ -1,15 +1,12 @@
-"""Annotation Review 架构审计（Phase 4.1 Step 29）—— AST 精确边界。
+"""Real Evidence Import 架构审计（Phase 4.1 Step 31）—— AST 精确边界。
 
 审计目标：
 
-    1. ``backend/app/`` 中**不得出现**：AnnotationReviewService /
-       AnnotationComparisonService / DomainReviewService / AnnotatorService，
-       以及 annotation_review / annotation_comparison / domain_review 模块；
-    2. 生产模块不得 import tests / annotation review / evaluation review；
-    3. Annotation Review 属 offline Evaluation Layer，不进入 production runtime；
+    1. ``backend/app/`` 中**不得新增**：real_evidence / evidence_import /
+       evaluation_import 等生产模块与实现；
+    2. Import Contract 只允许存在于 tests/；
+    3. Conversation 运行时无 import 契约耦合；
     4. 本审计自身纯静态、离线。
-
-事实依据：production 中 "annotation"（含泛词）当前零命中（Step 28 侦察 + 审计确认）。
 
 纯离线：DB = 0 · Network = 0 · LLM = 0。
 """
@@ -19,46 +16,41 @@ import ast
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SELF = "tests/test_conversation_context_annotation_review_architecture.py"
-_REVIEW_TEST = "tests/test_conversation_context_annotation_review.py"
-_REVIEW_FIXTURE = "tests/fixtures/conversation_context/annotation_review_cases.yaml"
-_REVIEW_DOC = "docs/evaluation/Phase 4.1 Step 29 — Annotation Review Procedure.md"
+_SELF = "tests/test_conversation_context_real_evidence_import_architecture.py"
+_IMPORT_TEST = "tests/test_conversation_context_real_evidence_import.py"
+_IMPORT_FIXTURE = (
+    "tests/fixtures/conversation_context/real_evidence_import_cases.yaml"
+)
+_IMPORT_DOC = "docs/evaluation/Phase 4.1 Step 31 — Real Evidence Import Contract.md"
 
 _BACKEND_ROOT = "backend/app"
 
-#: 禁止进入 production 的 Step 29 专有标识符。
+#: 禁止进入 production 的 Import 专有标识符。
 _FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
-    "AnnotationReviewService",
-    "AnnotationComparisonService",
-    "DomainReviewService",
-    "AnnotatorService",
-    "AnnotationDraft",
-    "ComparisonOutcome",
-    "ReviewStatistics",
-    "compare_annotations",
-    "finalize_domain_review",
-    "summarize_reviews",
-    "format_agreement_rate",
-    "review_phase",
-    "DOMAIN_REVIEW_REQUIRED",
-    "FINAL_REVIEW",
+    "RealEvidenceImportResult",
+    "RealEvidenceImportContract",
+    "DeIdentificationAttestation",
+    "import_real_evidence",
+    "ImportContractError",
+    "IMPORT_SCENARIOS",
+    "FAILURE_CODES_REAL_IMPORT",
 )
 
 #: 禁止出现的模块命名（组合词）。
 _FORBIDDEN_MODULE_KEYWORDS: tuple[str, ...] = (
-    "annotation_review",
-    "annotation_comparison",
-    "domain_review",
-    "annotator",
+    "real_evidence",
+    "evidence_import",
+    "evaluation_import",
+    "import_contract",
+    "de_identification",
 )
 
-#: 禁止的 runtime coupling：生产模块不得 import tests / annotation review / evaluation review。
+#: 关键 runtime 文件（不得 import tests / import 契约）。
 _RUNTIME_FILES: tuple[str, ...] = (
     "backend/app/services/conversation_service.py",
     "backend/app/services/chat_application_service.py",
     "backend/app/services/conversation_context_builder.py",
     "backend/app/services/ai_orchestrator_service.py",
-    "backend/app/services/ai_router_service.py",
     "backend/app/services/rag_service.py",
     "backend/app/services/tool_chat_service.py",
     "backend/app/services/text_to_sql_service.py",
@@ -125,7 +117,7 @@ def _relative(path: Path) -> str:
 
 
 # ============================================================
-# 1. Production 边界（§二十一）
+# 1. Production 边界（§二十五）
 # ============================================================
 
 
@@ -135,7 +127,7 @@ class TestProductionBoundary:
         assert files, "backend/app 为空（审计失效）"
         assert len(files) > 50
 
-    def test_1b_no_review_service_identifiers_in_backend(self) -> None:
+    def test_1b_no_import_contract_identifiers_in_backend(self) -> None:
         offenders: list[str] = []
         for path in _backend_files():
             tokens = _ast_tokens(path)
@@ -144,7 +136,7 @@ class TestProductionBoundary:
                     offenders.append(f"{_relative(path)}:{forbidden}")
         assert offenders == [], offenders
 
-    def test_1c_no_annotation_review_modules_in_backend(self) -> None:
+    def test_1c_no_import_modules_in_backend(self) -> None:
         offenders: list[str] = []
         for path in _backend_files():
             name = path.name.lower()
@@ -153,27 +145,28 @@ class TestProductionBoundary:
                     offenders.append(_relative(path))
         assert offenders == [], offenders
 
-    def test_1d_annotation_word_still_absent_in_backend(self) -> None:
-        """事实断言（延续 Step 28）：production 无 annotation 语义。"""
+    def test_1d_annotation_and_provenance_still_absent(self) -> None:
+        """延续 Step 27~30：production 仍无 annotation / provenance 语义。"""
         offenders: list[str] = []
         for path in _backend_files():
             tokens = _ast_tokens(path)
-            if "annotation" in {token.lower() for token in tokens}:
-                offenders.append(_relative(path))
+            lowered = {str(token).lower() for token in tokens}
+            for forbidden in ("annotation", "provenance", "annotator"):
+                if forbidden in lowered:
+                    offenders.append(f"{_relative(path)}:{forbidden}")
         assert offenders == [], offenders
 
-    def test_1e_no_review_directories_created(self) -> None:
+    def test_1e_no_import_directories_created(self) -> None:
         for relative in (
-            "backend/app/annotation",
+            "backend/app/evidence",
+            "backend/app/import",
             "backend/app/evaluation",
-            "backend/app/db/annotation",
-            "backend/app/review",
         ):
             assert not (_REPO_ROOT / relative).exists(), relative
 
 
 # ============================================================
-# 2. Runtime isolation（§二十一）
+# 2. Runtime isolation
 # ============================================================
 
 
@@ -182,30 +175,27 @@ class TestRuntimeIsolation:
         for relative in _RUNTIME_FILES:
             assert (_REPO_ROOT / relative).exists(), relative
 
-    def test_2b_runtime_does_not_import_tests_or_review(self) -> None:
+    def test_2b_runtime_does_not_import_tests_or_import_contract(self) -> None:
         for relative in _RUNTIME_FILES:
             modules = _module_imports(relative)
             assert modules, f"AST 未解析到 import: {relative}"
             for module in modules:
                 assert not module.startswith("tests"), f"{relative}:{module}"
                 for forbidden in (
-                    "annotation",
-                    "annotation_review",
-                    "domain_review",
-                    "evaluation_review",
-                    "annotator",
+                    "real_evidence",
+                    "evidence_import",
+                    "evaluation_import",
+                    "import_contract",
                 ):
                     assert forbidden not in module, f"{relative}:{module}"
 
-    def test_2c_runtime_has_no_review_tokens(self) -> None:
+    def test_2c_runtime_has_no_import_contract_tokens(self) -> None:
         for relative in _RUNTIME_FILES:
             tokens = _ast_tokens(_REPO_ROOT / relative)
             for forbidden in (
-                "annotator",
-                "review_status",
-                "domain_review",
-                "annotation_review",
-                "comparison_outcome",
+                "import_real_evidence",
+                "de_identification_attestation",
+                "RealEvidenceImportResult",
             ):
                 assert forbidden not in tokens, f"{relative}:{forbidden}"
 
@@ -216,24 +206,20 @@ class TestRuntimeIsolation:
 
 
 class TestTestLocalContract:
-    def test_3a_review_test_defines_contract(self) -> None:
-        review = _REPO_ROOT / _REVIEW_TEST
-        assert review.exists()
-        tokens = _ast_tokens(review)
+    def test_3a_import_test_defines_contract(self) -> None:
+        import_test = _REPO_ROOT / _IMPORT_TEST
+        assert import_test.exists()
+        tokens = _ast_tokens(import_test)
         for name in (
-            "AnnotationDraft",
-            "ComparisonOutcome",
-            "ReviewStatistics",
-            "compare_annotations",
-            "review_phase",
-            "finalize_domain_review",
-            "format_agreement_rate",
-            "summarize_reviews",
+            "RealEvidenceImportResult",
+            "DeIdentificationAttestation",
+            "import_real_evidence",
+            "ImportContractError",
         ):
             assert name in tokens, name
 
-    def test_3b_review_test_is_offline(self) -> None:
-        modules = _module_imports(_REVIEW_TEST)
+    def test_3b_import_test_is_offline(self) -> None:
+        modules = _module_imports(_IMPORT_TEST)
         assert modules, "AST 未解析到 import（审计失效）"
         for module in modules:
             for forbidden in (
@@ -248,49 +234,39 @@ class TestTestLocalContract:
             ):
                 assert not module.startswith(forbidden), module
 
-    def test_3c_review_test_reuses_prior_contracts(self) -> None:
-        modules = _module_imports(_REVIEW_TEST)
+    def test_3c_import_test_reuses_prior_contracts(self) -> None:
+        modules = _module_imports(_IMPORT_TEST)
         for required in (
+            "tests.test_conversation_context_real_evidence_boundary",
+            "tests.test_conversation_context_evidence_provenance",
             "tests.test_conversation_context_annotation_workflow",
-            "tests.test_conversation_context_evaluation_rubric",
         ):
             assert required in modules, sorted(modules)
 
-    def test_3d_review_fixture_is_synthetic_only(self) -> None:
-        fixture = _source(_REVIEW_FIXTURE)
+    def test_3d_import_fixture_is_synthetic_only(self) -> None:
+        fixture = _source(_IMPORT_FIXTURE)
         assert "synthetic" in fixture
         assert "非生产数据" in fixture
         for forbidden in (
-            "annotation:",
-            "reference:",
-            "impact:",
-            "conversation_id",
-            "turn_id",
-            "assistant_request_id",
-            "provider_request_id",
+            "conversation_id:",
+            "assistant_request_id:",
+            "turn_id:",
+            "provider_request_id:",
         ):
             assert forbidden not in fixture, forbidden
 
-    def test_3e_review_doc_exists_with_contract_statements(self) -> None:
-        doc = _source(_REVIEW_DOC)
+    def test_3e_import_doc_exists_with_statements(self) -> None:
+        doc = _source(_IMPORT_DOC)
         for statement in (
-            "DOMAIN_REVIEW_REQUIRED",
-            "FINAL_REVIEW",
-            "agreement_rate",
-            "N/A",
-            "G1 = BLOCKED",
-            "G3 Evidence = BLOCKED",
+            "Import PASS",
+            "G1 READY",
+            "Synthetic only",
+            "No real WMS import",
             "Selection Strategy = BLOCKED",
         ):
             assert statement in doc, statement
 
-    def test_3f_step21_dataset_and_prior_fixtures_unchanged(self) -> None:
-        dataset = _source(
-            "tests/fixtures/conversation_context/wms_multiturn_conversations.yaml"
-        )
-        for field in ("annotation:", "reference:", "impact:"):
-            assert field not in dataset, field
-        # fixture 目录恰好五个文件（Step 21 dataset + Step 29/30/31/32 fixtures）
+    def test_3f_fixture_set_is_exactly_five_files(self) -> None:
         files = sorted(
             path.name
             for path in (
@@ -305,6 +281,13 @@ class TestTestLocalContract:
             "real_evidence_import_cases.yaml",
             "wms_multiturn_conversations.yaml",
         ], files
+
+    def test_3g_step21_dataset_unchanged(self) -> None:
+        dataset = _source(
+            "tests/fixtures/conversation_context/wms_multiturn_conversations.yaml"
+        )
+        for field in ("annotation:", "reference:", "impact:"):
+            assert field not in dataset, field
 
 
 # ============================================================

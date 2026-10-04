@@ -43,6 +43,7 @@ _AUDIT_DOC = "docs/evaluation/Phase 4.1 Step 2 — Conversation Data Model Audit
 _API_DIR = "backend/app/api"
 _DB_MODELS_DIR = "backend/app/db/models"
 _SERVICES_DIR = "backend/app/services"
+_DTO_DIR = "backend/app/dto"
 _TRACE_API = "backend/app/api/assistant_trace.py"
 _TIMELINE_API = "backend/app/api/assistant_timeline.py"
 _OUTCOME_MODEL = "backend/app/db/models/assistant_outcome_record.py"
@@ -605,33 +606,39 @@ class TestExistingBoundaryUnchanged:
 
 
 class TestProductionImplementationScope:
-    """Step 5 起 Conversation 持久化层已实现：守卫改为**范围**校验。
+    """Step 5~8 起 Conversation 各层已实现：守卫 = **冻结范围**校验。
 
-    * 只允许 Step 5 冻结的文件 / 类存在（多出的 conversation 代码 = 漂移）；
-    * API 层仍然不允许出现 conversation 模块（Conversation API = NOT IMPLEMENTED）。
+    * 只允许已登记的生产文件 / 类存在（多出的 conversation 代码 = 漂移）；
+    * 各层职责不变：ORM / 仓储在 db 层，Service 在 services 层，
+      HTTP 边界只允许声明的 conversations.py（未登记 = 漂移）。
     """
 
-    #: Step 5 允许存在的生产文件（相对仓库根）。
+    #: 已实现并冻结的生产文件（相对仓库根；新增未登记文件 = 漂移）。
     ALLOWED_CONVERSATION_MODULES: tuple[str, ...] = (
+        "backend/app/api/conversations.py",
+        "backend/app/db/conversation_repository.py",
         "backend/app/db/models/conversation.py",
         "backend/app/db/models/conversation_turn.py",
-        "backend/app/db/conversation_repository.py",
+        "backend/app/dto/conversation_api.py",
+        "backend/app/services/conversation_context_builder.py",
         "backend/app/services/conversation_service.py",
     )
 
-    #: 只允许在这些（Step 5 冻结的）文件中定义 Conversation* 类。
+    #: 只允许在这些（已冻结的）文件中定义 Conversation* 类。
     ALLOWED_CONVERSATION_CLASS_FILES: frozenset[str] = frozenset(
         {
             "conversation.py",
             "conversation_turn.py",
             "conversation_repository.py",
             "conversation_service.py",
+            "conversation_context_builder.py",
+            "conversation_api.py",
         }
     )
 
     def test_8a_conversation_files_are_within_allowed_scope(self) -> None:
         found: list[str] = []
-        for sub in ("db", "api", "services"):
+        for sub in ("db", "api", "services", "dto"):
             root = _REPO_ROOT / "backend" / "app" / sub
             found.extend(
                 str(path.relative_to(_REPO_ROOT)).replace("\\", "/")
@@ -639,13 +646,16 @@ class TestProductionImplementationScope:
             )
         assert sorted(found) == sorted(self.ALLOWED_CONVERSATION_MODULES)
 
-    def test_8b_no_conversation_api_module(self) -> None:
+    def test_8b_conversation_api_module_is_declared(self) -> None:
+        """Step 8 起 Conversation API 已实现：API 层只允许声明的 conversations.py。"""
         root = _REPO_ROOT / _API_DIR
-        assert [p.name for p in root.rglob("conversation*.py")] == []
+        assert [
+            p.name for p in root.rglob("conversation*.py")
+        ] == ["conversations.py"]
 
     def test_8c_conversation_classes_only_in_allowed_files(self) -> None:
-        """Conversation* 类只能定义于 Step 5 冻结的文件（其余文件 = 漂移）。"""
-        for sub in (_DB_MODELS_DIR, _SERVICES_DIR, _API_DIR):
+        """Conversation* 类只能定义于已冻结的文件（其余文件 = 漂移）。"""
+        for sub in (_DB_MODELS_DIR, _SERVICES_DIR, _API_DIR, _DTO_DIR):
             root = _REPO_ROOT / sub
             for path in sorted(root.rglob("*.py")):
                 # utf-8-sig：兼容个别带 BOM 的既有源文件（不跳过任何文件）
@@ -658,10 +668,13 @@ class TestProductionImplementationScope:
                             f"{path.name}:{node.name}"
                         )
 
-    def test_8c_no_conversation_routes_registered(self) -> None:
+    def test_8c_conversation_routes_only_in_declared_module(self) -> None:
+        """Step 8 起路由已注册：只有 conversations.py 可以持有 /conversations。"""
         api_root = _REPO_ROOT / _API_DIR
         for path in sorted(api_root.glob("*.py")):
-            assert "/conversations" not in path.read_text(encoding="utf-8"), path.name
+            source = path.read_text(encoding="utf-8")
+            if "/conversations" in source:
+                assert path.name == "conversations.py", path.name
 
     def test_8d_design_doc_records_unchanged_invariants(self) -> None:
         doc = _source(_AUDIT_DOC)

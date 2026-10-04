@@ -184,9 +184,12 @@ FORBIDDEN_SENSITIVE_FIELDS: tuple[str, ...] = (
 
 #: Step 5 起允许存在的生产文件（相对仓库根；多出的 conversation 代码 = 漂移）。
 ALLOWED_PRODUCTION_MODULES: tuple[str, ...] = (
+    "backend/app/api/conversations.py",
+    "backend/app/db/conversation_repository.py",
     "backend/app/db/models/conversation.py",
     "backend/app/db/models/conversation_turn.py",
-    "backend/app/db/conversation_repository.py",
+    "backend/app/dto/conversation_api.py",
+    "backend/app/services/conversation_context_builder.py",
     "backend/app/services/conversation_service.py",
 )
 
@@ -350,7 +353,7 @@ def _find_route(router: Any, path: str) -> Any:
 
 
 def _conversation_production_modules() -> list[Path]:
-    """条件式 AST 守卫的目标（当前应为空；未来一旦出现即自动生效）。"""
+    """AST 守卫目标（Step 5~8 起 = 冻结的已实现 Conversation 生产模块）。"""
     return sorted((_REPO_ROOT / _APP_DIR).rglob("conversation*.py"))
 
 
@@ -828,7 +831,7 @@ class TestTestDbStrategy:
 
 class TestAstGuard:
     def test_15a_conversation_production_modules_are_declared(self) -> None:
-        """Step 5 起持久化层已实现：只允许冻结的 4 个生产文件。"""
+        """Step 5~8 起 Conversation 各层已实现：只允许冻结的已声明文件。"""
         modules = [
             str(path.relative_to(_REPO_ROOT)).replace("\\", "/")
             for path in _conversation_production_modules()
@@ -928,7 +931,7 @@ class TestExistingBoundaryUnchanged:
         assert "conversation_id" not in _source(_OUTCOME_MODEL)
 
     def test_16d_conversation_schema_is_defined_in_db_layer_only(self) -> None:
-        """Conversation ORM / 仓储只允许出现在 db 层；API 层不得出现。"""
+        """Conversation ORM / 仓储只允许出现在 db 层；API 层只允许 HTTP 边界。"""
         assert sorted(
             path.name
             for path in (_REPO_ROOT / _DB_MODELS_DIR).glob("conversation*.py")
@@ -937,9 +940,16 @@ class TestExistingBoundaryUnchanged:
             path.name
             for path in (_REPO_ROOT / _DB_DIR).glob("conversation*.py")
         ] == ["conversation_repository.py"]
+        # Step 8 起 Conversation HTTP 边界（conversations.py）已实现：
+        # API 层只允许该文件，且其中不得定义 ORM / 触碰 db.models。
         assert [
             path.name for path in (_REPO_ROOT / _API_DIR).glob("conversation*.py")
-        ] == []
+        ] == ["conversations.py"]
+        api_source = (_REPO_ROOT / _API_DIR / "conversations.py").read_text(
+            encoding="utf-8"
+        )
+        assert "DeclarativeBase" not in api_source
+        assert "backend.app.db.models" not in api_source
 
 
 # ============================================================
