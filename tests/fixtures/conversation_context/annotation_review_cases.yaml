@@ -1,0 +1,81 @@
+# WMS Annotation Review Procedure Fixture（Phase 4.1 Step 29）
+#
+# 性质（严格）：
+#   * synthetic but WMS-realistic —— **非生产数据**；
+#   * **不**包含真实客户 / 供应商 / 订单号 / 真实库存数量 / 生产数据；
+#   * 仅用于 annotation review procedure 契约测试（**不是** database seed）；
+#   * schema 极简：`id` / `project_id` / `review_scenario` / `turns[{role, content}]`；
+#   * role 仅允许 `user` / `assistant`；
+#   * 约定：每个 case 的**最后一个 turn 是当前问题（user）**；
+#   * **不含**任何 annotation / reference / impact 结论 ——
+#     标注结果由测试在内存中构造（procedure 模拟），不预置结论。
+#
+# 覆盖场景（review_scenario）：
+#   agreement / dependency_disagreement / impact_disagreement /
+#   outcome_disagreement / reference_disagreement / domain_review
+
+- id: review_agreement_001
+  project_id: vietnam-wms
+  review_scenario: agreement
+  turns:
+    - role: user
+      content: "只看 A01 仓库"
+    - role: assistant
+      content: "已限定 A01 仓库（示例）。"
+    - role: user
+      content: "查询库存"
+
+- id: review_dependency_disagreement_002
+  project_id: vietnam-wms
+  review_scenario: dependency_disagreement
+  turns:
+    - role: user
+      content: "先看越南一厂"
+    - role: assistant
+      content: "已限定越南一厂（示例）。"
+    - role: user
+      content: "那批国产原材料呢"
+
+- id: review_impact_disagreement_003
+  project_id: vietnam-wms
+  review_scenario: impact_disagreement
+  turns:
+    - role: user
+      content: "只查询待处理入库单"
+    - role: assistant
+      content: "共有 12 张待处理入库单（示例）。"
+    - role: user
+      content: "今天到货的有几张"
+
+- id: review_outcome_disagreement_004
+  project_id: vietnam-wms
+  review_scenario: outcome_disagreement
+  turns:
+    - role: user
+      content: "看看 A01 仓库的库存明细"
+    - role: assistant
+      content: "A01 仓库约 320 件（示例）。"
+    - role: user
+      content: "顺便看下 B01 的"
+
+- id: review_reference_disagreement_005
+  project_id: vietnam-wms
+  review_scenario: reference_disagreement
+  turns:
+    - role: user
+      content: "查询国产原材料的库存"
+    - role: assistant
+      content: "国产原材料约 500 件（示例）。"
+    - role: user
+      content: "只看 A01 仓库里的"
+
+- id: review_domain_review_006
+  project_id: vietnam-wms
+  review_scenario: domain_review
+  turns:
+    - role: user
+      content: "刚才那批出库单处理完了吗"
+    - role: assistant
+      content: "已处理 8 张（示例）。"
+    - role: user
+      content: "还没处理的给我列一下"

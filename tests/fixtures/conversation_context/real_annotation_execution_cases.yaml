@@ -1,0 +1,90 @@
+# WMS Real Annotation Execution Cases（Phase 3.12 Step 32）
+#
+# 性质（严格）：
+#   * **SYNTHETIC_ONLY** —— synthetic execution contract fixture，**非生产数据**；
+#   * **不**包含真实客户 / 供应商 / 订单 / 库存 / 员工 / 个人信息；
+#   * **不**伪装成真实数据（REAL_DEIDENTIFIED 结构模拟仅用于契约测试）；
+#   * 仅用于 real annotation execution 契约测试（**不是** database seed）；
+#   * 本阶段不执行真实人工标注（annotation 由未来 human annotator 产生）。
+#
+# 记录格式（flat record；每个 `- kind:` 开始一条新记录，后续 `key: value` 归属它）：
+#   kind = case      → case_id / project_id / roles
+#   kind = scenario  → scenario / requested（逗号分隔 case_id）/
+#                      annotator_1 / annotator_2 /
+#                      requested_dataset_version / leak_field
+#
+# 值约定：
+#   roles:  role 序列（逗号分隔；USER / ASSISTANT）
+#   leak_field: none | previous_annotation | review_hint | annotator_id
+#   默认值：annotator_1=annotator-a · annotator_2=annotator-b ·
+#           requested_dataset_version=wms-v1 · leak_field=none
+#
+# 覆盖场景（6）：normal_independent / duplicate_case / missing_case /
+#   dataset_version_mismatch / same_annotator / input_leakage
+
+records:
+  # ---- case 定义（4 个 synthetic case）----
+  - kind: case
+    case_id: exec_case_001
+    project_id: vietnam-wms
+    roles: USER,ASSISTANT,USER
+
+  - kind: case
+    case_id: exec_case_002
+    project_id: vietnam-wms
+    roles: USER,USER
+
+  - kind: case
+    case_id: exec_case_003
+    project_id: vietnam-wms
+    roles: USER,ASSISTANT,USER,ASSISTANT,USER
+
+  - kind: case
+    case_id: exec_case_004
+    project_id: vietnam-wms
+    roles: USER
+
+  # ---- 场景定义 ----
+  # 1. normal independent annotation
+  - kind: scenario
+    scenario: normal_independent
+    requested: exec_case_001,exec_case_002
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+
+  # 2. duplicate case（请求列表内重复）
+  - kind: scenario
+    scenario: duplicate_case
+    requested: exec_case_001,exec_case_001
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+
+  # 3. missing case（请求不存在的 case）
+  - kind: scenario
+    scenario: missing_case
+    requested: exec_case_999
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+
+  # 4. dataset version mismatch（requested != evidence）
+  - kind: scenario
+    scenario: dataset_version_mismatch
+    requested: exec_case_001
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+    requested_dataset_version: wms-v2
+
+  # 5. same annotator（独立性违规）
+  - kind: scenario
+    scenario: same_annotator
+    requested: exec_case_001
+    annotator_1: annotator-a
+    annotator_2: annotator-a
+
+  # 6. annotator input leakage（携带他人标注 / 提示）
+  - kind: scenario
+    scenario: input_leakage
+    requested: exec_case_001
+    annotator_1: annotator-a
+    annotator_2: annotator-b
+    leak_field: previous_annotation

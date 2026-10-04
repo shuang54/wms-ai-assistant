@@ -411,6 +411,11 @@ class TestSecurityAudit:
             "/api/chat/with-tools",
             "/api/ai/chat",
             "/api/rag/answer",
+            # ---- Conversation Management（Phase 4.1 Step 7/8/12；精确路由，无 wildcard）----
+            # 创建（Step 8）· 归档（Step 8）· 发送消息（Step 12）
+            "/api/conversations",
+            "/api/conversations/{conversation_id}/archive",
+            "/api/conversations/{conversation_id}/messages",
         }, write_routes
         for route in discover_routes():
             if route.method.lower() in _WRITE_METHODS:

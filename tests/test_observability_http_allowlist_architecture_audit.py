@@ -81,11 +81,20 @@ _EXPECTED_PATH_SET_REGISTRY: dict[str, int] = {
 }
 
 #: **冻结期望：文件系统 traversal 登记表**（module → 遍历次数；目标命中 backend/app/api）。
+#: 每条登记 = module + scanner operation + reason（新模块 / 计数变化 → 先失败，再人工授权）。
 _EXPECTED_FS_TRAVERSAL_REGISTRY: dict[str, int] = {
     _SCANNER_MODULE: 1,                                        # Route Discovery（唯一 scanner）
     _ALLOWLIST_MODULE: 2,                                      # 路由白名单扫描 + 依赖方向扫描
     "tests/test_tool_observability_persistence_architecture.py": 2,   # 静态依赖审计（非路由发现）
     "tests/test_tool_chat_architecture_contract.py": 1,        # 静态契约审计（非路由发现）
+    # ---- Conversation 契约族（Phase 4.1 Step 2~9；静态契约审计，非路由发现）----
+    # operation 均为 backend/app/api 目录遍历；只做文件清单 / AST 边界检查，不产 route 集合。
+    "tests/test_conversation_api_architecture_audit.py": 1,     # api_root.rglob('conversation*.py') —— API 模块边界审计
+    "tests/test_conversation_api_contract.py": 1,               # api_root.rglob('conversation*.py') —— 路由集合契约冻结
+    "tests/test_conversation_architecture_contract.py": 1,      # api_root.glob('*.py') —— 设计阶段架构审计
+    "tests/test_conversation_model_contract.py": 1,             # api_root.glob('*.py') —— 模型契约 scope 审计
+    "tests/test_conversation_persistence_contract.py": 1,       # (_REPO_ROOT / _API_DIR).glob('conversation*.py') —— 持久化契约 AST guard
+    "tests/test_conversation_service_boundary_contract.py": 1,  # api_root.glob('*.py') —— Service 边界契约审计
 }
 
 #: 只允许 scanner 模块实现的"路由发现"函数持有者集合。
@@ -662,7 +671,8 @@ class TestMetaGuards:
             assert find_module_level_assignments(name) == (_SELF,), name
 
         assert len(_EXPECTED_PATH_SET_REGISTRY) == 3
-        assert len(_EXPECTED_FS_TRAVERSAL_REGISTRY) == 4
+        # 4 既有条目 + 6 Conversation 契约族（Phase 4.1 Step 2~9）—— 逐条显式登记，非通配放行
+        assert len(_EXPECTED_FS_TRAVERSAL_REGISTRY) == 10
         assert _EXPECTED_DISCOVERY_MODULES == frozenset({_SCANNER_MODULE})
         assert _EXPECTED_MODULE_LEVEL_EDGES == frozenset(
             {(_FROZEN_MODULE, _SCANNER_MODULE)}
