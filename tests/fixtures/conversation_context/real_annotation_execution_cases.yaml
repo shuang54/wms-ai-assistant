@@ -1,4 +1,4 @@
-# WMS Real Annotation Execution Cases（Phase 3.12 Step 32）
+# WMS Real Annotation Execution Cases（Phase 4.1 Step 32；沿用 Phase 3.12 Step 32 产物）
 #
 # 性质（严格）：
 #   * **SYNTHETIC_ONLY** —— synthetic execution contract fixture，**非生产数据**；
@@ -8,41 +8,52 @@
 #   * 本阶段不执行真实人工标注（annotation 由未来 human annotator 产生）。
 #
 # 记录格式（flat record；每个 `- kind:` 开始一条新记录，后续 `key: value` 归属它）：
-#   kind = case      → case_id / project_id / roles
+#   kind = case      → case_id / project_id / roles / case_kind
 #   kind = scenario  → scenario / requested（逗号分隔 case_id）/
 #                      annotator_1 / annotator_2 /
 #                      requested_dataset_version / leak_field
 #
 # 值约定：
 #   roles:  role 序列（逗号分隔；USER / ASSISTANT）
+#   case_kind: straightforward | disagreement | revision | multi-turn
 #   leak_field: none | previous_annotation | review_hint | annotator_id
 #   默认值：annotator_1=annotator-a · annotator_2=annotator-b ·
 #           requested_dataset_version=wms-v1 · leak_field=none
 #
 # 覆盖场景（6）：normal_independent / duplicate_case / missing_case /
 #   dataset_version_mismatch / same_annotator / input_leakage
+#
+# case_kind 覆盖（四类各 1）：
+#   straightforward → exec_case_001（早期约束型短程 case）
+#   disagreement    → exec_case_002（两位 annotator 可产生分歧的最小 case）
+#   revision        → exec_case_004（单轮，可走 revise 路径的最小 case）
+#   multi-turn      → exec_case_003（5 轮多主题，用于多轮依赖）
 
 records:
-  # ---- case 定义（4 个 synthetic case）----
+  # ---- case 定义（4 个 synthetic case；case_kind 四类各 1）----
   - kind: case
     case_id: exec_case_001
     project_id: vietnam-wms
     roles: USER,ASSISTANT,USER
+    case_kind: straightforward
 
   - kind: case
     case_id: exec_case_002
     project_id: vietnam-wms
     roles: USER,USER
+    case_kind: disagreement
 
   - kind: case
     case_id: exec_case_003
     project_id: vietnam-wms
     roles: USER,ASSISTANT,USER,ASSISTANT,USER
+    case_kind: multi-turn
 
   - kind: case
     case_id: exec_case_004
     project_id: vietnam-wms
     roles: USER
+    case_kind: revision
 
   # ---- 场景定义 ----
   # 1. normal independent annotation

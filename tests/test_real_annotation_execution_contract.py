@@ -1,4 +1,7 @@
-"""Real Annotation Execution Contract（Phase 3.12 Step 32 —— **Contract only**）。
+"""Real Annotation Execution Contract（Phase 4.1 Step 32 —— **Contract only**）。
+
+（原 Phase 3.12 Step 32 产物；Phase 4.1 Step 32 在既有结构上补齐采样边界 /
+annotation 级独立性 / comparison→finalization 复用路径。）
 
 本文件冻结未来"真实脱敏数据人工标注"如何执行（test-local；**非 production**），
 但**不执行真实人工标注**：
@@ -36,9 +39,17 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from tests.test_conversation_context_annotation_finalization import (
+    CaseFinalizationMetadata,
+    finalize_annotated_evidence,
+)
 from tests.test_conversation_context_annotation_review import (
     AnnotationDraft,
+    ComparisonOutcome,
     compare_annotations,
+    finalize_domain_review,
+    review_phase,
+    review_status_for,
 )
 from tests.test_conversation_context_annotation_workflow import (
     AnnotatedEvidence,
@@ -75,7 +86,7 @@ from tests.test_conversation_selection_evidence_data_audit import (
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SELF = "tests/test_real_annotation_execution_contract.py"
 _AUDIT_DOC = (
-    "docs/evaluation/Phase 3.12 Step 32 — Real Annotation Execution Contract.md"
+    "docs/evaluation/Phase 4.1 Step 32 — Real Annotation Execution Contract.md"
 )
 _FIXTURE = (
     "tests/fixtures/conversation_context/real_annotation_execution_cases.yaml"
@@ -149,6 +160,14 @@ EXECUTION_SCENARIOS: tuple[str, ...] = (
     "dataset_version_mismatch",
     "same_annotator",
     "input_leakage",
+)
+
+#: §十八：fixture case 形状覆盖（四类，每类至少 1 个 case）。
+CASE_KINDS: tuple[str, ...] = (
+    "straightforward",
+    "disagreement",
+    "revision",
+    "multi-turn",
 )
 
 EVIDENCE_DATASET_VERSION = "wms-v1"
@@ -274,6 +293,8 @@ def sample_cases(
     ordered = sorted(available)
     if start < 0:
         raise AnnotationExecutionError("INVALID_CASE", "start must be >= 0")
+    if limit is not None and limit < 0:
+        raise AnnotationExecutionError("INVALID_CASE", "limit must be >= 0")
     window = ordered[start:] if limit is None else ordered[start : start + limit]
     return AnnotationSamplingResult(
         dataset_version=dataset_version,
@@ -317,6 +338,20 @@ def build_case_input(evidence: Mapping[str, Any], case_id: str) -> AnnotatorCase
 
 def check_independence(annotator_1: str, annotator_2: str) -> bool:
     return bool(annotator_1) and bool(annotator_2) and annotator_1 != annotator_2
+
+
+def check_annotation_independence(
+    annotation_a: AnnotationDraft, annotation_b: AnnotationDraft
+) -> bool:
+    """§九：independence 以 **annotator identity** 为准（annotation 级检查）。
+
+    * 同一 annotator（annotator_id 相同）→ False（须拒绝：ANNOTATOR_NOT_INDEPENDENT）；
+    * 不同 session / 时间 / 机器**不构成** independence —— 只有身份不同才算；
+    * 复用 Step 29 ``AnnotationDraft.annotator``，不新增身份结构。
+    """
+    annotator_a = annotation_a.annotator.annotator_id
+    annotator_b = annotation_b.annotator.annotator_id
+    return bool(annotator_a) and bool(annotator_b) and annotator_a != annotator_b
 
 
 def check_input_isolation(payload: Mapping[str, Any]) -> bool:
@@ -375,6 +410,52 @@ def check_cross_isolation(
     if annotation_a is not None and _annotation_only_keys(annotation_a) & b_keys:
         return False
     return check_input_isolation(a_payload) and check_input_isolation(b_payload)
+
+
+def build_annotation_draft(
+    case_id: str,
+    annotator_id: str,
+    *,
+    dependency_flag: str = "early_constraint",
+    business_outcome: str = "SQL_SEMANTICS",
+) -> AnnotationDraft:
+    """构造单个 annotator 的独立 draft（复用 Step 29 DTO；不引入新结构）。
+
+    仅供本文件测试使用（comparison / independence / revision 路径）；
+    dependency_flag 必须为 5 维度之一（其余置 False）。
+    """
+    flags: dict[str, bool] = {
+        "early_constraint": False,
+        "middle_decision": False,
+        "recent_context": False,
+        "old_topic": False,
+        "standalone": False,
+    }
+    assert dependency_flag in flags, dependency_flag
+    flags[dependency_flag] = True
+    return AnnotationDraft(
+        case_id=case_id,
+        annotator=AnnotatorIdentity(annotator_id),
+        dependency_annotation=ContextDependencyAnnotation(
+            case_id=case_id, current_turn_id="t3", **flags
+        ),
+        reference_annotation=ReferenceAnnotation(
+            reference_type="FULL_HISTORY",
+            outcome_type="SQL_SEMANTICS",
+            expected_behavior="仅统计 A01 仓库库存",
+            reference_created_by_human=True,
+        ),
+        impact_annotation=ContextImpactAnnotation(
+            case_id=case_id,
+            full_history_result="A01 库存 320",
+            selected_history_result="全部仓库库存 1000",
+            business_outcome_changed="false",
+            critical_constraint_lost="false",
+            entity_changed="false",
+            intent_changed="false",
+        ),
+        business_outcome=business_outcome,
+    )
 
 
 # ============================================================
@@ -640,6 +721,21 @@ class TestSamplingContract:
             for name in function_names:
                 assert forbidden not in name.lower(), f"{name}:{forbidden}"
 
+    def test_34_invalid_start_and_limit_rejected(self) -> None:
+        """§八：非法采样参数（start < 0 / limit < 0）→ INVALID_CASE。"""
+        evidence = build_evidence()
+        for kwargs, marker in (
+            ({"start": -1}, "start"),
+            ({"limit": -1}, "limit"),
+        ):
+            try:
+                sample_cases(evidence, **kwargs)
+            except AnnotationExecutionError as exc:
+                assert exc.code == "INVALID_CASE"
+                assert marker in str(exc)
+            else:  # pragma: no cover
+                raise AssertionError(f"invalid sampling kwargs must be rejected: {kwargs}")
+
 
 # ============================================================
 # 2. Independence / Isolation（§九 / §十 / §十二）
@@ -709,6 +805,35 @@ class TestIndependenceAndIsolation:
             case_ids=["exec_case_001"],
         )
         assert evidence == snapshot
+
+    def test_35_annotation_level_independence(self) -> None:
+        """§九：independence 以 annotator identity 为准（annotation 级）。"""
+        draft_a = build_annotation_draft("exec_case_001", "annotator-a")
+        draft_a_other_session = build_annotation_draft("exec_case_001", "annotator-a")
+        draft_b = build_annotation_draft("exec_case_001", "annotator-b")
+        assert check_annotation_independence(draft_a, draft_b) is True
+        # 不同 session / 时间 / 机器不是 independence 依据：身份相同 → 拒绝
+        assert (
+            check_annotation_independence(draft_a, draft_a_other_session) is False
+        )
+
+    def test_36_leak_is_rejected_not_sanitized(self) -> None:
+        """§十二：禁止字段 → ANNOTATOR_INPUT_LEAK；不得静默删除字段后继续。"""
+        leaked_payload = {
+            "dataset_version": EVIDENCE_DATASET_VERSION,
+            "case_id": "exec_case_001",
+            "project_id": "vietnam-wms",
+            "turns": ({"role": "USER", "content": "x"},),
+            "previous_annotation": {"early_constraint": True},
+        }
+        assert check_input_isolation(leaked_payload) is False
+        # 无 sanitize 行为：禁止键保持原位（拒绝而不是清洗）
+        assert "previous_annotation" in leaked_payload
+        result, _, evidence = run_scenario("input_leakage")
+        assert result.isolation_valid is False
+        assert "ANNOTATOR_INPUT_LEAK" in result.failure_codes
+        # leak 只存在于执行层额外 payload；不写回 evidence
+        assert "previous_annotation" not in repr(evidence)
 
 
 # ============================================================
@@ -965,6 +1090,98 @@ class TestStep29And30Compatibility:
 
 
 # ============================================================
+# 6b. Comparison → Revision / Finalization 复用路径（§十六 / §十七）
+# ============================================================
+
+
+class TestComparisonAndFinalizationReuse:
+    """独立 annotation → comparison → resolution → finalization（全部复用，不重实现）。"""
+
+    def test_37_disagreement_to_domain_review_then_reviewed(self) -> None:
+        """§十六 / §十七：DISAGREEMENT → Domain Review → FINAL_REVIEW / REVIEWED。"""
+        draft_a = build_annotation_draft("exec_case_002", "annotator-a")
+        draft_b = build_annotation_draft(
+            "exec_case_002", "annotator-b", dependency_flag="recent_context"
+        )
+        outcome = compare_annotations(draft_a, draft_b)
+        assert isinstance(outcome, ComparisonOutcome)
+        assert outcome.result == "DISAGREEMENT"
+        assert "dependency_annotation" in outcome.differing_fields
+        assert review_phase(outcome) == "DOMAIN_REVIEW_REQUIRED"
+        assert review_status_for(outcome, domain_review_completed=False) == "DISPUTED"
+
+        _, final_draft, phase = finalize_domain_review(
+            outcome,
+            reviewer=AnnotatorIdentity("domain-reviewer-01"),
+            final_draft=draft_a,
+        )
+        assert phase == "FINAL_REVIEW"
+        assert final_draft.case_id == "exec_case_002"
+        assert review_status_for(outcome, domain_review_completed=True) == "REVIEWED"
+        # 无自动合并：final_draft 必须由人工提供（调用方传入），不是函数内部合成
+        assert final_draft is draft_a
+
+    def test_38_finalization_path_reuses_step30(self) -> None:
+        """§十七：独立 annotation → comparison → resolution → Step 30 finalization。"""
+        evidence = AnnotatedEvidence(
+            dataset_version=EVIDENCE_DATASET_VERSION,
+            annotation_version=EXAMPLE_ANNOTATION_VERSION,
+            source_type=EVIDENCE_SOURCE_TYPE,
+            cases=(
+                CaseAnnotation(
+                    case_id="exec_case_001",
+                    dependency_annotation=ContextDependencyAnnotation(
+                        case_id="exec_case_001",
+                        current_turn_id="t3",
+                        early_constraint=True,
+                    ),
+                    reference_annotation=ReferenceAnnotation(
+                        reference_type="FULL_HISTORY",
+                        outcome_type="SQL_SEMANTICS",
+                        expected_behavior="仅统计 A01 仓库库存",
+                        reference_created_by_human=True,
+                    ),
+                    impact_annotation=ContextImpactAnnotation(
+                        case_id="exec_case_001",
+                        full_history_result="A01 库存 320",
+                        selected_history_result="全部仓库库存 1000",
+                        business_outcome_changed="false",
+                        critical_constraint_lost="false",
+                        entity_changed="false",
+                        intent_changed="false",
+                    ),
+                    review_status="REVIEWED",
+                ),
+            ),
+            annotator=AnnotatorIdentity("domain-reviewer-01"),
+        )
+        metadata = (
+            CaseFinalizationMetadata(
+                case_id="exec_case_001",
+                dataset_version=EVIDENCE_DATASET_VERSION,
+                annotation_version=EXAMPLE_ANNOTATION_VERSION,
+                disagreement=True,
+                domain_review_completed=True,
+                annotator_1="annotator-a",
+                annotator_2="annotator-b",
+            ),
+        )
+        result = finalize_annotated_evidence(evidence, metadata=metadata)
+        assert result.valid is True
+        assert result.failure_codes == ()
+        assert result.cases_finalized == 1
+        assert result.source_type == EVIDENCE_SOURCE_TYPE
+
+        # 复用 Step 30 的独立性校验：dispute 记录中同一 annotator → 拒绝
+        bad_metadata = (
+            dataclasses.replace(metadata[0], annotator_2="annotator-a"),
+        )
+        bad = finalize_annotated_evidence(evidence, metadata=bad_metadata)
+        assert bad.valid is False
+        assert "ANNOTATOR_NOT_INDEPENDENT" in bad.failure_codes
+
+
+# ============================================================
 # 7. Fixture / Production Boundary / 文档
 # ============================================================
 
@@ -975,6 +1192,13 @@ class TestFixtureBoundaryAndDocument:
         assert sorted(set(scenarios)) == sorted(EXECUTION_SCENARIOS)
         assert len(fixture_cases()) == 4
         assert len(set(case["case_id"] for case in fixture_cases())) == 4
+
+    def test_39_fixture_case_kinds_cover_four_shapes(self) -> None:
+        """§十八：4 个 case 覆盖四类形状（straightforward / disagreement / revision / multi-turn）。"""
+        kinds = {case["case_id"]: case["case_kind"] for case in fixture_cases()}
+        assert sorted(set(kinds.values())) == sorted(CASE_KINDS)
+        for kind in CASE_KINDS:
+            assert sum(1 for value in kinds.values() if value == kind) == 1, kind
 
     def test_30_fixture_is_synthetic_only(self) -> None:
         text = _source(_FIXTURE)
@@ -1022,25 +1246,32 @@ class TestFixtureBoundaryAndDocument:
     def test_32_document_sections_and_statements(self) -> None:
         doc = _source(_AUDIT_DOC)
         for section in (
-            "## 1. Purpose",
-            "## 2. Sampling",
-            "## 3. Annotator Independence",
+            "## 1. Sampling Contract",
+            "## 2. Annotator Input Contract",
+            "## 3. Independence",
             "## 4. Input Isolation",
             "## 5. Versioning",
-            "## 6. Revision",
-            "## 7. Security",
-            "## 8. Current State",
-            "## 9. Deferred",
+            "## 6. Comparison",
+            "## 7. Revision",
+            "## 8. Finalization",
+            "## 9. Failure Codes",
+            "## 10. Synthetic Fixture",
+            "## 11. Step 29 Compatibility",
+            "## 12. Step 30 Compatibility",
+            "## 13. G3 Status",
+            "## 14. G4 Status",
+            "## 15. Security Boundary",
         ):
             assert section in doc, section
         for statement in (
-            "Synthetic only",
-            "No real annotation",
-            "G1 blocked",
-            "G3 blocked",
-            "annotator_1 != annotator_2",
+            "SYNTHETIC_ONLY",
+            "G3 = BLOCKED",
+            "G4 = BLOCKED",
+            "annotator identity",
             "previous_annotation",
             "new annotation_version",
+            "project_id",
+            "authorization",
         ):
             assert statement in doc, statement
 
@@ -1071,6 +1302,7 @@ __all__ = [
     "ALLOWED_INPUT_KEYS",
     "FORBIDDEN_INPUT_KEYS",
     "EXECUTION_SCENARIOS",
+    "CASE_KINDS",
     "EVIDENCE_DATASET_VERSION",
     "EVIDENCE_SOURCE_TYPE",
     "AnnotationExecutionError",
@@ -1079,7 +1311,9 @@ __all__ = [
     "RealAnnotationExecutionResult",
     "sample_cases",
     "build_case_input",
+    "build_annotation_draft",
     "check_independence",
+    "check_annotation_independence",
     "check_input_isolation",
     "check_cross_isolation",
     "execute_annotation_assignment",
