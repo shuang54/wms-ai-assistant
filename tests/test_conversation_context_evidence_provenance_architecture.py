@@ -159,7 +159,14 @@ class TestProductionBoundary:
             if "dataset_version" in _ast_tokens(path):
                 owners.add(_relative(path))
         assert owners, "既有 dataset_version 分布发生变化（审计需更新）"
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         for owner in owners:
+            if owner in frozen:  # Step 37：Evidence 持久化域
+                continue
             assert "text_to_sql" in owner, owner
 
 
@@ -256,9 +263,20 @@ class TestTestLocalContract:
     def test_3d_no_evidence_directories_created(self) -> None:
         for relative in ("backend/app/evidence", "backend/app/db/evidence"):
             assert not (_REPO_ROOT / relative).exists(), relative
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         for directory in _AUDITED_DIRS:
             for path in (_REPO_ROOT / directory).rglob("evidence*.py"):
-                raise AssertionError(_relative(path))
+                assert _relative(path) in frozen, _relative(path)
+        for forbidden in (
+            "backend/app/services/evidence_service.py",
+            "backend/app/api/evidence_api.py",
+            "backend/app/services/evidence_workflow.py",
+        ):
+            assert not (_REPO_ROOT / forbidden).exists(), forbidden
 
 
 # ============================================================

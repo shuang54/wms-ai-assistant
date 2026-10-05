@@ -148,8 +148,16 @@ class TestProductionBoundary:
         assert len(files) > 50
 
     def test_1b_no_annotation_identifiers_in_backend(self) -> None:
+        """Step 37：annotation 持久化已存在 —— 但只允许冻结的 Step 37 模块。"""
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         offenders: list[str] = []
         for path in _backend_files():
+            if _relative(path) in frozen:
+                continue
             tokens = _ast_tokens(path)
             for forbidden in _FORBIDDEN_IDENTIFIERS:
                 if forbidden in tokens:
@@ -166,8 +174,16 @@ class TestProductionBoundary:
         assert offenders == [], offenders
 
     def test_1d_no_annotation_modules_in_backend(self) -> None:
+        """Step 37：只允许冻结的 annotation 持久化模块；API / Service / Workflow 仍禁止。"""
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         offenders: list[str] = []
         for path in _backend_files():
+            if _relative(path) in frozen:
+                continue
             name = path.name.lower()
             for keyword in _FORBIDDEN_MODULE_KEYWORDS:
                 if keyword in name:

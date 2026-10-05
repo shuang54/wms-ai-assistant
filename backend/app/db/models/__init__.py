@@ -20,6 +20,8 @@ from __future__ import annotations
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_turn import ConversationTurn
+from backend.app.db.models.evidence_annotation_record import EvidenceAnnotationRecord
+from backend.app.db.models.evidence_record import EvidenceRecord
 from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
@@ -39,6 +41,10 @@ _MODELS: tuple[type, ...] = (
     # Conversation 必须先于 ConversationTurn（后者有指向前者的 FK）。
     Conversation,
     ConversationTurn,
+    # Phase 4.1 Step 37：Evidence / Annotation 持久化（ai_ops schema；非 public）。
+    # EvidenceRecord 必须先于 EvidenceAnnotationRecord（后者有指向前者的 FK）。
+    EvidenceRecord,
+    EvidenceAnnotationRecord,
 )
 
 
@@ -46,6 +52,8 @@ __all__ = [
     "AssistantOutcomeRecord",
     "Conversation",
     "ConversationTurn",
+    "EvidenceRecord",
+    "EvidenceAnnotationRecord",
     "KnowledgeDocument",
     "KnowledgeChunk",
     "LLMUsageRecord",
