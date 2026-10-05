@@ -206,6 +206,19 @@ FORBIDDEN TRANSITIONS
 无充分证据 → 写 `UNDEFINED` + `Decision Required`，不得猜测。
 （当前 1–4 均为 UNDEFINED；仅 5 已由 TRANSITIONS 支持：`FINALIZED → ()`。）
 
+**Step 42 实现状态：COMPLETE（Contract Freeze，非实现）**
+
+```text
+Finalization Contract = PARTIALLY FROZEN
+FROZEN   : REVIEWED → FINALIZED（唯一入边）· FINALIZED terminal（5 条出边全禁）
+           Provenance 不可改 · Evidence 业务字段不可改（无写入入口）
+UNDEFINED: Finalization Precondition · Annotation 是否必须全 REVIEWED
+           FINALIZED 后 Annotation 新建/review 是否禁止 · Finalization trigger owner
+证据      : tests/test_evidence_finalization_contract_db.py（13 passed，真实 PostgreSQL）
+产出      : 未新增 Service / API / Workflow；DB Schema Changes = 0
+Open      : OD-3 · OD-4 · OD-7（与 Step 43 状态矩阵一并决定）
+```
+
 ---
 
 ## 六、Step 43 — Evidence / Annotation Lifecycle Consistency
@@ -224,6 +237,20 @@ FINALIZED + REVIEWED
 
 每个组合标注 `ALLOWED` / `FORBIDDEN` / `UNDEFINED`；
 当前真实状态：**全部 UNCONSTRAINED**（Repository 不做任何组合校验）→ 需由 Step 43 冻结。
+
+**Step 43 实现状态：COMPLETE（Contract Freeze，非实现）**
+
+```text
+Lifecycle Matrix = PARTIAL（3 FROZEN / 2 FORBIDDEN / 4 UNDEFINED）
+FROZEN   : ANNOTATED+DRAFT · ANNOTATED+REVIEWED · create_annotation 推进（Step 37 §Transaction）
+FORBIDDEN: PERSISTED+DRAFT · PERSISTED+REVIEWED（不可达：创建即推进 ANNOTATED）
+UNDEFINED: IMPORTED+DRAFT · REVIEWED+DRAFT · REVIEWED+REVIEWED
+           FINALIZED+DRAFT · FINALIZED+REVIEWED
+Observed/Contract 严格分离；新增 OD-8 / OD-9 / OD-10
+证据      : tests/test_evidence_lifecycle_consistency_db.py（3 passed）+ 既有测试复用
+产出      : 无 Service / 无 API / 无 enforcement；DB Schema Changes = 0
+Step 43 COMPLETE —— Open Decisions remain for future implementation
+```
 
 ### Step 41–43 Dependency（Sequential）
 
@@ -274,6 +301,22 @@ Cardinality · Identity · Lifecycle Interaction
    `evidence_id`，不建约束（最符合 Production ID Isolation）。
 2. **次选候选：关联表** `conversation_evidence(conversation_id, evidence_id)` ——
    仅在 Step 44 论证确需持久化关联时采用；仍不得把 conversation_id 写入 Evidence 本体。
+
+**Step 44 实现状态：COMPLETE（Contract Design，非实现）**
+
+```text
+Conversation ↔ Evidence Contract = PARTIAL FROZEN
+FROZEN   : Evidence = Independent（Conversation ≠ Owner）· Reference ≠ Ownership
+           Identity Boundary · no cascade lifecycle（6 条删除/状态规则）
+           Evidence = Reusable · 无自动 Evidence 创建 / 无状态联动
+REJECTED : Candidate A（直接 FK —— 违反 Step 27）
+RECOMMENDED（未实现）: Candidate B（关联表）
+INSUFFICIENT: Candidate C（无持久化 —— 无法满足 Step 46 read-back）
+UNDEFINED: 关联基数（OD-11）· Turn-level 引用（OD-12）· 重复引用语义（OD-13）
+证据      : tests/test_conversation_evidence_contract.py（8 passed，离线）
+产出      : 未建表 / 未加列 / 未加 FK / 未加 Service / 未加 API；DB Schema Changes = 0
+Step 44 COMPLETE —— Open Decisions remain（OD-11 / OD-12 / OD-13）
+```
 
 ---
 
@@ -432,9 +475,9 @@ RBAC · Multi-tenancy · Chat UI · Streaming · Long-term Memory · Tool market
 | ID  | Gap                                              | Impact                              | Required Step | Blocking |
 | --- | ------------------------------------------------ | ----------------------------------- | ------------- | -------- |
 | G-A | ~~Annotation `review_status` 无迁移能力~~         | ~~Review 无法落地~~ **RESOLVED（Step 41）** | 41 | **CLOSED** |
-| G-B | Evidence REVIEWED ⇄ Annotation REVIEWED 关系未定义 | 状态一致性无法保证                   | 43            | YES      |
-| G-C | FINALIZED 后置不可变性未定义                      | Finalization 语义不完整              | 42            | YES      |
-| G-D | Conversation ↔ Evidence 关系未设计                | Step 45 无法定模型                   | 44            | YES      |
+| G-B | ~~Evidence REVIEWED ⇄ Annotation REVIEWED 关系未定义~~（矩阵已 documented；OD-8/9/10 仍 Open） | 状态一致性**部分**冻结              | 43 | **PARTIAL** |
+| G-C | ~~FINALIZED 后置不可变性未定义~~（部分解决：Provenance / 业务字段 / terminal 已 FROZEN；Annotation 不可变性仍 Open = OD-4） | ~~Finalization 语义不完整~~ 已提供审计证据 | 42 | **PARTIAL** |
+| G-D | ~~Conversation ↔ Evidence 关系未设计~~（Contract 已冻结：Ownership / Reference / Identity / no-cascade；OD-11/12/13 仍 Open） | Step 45 可基于 Contract + OD 决策定模型 | 44 | **PARTIAL** |
 | G-E | Evidence 无 Service / API                        | 仅 Repository 可调用                 | Deferred      | NO       |
 | G-G | Step 39/40 未进入 roadmap 文档                    | 追溯链断裂                           | 48            | NO       |
 
