@@ -62,7 +62,10 @@ __all__ = [
     "EvidenceNotFoundError",
     "InvalidEvidenceStatusTransitionError",
     "EvidenceRow",
+    "EvidenceProvenanceRow",
+    "EvidenceWithProvenance",
     "AnnotationRow",
+    "validate_provenance",
     "EVIDENCE_READ_COLUMNS",
     "ANNOTATION_READ_COLUMNS",
     "validate_evidence_id",
@@ -129,6 +132,39 @@ class AnnotationRow:
     review_status: str
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class EvidenceProvenanceRow:
+    """EvidenceProvenance 读取模型（**严格复用 Step 27 冻结的两个字段**）。
+
+    Step 27 契约：``EvidenceProvenance`` 只含 ``dataset_version`` + ``source_type``；
+    不得新增 source_ref / content_ref / locator / file_path / raw_content / url。
+    """
+
+    dataset_version: str
+    source_type: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "dataset_version": self.dataset_version,
+            "source_type": self.source_type,
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceWithProvenance:
+    """Evidence + Provenance 读取模型（不含 Session / ORM / SQL 对象）。"""
+
+    evidence_id: str
+    dataset_version: str
+    source_type: str
+    de_identification_attested: bool
+    de_identification_method: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    provenance: EvidenceProvenanceRow
 
 
 class EvidenceRepositoryError(Exception):
@@ -350,8 +386,8 @@ class EvidenceRepository:
     ) -> EvidenceRow:
         """插入 Evidence；**幂等**：同 (source_type, dataset_version) 返回既有记录。"""
         validate_evidence_id(evidence_id)
-        validate_dataset_version(dataset_version)
-        validate_source_type(source_type)
+        # Step 38：provenance（dataset_version + source_type）必填且合法；缺失 → 拒绝
+        self.validate_provenance(dataset_version, source_type)
         target_status = validate_evidence_status(
             status or EVIDENCE_STATUS_VALUES[0]
         )
@@ -471,3 +507,50 @@ class EvidenceRepository:
                 return AnnotationRow(*row)
         except SQLAlchemyError as exc:
             raise EvidenceRepositoryError(f"写入 Annotation 失败: {exc}") from exc
+
+    # ---------- Provenance（Step 38：复用 Step 27 契约；与 Evidence 同行持久化）----------
+
+    @staticmethod
+    def validate_provenance(dataset_version: str, source_type: str) -> None:
+        """校验 Provenance（Step 27 规则；**不自动补值**）。
+
+        * dataset_version：非空 且 stable（无前后空白）；
+        * source_type：必须属于 ``SOURCE_TYPE_VALUES``；
+        * 缺失 / 非法 → 拒绝持久化（禁止用 unknown / default / fake 替代）。
+        """
+        version = validate_dataset_version(dataset_version)
+        if version != version.strip():
+            raise ValueError("dataset_version must be stable (no padding)")
+        validate_source_type(source_type)
+
+    def get_by_id(self, evidence_id: str) -> EvidenceWithProvenance | None:
+        """按 evidence_id 读取 Evidence **及其 Provenance**（不暴露 Session / ORM）。"""
+        validate_evidence_id(evidence_id)
+        factory = self._factory()
+        try:
+            with factory() as session:
+                row = session.execute(self.build_evidence_select(evidence_id)).first()
+        except SQLAlchemyError as exc:
+            raise EvidenceRepositoryError(f"读取 Evidence 失败: {exc}") from exc
+        if row is None:
+            return None
+        evidence = EvidenceRow(*row)
+        return EvidenceWithProvenance(
+            evidence_id=evidence.evidence_id,
+            dataset_version=evidence.dataset_version,
+            source_type=evidence.source_type,
+            de_identification_attested=evidence.de_identification_attested,
+            de_identification_method=evidence.de_identification_method,
+            status=evidence.status,
+            created_at=evidence.created_at,
+            updated_at=evidence.updated_at,
+            provenance=EvidenceProvenanceRow(
+                dataset_version=evidence.dataset_version,
+                source_type=evidence.source_type,
+            ),
+        )
+
+    def get_provenance(self, evidence_id: str) -> EvidenceProvenanceRow | None:
+        """只读取 Provenance（dataset_version + source_type）。"""
+        found = self.get_by_id(evidence_id)
+        return None if found is None else found.provenance

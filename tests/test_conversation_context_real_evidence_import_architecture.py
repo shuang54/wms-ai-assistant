@@ -147,14 +147,28 @@ class TestProductionBoundary:
 
     def test_1d_annotation_and_provenance_still_absent(self) -> None:
         """延续 Step 27~30：production 仍无 annotation / provenance 语义。"""
+        # Step 38：annotation / provenance 持久化只允许存在于冻结文件内
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         offenders: list[str] = []
         for path in _backend_files():
+            if _relative(path) in frozen:
+                continue
             tokens = _ast_tokens(path)
             lowered = {str(token).lower() for token in tokens}
             for forbidden in ("annotation", "provenance", "annotator"):
                 if forbidden in lowered:
                     offenders.append(f"{_relative(path)}:{forbidden}")
         assert offenders == [], offenders
+        for forbidden in (
+            "backend/app/services/provenance_service.py",
+            "backend/app/api/provenance_api.py",
+            "backend/app/services/provenance_workflow.py",
+        ):
+            assert not (_REPO_ROOT / forbidden).exists(), forbidden
 
     def test_1e_no_import_directories_created(self) -> None:
         for relative in (
