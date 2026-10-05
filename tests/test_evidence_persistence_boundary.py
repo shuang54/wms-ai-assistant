@@ -614,9 +614,18 @@ class TestSecurityAndProductionBoundary:
         """审计快照：production 尚无 Evidence / Annotation 持久化（未来实现后需更新）。"""
         backend = sorted((_REPO_ROOT / "backend/app").rglob("*.py"))
         assert backend, "backend/app 为空（审计失效）"
-        names = {path.name for path in backend}
-        assert not any("evidence" in name for name in names)
-        assert not any("annotation" in name for name in names)
+        matched = sorted(
+            str(path.relative_to(_REPO_ROOT)).replace("\\", "/")
+            for path in backend
+            if "evidence" in path.name or "annotation" in path.name
+        )
+        assert matched == sorted(
+            (
+                "backend/app/db/models/evidence_record.py",
+                "backend/app/db/models/evidence_annotation_record.py",
+                "backend/app/db/evidence_repository.py",
+            )
+        ), matched
 
     def test_20_deterministic_replay(self) -> None:
         first = _registry()
