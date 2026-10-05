@@ -64,6 +64,16 @@ ANNOTATION_REVIEW_VALUES: Final[tuple[str, ...]] = (
     ANNOTATION_REVIEW_REVIEWED,
 )
 
+#: Step 41 冻结的合法评审迁移（**单向**：DRAFT → REVIEWED；REVIEWED 为终态）。
+#:
+#: 明确禁止：REVIEWED → DRAFT（回退）· REVIEWED → REVIEWED（重复评审）。
+#: 与 Evidence 状态迁移（``EVIDENCE_STATUS_TRANSITIONS``）**互不联动** ——
+#: Annotation 评审属 Step 41，Evidence 状态推进属 Step 43。
+ANNOTATION_REVIEW_TRANSITIONS: Final[dict[str, tuple[str, ...]]] = {
+    ANNOTATION_REVIEW_DRAFT: (ANNOTATION_REVIEW_REVIEWED,),
+    ANNOTATION_REVIEW_REVIEWED: (),
+}
+
 
 class EvidenceAnnotationRecord(Base):
     """Annotation 行（一条 = 某个 Evidence 的某个 case 的一次标注版本）。"""
@@ -159,4 +169,5 @@ __all__ = [
     "ANNOTATION_REVIEW_DRAFT",
     "ANNOTATION_REVIEW_REVIEWED",
     "ANNOTATION_REVIEW_VALUES",
+    "ANNOTATION_REVIEW_TRANSITIONS",
 ]

@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.db.models.evidence_annotation_record import (
     ANNOTATION_REVIEW_DRAFT,
+    ANNOTATION_REVIEW_TRANSITIONS,
     ANNOTATION_REVIEW_VALUES,
     EvidenceAnnotationRecord,
 )
@@ -61,6 +62,8 @@ __all__ = [
     "EvidenceRepositoryError",
     "EvidenceNotFoundError",
     "InvalidEvidenceStatusTransitionError",
+    "AnnotationNotFoundError",
+    "InvalidAnnotationReviewTransitionError",
     "EvidenceRow",
     "EvidenceProvenanceRow",
     "EvidenceWithProvenance",
@@ -177,6 +180,14 @@ class EvidenceNotFoundError(EvidenceRepositoryError):
 
 class InvalidEvidenceStatusTransitionError(EvidenceRepositoryError):
     """非法状态迁移（禁止跳级）。"""
+
+
+class AnnotationNotFoundError(EvidenceRepositoryError):
+    """Annotation 不存在（评审迁移不得凭空创建 Annotation）。"""
+
+
+class InvalidAnnotationReviewTransitionError(EvidenceRepositoryError):
+    """非法 Annotation 评审迁移（Step 41：DRAFT → REVIEWED 单向；REVIEWED 为终态）。"""
 
 
 def _require_text(value: object, name: str, max_length: int) -> str:
@@ -328,6 +339,25 @@ class EvidenceRepository:
                 EvidenceAnnotationRecord.case_id,
                 EvidenceAnnotationRecord.annotation_version,
             )
+        )
+
+    def build_annotation_select_by_id(self, annotation_id: str) -> Any:
+        """按主键读取单条 Annotation（Step 41：评审前加载 + 读回校验）。"""
+        return (
+            select(*self._annotation_columns()).where(
+                EvidenceAnnotationRecord.annotation_id == annotation_id
+            )
+        )
+
+    def build_annotation_review_update(
+        self, annotation_id: str, review_status: str
+    ) -> Any:
+        """只更新 ``review_status`` + ``updated_at``（**不触碰**其余字段）。"""
+        return (
+            update(EvidenceAnnotationRecord)
+            .where(EvidenceAnnotationRecord.annotation_id == annotation_id)
+            .values(review_status=review_status, updated_at=func.now())
+            .returning(*self._annotation_columns())
         )
 
     # ---------- 读 ----------
@@ -507,6 +537,68 @@ class EvidenceRepository:
                 return AnnotationRow(*row)
         except SQLAlchemyError as exc:
             raise EvidenceRepositoryError(f"写入 Annotation 失败: {exc}") from exc
+
+    # ---------- Annotation Review Transition（Step 41）----------
+
+    def get_annotation(self, annotation_id: str) -> AnnotationRow | None:
+        """按主键读取 Annotation（不存在 → ``None``；与 ``get_evidence`` 同风格）。"""
+        validate_evidence_id(annotation_id)
+        factory = self._factory()
+        try:
+            with factory() as session:
+                row = session.execute(
+                    self.build_annotation_select_by_id(annotation_id)
+                ).first()
+        except SQLAlchemyError as exc:
+            raise EvidenceRepositoryError(f"读取 Annotation 失败: {exc}") from exc
+        return AnnotationRow(*row) if row is not None else None
+
+    def update_annotation_review_status(
+        self, annotation_id: str, review_status: str
+    ) -> AnnotationRow:
+        """**Annotation-only** 评审迁移：``DRAFT → REVIEWED``。
+
+        Step 41 边界（不得越界）：
+
+        * 只变更 ``review_status`` + ``updated_at``；
+          ``evidence_id`` / ``case_id`` / ``annotation_version`` / ``annotator_id``
+          / ``created_at`` 一律保持不变；
+        * **不联动** Evidence 状态 ——
+          ``PERSISTED → ANNOTATED`` 与 ``ANNOTATED → REVIEWED`` 均属 Step 43，
+          本方法绝不推进 Evidence；
+        * **先验证、后写入**：非法迁移 / 未知状态 / Annotation 不存在
+          → 抛错且数据库状态不变（禁止"先 UPDATE 再验证"）。
+
+        事务边界沿用 Step 37/40：Repository owns transaction
+        （``with factory() as session, session.begin():``）。
+        """
+        validate_evidence_id(annotation_id)
+        validate_review_status(review_status)
+        factory = self._factory()
+        try:
+            with factory() as session, session.begin():
+                row = session.execute(
+                    self.build_annotation_select_by_id(annotation_id)
+                ).first()
+                if row is None:
+                    raise AnnotationNotFoundError(
+                        f"Annotation 不存在: {annotation_id}"
+                    )
+                current_status = str(row[5])
+                if review_status not in ANNOTATION_REVIEW_TRANSITIONS[current_status]:
+                    raise InvalidAnnotationReviewTransitionError(
+                        f"非法 Annotation 评审迁移: {current_status} -> {review_status}"
+                    )
+                updated = session.execute(
+                    self.build_annotation_review_update(annotation_id, review_status)
+                ).first()
+                if updated is None:  # pragma: no cover
+                    raise EvidenceRepositoryError("Annotation 评审更新未返回结果")
+                return AnnotationRow(*updated)
+        except SQLAlchemyError as exc:
+            raise EvidenceRepositoryError(
+                f"更新 Annotation 评审状态失败: {exc}"
+            ) from exc
 
     # ---------- Provenance（Step 38：复用 Step 27 契约；与 Evidence 同行持久化）----------
 

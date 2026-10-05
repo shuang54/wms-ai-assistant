@@ -167,6 +167,16 @@ Conversation               （属 Step 44/45）
 
 建议 `Database Evolution = 0`（`review_status` 列已存在，仅补 Repository 迁移逻辑与校验）。
 
+**Step 41 实现状态：COMPLETE**
+
+```text
+ANNOTATION_REVIEW_TRANSITIONS = { DRAFT: (REVIEWED,), REVIEWED: () }
+EvidenceRepository.get_annotation(annotation_id)
+EvidenceRepository.update_annotation_review_status(annotation_id, review_status)
+异常：AnnotationNotFoundError · InvalidAnnotationReviewTransitionError
+DB Schema Changes = 0 · Evidence 状态机未联动 · 无 Service / 无 API
+```
+
 ---
 
 ## 五、Step 42 — Evidence Finalization Contract（重新定义）
@@ -421,7 +431,7 @@ RBAC · Multi-tenancy · Chat UI · Streaming · Long-term Memory · Tool market
 
 | ID  | Gap                                              | Impact                              | Required Step | Blocking |
 | --- | ------------------------------------------------ | ----------------------------------- | ------------- | -------- |
-| G-A | Annotation `review_status` 无迁移能力             | Review 无法落地                      | 41            | YES      |
+| G-A | ~~Annotation `review_status` 无迁移能力~~         | ~~Review 无法落地~~ **RESOLVED（Step 41）** | 41 | **CLOSED** |
 | G-B | Evidence REVIEWED ⇄ Annotation REVIEWED 关系未定义 | 状态一致性无法保证                   | 43            | YES      |
 | G-C | FINALIZED 后置不可变性未定义                      | Finalization 语义不完整              | 42            | YES      |
 | G-D | Conversation ↔ Evidence 关系未设计                | Step 45 无法定模型                   | 44            | YES      |

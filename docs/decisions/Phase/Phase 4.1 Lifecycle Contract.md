@@ -52,12 +52,19 @@ review_status 仅在 create_annotation() 时给定（默认 DRAFT）
 无 Repository 迁移方法   → UNDEFINED（Gap G-A）
 ```
 
-待 Step 41 冻结（本次**不冻结**）：
+**Step 41 已实现并冻结**（Repository：`EvidenceRepository.update_annotation_review_status`）：
 
-| Current | Event  | Next    | 状态       |
-| ------- | ------ | ------- | ---------- |
-| DRAFT   | review | REVIEWED | **UNDEFINED**（Step 41） |
-| REVIEWED | —     | —        | **UNDEFINED** 是否终态（Step 41） |
+| Current  | Event  | Next     | 状态                         |
+| -------- | ------ | -------- | ---------------------------- |
+| DRAFT    | review | REVIEWED | **FROZEN: ALLOWED**（Step 41） |
+| REVIEWED | revert | DRAFT    | **FROZEN: FORBIDDEN**（Step 41） |
+| REVIEWED | review | REVIEWED | **FROZEN: FORBIDDEN**（Step 41，重复评审） |
+| DRAFT    | —      | 未知状态（如 APPROVED） | **FROZEN: FORBIDDEN**（Step 41） |
+
+* `REVIEWED` = **终态**（`ANNOTATION_REVIEW_TRANSITIONS[REVIEWED] = ()`）；
+* 契约常量：`ANNOTATION_REVIEW_TRANSITIONS`（`models/evidence_annotation_record.py`）；
+* 未扩展状态值域（无 APPROVED / REJECTED / FINALIZED / ARCHIVED / CANCELLED），
+  未新增 `reviewed_at` / `reviewer_id` / `review_comment` 等字段。
 
 ---
 
@@ -73,13 +80,18 @@ review_status 仅在 create_annotation() 时给定（默认 DRAFT）
 事务   = Repository owns（with factory() as session, session.begin():）
 ```
 
-### Annotation（UNDEFINED → Step 41）
+### Annotation（Step 41 已 FROZEN）
 
 ```text
-合法迁移   = UNDEFINED
-非法迁移   = UNDEFINED
-失败语义   = UNDEFINED（建议沿用 typed error，由 Step 41 决定）
-事务边界   = UNDEFINED（建议沿用 Step 40 冻结的 Repository transaction pattern）
+合法迁移   = DRAFT → REVIEWED（唯一）
+非法迁移   = REVIEWED → DRAFT · REVIEWED → REVIEWED · 任何未知状态
+失败语义   = InvalidAnnotationReviewTransitionError（typed，继承自
+             EvidenceRepositoryError）；Annotation 不存在 → AnnotationNotFoundError
+验证顺序   = 先验证迁移 → 后写入（禁止先 UPDATE 再验证；失败时 DB 状态不变）
+事务边界   = Repository owns（with factory() as session, session.begin():）
+联动禁止   = 不推进 Evidence 状态（PERSISTED→ANNOTATED / ANNOTATED→REVIEWED 属 Step 43）
+字段隔离   = 仅 review_status + updated_at 可变；evidence_id / case_id /
+             annotation_version / annotator_id / created_at 保持不变
 ```
 
 ### 跨实体触发规则（UNDEFINED → Step 43）
@@ -139,7 +151,9 @@ Evidence: 状态值越界              → validate_evidence_status 拒绝
 **UNDEFINED（待 Step 41/42/43）**：
 
 ```text
-Annotation: REVIEWED → DRAFT（回退）是否禁止        UNDEFINED
+Annotation: REVIEWED → DRAFT（回退）               FROZEN: 禁止（Step 41）
+Annotation: REVIEWED → REVIEWED（重复评审）         FROZEN: 禁止（Step 41）
+Annotation: 未知状态（如 APPROVED）                 FROZEN: 禁止（Step 41）
 Annotation: 同 (evidence_id, case_id, annotation_version) 重复  已有 UNIQUE 约束（FROZEN）
 Evidence FINALIZED 状态下新增 / 修改 Annotation     UNDEFINED
 Evidence FINALIZED 状态下修改 Provenance            UNDEFINED
@@ -173,8 +187,8 @@ Annotation REVIEWED 后是否不可变                 UNDEFINED（Step 41）
 
 | ID   | Open Decision                                              | 归属 Step |
 | ---- | ---------------------------------------------------------- | --------- |
-| OD-1 | Annotation `review_status` 合法/非法迁移与失败语义           | 41        |
-| OD-2 | `REVIEWED` 是否为 Annotation 终态                            | 41        |
+| OD-1 | ~~Annotation `review_status` 合法/非法迁移与失败语义~~ **CLOSED（Step 41）** | 41 |
+| OD-2 | ~~`REVIEWED` 是否为 Annotation 终态~~ **CLOSED（Step 41）：是，终态** | 41 |
 | OD-3 | Finalization Precondition（是否要求全部 Annotation REVIEWED） | 42        |
 | OD-4 | FINALIZED 后 Annotation / Provenance 不可变性               | 42        |
 | OD-5 | Allowed State Matrix 的 ALLOWED / FORBIDDEN 判定            | 43        |
