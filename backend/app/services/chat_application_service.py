@@ -22,7 +22,14 @@ ChatApplicationService
     8. 条件式 append ASSISTANT turn  （仅当存在可展示 content 且 metadata.request_id 合法）
     9. 原样返回 AIOrchestrationResult
 
-Context 语义（Step 13 / Step 14 冻结）：
+Context 语义（Step 13 / Step 14 冻结；Phase 4.2 Step 7E 追加 Selection 层）：
+
+    * ``previous_turns``（排除 current turn）→ ``select_history``（Step 7C 契约：
+      ≤20 turns · ≤12000 content 字符 · 最新 turn 豁免 · 连续后缀 · USER-anchored）
+      → ``build_context``（纯格式化）—— Selection ≠ Formatting（Step 7B 冻结）；
+    * 选择层只读 ``turn_id``（仅用于排除）/ ``role`` / ``content``，**不读**
+      ``idempotency_key`` / ``assistant_request_id`` / ``created_at``；
+
 
     * ``context`` 只包含**历史**（previous turns）；首个 turn →
       ``build_context(())`` → ``None``（不伪造 "" / "None" / 当前问题）；
@@ -110,6 +117,9 @@ from typing import Final, Protocol
 from backend.app.services.ai_orchestrator_service import AIOrchestrationResult
 from backend.app.services.conversation_context_builder import (
     ConversationContextBuilder,
+)
+from backend.app.services.conversation_context_selection_service import (
+    select_history,
 )
 from backend.app.services.conversation_service import (
     IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD,
@@ -423,10 +433,18 @@ class ChatApplicationService:
         previous_turns = tuple(
             turn for turn in history if turn.turn_id != user_turn.turn_id
         )
-        # Context Builder（Step 13；唯一入口 build_context；纯内存）——
-        # 首个 turn → previous_turns == () → context = None；
+        # Context Selection（Phase 4.2 Step 7E；Step 7C 冻结契约）：
+        # 整 turn 窗口（≤20 turns · ≤12000 content 字符 · 最新 turn 豁免 ·
+        # 连续后缀 · USER-anchored）—— 纯函数、只读 turn_id/role/content，
+        # 不排序（顺序来自 Repository）、不截断、不读 idempotency_key。
+        selected_turns = select_history(
+            previous_turns,
+            current_turn_id=user_turn.turn_id,
+        )
+        # Context Builder（Step 13；唯一入口 build_context；纯内存格式化）——
+        # 窗口为空 → context = None；
         # 构建失败：AI = 0，异常原样上抛（**不**包装 / **不**降级）。
-        context = self._context_builder.build_context(previous_turns)
+        context = self._context_builder.build_context(selected_turns)
 
         # AI execution（**事务之外**；project = conversation.project_id；
         # question = 当前问题，context = 仅历史 —— 当前问题不重复进 context）

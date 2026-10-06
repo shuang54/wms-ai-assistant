@@ -275,9 +275,10 @@ class TestRagServiceCurrentState:
 
         assert "current_assistant_request_id()" in source
         assert "RagExecutionObservation" in source
-        # 公开 API 契约不变（request_id 不是参数）
+        # 公开 API 契约（request_id 仍**不是**参数；Phase 4.2 Step 7F 新增
+        # 可选 conversation_context —— untrusted reference，与观测无关）
         assert list(inspect.signature(RagService.answer).parameters) == [
-            "self", "query", "top_k", "knowledge_scope",
+            "self", "query", "top_k", "knowledge_scope", "conversation_context",
         ]
         assert "request_id" not in inspect.signature(
             RagService.answer

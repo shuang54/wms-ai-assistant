@@ -49,6 +49,8 @@ _ALLOWED_IMPORT_PREFIXES: tuple[str, ...] = (
     "typing",
     "backend.app.services.conversation_service",
     "backend.app.services.conversation_context_builder",
+    # Phase 4.2 Step 7E：Selection 层（纯函数窗口选择）
+    "backend.app.services.conversation_context_selection_service",
     "backend.app.services.ai_orchestrator_service",
     "backend.app.services.project_orchestrator_factory",
 )

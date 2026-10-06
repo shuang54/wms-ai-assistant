@@ -74,6 +74,8 @@ _APPLICATION_SERVICE_ALLOWED_PREFIXES: tuple[str, ...] = (
     # Phase 4.2 Step 6：MessageReplay（frozen DTO）
     "dataclasses",
     "typing",
+    # Phase 4.2 Step 7E：Selection 层（Step 7C 契约实现）
+    "backend.app.services.conversation_context_selection_service",
     "backend.app.services.conversation_service",
     "backend.app.services.conversation_context_builder",
     "backend.app.services.ai_orchestrator_service",
