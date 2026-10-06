@@ -211,7 +211,12 @@ class TestConversationChainBoundary:
 
     def test_2d_application_service_execute_signature_unchanged(self) -> None:
         params = _call_parameter_names(_APPLICATION_SERVICE, "execute_message")
-        assert params - {"self"} == {"conversation_id", "content"}
+        # Phase 4.2 Step 6：新增可选幂等键（不改 Context / 选择语义）
+        assert params - {"self"} == {
+            "conversation_id",
+            "content",
+            "idempotency_key",
+        }
 
     def test_2e_conversation_service_methods_have_no_policy(self) -> None:
         for function_name in (

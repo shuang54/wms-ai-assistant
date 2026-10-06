@@ -28,6 +28,12 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.app.db.base import Base
+from backend.app.db.models.conversation_turn import (
+    CONVERSATION_SCHEMA,
+    CONVERSATION_TURN_IDEMPOTENCY_INDEX,
+    CONVERSATION_TURN_TABLE,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+)
 from backend.app.db.models.llm_usage_record import (
     LLM_USAGE_ASSISTANT_REQUEST_ID_INDEX,
     LLM_USAGE_REQUEST_ID_INDEX,
@@ -183,6 +189,101 @@ def ensure_assistant_request_id_index(conn: Any) -> bool:
     return True
 
 
+# Phase 4.2 Step 6：Conversation 消息幂等键（``conversation_turn.idempotency_key``）。
+#
+# 与 request_id / assistant_request_id 同理：`Base.metadata.create_all(
+# checkfirst=True)` 对**已存在**的表整体跳过，不会补建后来新增的列与索引 →
+# 已存在的库必须通过本 DDL 显式补齐，同时对全新库仍然幂等（`IF NOT EXISTS`）。
+#
+# nullable：历史行与"未提供 Idempotency-Key"的请求必须保持 NULL（**不 backfill**）。
+# 唯一索引：标准 UNIQUE（**非** NULLS NOT DISTINCT）⇒ NULL 互不冲突，历史行不受约束。
+_TURN_TABLE: Final[str] = f"{CONVERSATION_SCHEMA}.{CONVERSATION_TURN_TABLE}"
+_CREATE_TURN_IDEMPOTENCY_KEY_COLUMN_SQL: Final[str] = (
+    f"ALTER TABLE {_TURN_TABLE} "
+    f"ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR({IDEMPOTENCY_KEY_MAX_LENGTH})"
+)
+_CREATE_TURN_IDEMPOTENCY_UNIQUE_INDEX_SQL: Final[str] = (
+    f"CREATE UNIQUE INDEX IF NOT EXISTS {CONVERSATION_TURN_IDEMPOTENCY_INDEX} "
+    f"ON {_TURN_TABLE} (conversation_id, idempotency_key)"
+)
+_DUPLICATE_TURN_IDEMPOTENCY_KEY_SQL: Final[str] = (
+    "SELECT conversation_id, idempotency_key, COUNT(*) AS cnt FROM "
+    f"{_TURN_TABLE} "
+    "WHERE idempotency_key IS NOT NULL "
+    "GROUP BY conversation_id, idempotency_key HAVING COUNT(*) > 1 "
+    "ORDER BY conversation_id"
+)
+
+
+def ensure_conversation_turn_idempotency_key_column(conn: Any) -> bool:
+    """确保 `ai_ops.conversation_turn.idempotency_key` 列存在（Phase 4.2 Step 6）。
+
+    幂等行为：列已存在 → 什么都不做（`ADD COLUMN IF NOT EXISTS`）；
+    不修改任何已有数据（历史行保持 NULL），不新建表、不引入 Alembic。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  列已存在或本次成功新增。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+    """
+    if not inspect(conn).has_table(
+        CONVERSATION_TURN_TABLE, schema=CONVERSATION_SCHEMA
+    ):
+        return False
+
+    conn.execute(text(_CREATE_TURN_IDEMPOTENCY_KEY_COLUMN_SQL))
+    logger.info("conversation_turn idempotency_key column ensured")
+    return True
+
+
+def ensure_conversation_turn_idempotency_unique_index(conn: Any) -> bool:
+    """确保 `UNIQUE(conversation_id, idempotency_key)` 存在（Phase 4.2 Step 6）。
+
+    并发最终保证层（Step 1A §10 / Step 4A §12）：应用层 check-then-act
+    **不作**为唯一手段，重复插入由该索引兜底。
+
+    已有库保护（沿用 `ensure_request_id_idempotency_index` 先例 ——
+    **绝不**自动清理数据）：检测到重复 (conversation_id, idempotency_key)
+    → 明确报告并停止（raise RuntimeError），不 DELETE / 不 UPDATE。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  索引已存在或本次成功创建。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+
+    Raises:
+        RuntimeError: 检测到重复幂等键数据（需要人工处理）。
+    """
+    if not inspect(conn).has_table(
+        CONVERSATION_TURN_TABLE, schema=CONVERSATION_SCHEMA
+    ):
+        return False
+
+    duplicates = list(
+        conn.execute(text(_DUPLICATE_TURN_IDEMPOTENCY_KEY_SQL)).all()
+    )
+    if duplicates:
+        detail = ", ".join(
+            f"{conversation_id}/{key}={count} 条"
+            for conversation_id, key, count in duplicates[:10]
+        )
+        raise RuntimeError(
+            "无法创建 conversation_turn 幂等唯一索引："
+            f"已存在 {len(duplicates)} 组重复 (conversation_id, idempotency_key)"
+            f"（示例：{detail}）。"
+            "本阶段不会自动删除 / 合并 / 更新任何数据——"
+            "请先人工确认并处理重复记录后重试。"
+        )
+
+    conn.execute(text(_CREATE_TURN_IDEMPOTENCY_UNIQUE_INDEX_SQL))
+    logger.info("conversation_turn idempotency unique index ensured")
+    return True
+
+
 def init_db() -> None:
     """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引 / 关联列。
 
@@ -194,12 +295,19 @@ def init_db() -> None:
           历史数据保持 NULL（Phase 3.12 Step 36）
         - assistant_request_id 索引已存在 → 不报错（IF NOT EXISTS，
           Phase 3.12 Step 52；不改任何数据）
+        - conversation_turn.idempotency_key 列已存在 → 不报错（IF NOT EXISTS，
+          Phase 4.2 Step 6；历史行保持 NULL，不 backfill）
+        - 幂等唯一索引已存在 → 不报错（IF NOT EXISTS，Phase 4.2 Step 6）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
         RuntimeError: DB 不可达、extension 不可用或 DDL 失败。
         RuntimeError: llm_usage_record 中已存在重复 request_id
                       （见 :func:`ensure_request_id_idempotency_index`）。
+        RuntimeError: conversation_turn 中已存在重复
+                      (conversation_id, idempotency_key)
+                      （见
+                      :func:`ensure_conversation_turn_idempotency_unique_index`）。
     """
     engine = get_engine()
     if engine is None:
@@ -234,6 +342,12 @@ def init_db() -> None:
             #    （普通 B-tree · 非唯一；对已存在的表显式补齐；
             #     只影响执行计划，不改变查询结果 / 数据）
             ensure_assistant_request_id_index(conn)
+
+            # 8. Phase 4.2 Step 6：Conversation 消息幂等键
+            #    （列 + UNIQUE(conversation_id, idempotency_key)；
+            #      历史行保持 NULL · 不 backfill · 不清理数据）
+            ensure_conversation_turn_idempotency_key_column(conn)
+            ensure_conversation_turn_idempotency_unique_index(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -263,6 +377,8 @@ __all__ = [
     "ensure_request_id_idempotency_index",
     "ensure_assistant_request_id_column",
     "ensure_assistant_request_id_index",
+    "ensure_conversation_turn_idempotency_key_column",
+    "ensure_conversation_turn_idempotency_unique_index",
 ]
 
 

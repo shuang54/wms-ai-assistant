@@ -6,8 +6,14 @@
     get_conversation(conversation_id)                     读取会话（无记录 → None）
     archive_conversation(conversation_id)                 归档（幂等；ACTIVE → ARCHIVED）
     append_turn(*, conversation_id, role, content,
-                assistant_request_id)                     追加一条消息
+                assistant_request_id, idempotency_key=None)   追加一条消息
     list_turns(conversation_id)                           消息列表（created_at, turn_id）
+    find_turn_by_idempotency_key(*)                       按 (conversation_id,
+                                                          idempotency_key) 查 USER Turn
+    find_assistant_turn_after(*)                          指定 USER Turn 之后的
+                                                          第一个 ASSISTANT Turn
+    message_fingerprint(*)                                请求 payload 指纹
+                                                          （SHA-256；不落库）
 
 边界（严格）：
 
@@ -29,6 +35,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,10 +50,12 @@ from backend.app.db.conversation_repository import (
     ConversationNotFoundRepositoryError,
     ConversationRepository,
     ConversationRow,
+    ConversationTurnIdempotencyConflictRepositoryError,
     ConversationTurnRow,
     validate_assistant_request_id,
     validate_content,
     validate_conversation_id,
+    validate_idempotency_key,
     validate_project_id,
     validate_role,
 )
@@ -56,11 +65,26 @@ __all__ = [
     "ConversationServiceError",
     "ConversationNotFoundError",
     "ConversationArchivedError",
+    "ConversationMessageIdempotencyConflictError",
+    "IdempotencyKeyReusedWithDifferentPayloadError",
+    "IdempotencyKeyInFlightError",
     "ConversationView",
     "ConversationTurnView",
     "new_conversation_id",
+    "message_fingerprint",
     "CONVERSATION_ID_PREFIX",
+    "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD",
+    "IDEMPOTENCY_KEY_IN_FLIGHT",
 ]
+
+#: 错误码（Phase 4.2 Step 6；固定文案，供 API 层 409 detail 使用）。
+IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD: Final[str] = (
+    "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD"
+)
+IDEMPOTENCY_KEY_IN_FLIGHT: Final[str] = "IDEMPOTENCY_KEY_IN_FLIGHT"
+
+#: 指纹分隔符（避免 ``conversation_id + content`` 拼接歧义；不参与任何 ID 体系）。
+_FINGERPRINT_SEPARATOR: Final[str] = "\x1f"
 
 #: 仅用于日志 / 错误文案标识（conversation_id 本身无前缀）。
 CONVERSATION_ID_PREFIX: Final[str] = "conv"
@@ -107,6 +131,46 @@ class ConversationNotFoundError(ConversationServiceError):
 
 class ConversationArchivedError(ConversationServiceError):
     """ARCHIVED 会话不允许追加 Turn。"""
+
+
+class ConversationMessageIdempotencyConflictError(ConversationServiceError):
+    """消息幂等冲突基类（Phase 4.2 Step 6）→ HTTP **409**。
+
+    语义：请求**未被静默执行**（AI = 0 次），客户端需按 409 语义处理
+    （换 key 重试 / 稍后重试）。**不是** 500（不是基础设施失败）。
+    """
+
+
+class IdempotencyKeyReusedWithDifferentPayloadError(
+    ConversationMessageIdempotencyConflictError
+):
+    """同一 (conversation_id, idempotency_key) 但 payload 不同（同 key 异内容）。"""
+
+
+class IdempotencyKeyInFlightError(ConversationMessageIdempotencyConflictError):
+    """同一 (conversation_id, idempotency_key) 已被占用（并发 / 未决请求）。
+
+    由 ``UNIQUE(conversation_id, idempotency_key)`` 冲突映射而来
+    （Step 6 §13；并发最终保证层是数据库，不是应用层 check-then-act）。
+    """
+
+
+def message_fingerprint(*, conversation_id: str, content: str) -> str:
+    """请求 payload 指纹（Phase 4.2 Step 1A §8 / Step 6 §7）。
+
+    ```text
+    SHA-256(conversation_id + content)
+    ```
+
+    * **不落库**（不需要 fingerprint 列）：已持久化的 USER Turn 保存了
+      ``content``，请求进入时用同一函数现算再比对；
+    * 幂等键本身**不进入**指纹（指纹判断"同 key 是否为同请求"）；
+    * 用途唯一：同 key 不同 payload → 冲突（**不**静默执行第二条）。
+    """
+    validated_id = validate_conversation_id(conversation_id)
+    validated_content = validate_content(content)
+    payload = f"{validated_id}{_FINGERPRINT_SEPARATOR}{validated_content}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _to_conversation_view(row: ConversationRow) -> ConversationView:
@@ -214,6 +278,7 @@ class ConversationService:
         role: str,
         content: str,
         assistant_request_id: str | None,
+        idempotency_key: str | None = None,
     ) -> ConversationTurnView:
         """追加一条消息（业务规则 owner；ARCHIVED 在写入前拒绝）。
 
@@ -222,21 +287,33 @@ class ConversationService:
             USER      → assistant_request_id 必须为 None
             ASSISTANT → assistant_request_id 必须非空
 
+        Phase 4.2 Step 6（§11 硬规则）：
+
+            idempotency_key **只写 USER Turn**
+            ASSISTANT → idempotency_key 必须为 None
+
         Raises:
             ValueError:                   字段非法 / role 与 request 组合非法。
             ConversationNotFoundError:    会话不存在。
             ConversationArchivedError:    会话已归档（**DB write = 0**）。
+            IdempotencyKeyInFlightError:  幂等键已被同一会话占用（并发）。
             ConversationRepositoryError:   DB 未配置或写入失败。
         """
         validated_id = validate_conversation_id(conversation_id)
         validated_role = validate_role(role)
         validated_content = validate_content(content)
         validated_request_id = validate_assistant_request_id(assistant_request_id)
+        validated_key = validate_idempotency_key(idempotency_key)
 
         if validated_role == TURN_ROLE_USER and validated_request_id is not None:
             raise ValueError("USER turn 的 assistant_request_id 必须为 None")
         if validated_role == TURN_ROLE_ASSISTANT and validated_request_id is None:
             raise ValueError("ASSISTANT turn 的 assistant_request_id 必须非空")
+        if validated_role == TURN_ROLE_ASSISTANT and validated_key is not None:
+            raise ValueError(
+                "ASSISTANT turn 的 idempotency_key 必须为 None"
+                "（幂等键只写 USER Turn）"
+            )
 
         # 状态守卫（写入前判定：write before reject = 0）
         current = self._repository.get_by_conversation_id(validated_id)
@@ -251,11 +328,17 @@ class ConversationService:
                 role=validated_role,
                 content=validated_content,
                 assistant_request_id=validated_request_id,
+                idempotency_key=validated_key,
             )
         except ConversationNotFoundRepositoryError as exc:
             raise ConversationNotFoundError(str(exc)) from exc
         except ConversationArchivedRepositoryError as exc:
             raise ConversationArchivedError(str(exc)) from exc
+        except ConversationTurnIdempotencyConflictRepositoryError as exc:
+            raise IdempotencyKeyInFlightError(
+                f"{IDEMPOTENCY_KEY_IN_FLIGHT}: 相同 Idempotency-Key 的请求"
+                "正在处理或已提交，请稍后重试或使用新的 Idempotency-Key"
+            ) from exc
         return _to_turn_view(row)
 
     def list_turns(self, conversation_id: str) -> tuple[ConversationTurnView, ...]:
@@ -271,3 +354,54 @@ class ConversationService:
         except ConversationNotFoundRepositoryError as exc:
             raise ConversationNotFoundError(str(exc)) from exc
         return tuple(_to_turn_view(row) for row in rows)
+
+    def find_turn_by_idempotency_key(
+        self,
+        *,
+        conversation_id: str,
+        idempotency_key: str | None,
+    ) -> ConversationTurnView | None:
+        """按 ``(conversation_id, idempotency_key)`` 读 USER Turn；无记录 → ``None``。
+
+        Phase 4.2 Step 6（§15）：请求进入时**先查**幂等键（避免"先创建 USER
+        再发现 duplicate"）。``idempotency_key`` 为 None / 空白 → 返回 ``None``
+        （= 本请求不参与幂等，走历史行为）。
+
+        Raises:
+            ValueError:                   conversation_id 非法 / key 超长。
+            ConversationRepositoryError:  DB 未配置或读取失败。
+        """
+        validated_id = validate_conversation_id(conversation_id)
+        validated_key = validate_idempotency_key(idempotency_key)
+        if validated_key is None:
+            return None
+        row = self._repository.find_turn_by_idempotency_key(
+            conversation_id=validated_id, idempotency_key=validated_key
+        )
+        if row is None:
+            return None
+        return _to_turn_view(row)
+
+    def find_assistant_turn_after(
+        self,
+        *,
+        conversation_id: str,
+        after_turn_id: int,
+    ) -> ConversationTurnView | None:
+        """读取 ``after_turn_id`` 之后的第一个 ASSISTANT Turn；无记录 → ``None``。
+
+        Phase 4.2 Step 6（§16）：``completed = USER Turn + 其后 ASSISTANT Turn``；
+        归属只依赖 ``conversation_id`` + ``turn_id`` 顺序，**不**通过
+        ``assistant_request_id`` 反查（correlation only）。
+
+        Raises:
+            ValueError:                   参数非法。
+            ConversationRepositoryError:  DB 未配置或读取失败。
+        """
+        validated_id = validate_conversation_id(conversation_id)
+        row = self._repository.find_next_assistant_turn(
+            conversation_id=validated_id, after_turn_id=after_turn_id
+        )
+        if row is None:
+            return None
+        return _to_turn_view(row)

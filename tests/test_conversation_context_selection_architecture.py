@@ -243,6 +243,8 @@ class TestChatApplicationServiceBoundary:
             "__future__",
             "logging",
             "collections.abc",
+            # Phase 4.2 Step 6：MessageReplay（frozen DTO）
+            "dataclasses",
             "typing",
             "backend.app.services.conversation_service",
             "backend.app.services.conversation_context_builder",

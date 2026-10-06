@@ -41,6 +41,7 @@ from backend.app.db.conversation_repository import (
 )
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_turn import (
+    CONVERSATION_TURN_IDEMPOTENCY_INDEX,
     CONVERSATION_TURN_INDEX,
     ConversationTurn,
 )
@@ -171,6 +172,7 @@ class TestOrmSchemaContract:
 
         assert table.schema == "ai_ops"
         assert table.name == "conversation_turn"
+        # Phase 4.2 Step 6：新增 idempotency_key（7 列）
         assert set(table.columns.keys()) == {
             "turn_id",
             "conversation_id",
@@ -178,6 +180,7 @@ class TestOrmSchemaContract:
             "content",
             "assistant_request_id",
             "created_at",
+            "idempotency_key",
         }
         assert table.c.turn_id.primary_key is True
         assert isinstance(table.c.turn_id.type, BigInteger)
@@ -188,6 +191,32 @@ class TestOrmSchemaContract:
         assert table.c.assistant_request_id.nullable is True  # USER 为 NULL
         assert isinstance(table.c.assistant_request_id.type, String)
         assert table.c.assistant_request_id.type.length == 128
+        # Phase 4.2 Step 6：幂等键列（NULL 兼容历史行；只写 USER Turn）
+        assert table.c.idempotency_key.nullable is True
+        assert isinstance(table.c.idempotency_key.type, String)
+        assert table.c.idempotency_key.type.length == 128
+
+    def test_idempotency_key_unique_index_contract(self) -> None:
+        """Phase 4.2 Step 6：UNIQUE(conversation_id, idempotency_key)。
+
+        * **非** UNIQUE(idempotency_key)：scope = conversation（跨会话隔离）；
+        * 标准 UNIQUE（无 NULLS NOT DISTINCT）⇒ 历史 NULL 行不受约束。
+        """
+        table = ConversationTurn.__table__
+        index = next(
+            (
+                candidate
+                for candidate in table.indexes
+                if candidate.name == CONVERSATION_TURN_IDEMPOTENCY_INDEX
+            ),
+            None,
+        )
+        assert index is not None, CONVERSATION_TURN_IDEMPOTENCY_INDEX
+        assert index.unique is True
+        assert [column.name for column in index.columns] == [
+            "conversation_id",
+            "idempotency_key",
+        ]
 
     def test_turn_foreign_key_is_conversation_cascade(self) -> None:
         table = ConversationTurn.__table__
@@ -206,9 +235,18 @@ class TestOrmSchemaContract:
     def test_only_composite_index_exists(self) -> None:
         table = ConversationTurn.__table__
 
-        assert len(table.indexes) == 1
-        index = next(iter(table.indexes))
-        assert index.name == CONVERSATION_TURN_INDEX
+        # Phase 4.2 Step 6：1（列表排序） + 1（幂等唯一）= 2
+        assert len(table.indexes) == 2
+        names = {index.name for index in table.indexes}
+        assert names == {
+            CONVERSATION_TURN_INDEX,
+            CONVERSATION_TURN_IDEMPOTENCY_INDEX,
+        }
+        index = next(
+            candidate
+            for candidate in table.indexes
+            if candidate.name == CONVERSATION_TURN_INDEX
+        )
         assert [column.name for column in index.columns] == [
             "conversation_id",
             "created_at",
@@ -716,6 +754,7 @@ class TestPersistenceSecurityContract:
             "updated_at",
             "status",
         )
+        # Phase 4.2 Step 6：新增 idempotency_key（显式列；不用 SELECT *）
         assert CONVERSATION_TURN_READ_COLUMNS == (
             "turn_id",
             "conversation_id",
@@ -723,6 +762,7 @@ class TestPersistenceSecurityContract:
             "content",
             "assistant_request_id",
             "created_at",
+            "idempotency_key",
         )
 
     def test_no_sensitive_columns_exist(self) -> None:

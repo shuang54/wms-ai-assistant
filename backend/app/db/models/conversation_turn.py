@@ -1,6 +1,6 @@
 """ConversationTurn ORM Model（Phase 4.1 Step 5 —— 最小持久化层）。
 
-严格对应 Step 2 冻结的 6 字段模型：
+Step 2 冻结的 6 字段模型 + Phase 4.2 Step 6 新增 1 个幂等列：
 
     ConversationTurn（一行 = 一条消息；一次对话回合 = USER + ASSISTANT 两行）
     ├── turn_id               BigInteger PK 自增
@@ -8,6 +8,7 @@
     ├── role                  String(32) NOT NULL（USER / ASSISTANT）
     ├── content               Text NOT NULL（仅用户可见文本）
     ├── assistant_request_id  String(128) NULL（correlation；**不是** ForeignKey）
+    ├── idempotency_key       String(128) NULL（Phase 4.2 Step 6；仅 USER Turn；不进入任何 ID 体系）
     └── created_at            DateTime(timezone=True) server_default=now()
 
 关键边界：
@@ -59,9 +60,22 @@ TURN_ROLE_ASSISTANT: Final[str] = "ASSISTANT"
 #: assistant_request_id 列宽（与观测表同名的 VARCHAR(128) 一致）。
 ASSISTANT_REQUEST_ID_MAX_LENGTH: Final[int] = 128
 
+#: idempotency_key 列宽（Phase 4.2 Step 6；客户端请求幂等键，服务端不生成）。
+IDEMPOTENCY_KEY_MAX_LENGTH: Final[int] = 128
+
 #: 唯一复合索引（列表 + 时间排序；Step 2 §14 / Step 4 §8 冻结）。
 CONVERSATION_TURN_INDEX: Final[str] = (
     "ix_conversation_turn_conversation_id_created_at"
+)
+
+#: 幂等唯一索引（Phase 4.2 Step 6；``UNIQUE(conversation_id, idempotency_key)``）。
+#:
+#: * **非 partial · 非 NULLS NOT DISTINCT**：PostgreSQL 标准 UNIQUE 下 NULL
+#:   互不冲突 ⇒ 历史行（``idempotency_key IS NULL``）与无幂等请求**不受约束**；
+#: * 幂等键**只写 USER Turn**（ASSISTANT 恒 NULL）⇒ 同一请求在库内只有一行带键；
+#: * scope = conversation ⇒ 不同会话的同名 key 互相独立。
+CONVERSATION_TURN_IDEMPOTENCY_INDEX: Final[str] = (
+    "uq_conversation_turn_conversation_id_idempotency_key"
 )
 
 
@@ -116,6 +130,16 @@ class ConversationTurn(Base):
         ),
     )
 
+    # ---- 请求幂等键（Phase 4.2 Step 6；**只写 USER Turn**）----
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(IDEMPOTENCY_KEY_MAX_LENGTH),
+        nullable=True,
+        comment=(
+            "客户端请求幂等键（Header Idempotency-Key；仅 USER Turn；"
+            "NULL = 无幂等；UNIQUE(conversation_id, idempotency_key)）"
+        ),
+    )
+
     # ---- 时间戳 ----
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -126,6 +150,12 @@ class ConversationTurn(Base):
 
     __table_args__ = (
         Index(CONVERSATION_TURN_INDEX, "conversation_id", "created_at"),
+        Index(
+            CONVERSATION_TURN_IDEMPOTENCY_INDEX,
+            "conversation_id",
+            "idempotency_key",
+            unique=True,
+        ),
         {"schema": CONVERSATION_SCHEMA},
     )
 
@@ -140,8 +170,10 @@ __all__ = [
     "ConversationTurn",
     "CONVERSATION_TURN_TABLE",
     "CONVERSATION_TURN_INDEX",
+    "CONVERSATION_TURN_IDEMPOTENCY_INDEX",
     "TURN_ROLE_MAX_LENGTH",
     "TURN_ROLE_USER",
     "TURN_ROLE_ASSISTANT",
     "ASSISTANT_REQUEST_ID_MAX_LENGTH",
+    "IDEMPOTENCY_KEY_MAX_LENGTH",
 ]

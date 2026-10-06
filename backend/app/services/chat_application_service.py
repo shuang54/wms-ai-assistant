@@ -72,11 +72,39 @@ Content 语义（Step 2 §8 / Step 10 §7 冻结）：
 
 不在本层（Deferred）：Memory / Summary / Token Budget / Regenerate /
 Auth / Pagination / Prompt 模板 / Context 缓存。
+
+Phase 4.2 Step 6 —— 消息幂等（契约已冻结，直接实现）：
+
+```text
+请求进入
+    ↓
+Conversation 读（不存在 → 404；ARCHIVED → 409；写入前拒绝）
+    ↓
+idempotency_key 为空/空白  → 历史行为（每次独立；不生成 key）
+idempotency_key 非空
+    ├─ 已存在 USER Turn
+    │     ├─ payload 指纹不一致 → IdempotencyKeyReusedWithDifferentPayloadError（409）
+    │     ├─ 其后存在 ASSISTANT Turn → COMPLETED → MessageReplay（AI = 0 次）
+    │     └─ 其后无 ASSISTANT Turn  → NOT_COMPLETED → 复用既有 USER Turn 重试
+    └─ 不存在 USER Turn → append_turn（TX1；幂等键随 USER Turn 写入）
+```
+
+OD-26（EMPTY = NOT completed）：无 ASSISTANT Turn 即视为未完成，允许重试；
+幂等键**永远不会锁死**一个失败请求。
+
+OD-34（Duplicate = Message Replay）：重放只返回**已持久化的 assistant message**
+（content + assistant_request_id）；`route / data / metadata` 未持久化 ⇒ 一律
+**不伪造**（转到 :class:`MessageReplay`，由 API 层映射为 `route=null`）。
+
+并发（Step 6 §12/§13）：应用层 check-then-act **不是**唯一手段；最终保证层 =
+``UNIQUE(conversation_id, idempotency_key)``，冲突映射为
+``IdempotencyKeyInFlightError``（409，**不是** 500）。
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Final, Protocol
 
 from backend.app.services.ai_orchestrator_service import AIOrchestrationResult
@@ -84,15 +112,20 @@ from backend.app.services.conversation_context_builder import (
     ConversationContextBuilder,
 )
 from backend.app.services.conversation_service import (
+    IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD,
     ConversationArchivedError,
     ConversationNotFoundError,
     ConversationService,
+    ConversationTurnView,
+    IdempotencyKeyReusedWithDifferentPayloadError,
+    message_fingerprint,
 )
 
 __all__ = [
     "ChatApplicationService",
     "ChatOrchestrator",
     "OrchestratorFactory",
+    "MessageReplay",
     "ASSISTANT_ROLE",
     "USER_ROLE",
     "CONVERSATION_STATUS_ARCHIVED",
@@ -111,6 +144,26 @@ CONVERSATION_STATUS_ARCHIVED: Final[str] = "ARCHIVED"
 
 #: Assistant Trace ID 在 AIOrchestrationResult.metadata 中的 key（Step 10 §6 冻结）。
 REQUEST_ID_METADATA_KEY: Final[str] = "request_id"
+
+
+@dataclass(frozen=True)
+class MessageReplay:
+    """**Duplicate 重放**结果（Phase 4.2 Step 6 / OD-34）。
+
+    ``Message Replay`` ≠ ``AI Result Replay``：
+
+    * 只承载**已持久化的 assistant message**（``content`` +
+      ``assistant_request_id``）；
+    * ``route / data / metadata`` **从未**写入 ``conversation_turn``，因此这里
+      **不提供**、也**不得**伪造（API 层映射为 ``route=null · data=null``）；
+    * AI 执行次数 = **0**，不创建第二条 USER / ASSISTANT Turn。
+
+    ``assistant_request_id`` 取自 ASSISTANT Turn（**不重新生成**），仅作
+    Trace correlation（Phase 4.1 冻结：correlation only）。
+    """
+
+    content: str
+    assistant_request_id: str | None
 
 
 class ChatOrchestrator(Protocol):
@@ -217,6 +270,87 @@ class ChatApplicationService:
         """历史 → context 转换器（Step 13 Context Builder）。"""
         return self._context_builder
 
+    # ---------- 幂等前置（Phase 4.2 Step 6） ----------
+
+    def _resolve_user_turn(
+        self,
+        *,
+        conversation_id: str,
+        content: str,
+        idempotency_key: str | None,
+    ) -> ConversationTurnView | MessageReplay:
+        """解析本次请求的 USER Turn（**先查幂等键，再决定写 / 重放 / 重试**）。
+
+        顺序（Step 6 §15 —— 绝不"先创建 USER 再发现 duplicate"）：
+
+        ```text
+        key 为空/空白          → 直接 append USER Turn（历史行为；不生成 key）
+        已存在 USER Turn
+            payload 指纹不一致 → IdempotencyKeyReusedWithDifferentPayloadError（409）
+            其后有 ASSISTANT  → COMPLETED    → MessageReplay（AI = 0）
+            其后无 ASSISTANT  → NOT_COMPLETED → 复用既有 USER Turn（retry）
+        不存在 USER Turn       → append USER Turn（幂等键随 TX1 写入）
+        ```
+
+        并发最终保证**不**在本方法：``UNIQUE(conversation_id, idempotency_key)``
+        冲突由 Repository 抛 ``ConversationTurnIdempotencyConflictRepositoryError``
+        → Service 映射 ``IdempotencyKeyInFlightError``（409）。
+        """
+        existing: ConversationTurnView | None = None
+        if idempotency_key is not None:
+            existing = self._conversations.find_turn_by_idempotency_key(
+                conversation_id=conversation_id,
+                idempotency_key=idempotency_key,
+            )
+
+        if existing is not None:
+            incoming_fingerprint = message_fingerprint(
+                conversation_id=conversation_id, content=content
+            )
+            stored_fingerprint = message_fingerprint(
+                conversation_id=conversation_id, content=existing.content
+            )
+            if incoming_fingerprint != stored_fingerprint:
+                raise IdempotencyKeyReusedWithDifferentPayloadError(
+                    f"{IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD}: "
+                    "相同 Idempotency-Key 携带了不同的 content"
+                    "（不得静默执行第二条请求）"
+                )
+
+            assistant_turn = self._conversations.find_assistant_turn_after(
+                conversation_id=conversation_id,
+                after_turn_id=existing.turn_id,
+            )
+            if assistant_turn is not None:
+                logger.info(
+                    "duplicate 请求命中已完成 Idempotency-Key，直接重放"
+                    "（conversation_id=%s, assistant_turn_id=%s）",
+                    conversation_id,
+                    assistant_turn.turn_id,
+                )
+                return MessageReplay(
+                    content=assistant_turn.content,
+                    assistant_request_id=assistant_turn.assistant_request_id,
+                )
+
+            # NOT_COMPLETED（EMPTY / REFUSED+empty / FAILED / Crash / TX2 失败）
+            # → 复用既有 USER Turn 重试（**不**创建第二条 USER Turn；OD-26）。
+            logger.info(
+                "Idempotency-Key 对应请求尚未完成（无 ASSISTANT Turn），"
+                "复用既有 USER Turn 重试（conversation_id=%s, turn_id=%s）",
+                conversation_id,
+                existing.turn_id,
+            )
+            return existing
+
+        return self._conversations.append_turn(
+            conversation_id=conversation_id,
+            role=USER_ROLE,
+            content=content,
+            assistant_request_id=None,
+            idempotency_key=idempotency_key,
+        )
+
     # ---------- 对外 Contract ----------
 
     async def execute_message(
@@ -224,14 +358,32 @@ class ChatApplicationService:
         *,
         conversation_id: str,
         content: str,
-    ) -> AIOrchestrationResult:
+        idempotency_key: str | None = None,
+    ) -> AIOrchestrationResult | MessageReplay:
         """执行一条会话消息（USER turn → AI → 条件式 ASSISTANT turn）。
 
+        Args:
+            conversation_id: 会话 ID。
+            content:          用户消息正文。
+            idempotency_key:  客户端请求幂等键（Phase 4.2 Step 6）。
+                              ``None`` / 纯空白 = **不参与幂等**（历史行为）；
+                              非空时按 (conversation_id, key) 判定
+                              duplicate / conflict / retry。
+                              服务端**不生成 / 不改写 / 不 trim 后持久化**。
+
+        Returns:
+            AIOrchestrationResult: 本次**真实执行**了 AI（首次 / retry）。
+            MessageReplay:         duplicate 重放（AI = 0 次；OD-34 Message Replay）。
+
         Raises:
-            ValueError:                    conversation_id / content 非法
+            ValueError:                    conversation_id / content /
+                                          idempotency_key 非法
                                           （由 ConversationService 校验；AI = 0 次）。
             ConversationNotFoundError:     会话不存在（AI = 0 次）。
             ConversationArchivedError:     会话已归档（AI = 0 次；**写入前**拒绝）。
+            IdempotencyKeyReusedWithDifferentPayloadError:
+                                          同 key 不同 payload（AI = 0 次；409）。
+            IdempotencyKeyInFlightError:   幂等键已被占用（并发；AI = 0 次；409）。
             ConversationRepositoryError:   持久化失败（USER 失败 → AI = 0 次；
                                           history 读失败 → AI = 0 次，USER 保留；
                                           ASSISTANT 失败 → AI = 1 次，不重试）。
@@ -240,7 +392,8 @@ class ChatApplicationService:
                                           异常原样上抛（不包装 / 不降级）。
             Exception:                     AIOrchestrator 的异常**原样**上抛
                                           （USER turn 已提交保留；不创建
-                                          ASSISTANT turn；不包装 / 不 retry）。
+                                          ASSISTANT turn；不包装 / 不 retry；
+                                          按 OD-26 → NOT_COMPLETED → 同 key 可重试）。
         """
         conversation = self._conversations.get_conversation(conversation_id)
         if conversation is None:
@@ -252,19 +405,21 @@ class ChatApplicationService:
                 f"conversation 已归档: {conversation.conversation_id}"
             )
 
-        # TX1：USER turn（Repository 内提交；AI 执行前完成）
-        user_turn = self._conversations.append_turn(
+        user_turn = self._resolve_user_turn(
             conversation_id=conversation.conversation_id,
-            role=USER_ROLE,
             content=content,
-            assistant_request_id=None,
+            idempotency_key=idempotency_key,
         )
+        if isinstance(user_turn, MessageReplay):
+            return user_turn
 
-        # 历史读（TX1 commit 之后；纯读）——
+        # 历史读（TX1 commit / 复用既有 turn 之后；纯读）——
         # 读取失败：AI = 0，异常原样上抛（**不**降级为 [] / context=None）。
         history = self._conversations.list_turns(conversation.conversation_id)
-        # 排除 current USER turn：按 append 返回的 turn_id 精确排除
-        # （不依赖 turns[-1] 猜测）。
+        # 排除 current USER turn：按 turn_id **精确排除**
+        # （不依赖 turns[-1] 猜测）——
+        # retry 路径复用既有 USER Turn ⇒ 该 turn 同样被排除，
+        # 保证"当前问题"不会同时进入 context 与 question（Step 6 §10）。
         previous_turns = tuple(
             turn for turn in history if turn.turn_id != user_turn.turn_id
         )

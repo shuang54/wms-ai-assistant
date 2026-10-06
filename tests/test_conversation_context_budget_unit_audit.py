@@ -303,6 +303,8 @@ class TestBoundaryPreservation:
         assert params == {
             "conversation_id": inspect.Parameter.KEYWORD_ONLY,
             "content": inspect.Parameter.KEYWORD_ONLY,
+            # Phase 4.2 Step 6：可选幂等键（keyword-only）
+            "idempotency_key": inspect.Parameter.KEYWORD_ONLY,
         }
 
     def test_08_budget_does_not_enter_builder(self) -> None:
@@ -345,6 +347,9 @@ class TestBoundaryPreservation:
             "update_status",
             "append_turn",
             "list_turns_by_conversation_id",
+            # Phase 4.2 Step 6：幂等查询（只读 · 显式列）
+            "find_turn_by_idempotency_key",
+            "find_next_assistant_turn",
         }
 
 

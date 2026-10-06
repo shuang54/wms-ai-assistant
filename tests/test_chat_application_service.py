@@ -156,6 +156,7 @@ class FakeConversationRepository:
         role: str,
         content: str,
         assistant_request_id: str | None,
+        idempotency_key: str | None = None,
     ) -> ConversationTurnRow:
         self._append_count += 1
         self.append_calls.append(
@@ -164,6 +165,7 @@ class FakeConversationRepository:
                 "role": role,
                 "content": content,
                 "assistant_request_id": assistant_request_id,
+                "idempotency_key": idempotency_key,
             }
         )
         self.events.append(f"append:{role}")
@@ -186,11 +188,41 @@ class FakeConversationRepository:
             content=content,
             assistant_request_id=assistant_request_id,
             created_at=now,
+            idempotency_key=idempotency_key,
         )
         self._next_turn_id += 1
         self._turns.setdefault(conversation_id, []).append(turn)
         self._conversations[conversation_id] = replace(current, updated_at=now)
         return turn
+
+    def find_turn_by_idempotency_key(
+        self,
+        *,
+        conversation_id: str,
+        idempotency_key: str | None,
+        role: str = TURN_ROLE_USER,
+    ) -> ConversationTurnRow | None:
+        """Phase 4.2 Step 6：按 (conversation_id, idempotency_key) 查 USER Turn。"""
+        if idempotency_key is None or not idempotency_key.strip():
+            return None
+        for turn in self._turns.get(conversation_id, ()):
+            if turn.idempotency_key == idempotency_key and turn.role == role:
+                return turn
+        return None
+
+    def find_next_assistant_turn(
+        self,
+        *,
+        conversation_id: str,
+        after_turn_id: int,
+    ) -> ConversationTurnRow | None:
+        """Phase 4.2 Step 6：after_turn_id 之后的第一个 ASSISTANT Turn。"""
+        for turn in sorted(
+            self._turns.get(conversation_id, ()), key=lambda item: item.turn_id
+        ):
+            if turn.turn_id > after_turn_id and turn.role == TURN_ROLE_ASSISTANT:
+                return turn
+        return None
 
     def list_turns_by_conversation_id(
         self, conversation_id: str
@@ -732,6 +764,8 @@ class TestBoundaryAudit:
         assert params == {
             "conversation_id": inspect.Parameter.KEYWORD_ONLY,
             "content": inspect.Parameter.KEYWORD_ONLY,
+            # Phase 4.2 Step 6：幂等键（可选；keyword-only）
+            "idempotency_key": inspect.Parameter.KEYWORD_ONLY,
         }
         assert inspect.iscoroutinefunction(ChatApplicationService.execute_message)
 

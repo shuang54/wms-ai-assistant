@@ -71,6 +71,8 @@ _APPLICATION_SERVICE_ALLOWED_PREFIXES: tuple[str, ...] = (
     "__future__",
     "logging",
     "collections.abc",
+    # Phase 4.2 Step 6：MessageReplay（frozen DTO）
+    "dataclasses",
     "typing",
     "backend.app.services.conversation_service",
     "backend.app.services.conversation_context_builder",
@@ -156,6 +158,8 @@ class TestOrmBoundary:
             "content",
             "assistant_request_id",
             "created_at",
+            # Phase 4.2 Step 6：消息幂等键（只写 USER Turn；非预算字段）
+            "idempotency_key",
         }
         for forbidden in _BUDGET_IDENTIFIERS:
             assert forbidden not in fields, forbidden

@@ -82,8 +82,20 @@ class FakeChatApplicationService:
     def raise_on(self, conversation_id: str, error: Exception) -> None:
         self._errors[conversation_id] = error
 
-    async def execute_message(self, *, conversation_id: str, content: str):
-        self.calls.append({"conversation_id": conversation_id, "content": content})
+    async def execute_message(
+        self,
+        *,
+        conversation_id: str,
+        content: str,
+        idempotency_key: str | None = None,
+    ):
+        self.calls.append(
+            {
+                "conversation_id": conversation_id,
+                "content": content,
+                "idempotency_key": idempotency_key,
+            }
+        )
         error = self._errors.get(conversation_id)
         if error is not None:
             raise error
@@ -222,9 +234,11 @@ class TestHttpStatusSemantics:
         _post(client, {"content": "你好"})
 
         assert len(fake.calls) == 1
+        # Phase 4.2 Step 6：未提供 Idempotency-Key → 透传 None（不生成键）
         assert fake.calls[0] == {
             "conversation_id": _CONVERSATION_ID,
             "content": "你好",
+            "idempotency_key": None,
         }
 
 
@@ -370,9 +384,14 @@ class TestClientCannotOverrideBinding:
         )
 
         assert response.status_code == 200
-        # Application Service 只收到 conversation_id / content（无覆盖入口）
+        # Application Service 只收到 conversation_id / content / idempotency_key
+        # （无覆盖入口；幂等键只来自 Header，Body 字段被忽略）
         assert fake.calls == [
-            {"conversation_id": _CONVERSATION_ID, "content": "你好"}
+            {
+                "conversation_id": _CONVERSATION_ID,
+                "content": "你好",
+                "idempotency_key": None,
+            }
         ]
 
     def test_response_metadata_comes_from_ai_result(

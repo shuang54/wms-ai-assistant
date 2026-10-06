@@ -8,6 +8,10 @@
     update_status(...)                   状态迁移 + updated_at = now（无记录 → None）
     append_turn(...)                     **原子**：插入 Turn + 更新会话 updated_at
     list_turns_by_conversation_id(...)   会话的 Turn 列表（created_at ASC, turn_id ASC）
+    find_turn_by_idempotency_key(...)    只读：按 (conversation_id, idempotency_key)
+                                         查 USER Turn（无记录 → None）
+    find_next_assistant_turn(...)        只读：指定 USER Turn 之后的第一个
+                                         ASSISTANT Turn（无记录 → None）
 
 复用基础设施（不新增第二套机制）：
 
@@ -40,7 +44,7 @@ from datetime import datetime
 from typing import Any, Final
 
 from sqlalchemy import func, insert, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.app.db.models.conversation import (
@@ -49,6 +53,8 @@ from backend.app.db.models.conversation import (
     Conversation,
 )
 from backend.app.db.models.conversation_turn import (
+    CONVERSATION_TURN_IDEMPOTENCY_INDEX,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
     TURN_ROLE_ASSISTANT,
     TURN_ROLE_USER,
     ConversationTurn,
@@ -60,18 +66,21 @@ __all__ = [
     "ConversationRepositoryError",
     "ConversationNotFoundRepositoryError",
     "ConversationArchivedRepositoryError",
+    "ConversationTurnIdempotencyConflictRepositoryError",
     "ConversationRow",
     "ConversationTurnRow",
     "CONVERSATION_READ_COLUMNS",
     "CONVERSATION_TURN_READ_COLUMNS",
     "CONVERSATION_STATUS_VALUES",
     "TURN_ROLE_VALUES",
+    "IDEMPOTENCY_KEY_MAX_LENGTH",
     "validate_conversation_id",
     "validate_project_id",
     "validate_status",
     "validate_role",
     "validate_content",
     "validate_assistant_request_id",
+    "validate_idempotency_key",
 ]
 
 #: Conversation 只读查询允许返回的字段（显式列，**不用** SELECT *）。
@@ -84,6 +93,7 @@ CONVERSATION_READ_COLUMNS: Final[tuple[str, ...]] = (
 )
 
 #: ConversationTurn 只读查询允许返回的字段（显式列）。
+#: Phase 4.2 Step 6：新增 ``idempotency_key``（仅 USER Turn 有值）。
 CONVERSATION_TURN_READ_COLUMNS: Final[tuple[str, ...]] = (
     "turn_id",
     "conversation_id",
@@ -91,6 +101,7 @@ CONVERSATION_TURN_READ_COLUMNS: Final[tuple[str, ...]] = (
     "content",
     "assistant_request_id",
     "created_at",
+    "idempotency_key",
 )
 
 #: status 合法取值（Step 2 §1.4 冻结；只有两态）。
@@ -132,6 +143,9 @@ class ConversationTurnRow:
     content: str
     assistant_request_id: str | None
     created_at: datetime
+    #: Phase 4.2 Step 6：请求幂等键（仅 USER Turn 有值；ASSISTANT 恒 None）。
+    #: 带默认值 —— 兼容历史行 / 无幂等写入路径。
+    idempotency_key: str | None = None
 
 
 class ConversationRepositoryError(Exception):
@@ -148,6 +162,18 @@ class ConversationNotFoundRepositoryError(ConversationRepositoryError):
 class ConversationArchivedRepositoryError(ConversationRepositoryError):
     """会话已归档，禁止追加 Turn（供 Service 映射为
     ``ConversationArchivedError``）。"""
+
+
+class ConversationTurnIdempotencyConflictRepositoryError(
+    ConversationRepositoryError
+):
+    """``UNIQUE(conversation_id, idempotency_key)`` 冲突（Phase 4.2 Step 6）。
+
+    含义：同一会话内该幂等键**已经**被另一个请求占用（并发 / 重复提交）。
+    最终保证层 = 数据库唯一索引（应用层 check-then-act **不是**唯一手段）。
+
+    供 Service 映射为幂等冲突 → HTTP **409**（**不得**退化为 500）。
+    """
 
 
 def validate_conversation_id(value: object) -> str:
@@ -222,6 +248,81 @@ def validate_assistant_request_id(value: object) -> str | None:
             f"{len(value)} > {_ASSISTANT_REQUEST_ID_MAX_LENGTH}）"
         )
     return value
+
+
+def validate_idempotency_key(value: object) -> str | None:
+    """校验 idempotency_key（Phase 4.2 Step 6；可空；**不生成 / 不改写**）。
+
+    规则：
+
+        * ``None``                     → 无幂等（原样返回 None）
+        * 纯空白（``strip()`` 后为空）  → 视为无幂等（返回 None；**不是**错误）
+        * 非空且 ``len <= 128``        → 原样返回（**不 trim / 不规范化**）
+        * ``len > 128``                → ``ValueError``（API 层映射 422）
+
+    Returns:
+        规范化后的幂等键（``None`` = 本请求不参与幂等）。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"idempotency_key 必须是 str 或 None（当前: {type(value).__name__}）"
+        )
+    if not value.strip():
+        return None
+    if len(value) > IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise ValueError(
+            f"idempotency_key 超出长度上限（{len(value)} > "
+            f"{IDEMPOTENCY_KEY_MAX_LENGTH}）"
+        )
+    return value
+
+
+#: PostgreSQL UNIQUE violation 的 SQLSTATE（psycopg2 ``pgcode`` / psycopg3 ``sqlstate``）。
+_UNIQUE_VIOLATION_SQLSTATE: Final[frozenset[str]] = frozenset({"23505"})
+
+
+def _to_turn_row(raw: Any) -> ConversationTurnRow:
+    """Row 组装（显式逐字段；**不**返回 ORM 对象）。"""
+    return ConversationTurnRow(
+        turn_id=raw.turn_id,
+        conversation_id=raw.conversation_id,
+        role=raw.role,
+        content=raw.content,
+        assistant_request_id=raw.assistant_request_id,
+        created_at=raw.created_at,
+        idempotency_key=raw.idempotency_key,
+    )
+
+
+def _is_idempotency_unique_violation(exc: IntegrityError) -> bool:
+    """判断 IntegrityError 是否命中 ``UNIQUE(conversation_id, idempotency_key)``。
+
+    **只识别幂等唯一约束**（Step 6 §13）：其它 IntegrityError（PK / NOT NULL /
+    FK / 其它唯一约束）**不得**被误判为幂等冲突（否则错误语义被污染）。
+
+    判定顺序：
+
+        1. SQLSTATE 必须是 UNIQUE violation（``23505``）；
+        2. 约束名（``diag.constraint_name``）等于幂等索引名 → 命中；
+        3. 约束名不可得 → 退化为消息文本匹配（仅当显式指向幂等键 / 幂等索引）。
+    """
+    original = getattr(exc, "orig", None)
+    code = getattr(original, "pgcode", None) or getattr(original, "sqlstate", None)
+    if code not in _UNIQUE_VIOLATION_SQLSTATE:
+        return False
+
+    diagnostic = getattr(original, "diag", None)
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    if constraint_name is not None:
+        return constraint_name == CONVERSATION_TURN_IDEMPOTENCY_INDEX
+
+    message = str(exc).lower()
+    return (
+        "idempotency_key" in message
+        or CONVERSATION_TURN_IDEMPOTENCY_INDEX.lower() in message
+    )
 
 
 class ConversationRepository:
@@ -323,8 +424,14 @@ class ConversationRepository:
         role: str,
         content: str,
         assistant_request_id: str | None,
+        idempotency_key: str | None = None,
     ) -> Any:
-        """插入一条消息（created_at 由数据库 now() 生成）。"""
+        """插入一条消息（created_at 由数据库 now() 生成）。
+
+        Args:
+            idempotency_key: Phase 4.2 Step 6 请求幂等键（**只写 USER Turn**；
+                ASSISTANT 必须 None）。
+        """
         return (
             insert(ConversationTurn)
             .values(
@@ -332,8 +439,49 @@ class ConversationRepository:
                 role=role,
                 content=content,
                 assistant_request_id=assistant_request_id,
+                idempotency_key=idempotency_key,
             )
             .returning(*self._turn_columns())
+        )
+
+    def build_turn_select_by_idempotency_key(
+        self,
+        *,
+        conversation_id: str,
+        idempotency_key: str,
+        role: str = TURN_ROLE_USER,
+    ) -> Any:
+        """按 ``(conversation_id, idempotency_key)`` 读取 USER Turn（精确匹配）。
+
+        并发说明：本查询**只是**前置检查；最终唯一性由
+        ``UNIQUE(conversation_id, idempotency_key)`` 保证（Step 4A §12）。
+        """
+        return (
+            select(*self._turn_columns())
+            .where(ConversationTurn.conversation_id == conversation_id)
+            .where(ConversationTurn.idempotency_key == idempotency_key)
+            .where(ConversationTurn.role == role)
+            .order_by(ConversationTurn.turn_id.asc())
+        )
+
+    def build_next_assistant_turn_select(
+        self,
+        *,
+        conversation_id: str,
+        after_turn_id: int,
+    ) -> Any:
+        """读取指定 USER Turn 之后的**第一个** ASSISTANT Turn。
+
+        归属判定只依赖 ``conversation_id`` + ``turn_id`` 顺序（Step 6 §16）：
+        **不**通过 ``assistant_request_id`` 反查会话（它只是 correlation ID）。
+        """
+        return (
+            select(*self._turn_columns())
+            .where(ConversationTurn.conversation_id == conversation_id)
+            .where(ConversationTurn.role == TURN_ROLE_ASSISTANT)
+            .where(ConversationTurn.turn_id > after_turn_id)
+            .order_by(ConversationTurn.turn_id.asc())
+            .limit(1)
         )
 
     def build_conversation_status_lookup(self, conversation_id: str) -> Any:
@@ -388,6 +536,7 @@ class ConversationRepository:
         role: str,
         content: str,
         assistant_request_id: str | None,
+        idempotency_key: str | None = None,
     ) -> ConversationTurnRow:
         """**原子**追加一条消息（插入 Turn + 更新会话 updated_at）。
 
@@ -395,23 +544,31 @@ class ConversationRepository:
 
             BEGIN
               1) SELECT conversation.status（存在 / 状态守卫）
-              2) INSERT conversation_turn
+              2) INSERT conversation_turn（含 idempotency_key）
               3) UPDATE conversation SET updated_at = now()
             COMMIT
 
         任一步失败 → ROLLBACK：绝不留"Turn 已存在但 updated_at 未更新"。
         ARCHIVED 会话在 **插入之前** 拒绝（write before reject = 0）。
 
+        Phase 4.2 Step 6：``idempotency_key`` 非 None 且发生
+        ``UNIQUE(conversation_id, idempotency_key)`` 冲突 →
+        :class:`ConversationTurnIdempotencyConflictRepositoryError`
+        （供上层映射 409；**不是** 500）。
+
         Raises:
             ValueError:                              参数非法。
             ConversationNotFoundRepositoryError:    会话不存在。
             ConversationArchivedRepositoryError:    会话已归档。
-            ConversationRepositoryError:            DB 未配置 / SQL 失败。
+            ConversationTurnIdempotencyConflictRepositoryError:
+                                                    幂等键已被占用（并发 / 重复）。
+            ConversationRepositoryError:            DB 未配置 / 其它 SQL 失败。
         """
         validated_conversation_id = validate_conversation_id(conversation_id)
         validated_role = validate_role(role)
         validated_content = validate_content(content)
         validated_request_id = validate_assistant_request_id(assistant_request_id)
+        validated_key = validate_idempotency_key(idempotency_key)
         factory = self._get_session_factory()
 
         status_statement = self.build_conversation_status_lookup(
@@ -422,6 +579,7 @@ class ConversationRepository:
             role=validated_role,
             content=validated_content,
             assistant_request_id=validated_request_id,
+            idempotency_key=validated_key,
         )
         touch_statement = self.build_conversation_touch_update(
             validated_conversation_id
@@ -444,18 +602,20 @@ class ConversationRepository:
             ConversationArchivedRepositoryError,
         ):
             raise
+        except IntegrityError as exc:
+            if _is_idempotency_unique_violation(exc):
+                raise ConversationTurnIdempotencyConflictRepositoryError(
+                    "idempotency_key 已被同一会话内的其它请求占用: "
+                    f"conversation_id={validated_conversation_id}"
+                ) from exc
+            raise ConversationRepositoryError(
+                f"ConversationTurn 写入失败: {type(exc).__name__}"
+            ) from exc
         except SQLAlchemyError as exc:
             raise ConversationRepositoryError(
                 f"ConversationTurn 写入失败: {type(exc).__name__}"
             ) from exc
-        return ConversationTurnRow(
-            turn_id=raw.turn_id,
-            conversation_id=raw.conversation_id,
-            role=raw.role,
-            content=raw.content,
-            assistant_request_id=raw.assistant_request_id,
-            created_at=raw.created_at,
-        )
+        return _to_turn_row(raw)
 
     def update_status(self, conversation_id: str, status: str) -> ConversationRow | None:
         """状态迁移（+ updated_at = now）；无匹配 → ``None``（不是错误）。
@@ -537,14 +697,80 @@ class ConversationRepository:
             raise ConversationRepositoryError(
                 f"ConversationTurn 读取失败: {type(exc).__name__}"
             ) from exc
-        return tuple(
-            ConversationTurnRow(
-                turn_id=raw.turn_id,
-                conversation_id=raw.conversation_id,
-                role=raw.role,
-                content=raw.content,
-                assistant_request_id=raw.assistant_request_id,
-                created_at=raw.created_at,
-            )
-            for raw in rows
+        return tuple(_to_turn_row(raw) for raw in rows)
+
+    def find_turn_by_idempotency_key(
+        self,
+        *,
+        conversation_id: str,
+        idempotency_key: str,
+        role: str = TURN_ROLE_USER,
+    ) -> ConversationTurnRow | None:
+        """按 ``(conversation_id, idempotency_key)`` 读取 USER Turn；无记录 → ``None``。
+
+        Phase 4.2 Step 6（Step 6 §15）：请求进入时**先查**幂等键，避免
+        "先创建 USER 再发现 duplicate"。
+
+        Raises:
+            ValueError:                    参数非法（含 role 非法）。
+            ConversationRepositoryError:   DB 未配置 / 读取失败。
+        """
+        validated_id = validate_conversation_id(conversation_id)
+        validated_role = validate_role(role)
+        validated_key = validate_idempotency_key(idempotency_key)
+        if validated_key is None:
+            raise ValueError("idempotency_key 不能为空（查询幂等键必须显式提供）")
+        factory = self._get_session_factory()
+        statement = self.build_turn_select_by_idempotency_key(
+            conversation_id=validated_id,
+            idempotency_key=validated_key,
+            role=validated_role,
         )
+        try:
+            with factory() as session:
+                rows = session.execute(statement).all()
+        except SQLAlchemyError as exc:
+            raise ConversationRepositoryError(
+                f"ConversationTurn 读取失败: {type(exc).__name__}"
+            ) from exc
+        if not rows:
+            return None
+        return _to_turn_row(rows[0])
+
+    def find_next_assistant_turn(
+        self,
+        *,
+        conversation_id: str,
+        after_turn_id: int,
+    ) -> ConversationTurnRow | None:
+        """读取 ``after_turn_id`` 之后的第一个 ASSISTANT Turn；无记录 → ``None``。
+
+        Phase 4.2 Step 6（§16）：completed 判定 =
+        ``USER Turn 存在 + 其后存在 ASSISTANT Turn``；归属只依赖
+        ``conversation_id`` + ``turn_id`` 顺序，**不**用
+        ``assistant_request_id`` 反查（correlation only）。
+
+        Raises:
+            ValueError:                    参数非法。
+            ConversationRepositoryError:   DB 未配置 / 读取失败。
+        """
+        validated_id = validate_conversation_id(conversation_id)
+        if not isinstance(after_turn_id, int) or isinstance(after_turn_id, bool):
+            raise ValueError(
+                f"after_turn_id 必须是 int（当前: {type(after_turn_id).__name__}）"
+            )
+        factory = self._get_session_factory()
+        statement = self.build_next_assistant_turn_select(
+            conversation_id=validated_id,
+            after_turn_id=after_turn_id,
+        )
+        try:
+            with factory() as session:
+                raw = session.execute(statement).first()
+        except SQLAlchemyError as exc:
+            raise ConversationRepositoryError(
+                f"ConversationTurn 读取失败: {type(exc).__name__}"
+            ) from exc
+        if raw is None:
+            return None
+        return _to_turn_row(raw)
