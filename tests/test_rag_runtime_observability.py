@@ -751,9 +751,14 @@ class TestRuntimeOnlyBoundaries:
     def test_rag_public_contract_unchanged(self) -> None:
         import inspect
 
+        # Phase 4.2 Step 7F：新增**可选** conversation_context（untrusted
+        # reference；不参与检索 / 不进入 RagResponse；默认 None ⇒ 旧行为等价）。
         assert list(inspect.signature(RagService.answer).parameters) == [
-            "self", "query", "top_k", "knowledge_scope",
+            "self", "query", "top_k", "knowledge_scope", "conversation_context",
         ]
+        assert inspect.signature(
+            RagService.answer
+        ).parameters["conversation_context"].default is None
         assert [f.name for f in fields(RagResponse)] == [
             "answer", "sources", "used_chunks_count",
         ]

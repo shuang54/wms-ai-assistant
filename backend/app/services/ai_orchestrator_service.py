@@ -601,15 +601,23 @@ class AIOrchestratorService:
             try:
                 if decision.route == RouteType.RAG:
                     result = await self._run_rag(
-                        decision, normalized, request_id=request_id
+                        decision,
+                        normalized,
+                        request_id=request_id,
+                        context=context,
                     )
                 elif decision.route == RouteType.TOOL:
+                    # 本阶段（Phase 4.2 Step 7F）Tool 路径**不**消费
+                    # conversation context（无 LLM 生成步 ⇒ 契约 DEFERRED）。
                     result = await self._run_tool(
                         decision, normalized, request_id=request_id
                     )
                 elif decision.route == RouteType.TEXT_TO_SQL:
                     result = await self._run_text_to_sql(
-                        decision, normalized, request_id=request_id
+                        decision,
+                        normalized,
+                        request_id=request_id,
+                        context=context,
                     )
             except AIOrchestratorError:
                 # 失败路径（RAG / Tool / Text-to-SQL / 能力禁用 等）：
@@ -737,11 +745,16 @@ class AIOrchestratorService:
         question: str,
         *,
         request_id: str,
+        context: str | None = None,
     ) -> AIOrchestrationResult:
         """RAG 路径（Phase 3.12 Step 35：metadata 携带本次 trace request_id）。
 
         ``request_id`` 由 ``execute()`` 生成并透传（本方法不生成 ID ——
         保证 API / ToolExecutionRecord / metadata 三处同一 ID）。
+
+        Phase 4.2 Step 7F（OD-36）：``conversation_context`` 仅透传给
+        ``RagService.answer``（进入回答 prompt 的独立段），**不**参与
+        检索 query / embedding / rerank；``None`` ⇒ 调用形态与旧行为完全一致。
         """
         # Phase 3.8.2：能力硬校验（RagService 0 次调用）
         self._check_capability("knowledge")
@@ -751,12 +764,16 @@ class AIOrchestratorService:
             # Phase 3.8.4：把项目知识 scope 传给 RAG（Orchestrator 只传递
             # 上下文，不访问 Knowledge DB）。scope=None → 旧调用形态
             # （兼容既有 Fake RagService 的 answer(query, *, top_k) 签名）。
-            if self._knowledge_scope is None:
-                rag_response = await self._rag.answer(question)
-            else:
-                rag_response = await self._rag.answer(
-                    question, knowledge_scope=self._knowledge_scope
-                )
+            # Phase 4.2 Step 7F：conversation_context=None → **不传**该 kwarg，
+            # 保持既有 Fake / 契约签名完全不变（仅非 None 时才出现新 kwarg）。
+            rag_kwargs: dict[str, Any] = {}
+            if self._knowledge_scope is not None:
+                rag_kwargs["knowledge_scope"] = self._knowledge_scope
+            if context is not None:
+                # 关键字名 = RagService.answer 的 Conversation Context 参数
+                # （Orchestrator 只透传，**不**持有 conversation 语义）。
+                rag_kwargs["conversation_context"] = context
+            rag_response = await self._rag.answer(question, **rag_kwargs)
         except Exception as exc:
             raise AIOrchestratorExecutionError(
                 f"RAG 执行失败: {type(exc).__name__}"
@@ -905,6 +922,7 @@ class AIOrchestratorService:
         question: str,
         *,
         request_id: str,
+        context: str | None = None,
     ) -> AIOrchestrationResult:
         """Text-to-SQL 路径（Phase 3.12 Step 35：metadata 携带 trace id）。
 
@@ -967,8 +985,16 @@ class AIOrchestratorService:
         )
 
         # d) 生成 SQL（Generator 内部已调 Validator）
-        #    注：generate() 契约保持 Phase 3.7.6 原样（不新增参数），
-        #    结构化上下文经 render() 渲染为单段文本传入。
+        #    注：结构化上下文经 render() 渲染为单段文本传入。
+        #    Phase 4.2 Step 7F（OD-36）：conversation_context 仅**可选**透传
+        #    （进入生成 prompt 的独立段；不改变 schema / allowed tables /
+        #    MAX ROWS / read-only）；None ⇒ 调用形态与旧行为完全一致
+        #    （不传该 kwarg，保持既有 Fake generator 签名不变）。
+        generate_kwargs: dict[str, Any] = {}
+        if context is not None:
+            # 关键字名 = TextToSQLService.generate 的 Conversation Context
+            # 参数（Orchestrator 只透传，**不**持有 conversation 语义）。
+            generate_kwargs["conversation_context"] = context
         try:
             sql_result = await self._text_to_sql.generate(
                 question,
@@ -976,6 +1002,7 @@ class AIOrchestratorService:
                 allowed_tables=generation_context.allowed_tables or None,
                 schema=schema,
                 max_rows=generation_context.max_rows,
+                **generate_kwargs,
             )
         except Exception as exc:
             raise AIOrchestratorExecutionError(

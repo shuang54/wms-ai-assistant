@@ -624,6 +624,8 @@ class TestProductionImplementationScope:
         "backend/app/db/models/conversation_turn.py",
         "backend/app/dto/conversation_api.py",
         "backend/app/services/conversation_context_builder.py",
+        # Phase 4.2 Step 7E：Selection 层（Step 7C 契约实现；纯函数窗口选择）
+        "backend/app/services/conversation_context_selection_service.py",
         "backend/app/services/conversation_service.py",
     )
 
@@ -637,6 +639,8 @@ class TestProductionImplementationScope:
             "conversation_repository.py",
             "conversation_service.py",
             "conversation_context_builder.py",
+            # Phase 4.2 Step 7E：ConversationContextSelectionService
+            "conversation_context_selection_service.py",
             "conversation_api.py",
         }
     )

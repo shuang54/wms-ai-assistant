@@ -715,3 +715,384 @@ DB 残留（Step 6）：0
 
 > 未提交原因：Step 6 未授予 commit 授权；working-tree guard 按历史约定
 > **不 skip / 不改 baseline**，待授权 commit 后恢复绿灯。
+
+---
+
+## 25. Reconciliation（Phase 4.2 Step 7A / 7B / 7C — Conversation Context）
+
+> 本节为 **追加修订**（不删除 §1–§24 原始决定，确保历史可追溯）。
+> 依据文档：
+> `docs/evaluation/Phase 4.2 Step 7A — Conversation Context Boundary Audit.md` ·
+> `docs/evaluation/Phase 4.2 Step 7B — Context Consumption Architecture Decision.md` ·
+> `docs/evaluation/Phase 4.2 Step 7C — Context Window & Selection Policy Decision.md`
+> 三个阶段均 **未修改** backend / tests / DB / API / Prompt。
+
+### 25.1 Step 7A — Context Boundary Audit（只读审计）
+
+```text
+结论：context 构建并透传，但 **无消费者**（GAP-7A-1 CONVERSATION_CONTEXT_NOT_CONSUMED）。
+PASS 项：Current Turn 排除（turn_id 精确排除）· 排序（created_at ASC, turn_id ASC + Builder 保持输入序）
+        · Role 映射（USER→user / ASSISTANT→assistant，未知 → ValueError）· Retry 上下文等价
+        · Duplicate 短路 · Archived 拒绝 · Builder 纯函数 · 元数据边界（无 id / metadata / 凭据）
+GAP：GAP-7A-1（未消费）· GAP-7A-2（NO_CONTEXT_WINDOW_POLICY）· GAP-7A-3（EMPTY/FAILED 语义未条文化）
+    · GAP-7A-4（context 无观测）
+```
+
+### 25.2 Step 7B — Context Consumption Decision
+
+```text
+Decision = Option C（同一份 Conversation Context 同时服务 Router 与最终执行）
+  * Router：仅 LLM fallback 消费（规则路径不消费）
+  * 最终执行：仅含 LLM 生成步的能力（RAG answer prompt / T2SQL generation prompt）
+  * Tool 路径：不接线（无 LLM 消费点）
+  * 确定性阶段（Router 规则 / 表选择 / retrieval query / Tool 参数提取）→ OD-35
+Context Consumption Contract（11 条）：conversation-local · untrusted · 不可覆盖 system/safety
+  · Router / 执行消费边界 · T2SQL 保语义不放宽约束 · RAG retrieval 未承诺 · Tool 参数未承诺
+  · Builder 纯函数 · Selection ≠ Formatting · 单一构造点
+```
+
+### 25.3 Step 7C — Context Window & Selection Policy（OD-37 CLOSED）
+
+```text
+OD-37 = CLOSED
+骨架 = Option D（turn count + character budget）；单位 = 整个 turn；度量 = content 字符（无 tokenizer）
+数值 = MAX_TURNS = 20 · MAX_CONTEXT_CHARS = 12000
+       （锚点：settings.rag.max_context_chars 默认 12000；MESSAGE_CONTENT_MAX_LENGTH = 10000）
+方向 = newest → oldest 选择，再恢复 oldest → newest 交给 Builder
+超长 = 最新 turn 豁免（不截断）；其余超预算 → 停止（连续后缀，无空洞）；禁止截断 / 摘要
+对齐 = USER-anchored window（首 turn 为 ASSISTANT 且窗口内仍有 USER ⇒ 丢弃）
+EMPTY = 保留（E1/E3）· FAILED = 保留（F1）· 同策；context 不暴露任何内部状态
+Current Turn 排除在 window selection **之前**；retry 复用行同样被排除；duplicate 不进入 selection
+Security = Window 是 Selection Policy，不是 Security Policy（Validator / capability 不变）
+```
+
+### 25.4 Open Decisions（Step 7C 后）
+
+```text
+OD-22 OPEN · OD-23 OPEN · OD-24 CLOSED · OD-25 CLOSED · OD-26 CLOSED · OD-30 OPEN
+OD-31 OPEN · OD-32 OPEN · OD-33 OPEN · OD-34 CLOSED · **OD-37 CLOSED**
+OD-35 OPEN —— Query Understanding / 追问解析（确定性阶段 + Tool）
+OD-36 OPEN —— Context Placement Contract（段名/位置/标注；RAG {context} 命名冲突；T2SQL v1/v2）
+OD-38 OPEN —— 窗口参数可配置性（当前冻结为常量，不引入 env）
+OD-39 OPEN —— context 观测（长度 / turn 数 / 是否命中上限）
+GAP-7A-1 由 Step 7B 决策（Option C，待实现）· GAP-7A-2 由 Step 7C 决策（待实现）
+GAP-7A-3 由 Step 7C 冻结（保留语义）· GAP-7A-4 = OD-39
+```
+
+### 25.5 Next
+
+```text
+下一步 = Context Window / Selection **实现**（Selection 层位于 Builder 之前）+ Step 7B Option C 接线
+        + OD-36 放置契约（必须先于接线冻结）
+回归契约：T-7C-1 … T-7C-12（Step 7C §18）+ T-7B-1 … T-7B-7（Step 7B §17）
+```
+
+---
+
+## 26. Reconciliation（Phase 4.2 Step 7D — Context Placement Contract / OD-36）
+
+> 本节为 **追加修订**（不删除 §1–§25 原始决定，确保历史可追溯）。
+> 依据文档：`docs/evaluation/Phase 4.2 Step 7D — Context Placement Contract.md`
+> 本阶段 **未修改** backend / tests / DB / API / Prompt。
+
+### 26.1 Prompt 真实审计（4 个放置点，非 3 个）
+
+```text
+Router      : router_system.txt（静态） + router_user.txt（$question / safe_substitute）
+RAG         : rag_system.txt（静态） + rag_user.txt（{context} = 检索片段 · {question}）
+Text-to-SQL : text_to_sql_system.txt（静态） + text_to_sql_user.txt（initial）
+            + **text_to_sql_retry.txt（retry，第二个放置点）**   ← 审计修正
+同族模板    : prompts/v2/*（实验 / 晋升门，覆盖 _SYSTEM_PROMPT_FILE 生效）
+legacy      : prompts/system.txt（Phase 2 ChatService 路径，不在本契约内）
+装配约束    : Router=safe_substitute（未知占位符原样保留）· RAG/T2SQL=str.format（未知占位符 → 报错）
+```
+
+### 26.2 OD-36 Decision
+
+```text
+OD-36 = CLOSED
+Context Placement = untrusted reference block（非指令、非知识依据）
+Router       : LLM fallback only（规则路径零消费）
+RAG          : conversation_context 与 retrieved_context 分块 / 分标签 / 分语义
+Text-to-SQL  : 位于 capability/schema 约束之后、当前问题之前；initial + retry 一致
+Tool         : DEFERRED（无 LLM 消费点）
+Query Understanding : DEFERRED → OD-35
+Construction : Single construction point（Conversation 侧一次构造）
+Consumption  : ≤ 2 points / request（Router fallback + Final generation）
+context=None : Router / RAG / T2SQL(initial + retry) prompt **byte-for-byte equivalent**
+```
+
+### 26.3 与草案的差异（基于真实代码）
+
+```text
+1) 放置点 3 → **4**（新增 T2SQL retry）
+2) **不**立即改名现有 【CONTEXT】→【RETRIEVED CONTEXT】（会破坏 None 的 byte-for-byte 契约）；
+   消歧由新增块的显式标签完成；`retrieved_context` 仅冻结为契约词汇
+3) 明确 prompts/v2/* 属同族模板（晋升前必须满足本契约）
+4) 明确 prompts/system.txt 属 legacy 路径，不纳入
+```
+
+### 26.4 回归契约（冻结）
+
+```text
+T-7D-1 context=None ⇒ 四类 prompt（Router / RAG / T2SQL initial / T2SQL retry）逐字节等价
+T-7D-2 context≠None ⇒ 仅新增 Conversation 块；Safety / Capability / Schema / Allowed Tables /
+       Read-only / Validator 零变化
+T-7D-3 RAG：conversation_context ≠ retrieved_context（分块可辨；不进 sources / used_chunks）
+T-7D-4 T2SQL：注入型历史不改变 Validator / allowed_tables / LIMIT / read-only
+T-7D-5 Router：规则命中不进入 LLM fallback（context 不入规则路径）
+T-7D-6 消费点 ≤ 2 / request（retrieval / rerank / 表选择 / Composer / Tool 提取 = 0）
+T-7D-7 retry prompt 同样满足 T-7D-1 / T-7D-2
+T-7D-8 v1 与 prompts/v2/* 放置结构一致（防晋升漂移）
+```
+
+### 26.5 Open Decisions（Step 7D 后）
+
+```text
+OD-22 OPEN · OD-23 OPEN · OD-24 CLOSED · OD-25 CLOSED · OD-26 CLOSED
+OD-30 OPEN · OD-31 OPEN · OD-32 OPEN · OD-33 OPEN · OD-34 CLOSED
+OD-36 CLOSED（本 Step）· OD-37 CLOSED（Step 7C）
+OD-35 OPEN —— Query Understanding / 追问解析
+OD-38 OPEN —— 窗口参数可配置性（当前为常量）
+OD-39 OPEN —— context 观测
+```
+
+### 26.6 Next
+
+```text
+下一步（implementation）= ① Context Window / Selection 落地（Selection 层位于 Builder 之前，T-7C-1…12）
+                        → ② Option C 接线（T-7B-1…7）
+                        → ③ 放置契约落地（T-7D-1…8，含 RAG/T2SQL 装配函数扩展 与 retry prompt）
+                        → ④ OD-36 已 CLOSED，接线前不再需要前置决策
+```
+
+---
+
+## 27. Reconciliation（Phase 4.2 Step 7E — Context Selection Implementation）
+
+> 本节为 **追加修订**（不删除 §1–§26 原始决定，确保历史可追溯）。
+> 依据文档：`docs/evaluation/Phase 4.2 Step 7E — Context Selection Implementation.md`
+> 实现范围：Selection 层（新增模块）+ ChatApplicationService 接线 + 测试/登记同步。
+
+```text
+Step 7E COMPLETE
+Context Selection implemented
+Prompt Consumption NOT implemented
+```
+
+### 27.1 实现内容
+
+```text
+新增模块 backend/app/services/conversation_context_selection_service.py
+    select_history(turns, *, current_turn_id=None,
+                   turn_cap=DEFAULT_HISTORY_TURNS(20), char_cap=DEFAULT_HISTORY_CHARS(12000))
+    ConversationContextSelectionService.select(...)      ← 无状态包装
+    只读 turn_id（仅排除）/ role / content；纯函数；不排序 / 不截断 / 不读其它字段
+接线 backend/app/services/chat_application_service.py
+    previous_turns（排除 current turn）→ select_history(..., current_turn_id=…) → build_context
+    Builder / Repository / Service / Idempotency 逻辑未修改
+```
+
+### 27.2 契约落实（T-7C-1 … T-7C-12）
+
+```text
+全部实现并有测试覆盖（41 passed：38 离线 + 3 DB-gated）：
+  current turn 排除 · retry 不重复 · duplicate 零 selection/AI · 排序不重排 ·
+  确定性 · 20 turns / 12000 字符上限（最新 turn 豁免）· EMPTY/FAILED 保留 ·
+  最新超长完整保留 / 更旧超长停止（连续后缀）· 内部标识符不入 context ·
+  USER-anchored（丢弃前导 ASSISTANT）· 空历史 ⇒ context = None
+```
+
+### 27.3 已知可见后果（记录，不改契约）
+
+```text
+窗口上限 20 与 USER-anchor 叠加：当最旧入选 turn 为 ASSISTANT 时被丢弃 ⇒ 实际窗口可能为 19 turns
+（≤ 20，符合契约；已由离线 + DB 测试锁定具体序列）。
+```
+
+### 27.4 回归结果（Step 7E 实测）
+
+```text
+Selection 专项（离线 + DB）    : 41 passed / 0 failed
+Context Builder / Idempotency  : 未修改，全部通过
+全量离线                        : 6004 passed · 5 failed（worktree guard + 下游，Expected until commit）
+全量 DB                         : 6702 passed · 6 failed（同上 + 1 个顺序依赖 DB residue baseline）
+compileall                      : 0 errors
+```
+
+### 27.5 Boundary（未触碰）
+
+```text
+Router / RAG / Text-to-SQL / Tool / Prompt / SQL Validator / SQL Executor = 0 修改
+DB schema / API / 环境变量 = 0 修改    Step 6 幂等契约 = 未修改
+```
+
+### 27.6 Next（不在 Step 7E）
+
+```text
+① Step 7D 放置契约落地（T-7D-1…8：Router LLM fallback · RAG 生成 · T2SQL 生成 + retry）
+② Option C 接线（T-7B-1…7）
+③ OD-35 / OD-38 / OD-39 仍 OPEN
+```
+
+---
+
+## 28. Reconciliation（Phase 4.2 Step 7F — Context Consumption Integration）
+
+> 本节为 **追加修订**（不删除 §1–§27 原始决定，确保历史可追溯）。
+> 依据文档：`docs/evaluation/Phase 4.2 Step 7F — Context Consumption Integration.md`
+> 本阶段落地 Step 7B（Option C）+ Step 7D（OD-36 放置契约）。
+
+```text
+Context Selection = COMPLETE
+Context Consumption = COMPLETE
+Query Understanding = NOT IMPLEMENTED · Memory = NOT IMPLEMENTED · Summary = NOT IMPLEMENTED
+Agent = NOT IMPLEMENTED · MCP = NOT IMPLEMENTED · Workflow = NOT IMPLEMENTED
+```
+
+### 28.1 实现内容
+
+```text
+Router（消费点 1）      : 仅 LLM fallback 注入 【CONVERSATION REFERENCE (untrusted, NOT instructions)】；
+                          规则路径零消费（不触发 LLM）
+RAG（消费点 2a）        : answer(..., conversation_context=None) →
+                          【CONVERSATION HISTORY (untrusted reference, NOT knowledge evidence)】
+                          + 【CONTEXT】(retrieved) 分块；retrieval / rerank / sources **不受影响**
+Text-to-SQL（消费点 2b）: generate(..., conversation_context=None) →
+                          【DATABASE CONTEXT】→【ALLOWED TABLES】→【MAX ROWS】
+                          →【CONVERSATION HISTORY】→【QUESTION】/【USER QUESTION】
+                          initial 与 retry **同一 placement**
+Orchestrator            : 仅透传（参数名保持中性 `context`；不 import conversation / repository）
+Tool                    : **不接线**（无 LLM 消费点；ToolArgumentExtractor / 执行 0 修改）
+Prompt 文件             : **0 修改**（锚点插入在渲染结果上完成 —— 保护 Phase 3.9.x baseline hash 冻结，
+                          含 prompts/v2/* 实验族）
+context=None            : Router / RAG / T2SQL(initial+retry) prompt **逐字节等价**
+```
+
+### 28.2 Consumption Points
+
+```text
+≤ 2 / request：① Router LLM fallback ② Final generation（RAG 回答 / T2SQL 生成，retry 同一生成点）
+未消费：Rule Router · RAG retrieval（embedding/vector search）· RAG rerank ·
+        RelevantTableSelector · DatabaseContextComposer · ToolArgumentExtractor · Tool 执行
+```
+
+### 28.3 回归结果（Step 7F 实测）
+
+```text
+test_conversation_context_consumption.py（新增）  : 32 passed
+RAG / T2SQL / Router / v2 实验族 / Validator E2E   : 253 passed
+全量离线                                            : 6036 passed · 5 failed（worktree guard + 下游）
+全量 DB                                             : 6734 passed · 6 failed（同上 + 1 顺序依赖 residue baseline）
+DB 隔离（幂等 DB + Selection DB）                    : 55 passed
+compileall                                          : 0 errors
+```
+
+### 28.4 Boundary（未触碰）
+
+```text
+SQL Validator / SQL Executor / Tool Framework / RelevantTableSelector / DatabaseContextComposer
+= 0 修改；ConversationContextBuilder / Selection（Step 7E）/ Step 6 幂等 = 0 修改；
+DB schema / API / Evidence / Prompt 文件 = 0 修改。
+契约冻结同步（Intent 不变，仅登记新增可选参数）：
+  tests/test_rag_runtime_observability.py · tests/test_rag_trace_coverage_audit.py
+```
+
+### 28.5 Open Decisions（Step 7F 后）
+
+```text
+OD-35 OPEN —— Query Understanding / 追问解析（规则型阶段 + Tool 参数仍不消费 context）
+OD-38 OPEN —— 窗口参数可配置性（仍为常量 20 / 12000）
+OD-39 OPEN —— context 观测
+OD-22 / OD-23 / OD-30 / OD-31 / OD-32 / OD-33 OPEN（不阻塞）
+OD-24 / OD-25 / OD-26 / OD-34 / OD-36 / OD-37 CLOSED
+KL-1 · KL-2 仍然成立（AI exactly-once NOT GUARANTEED；duplicate 不重放 route/data）
+```
+
+### 28.6 Next
+
+```text
+① Step 7 收口审计（Release / Traceability / Regression 汇总）或 OD-35 立项（二选一，需明确授权）
+② OD-38（窗口可配置）与 OD-39（观测）可合并为一步决策
+③ 不得将 Query Understanding / Memory / Summary 混入收口步骤
+```
+
+---
+
+## 29. Reconciliation（Phase 4.2 Step 7G — Conversation E2E + Security + Regression）
+
+> 本节为 **追加修订**（不删除 §1–§28 原始决定，确保历史可追溯）。
+> 依据文档：`docs/evaluation/Phase 4.2 Step 7G — Conversation E2E + Security + Regression.md`
+> 本阶段 `生产代码 = 0 · DB schema = 0 · API = 0 · Prompt = 0 · migration = 0 · 真实 LLM = 0`。
+
+### 29.1 验证范围（真实 Runtime E2E）
+
+```text
+新增测试 : tests/test_conversation_context_e2e.py（13，离线）
+           tests/test_conversation_context_security_e2e.py（12，离线）
+           tests/test_conversation_context_e2e_db.py（9，RUN_DB_TESTS=1）
+链路     : POST /messages → Runtime → Idempotency → History → Selection → Builder
+           → AIOrchestrator → Router → {RAG | Text-to-SQL} → AI Result → Assistant Turn
+替换层   : 持久化介质 · AI 执行 · LLM Provider · Vector Search · SQL Executor · Schema Provider
+不替换   : Selection · Builder · Idempotency · Router 规则 · RAG 装配 · T2SQL 装配 · SQL Validator
+```
+
+### 29.2 结论（Q1–Q10 全部按预期）
+
+```text
+历史进入 AI ✅ · 当前消息不进自己的 history ✅ · Window 真实生效 ✅ ·
+RAG 区分 History 与 KB Context ✅ · T2SQL 消费 Context ✅ ·
+History 不能突破 SQL 安全边界 ✅（Validator 拒绝 + Executor 0 调用）·
+History 不能新增 Tool capability ✅ · Duplicate 不重新消费 ✅ ·
+Conversation / Project 隔离 ✅ · API contract 未变 ✅
+I-01 … I-24：全部自动确认（映射见评估文档 §2）
+```
+
+### 29.3 关键发现（记录，不修改生产代码）
+
+```text
+F-1  HTTP DTO content 上限 10000（Step 12 冻结）⇒ 单条 >12000 turn 不可经 HTTP 产生；
+     oversized-newest 豁免在 Runtime/Selection 层可达、HTTP 层不可达。
+     回归固化：content > 10000 → 422（0 写入）；累计 6000×3 经 HTTP 证明 12000 上限生效。
+F-2  ToolExecutionService.execute(context=ToolExecutionContext) 的 context 是 **Tool 运行时上下文**，
+     与 Conversation Context（str）不同；以签名/注解断言固化，防止未来误注入。
+生产 BUG：0（本阶段 0 最小修复）。
+```
+
+### 29.4 回归结果（实测）
+
+```text
+7G 新增（离线）: 25 passed · 7G 新增（DB）: 9 passed
+指定既有（离线）: consumption 32 · selection 38+3skip · builder 40 · idempotency 35
+指定既有（DB）  : idempotency_db 14 · selection(DB) 41 · 新 DB E2E 9 · multiturn_db_e2e 12 = 79
+全量离线        : 6061 passed · 5 failed（EXPECTED UNTIL COMMIT：worktree guard + 4 下游）
+全量 DB         : 6768 passed · 6 failed（同上 + 1 顺序依赖 residue baseline；isolated = PASS）
+compileall      : 0 errors · 真实 LLM = 0
+NEW FAILURE     : 0
+```
+
+### 29.5 Open Decisions（Step 7G 后）
+
+```text
+OD-22 / OD-23 / OD-30 / OD-31 / OD-32 / OD-33 / OD-35 / OD-38 / OD-39 = OPEN
+OD-24 / OD-25 / OD-26 / OD-34 / OD-36 / OD-37 = CLOSED
+KL-1（AI exactly-once NOT GUARANTEED）· KL-2（duplicate 不重放 route/data）仍成立
+```
+
+### 29.6 Status
+
+```text
+Context Selection = COMPLETE · Context Consumption = COMPLETE
+Conversation E2E = COMPLETE · Security Regression = COMPLETE
+Query Understanding / Memory / Summary / Agent / MCP / Workflow = NOT IMPLEMENTED
+Working Tree = dirty（7E + 7F + 7G 作为一次 Release Review 候选变更集合；未 commit）
+```
+
+### 29.7 Next（需明确授权）
+
+```text
+① Phase 4.2 Step 7H — Release Readiness（推荐：收口 Release / Traceability / Regression）
+② OD-35（Query Understanding）立项 —— 不得与 7H 混做
+③ OD-38 / OD-39（窗口可配置 / 观测）可合并为一步决策
+④ 不得将 Memory / Summary / Agent / MCP / Workflow 混入收口步骤
+```
