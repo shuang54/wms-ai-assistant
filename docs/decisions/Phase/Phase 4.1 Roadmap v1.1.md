@@ -331,6 +331,24 @@ DB Model · FK · Association Table · Repository · Indexes · Constraints · R
 具体模型当前：**UNDEFINED**（待 Step 44）。
 若采用关联表，需同时明确：cardinality、唯一约束、Read Model（frozen、不泄漏 ORM/Session）。
 
+**Step 45 实现状态：COMPLETE（Persistence，非 Runtime）**
+
+```text
+ai_ops.conversation_evidence   （1 新表 · 2 FK · 复合 PK · 1 index）
+ORM        : backend/app/db/models/conversation_evidence.py（已注册 create_all）
+Repository : backend/app/db/conversation_evidence_repository.py（唯一持久化 owner）
+            create_association / get_association
+            list_evidence_ids / list_conversation_ids
+Read Model : ConversationEvidenceReference（frozen）
+OD-11 = FROZEN（0..N × 0..N，已关闭）
+OD-13 = FROZEN（幂等 + UNIQUE(conversation_id, evidence_id)，已关闭）
+OD-12 = DEFERRED TO STEP 46（turn-level 未进入持久化，不是永久拒绝）
+证据      : tests/test_conversation_evidence_persistence_db.py（16 passed，真实 PostgreSQL）
+DB Schema  : 1 new table（父表 conversation / conversation_turn /
+             evidence_record / evidence_annotation_record 均未改动）
+Runtime    : 未接线（AIOrchestrator / Router / RAG / Tool / Text-to-SQL / API 全部未改）
+```
+
 ---
 
 ## 九、Step 46 — Real Conversation Evidence E2E
@@ -441,7 +459,7 @@ Step 50 → 51                             【Sequential】
 | 42   | 0（建议） | 0          | 0      | 0         | 0 |
 | 43   | 0（建议） | 0          | 0      | 0         | 0 |
 | 44   | 0（Design Only） | 0   | 0      | 0         | 0 |
-| 45   | **待定**（0 或 1 关联表） | 待定 | 待定 | 待定 | 待定 |
+| 45   | 1（conversation_evidence） | 0     | 2     | 1     | 1（复合 PK） |
 | 46   | 0         | 0          | 0      | 0         | 0 |
 | 47–51| 0         | 0          | 0      | 0         | 0 |
 

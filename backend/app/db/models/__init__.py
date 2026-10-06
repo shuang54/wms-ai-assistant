@@ -19,6 +19,7 @@ from __future__ import annotations
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
+from backend.app.db.models.conversation_evidence import ConversationEvidenceRecord
 from backend.app.db.models.conversation_turn import ConversationTurn
 from backend.app.db.models.evidence_annotation_record import EvidenceAnnotationRecord
 from backend.app.db.models.evidence_record import EvidenceRecord
@@ -45,12 +46,16 @@ _MODELS: tuple[type, ...] = (
     # EvidenceRecord 必须先于 EvidenceAnnotationRecord（后者有指向前者的 FK）。
     EvidenceRecord,
     EvidenceAnnotationRecord,
+    # Phase 4.1 Step 45：Conversation ↔ Evidence 关联（ai_ops schema）。
+    # 必须晚于 Conversation 与 EvidenceRecord（本表对两者都有 FK）。
+    ConversationEvidenceRecord,
 )
 
 
 __all__ = [
     "AssistantOutcomeRecord",
     "Conversation",
+    "ConversationEvidenceRecord",
     "ConversationTurn",
     "EvidenceRecord",
     "EvidenceAnnotationRecord",

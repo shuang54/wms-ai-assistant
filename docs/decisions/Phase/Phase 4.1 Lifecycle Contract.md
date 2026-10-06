@@ -570,8 +570,116 @@ Step 46 = Real Conversation Evidence E2E
 
 | ID    | Open Decision                                            | 归属     |
 | ----- | -------------------------------------------------------- | -------- |
-| OD-11 | Conversation ↔ Evidence 关联基数（0..N × 0..N 是否确认）    | Step 45 前 |
-| OD-12 | 是否需要 Turn-level（ConversationTurn ↔ Evidence）引用     | Step 45 前 |
-| OD-13 | 重复引用语义（幂等唯一 / 允许重复 / 以 turn_id 区分）        | Step 45 前 |
+| OD-11 | ~~关联基数~~ **CLOSED（Step 45）：FROZEN 0..N × 0..N**       | 45（已关闭） |
+| OD-12 | Turn-level（ConversationTurn ↔ Evidence）引用               | **DEFERRED TO STEP 46**（非永久拒绝） |
+| OD-13 | ~~重复引用语义~~ **CLOSED（Step 45）：幂等 + UNIQUE(conversation_id, evidence_id)** | 45（已关闭） |
 
-以上均**未**在本 Step 关闭；Step 44 不创建 `conversation_evidence`、不创建 Service / API。
+以上均**未**在 Step 44 关闭；Step 44 不创建 `conversation_evidence`、不创建 Service / API。
+
+---
+
+## 七、Conversation ↔ Evidence Persistence（Step 45）
+
+### 1. Association Table
+
+```text
+ai_ops.conversation_evidence
+  conversation_id  (PK part 1, FK → ai_ops.conversation.conversation_id, ON DELETE CASCADE)
+  evidence_id      (PK part 2, FK → ai_ops.evidence_record.evidence_id,   ON DELETE CASCADE)
+  created_at       server_default now()（无 updated_at —— 关联不可变）
+```
+
+* **无独立 ID**（关联记录无独立身份）· 无 turn_id · 无 assistant_request_id ·
+  无 dataset_version / source_type · 无 raw_content；
+* 由 `Base.metadata.create_all()` 建立（沿用项目模式，**不引入 Alembic**）；
+* ORM：`backend/app/db/models/conversation_evidence.py`（已注册到 `models/_MODELS`）。
+
+### 2. Cardinality（OD-11 = **FROZEN**，已关闭）
+
+```text
+Conversation → 0..N Evidence
+Evidence     → 0..N Conversation
+```
+
+依据：Step 44 FROZEN「Evidence = Reusable」+ Candidate B（关联表）+ 无冲突契约；
+实现验证：`list_evidence_ids()` / `list_conversation_ids()`（测试 09 / 10 / 11）。
+
+### 3. Ownership
+
+```text
+FROZEN（继承 Step 44）：Conversation ≠ Evidence Owner
+单一 persistence owner = ConversationEvidenceRepository
+ConversationRepository / EvidenceRepository 不持有该表
+```
+
+### 4. Reference Semantics
+
+```text
+FROZEN：关联 = Reference（不是 ownership、不是副本、不是 provenance）
+```
+
+### 5. Unique Constraint（OD-13 = **FROZEN: IDEMPOTENT**，已关闭）
+
+```text
+PRIMARY KEY (conversation_id, evidence_id) = pk_conversation_evidence
+Index: ix_conversation_evidence_evidence_id（支持 Evidence → Conversation 反向查询）
+Repository：重复 create_association → first-write-wins 返回既有行（沿用 Step 37/40）
+DB：重复 INSERT → 唯一约束拒绝（IntegrityError）
+```
+
+### 6. Foreign Keys（真实 PostgreSQL）
+
+```text
+conversation_evidence.conversation_id → conversation.conversation_id        ON DELETE CASCADE
+conversation_evidence.evidence_id     → evidence_record.evidence_id         ON DELETE CASCADE
+```
+
+实测 `pg_constraint`：两条 FK 均存在且带 ON DELETE CASCADE。
+
+### 7. Delete Semantics（实测）
+
+| 操作                | 结果                                             |
+| ------------------- | ------------------------------------------------ |
+| Delete Conversation | 关联行删除；**Evidence 保留**                     |
+| Delete Evidence     | 关联行删除；**Conversation 保留**                 |
+
+→ CASCADE 只作用于关联行，**绝不**级联删除对方父对象（测试 12 / 13）。
+
+### 8. Transaction Boundary
+
+```text
+Repository owns transaction：with factory() as session, session.begin():
+失败 → 整体回滚（无半关联）；非法父引用 → 先校验后写入
+```
+
+### 9. Turn-level Boundary（OD-12 = **DEFERRED TO STEP 46**）
+
+```text
+关联表不含 turn_id / assistant_request_id；Repository API 亦不接受
+延后原因：需真实 AI Runtime E2E 证据决定是否需要 Turn-level association
+不是永久拒绝、不是忽略
+```
+
+### 10. Provenance Boundary
+
+```text
+关联表不含 dataset_version / source_type
+Provenance 仍 = Evidence.dataset_version + Evidence.source_type（Step 38）
+查询 Provenance 必须经 evidence_id 访问 Evidence 本体
+```
+
+### 11. Security Boundary
+
+* Read Model `ConversationEvidenceReference`：frozen dataclass，字段仅
+  `conversation_id / evidence_id / created_at`；
+* 不含 Session / Connection / Engine / ORM / metadata / registry；
+* 不含 Evidence 内容（raw_content）、不含凭据；`project_id` 仍非 tenant boundary；
+* RBAC / Multi-tenancy 仍 OUT OF SCOPE。
+
+### 12. Step 46 Runtime Boundary
+
+```text
+Step 45 只提供 Persistence；Conversation 仍不会自动产生 Evidence 关联
+Conversation → AI Runtime → Evidence → Association 属 Step 46
+本 Step 未修改 AIOrchestrator / Router / RAG / Tool / Text-to-SQL / API
+```
