@@ -145,12 +145,24 @@ class TestProductionBoundary:
 
     def test_1d_no_provenance_word_in_backend(self) -> None:
         """事实断言：production 当前无 provenance 语义（含标识符与字符串常量）。"""
+        # Step 38：provenance 持久化只允许存在于 Step 37/38 冻结文件内
+        frozen = ("backend/app/db/evidence_repository.py",)
         offenders: list[str] = []
         for path in _backend_files():
+            if _relative(path) in frozen:
+                continue
             tokens = _ast_tokens(path)
             if "provenance" in {token.lower() for token in tokens}:
                 offenders.append(_relative(path))
         assert offenders == [], offenders
+        for forbidden in (
+            "backend/app/services/provenance_service.py",
+            "backend/app/api/provenance_api.py",
+            "backend/app/services/provenance_workflow.py",
+            "backend/app/services/provenance_manager.py",
+            "backend/app/services/provenance_registry.py",
+        ):
+            assert not (_REPO_ROOT / forbidden).exists(), forbidden
 
     def test_1e_dataset_version_domain_is_preexisting_t2sql_only(self) -> None:
         """既有 dataset_version 只属于 Text-to-SQL 评估域，不属 Conversation 证据域。"""
@@ -159,7 +171,14 @@ class TestProductionBoundary:
             if "dataset_version" in _ast_tokens(path):
                 owners.add(_relative(path))
         assert owners, "既有 dataset_version 分布发生变化（审计需更新）"
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         for owner in owners:
+            if owner in frozen:  # Step 37：Evidence 持久化域
+                continue
             assert "text_to_sql" in owner, owner
 
 
@@ -256,9 +275,20 @@ class TestTestLocalContract:
     def test_3d_no_evidence_directories_created(self) -> None:
         for relative in ("backend/app/evidence", "backend/app/db/evidence"):
             assert not (_REPO_ROOT / relative).exists(), relative
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         for directory in _AUDITED_DIRS:
             for path in (_REPO_ROOT / directory).rglob("evidence*.py"):
-                raise AssertionError(_relative(path))
+                assert _relative(path) in frozen, _relative(path)
+        for forbidden in (
+            "backend/app/services/evidence_service.py",
+            "backend/app/api/evidence_api.py",
+            "backend/app/services/evidence_workflow.py",
+        ):
+            assert not (_REPO_ROOT / forbidden).exists(), forbidden
 
 
 # ============================================================

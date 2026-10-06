@@ -159,8 +159,16 @@ class TestProductionBoundary:
         assert offenders == [], offenders
 
     def test_1d_no_rubric_modules_in_production(self) -> None:
+        """Rubric 边界保持不变；仅排除 Step 37 冻结的持久化模块。"""
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         offenders: list[str] = []
         for path in _production_files():
+            if _relative(path) in frozen:
+                continue
             name = path.name
             for keyword in _FORBIDDEN_MODULE_KEYWORDS:
                 if keyword in name:
@@ -177,10 +185,18 @@ class TestContractLocation:
     def test_2a_rubric_contract_is_test_local(self) -> None:
         assert (_REPO_ROOT / _RUBRIC_TEST).exists()
         # production 三目录中无同名 / 相似契约模块（精确组合词；允许既有 rag_evaluation_service）
+        frozen = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
         for directory in _AUDITED_DIRS:
-            names = sorted(path.name for path in (_REPO_ROOT / directory).rglob("*.py"))
-            assert names, directory
-            for name in names:
+            paths = sorted((_REPO_ROOT / directory).rglob("*.py"))
+            assert paths, directory
+            for path in paths:
+                if _relative(path) in frozen:
+                    continue
+                name = path.name
                 for keyword in _FORBIDDEN_MODULE_KEYWORDS:
                     assert keyword not in name, f"{directory}/{name}"
 
