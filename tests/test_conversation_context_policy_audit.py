@@ -278,6 +278,9 @@ class TestOwnershipBoundary:
             "archive_conversation",
             "append_turn",
             "list_turns",
+            # Phase 4.2 Step 6：幂等查询（读路径；不含 policy）
+            "find_turn_by_idempotency_key",
+            "find_assistant_turn_after",
         }
         for name in methods:
             params = inspect.signature(getattr(ConversationService, name)).parameters
@@ -305,6 +308,8 @@ class TestOwnershipBoundary:
         assert params == {
             "conversation_id": inspect.Parameter.KEYWORD_ONLY,
             "content": inspect.Parameter.KEYWORD_ONLY,
+            # Phase 4.2 Step 6：可选幂等键（keyword-only）
+            "idempotency_key": inspect.Parameter.KEYWORD_ONLY,
         }
 
     def test_07_no_production_policy_module_exists(self) -> None:

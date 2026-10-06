@@ -113,6 +113,9 @@ CONVERSATION_SERVICE_METHODS: tuple[str, ...] = (
     "archive_conversation",
     "append_turn",
     "list_turns",
+    # Phase 4.2 Step 6：消息幂等查询（读路径；不新增状态 / 不新增表）
+    "find_turn_by_idempotency_key",
+    "find_assistant_turn_after",
 )
 CONVERSATION_REPOSITORY_METHODS: tuple[str, ...] = (
     "create",
@@ -120,6 +123,9 @@ CONVERSATION_REPOSITORY_METHODS: tuple[str, ...] = (
     "update_status",
     "append_turn",
     "list_turns_by_conversation_id",
+    # Phase 4.2 Step 6：幂等键查询 / ASSISTANT 归属查询（显式列 · 只读）
+    "find_turn_by_idempotency_key",
+    "find_next_assistant_turn",
 )
 
 #: Deferred（本 Step 不实现）。

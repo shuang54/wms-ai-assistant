@@ -235,7 +235,9 @@ class TestApplicationServiceEntrypoint:
         endpoint = conversations_module.execute_conversation_message
         assert inspect.iscoroutinefunction(endpoint)
         params = list(inspect.signature(endpoint).parameters)
-        assert params == ["conversation_id", "request"]
+        # Phase 4.2 Step 6：新增可选 Header 参数 `idempotency_key`
+        # （幂等键只经 HTTP Header 传递，**不在** JSON Body）。
+        assert params == ["conversation_id", "request", "idempotency_key"]
 
 
 # ============================================================

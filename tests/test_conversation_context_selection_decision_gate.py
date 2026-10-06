@@ -503,6 +503,8 @@ class TestProductionBoundary:
             "content",
             "assistant_request_id",
             "created_at",
+            # Phase 4.2 Step 6：消息幂等键（只写 USER Turn）
+            "idempotency_key",
         }
 
 

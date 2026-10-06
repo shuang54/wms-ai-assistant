@@ -151,9 +151,19 @@ class ConversationMessageResponse(BaseModel):
       **不透传**（None）—— 深度映射统一属后续 Step；
     * Outcome（SUCCESS / EMPTY / REFUSED / FAILED）不是 HTTP 状态：
       AI 返回结果（含 EMPTY / Tool 业务失败）统一为 HTTP 200。
+    * Phase 4.2 Step 6（OD-34）：``route`` 在 **duplicate replay** 场景为
+      ``null``（该请求未执行 AI，故无真实路由）；字段名集合不变，
+      replay 标记只出现在 ``metadata["idempotent_replay"]``。
     """
 
-    route: str = Field(..., description="实际执行的路由（rag / tool / text_to_sql）")
+    route: str | None = Field(
+        default=None,
+        description=(
+            "实际执行的路由（rag / tool / text_to_sql）；"
+            "Phase 4.2 Step 6：duplicate replay（AI 未执行）为 null —— "
+            "**不得**伪造为 replay / unknown / conversation / duplicate / chat"
+        ),
+    )
     content: str | None = Field(
         default=None, description="自然语言内容 / 摘要（RAG 空结果可为 null）"
     )

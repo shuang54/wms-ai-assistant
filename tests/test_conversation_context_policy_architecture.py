@@ -40,6 +40,8 @@ _FROZEN_TURN_FIELDS: frozenset[str] = frozenset(
         "content",
         "assistant_request_id",
         "created_at",
+        # Phase 4.2 Step 6：消息幂等键（只写 USER Turn）
+        "idempotency_key",
     }
 )
 
@@ -84,6 +86,8 @@ _APPLICATION_SERVICE_ALLOWED_PREFIXES: tuple[str, ...] = (
     "__future__",
     "logging",
     "collections.abc",
+    # Phase 4.2 Step 6：MessageReplay（frozen DTO）
+    "dataclasses",
     "typing",
     "backend.app.services.conversation_service",
     "backend.app.services.conversation_context_builder",

@@ -63,7 +63,7 @@ import logging
 from collections.abc import Mapping
 from typing import Annotated, Any, Final
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, HTTPException, Header, Path, status
 
 from backend.app.db.conversation_repository import ConversationRepositoryError
 from backend.app.dto.conversation_api import (
@@ -74,9 +74,13 @@ from backend.app.dto.conversation_api import (
     ConversationTurnResponse,
     CreateConversationRequest,
 )
-from backend.app.services.chat_application_service import ChatApplicationService
+from backend.app.services.chat_application_service import (
+    ChatApplicationService,
+    MessageReplay,
+)
 from backend.app.services.conversation_service import (
     ConversationArchivedError,
+    ConversationMessageIdempotencyConflictError,
     ConversationNotFoundError,
     ConversationService,
     ConversationTurnView,
@@ -91,6 +95,10 @@ router = APIRouter()
 #: conversation_id 路径参数边界（与既有 Assistant Trace API 一致）。
 MIN_CONVERSATION_ID_LENGTH: int = 1
 MAX_CONVERSATION_ID_LENGTH: int = 128
+
+#: ``Idempotency-Key`` Header 长度上限（Phase 4.2 Step 6；
+#: 与 ``conversation_turn.idempotency_key`` 列宽一致；超长 → 422）。
+IDEMPOTENCY_KEY_MAX_LENGTH: int = 128
 
 #: 模块级 Service（Composition Root；测试可 monkeypatch 替换）。
 #: 与既有 api 模块风格一致（``api/chat.py`` 的 ``_chat_service``、
@@ -131,12 +139,29 @@ def _safe_message_data(data: object) -> dict[str, Any] | None:
 
 
 def _to_message_response(result: Any) -> ConversationMessageResponse:
-    """AIOrchestrationResult → HTTP DTO（**不修改** route / content / metadata）。
+    """执行结果 → HTTP DTO（**不修改** route / content / metadata）。
 
     ``result`` 使用 ``Any``：API 层**不 import** AI Core 模块（连类型标注也不），
-    实际形状由 ChatApplicationService 契约保证（``execute_message`` 返回
-    ``AIOrchestrationResult``）。
+    实际形状由 ChatApplicationService 契约保证：
+
+        * ``AIOrchestrationResult`` → 本次真实执行了 AI；
+        * ``MessageReplay``         → **duplicate 重放**（Phase 4.2 Step 6 /
+          OD-34 Message Replay）：AI = 0 次，只重放已持久化 assistant message。
     """
+    if isinstance(result, MessageReplay):
+        # route / data **未持久化** ⇒ 一律 null（**禁止**伪造 route）。
+        # metadata 只允许：request_id（来自 ASSISTANT Turn）+ idempotent_replay；
+        # **不含** turn_id / conversation_id / idempotency_key / outcome。
+        replay_metadata: dict[str, Any] = {"idempotent_replay": True}
+        if result.assistant_request_id is not None:
+            replay_metadata["request_id"] = result.assistant_request_id
+        return ConversationMessageResponse(
+            route=None,
+            content=result.content,
+            data=None,
+            metadata=replay_metadata,
+        )
+
     route = getattr(result.route, "value", result.route)
     return ConversationMessageResponse(
         route=str(route),
@@ -411,8 +436,19 @@ async def archive_conversation(
             )
         },
         404: {"description": "会话不存在"},
-        409: {"description": "会话已归档（禁止追加 Turn）"},
-        422: {"description": "请求体 / 路径参数校验失败（content 非法）"},
+        409: {
+            "description": (
+                "会话已归档（禁止追加 Turn）；或幂等冲突"
+                "（IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD / "
+                "IDEMPOTENCY_KEY_IN_FLIGHT）"
+            )
+        },
+        422: {
+            "description": (
+                "请求体 / 路径参数 / Idempotency-Key 校验失败"
+                "（content 非法 · key 超长）"
+            )
+        },
         500: {"description": "AI 执行失败或服务不可用（不暴露内部细节）"},
     },
 )
@@ -426,6 +462,19 @@ async def execute_conversation_message(
         ),
     ],
     request: ConversationMessageRequest,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            max_length=IDEMPOTENCY_KEY_MAX_LENGTH,
+            description=(
+                "客户端请求幂等键（**可选**；≤128 字符）。"
+                "同一会话内同 key + 同 content 且已完成 → 200 duplicate replay"
+                "（不重新执行 AI）；同 key 不同 content → 409；"
+                "未提供 / 纯空白 → 不参与幂等"
+            ),
+        ),
+    ] = None,
 ) -> ConversationMessageResponse:
     """执行一条会话消息（USER turn → AI → 条件式 ASSISTANT turn）。
 
@@ -434,23 +483,39 @@ async def execute_conversation_message(
     * project 只能来自 ``conversation.project_id``（客户端**不可**覆盖）；
     * ``assistant_request_id`` 由 AI 执行生成（响应 ``metadata.request_id``），
       客户端**不可**指定；
+    * 幂等键只经 **HTTP Header** 传递（**不在** JSON Body；
+      ``ConversationMessageRequest`` 仍只有 ``content``）；
     * API 只做适配：校验 + 调用 ChatApplicationService + DTO 转换 + 异常映射，
       **不**访问 Repository / DB / AIOrchestrator；
     * Outcome（SUCCESS / EMPTY / REFUSED / FAILED）不是 HTTP 状态 ——
       AI 返回结果（含 EMPTY / REFUSED / Tool 业务失败）统一为 HTTP 200；
       仅当执行抛异常（AI 失败 / 服务不可用）才映射 500。
+
+    Phase 4.2 Step 6（幂等）：
+
+    * ``Idempotency-Key`` 缺失 / 纯空白 → 历史行为（每次独立，服务端**不生成** key）；
+    * 已完成 + 同 key 同 content → **200 + duplicate replay**
+      （``route=null · data=null · metadata.idempotent_replay=true``）；
+    * 同 key 不同 content → **409** ``IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD``；
+    * 并发同 key（唯一约束冲突）→ **409** ``IDEMPOTENCY_KEY_IN_FLIGHT``。
     """
     service = get_chat_application_service()
     try:
         result = await service.execute_message(
             conversation_id=conversation_id,
             content=request.content,
+            idempotency_key=idempotency_key,
         )
     except ConversationNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
         )
     except ConversationArchivedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        )
+    except ConversationMessageIdempotencyConflictError as exc:
+        # 幂等冲突 = 409（**不是** 500）：请求未被静默执行，客户端需处理。
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(exc)
         )

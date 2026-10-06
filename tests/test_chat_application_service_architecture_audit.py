@@ -45,6 +45,7 @@ _ALLOWED_IMPORT_PREFIXES: tuple[str, ...] = (
     "__future__",
     "logging",
     "collections.abc",
+    "dataclasses",
     "typing",
     "backend.app.services.conversation_service",
     "backend.app.services.conversation_context_builder",
@@ -222,6 +223,8 @@ class TestServiceShapeBoundary:
         assert params == {
             "conversation_id": inspect.Parameter.KEYWORD_ONLY,
             "content": inspect.Parameter.KEYWORD_ONLY,
+            # Phase 4.2 Step 6：可选幂等键（keyword-only）
+            "idempotency_key": inspect.Parameter.KEYWORD_ONLY,
         }
 
 

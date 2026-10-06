@@ -643,3 +643,75 @@ KL-2  Duplicate replay 不重放 route / data / metadata（仅 content + request
       ⇒ Text-to-SQL 结果数据在 Architecture A 下丢失；
         完整重放需 Architecture B（OD-23），不得以持久化 AI Result 入 Turn 方式解决
 ```
+
+---
+
+## 24. Reconciliation（Phase 4.2 Step 6 — Transaction / Concurrency / Idempotency 实施）
+
+> 本节为 **追加修订**（不删除 §1–§23 原始决定，确保历史可追溯）。
+> Step 6 是 Phase 4.2 **第一个**允许修改 Backend / DB Schema / API / Tests 的实施阶段。
+> 冻结来源：Step 1 · 1A（OD-22）· 2 · 4A（OD-26）· 5A（OD-34）。
+
+### 24.1 实施内容
+
+```text
+Idempotency-Key Header（Optional · ≤128 · 空白=无幂等 · 超长 422 · 服务端不生成/不改写）
+conversation_turn.idempotency_key VARCHAR(128) NULL
+UNIQUE(conversation_id, idempotency_key)（标准 UNIQUE；禁止 NULLS NOT DISTINCT；历史 NULL 兼容）
+init_db 幂等 DDL：ensure_conversation_turn_idempotency_key_column
+                  ensure_conversation_turn_idempotency_unique_index
+ChatApplicationService._resolve_user_turn()：先查幂等键 → 写 / 重放 / 重试
+MessageReplay（frozen DTO）：content + assistant_request_id
+ConversationMessageResponse.route: str → str | None = None（字段名集合不变）
+409 映射：IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD · IDEMPOTENCY_KEY_IN_FLIGHT
+```
+
+### 24.2 事务模型（未修改）
+
+```text
+TX1（USER Turn + idempotency_key）→ AI execution（事务之外）→ TX2（ASSISTANT Turn）
+幂等键只写 USER Turn（ASSISTANT 恒 NULL）
+retry 复用既有 USER Turn：list_turns 后按 turn_id 精确排除 ⇒ 不重复注入 context
+```
+
+### 24.3 修改文件
+
+```text
+backend/app/api/conversations.py                    Header + 409 + replay DTO 映射
+backend/app/db/conversation_repository.py           校验 · 读列 · insert · 幂等查询 · 唯一冲突异常
+backend/app/db/init_db.py                           幂等 DDL（列 + 唯一索引）
+backend/app/db/models/conversation_turn.py          idempotency_key 列 + UNIQUE 索引
+backend/app/dto/conversation_api.py                 route 可选（OD-34）
+backend/app/services/chat_application_service.py    幂等流程 + MessageReplay
+backend/app/services/conversation_service.py        append_turn key · 查询方法 · fingerprint · 异常映射
+tests/（15 个既有文件同步更新 + 2 个新增文件）
+```
+
+### 24.4 Open Decisions（Step 6 后）
+
+```text
+OD-22 OPEN   DB 变更已实施（待你确认后 commit）
+OD-23 OPEN   完整 HTTP response replay（需要时走 Architecture B）
+OD-24 CLOSED · OD-25 CLOSED · OD-26 CLOSED · OD-30 OPEN · OD-31 OPEN · OD-32 OPEN
+OD-33 OPEN   in-flight vs NOT_COMPLETED 可区分性（实现采用 default retry）
+OD-34 CLOSED duplicate = Message Replay（已实施）
+```
+
+### 24.5 已知限制（实施后仍然成立）
+
+```text
+KL-1  Crash B（AI 已执行、ASSISTANT Turn 未提交）⇒ AI exactly-once execution = NOT GUARANTEED
+KL-2  duplicate replay 不重放 route / data / metadata（Text-to-SQL 行数据丢失）
+```
+
+### 24.6 回归状态
+
+```text
+全量（离线）    ：5931 passed · 5 failed（全部 = backend 未提交导致的 working-tree guard 及其下游）
+全量（DB）      ：6661 passed · 6 failed（同上 + 1 个既有 DB 残留 baseline，单独运行通过）
+compileall      ：0 errors
+DB 残留（Step 6）：0
+```
+
+> 未提交原因：Step 6 未授予 commit 授权；working-tree guard 按历史约定
+> **不 skip / 不改 baseline**，待授权 commit 后恢复绿灯。
