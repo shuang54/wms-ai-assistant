@@ -77,10 +77,13 @@ PROPOSED_API_PATHS: tuple[str, ...] = (
 )
 
 #: Step 5~8 已实现并冻结的 Conversation 生产模块（范围守卫；未声明 = 漂移）。
+#: Step 45 追加：Conversation ↔ Evidence **关联**持久化（association，不是新 Entity）。
 _DECLARED_CONVERSATION_MODULES: tuple[str, ...] = (
     "backend/app/api/conversations.py",
+    "backend/app/db/conversation_evidence_repository.py",
     "backend/app/db/conversation_repository.py",
     "backend/app/db/models/conversation.py",
+    "backend/app/db/models/conversation_evidence.py",
     "backend/app/db/models/conversation_turn.py",
     "backend/app/dto/conversation_api.py",
     "backend/app/services/conversation_context_builder.py",

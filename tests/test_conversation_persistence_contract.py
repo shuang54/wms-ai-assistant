@@ -183,10 +183,13 @@ FORBIDDEN_SENSITIVE_FIELDS: tuple[str, ...] = (
 )
 
 #: Step 5 起允许存在的生产文件（相对仓库根；多出的 conversation 代码 = 漂移）。
+#: Step 45 追加：Conversation ↔ Evidence 关联持久化（association，非新 Entity）。
 ALLOWED_PRODUCTION_MODULES: tuple[str, ...] = (
     "backend/app/api/conversations.py",
+    "backend/app/db/conversation_evidence_repository.py",
     "backend/app/db/conversation_repository.py",
     "backend/app/db/models/conversation.py",
+    "backend/app/db/models/conversation_evidence.py",
     "backend/app/db/models/conversation_turn.py",
     "backend/app/dto/conversation_api.py",
     "backend/app/services/conversation_context_builder.py",
@@ -932,14 +935,16 @@ class TestExistingBoundaryUnchanged:
 
     def test_16d_conversation_schema_is_defined_in_db_layer_only(self) -> None:
         """Conversation ORM / 仓储只允许出现在 db 层；API 层只允许 HTTP 边界。"""
+        # Step 45：conversation_evidence.py = 关联表 ORM（仍在 db/models 层）。
         assert sorted(
             path.name
             for path in (_REPO_ROOT / _DB_MODELS_DIR).glob("conversation*.py")
-        ) == ["conversation.py", "conversation_turn.py"]
-        assert [
+        ) == ["conversation.py", "conversation_evidence.py", "conversation_turn.py"]
+        # Step 45：conversation_evidence_repository.py = 关联表仓储（仍在 db 层）。
+        assert sorted(
             path.name
             for path in (_REPO_ROOT / _DB_DIR).glob("conversation*.py")
-        ] == ["conversation_repository.py"]
+        ) == ["conversation_evidence_repository.py", "conversation_repository.py"]
         # Step 8 起 Conversation HTTP 边界（conversations.py）已实现：
         # API 层只允许该文件，且其中不得定义 ORM / 触碰 db.models。
         assert [

@@ -614,10 +614,13 @@ class TestProductionImplementationScope:
     """
 
     #: 已实现并冻结的生产文件（相对仓库根；新增未登记文件 = 漂移）。
+    #: Step 45 追加：Conversation ↔ Evidence 关联持久化（association 模块）。
     ALLOWED_CONVERSATION_MODULES: tuple[str, ...] = (
         "backend/app/api/conversations.py",
+        "backend/app/db/conversation_evidence_repository.py",
         "backend/app/db/conversation_repository.py",
         "backend/app/db/models/conversation.py",
+        "backend/app/db/models/conversation_evidence.py",
         "backend/app/db/models/conversation_turn.py",
         "backend/app/dto/conversation_api.py",
         "backend/app/services/conversation_context_builder.py",
@@ -628,6 +631,8 @@ class TestProductionImplementationScope:
     ALLOWED_CONVERSATION_CLASS_FILES: frozenset[str] = frozenset(
         {
             "conversation.py",
+            # Step 45：ConversationEvidenceRecord（关联表 ORM，非新 Entity）
+            "conversation_evidence.py",
             "conversation_turn.py",
             "conversation_repository.py",
             "conversation_service.py",

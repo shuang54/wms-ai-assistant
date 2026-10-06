@@ -611,7 +611,30 @@ class TestSecurityAndProductionBoundary:
                 assert not module.startswith(forbidden), module
 
     def test_19_production_has_no_evidence_persistence_yet(self) -> None:
-        """审计快照：production 尚无 Evidence / Annotation 持久化（未来实现后需更新）。"""
+        """Evidence / Annotation 持久化边界快照（未登记的新文件 = 漂移）。
+
+        Step 45 起显式区分两类：
+
+        * **Evidence / Annotation 核心持久化**（3 个模块，Step 37 冻结）；
+        * **Conversation ↔ Evidence 关联持久化**（2 个 `conversation_evidence*` 模块，
+          Step 45 新增）—— 这是 **association persistence module**，
+          **不属于** Evidence / Annotation 核心 persistence boundary。
+
+        强度保持：任何未登记的 `evidence*` / `annotation*` 文件（例如
+        `evidence_fake_repository.py` / `random_evidence_service.py`）仍必须 FAIL；
+        关联模块也必须**恰好**等于显式登记的两个，不得借 association 之名新增。
+        """
+        #: Evidence / Annotation 核心持久化模块（Step 37）。
+        evidence_persistence_modules: tuple[str, ...] = (
+            "backend/app/db/models/evidence_record.py",
+            "backend/app/db/models/evidence_annotation_record.py",
+            "backend/app/db/evidence_repository.py",
+        )
+        #: Step 45：Conversation ↔ Evidence **关联**持久化（不是核心持久化）。
+        association_persistence_modules: tuple[str, ...] = (
+            "backend/app/db/models/conversation_evidence.py",
+            "backend/app/db/conversation_evidence_repository.py",
+        )
         backend = sorted((_REPO_ROOT / "backend/app").rglob("*.py"))
         assert backend, "backend/app 为空（审计失效）"
         matched = sorted(
@@ -619,12 +642,17 @@ class TestSecurityAndProductionBoundary:
             for path in backend
             if "evidence" in path.name or "annotation" in path.name
         )
+        # 关联模块必须恰好等于登记列表（防止以 association 名义新增未声明文件）
+        association_matched = [
+            item
+            for item in matched
+            if Path(item).name.startswith("conversation_evidence")
+        ]
+        assert sorted(association_matched) == sorted(
+            association_persistence_modules
+        ), association_matched
         assert matched == sorted(
-            (
-                "backend/app/db/models/evidence_record.py",
-                "backend/app/db/models/evidence_annotation_record.py",
-                "backend/app/db/evidence_repository.py",
-            )
+            evidence_persistence_modules + association_persistence_modules
         ), matched
 
     def test_20_deterministic_replay(self) -> None:
