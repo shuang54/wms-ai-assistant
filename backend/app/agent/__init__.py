@@ -8,8 +8,9 @@
 结构：
     errors.py    —— 错误分类 + 稳定错误码
     policy.py    —— AgentRuntimePolicy（frozen；fail-closed 校验）
-    decision.py  —— AgentDecision + 严格 JSON 解析（无修复 / 无猜测）
-    models.py    —— AgentLLM seam / AgentStep / AgentRuntimeResult（内存 DTO）
+    decision.py  —— AgentDecision + 严格 JSON 解析（文本 fallback 协议预留）
+    models.py    —— AgentLLM 端口 DTO / AgentStep / AgentRuntimeResult（内存 DTO）
+    llm.py       —— ProviderAgentLLM 适配器（provider-native function calling）
     runtime.py   —— AgentRuntime 主循环（授权 → ToolExecutionService → 回灌）
 
 明确不做：Multi-Agent · Planning · Memory · Workflow · LangGraph · MCP ·
@@ -48,12 +49,14 @@ from backend.app.agent.models import (
     AgentRuntimeResult,
     AgentStep,
 )
+from backend.app.agent.llm import ProviderAgentLLM
 from backend.app.agent.policy import AgentRuntimePolicy
 from backend.app.agent.runtime import AGENT_SYSTEM_INSTRUCTION, AgentRuntime
 
 __all__ = [
     "AgentRuntime",
     "AGENT_SYSTEM_INSTRUCTION",
+    "ProviderAgentLLM",
     "AgentRuntimePolicy",
     "AgentRuntimeResult",
     "AgentStep",

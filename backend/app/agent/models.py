@@ -14,7 +14,12 @@ Status（Phase 5 Decision §8）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Final, Mapping, Protocol
+from typing import TYPE_CHECKING, Any, Final, Mapping, Protocol, Sequence
+
+from backend.app.agent.decision import AgentDecision
+
+if TYPE_CHECKING:  # pragma: no cover —— 仅类型期引用（端口签名）
+    from backend.app.tools.base import ToolDefinition
 
 __all__ = [
     "AgentLLM",
@@ -54,25 +59,32 @@ TOOL_RESULT_MARKER: Final[str] = "【TOOL RESULT — UNTRUSTED DATA】"
 
 @dataclass(frozen=True)
 class AgentLLMCompletion:
-    """一次 Agent LLM 调用的最小返回（内部 seam）。
+    """一次 Agent LLM 调用的最小返回（Agent 端口 DTO；OQ-P5-1 = Option B）。
 
     Attributes:
-        text:         LLM 原始输出（待严格解析为 AgentDecision）。
-        total_tokens: 该次调用的 token 总量；provider 未返回 → ``None``
-                      （**不猜测 / 不伪造**；Runtime 会显式记录
-                      token 预算"不可验证"）。
+        decision:      已严格映射的 :class:`AgentDecision`（FINAL / TOOL_CALL）。
+                       映射责任在 **Agent 侧适配器**（见 ``agent/llm.py``）：
+                       非法协议 ⇒ 适配器抛 ``AgentDecisionParseError``（不返回半成品）。
+        total_tokens:  该次调用的 token 总量（``LLMResponse.usage.total_tokens``
+                       原样透传）；provider 未返回 usage → ``None``
+                       （**不估算 / 不伪造**；Runtime 显式记录
+                       ``token_budget_unverifiable``）。
+        finish_reason: Provider 原值（``stop`` / ``tool_calls`` / ``length`` ...）；
+                       不重新设计枚举；缺失 → ``None``。
 
     Raises:
-        ValueError: text 非 str / total_tokens 非法。
+        ValueError: decision 类型非法 / total_tokens 非法 / finish_reason 非法。
     """
 
-    text: str
+    decision: AgentDecision
     total_tokens: int | None = None
+    finish_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.text, str):
+        if not isinstance(self.decision, AgentDecision):
             raise ValueError(
-                f"AgentLLMCompletion.text 必须是 str（当前: {type(self.text).__name__}）"
+                "AgentLLMCompletion.decision 必须是 AgentDecision"
+                f"（当前: {type(self.decision).__name__}）"
             )
         if self.total_tokens is not None:
             if isinstance(self.total_tokens, bool) or not isinstance(
@@ -83,17 +95,34 @@ class AgentLLMCompletion:
                 )
             if self.total_tokens < 0:
                 raise ValueError("AgentLLMCompletion.total_tokens 必须 >= 0")
+        if self.finish_reason is not None and not isinstance(
+            self.finish_reason, str
+        ):
+            raise ValueError(
+                "AgentLLMCompletion.finish_reason 必须是 str 或 None"
+            )
 
 
 class AgentLLM(Protocol):
-    """Agent Runtime 依赖的 LLM seam（**不改动** 既有 ``LLMProvider`` contract）。
+    """Agent Runtime 依赖的 LLM 端口（agent 自有；provider-agnostic）。
 
-    真实接线（下一阶段）由适配器实现：``LLMProvider.chat(messages)`` → ``str``
-    （无 ``tools=`` ⇒ 无 usage）⇒ ``AgentLLMCompletion(text=..., total_tokens=None)``。
+    实现方（唯一生产实现 = :class:`backend.app.agent.llm.ProviderAgentLLM`）：
+
+        complete(*, messages, tools) -> AgentLLMCompletion
+
+    其中 ``tools`` 是 **AgentRuntime 已授权子集** 的 ``ToolDefinition``；
+    实现方负责 ``definitions_to_openai_tools()`` → ``provider.chat(messages, tools=...)``
+    → 严格映射 ``LLMResponse`` → :class:`AgentDecision`。
+
+    端口职责：只做决策映射与 usage/finish_reason 透传；
+    **不**做 RuntimePolicy / Tool Authorization / Tool 执行 / 持久化。
     """
 
     async def complete(
-        self, messages: list[dict[str, Any]]
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: Sequence[ToolDefinition],
     ) -> AgentLLMCompletion: ...
 
 
