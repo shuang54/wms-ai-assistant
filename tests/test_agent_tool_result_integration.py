@@ -683,6 +683,63 @@ class TestToolResultIntegrationBoundary:
             "tool_result_sink=build_agent_tool_result_write_point()"
         )
 
+    def test_composition_root_injects_write_point(
+        self, monkeypatch: Any
+    ) -> None:
+        """真装配：agent_enabled=True ⇒ AgentRuntime 持有写入点（真 provider 不建）。"""
+        import backend.app.db.session as session_module
+        from tests.test_project_configuration import _build, _configuration_provider
+
+        class _FakeProvider:
+            async def chat(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+                raise AssertionError("装配测试不应调用 provider")
+
+        provider, *_rest = _configuration_provider()
+        monkeypatch.setattr(session_module, "get_engine", lambda: object())
+        orchestrator = _build(
+            "project-a",
+            configuration_provider=provider,
+            agent_enabled=True,
+            agent_llm_provider=_FakeProvider(),
+        )
+
+        runtime = orchestrator._agent_runtime
+        assert isinstance(runtime, AgentRuntime)
+        assert isinstance(runtime.tool_result_sink, AgentToolResultWritePoint)
+        assert runtime.allowed_tools == ("get_inventory",)
+        # 生成的 Step / Run recorder 不受影响（各自独立 best-effort）
+        assert orchestrator._agent_run_recorder is not None
+
+    def test_composition_root_without_database_injects_no_sink(
+        self, monkeypatch: Any
+    ) -> None:
+        import backend.app.db.session as session_module
+        from tests.test_project_configuration import _build, _configuration_provider
+
+        class _FakeProvider:
+            async def chat(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+                raise AssertionError("装配测试不应调用 provider")
+
+        provider, *_rest = _configuration_provider()
+        monkeypatch.setattr(session_module, "get_engine", lambda: None)
+        orchestrator = _build(
+            "project-a",
+            configuration_provider=provider,
+            agent_enabled=True,
+            agent_llm_provider=_FakeProvider(),
+        )
+
+        runtime = orchestrator._agent_runtime
+        assert runtime.tool_result_sink is None  # 无 DATABASE_URL ⇒ 零开销跳过
+
+    def test_agent_disabled_default_has_no_runtime(self) -> None:
+        from tests.test_project_configuration import _build, _configuration_provider
+
+        provider, *_rest = _configuration_provider()
+        orchestrator = _build("project-a", configuration_provider=provider)
+
+        assert orchestrator._agent_runtime is None  # 默认关闭 ⇒ 无 Agent 接线
+
     def test_build_write_point_respects_engine_availability(
         self, monkeypatch: Any
     ) -> None:
