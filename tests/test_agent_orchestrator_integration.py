@@ -32,6 +32,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -263,6 +264,8 @@ def _agent_result(
         tool_calls=tool_calls,
         llm_calls=llm_calls,
         error=error,
+        # Phase 5 P-2：run_id 由 AgentRuntime 签发（持久化层只读取）
+        run_id=f"run-{uuid.uuid4().hex[:12]}",
         tokens_used=tokens_used,
         token_budget_unverifiable=token_budget_unverifiable,
         step_records=(
@@ -663,7 +666,13 @@ class TestAgentConversationContext:
             "idempotency",
             "request_id",
         )
+        # Phase 5 P-2：``recorder.py`` 是**持久化边界**（agent 包中唯一允许
+        # import DB 的模块）；执行内核（runtime / llm / decision / models /
+        # policy / errors / capability / ids）仍必须 0 DB 依赖，且**不得**依赖
+        # recorder（下面显式断言）。
         for path in sorted(_AGENT_DIR.glob("*.py")):
+            if path.name == "recorder.py":
+                continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -682,6 +691,16 @@ class TestAgentConversationContext:
                     assert node.id not in forbidden_names, (path.name, node.id)
                 if isinstance(node, ast.Attribute):
                     assert node.attr not in forbidden_names, (path.name, node.attr)
+
+        # 执行内核**不依赖**持久化边界（AgentRuntime 保持纯内存执行）
+        runtime_source = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
+        assert "recorder" not in runtime_source
+        for path in sorted(_AGENT_DIR.glob("*.py")):
+            if path.name == "recorder.py":
+                continue
+            source = path.read_text(encoding="utf-8")
+            assert "agent.recorder" not in source, path.name
+            assert "import recorder" not in source, path.name
 
     async def test_context_is_read_only_input_for_single_run(self) -> None:
         """同一 Run 内 context 只出现一次（不因 Tool Result 重新选择）。"""

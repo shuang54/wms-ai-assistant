@@ -157,6 +157,11 @@ class AgentRuntimeResult:
     """Agent Run 结果（IN-MEMORY ONLY；本阶段不持久化）。
 
     Attributes:
+        run_id:        Phase 5 P-2 —— 本次 Agent 执行的**身份**（Agent Runtime
+                       在 ``run()`` 内签发；持久化层只读取，不重新生成）。
+                       与 ``assistant_request_id``（AI 请求 correlation）/
+                       ``turn_id``（Conversation 消息）/ ``tool_call_id``
+                       （协议关联）互不相同。
         status:        COMPLETED / FAILED / LIMIT_REACHED（其余为预留常量）。
         content:       成功时的最终回答（FAILED / LIMIT_REACHED → None）。
         steps:         LLM 决策步数（每次**成功解析**的 Decision 计 1）。
@@ -166,7 +171,7 @@ class AgentRuntimeResult:
         tokens_used:   已计量 token 合计（provider 未返回 usage 时为 0）。
         token_budget_unverifiable: provider 未返回 usage ⇒ token 预算
                        **无法验证**（显式记录，**不伪造**）。
-        step_records:  内存步序（含 Tool 步与失败步）。
+        step_records:  内存步序（含 Tool 步与失败步；P-2 仍 **IN-MEMORY**）。
     """
 
     status: str
@@ -175,6 +180,7 @@ class AgentRuntimeResult:
     tool_calls: int
     llm_calls: int
     error: str | None
+    run_id: str
     tokens_used: int = 0
     token_budget_unverifiable: bool = False
     step_records: tuple[AgentStep, ...] = field(default_factory=tuple)

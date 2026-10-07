@@ -46,6 +46,7 @@ from backend.app.agent import (
     AgentRuntimePolicy,
     ProviderAgentLLM,
 )
+from backend.app.agent.recorder import build_agent_run_recorder
 from backend.app.llm.client import get_default_llm_client
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.configuration import (
@@ -284,6 +285,11 @@ def build_orchestrator_for_project(
     agent_runtime: AgentRuntime | None = None
     router_llm_client: Any | None = None
     shared_tool_execution: ToolExecutionService | None = None
+    # Phase 5 P-2：Agent Run 持久化边界 —— 与 observer 同方式继承 base
+    # （同一 Application lifetime 内共享一个 recorder；无 DB ⇒ None）。
+    resolved_agent_run_recorder: Any | None = getattr(
+        base, "agent_run_recorder", None
+    )
     if agent_enabled:
         resolved_agent_provider = (
             agent_llm_provider
@@ -319,6 +325,9 @@ def build_orchestrator_for_project(
         # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
         # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。
         router_llm_client = resolved_agent_provider
+        # Agent Run 持久化（P-2）：base 未提供时在本装配点创建（唯一允许位置）。
+        if resolved_agent_run_recorder is None:
+            resolved_agent_run_recorder = build_agent_run_recorder()
 
     logger.info(
         "project orchestrator built",
@@ -378,6 +387,8 @@ def build_orchestrator_for_project(
         # 显式注入 ToolExecutionService 时 observer 由该边界持有（同一实例）。
         tool_execution_service=shared_tool_execution,
         agent_runtime=agent_runtime,
+        # Phase 5 P-2：Agent Run 持久化（None ⇒ 0 行；仅在 AGENT 执行时写入）。
+        agent_run_recorder=resolved_agent_run_recorder,
     )
 
 

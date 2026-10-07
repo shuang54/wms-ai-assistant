@@ -60,6 +60,7 @@ from backend.app.agent.errors import (
     AgentPolicyError,
     AgentToolExecutionFailureError,
 )
+from backend.app.agent.ids import new_agent_run_id
 from backend.app.agent.models import (
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
@@ -256,8 +257,16 @@ class AgentRuntime:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question 必须是非空 str")
 
+        # Phase 5 P-2：本次执行的**身份**（Runtime 签发一次；持久化层只读取，
+        # 不重新生成第二个 run_id —— decision §30.7 / §十七）。
+        run_id = new_agent_run_id()
         start = self._clock()
         messages = self._initial_messages(question, conversation_context)
+
+        def build_result(**kwargs: Any) -> AgentRuntimeResult:
+            """绑定本次 run_id 的结果构造器（避免每处重复传参 / 避免共享可变状态）。"""
+            return type(self)._build_result(run_id=run_id, **kwargs)
+
         # 已授权 Tool 的 Definition（仅 schema 暴露；授权判断仍在本 Runtime）
         tool_definitions = self._allowed_tool_definitions()
         records: list[AgentStep] = []
@@ -277,7 +286,7 @@ class AgentRuntime:
             )
             if limit is not None:
                 logger.info("Agent Run 触限停止: %s", limit)
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_LIMIT_REACHED,
                     content=None,
                     steps=steps,
@@ -300,7 +309,7 @@ class AgentRuntime:
                 )
             except AgentDecisionParseError:
                 # 决策非法（空 content / 截断 / 非法 tool 结构）：不修复、不重试
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -313,7 +322,7 @@ class AgentRuntime:
                 )
             except AgentLLMFailureError as exc:
                 logger.warning("Agent Run LLM 调用失败: %s", exc)
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -328,7 +337,7 @@ class AgentRuntime:
                 logger.warning(
                     "Agent Run LLM 调用异常: %s", type(exc).__name__
                 )
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -360,7 +369,7 @@ class AgentRuntime:
                         elapsed_ms=_elapsed_ms(self._clock, start),
                     )
                 )
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_COMPLETED,
                     content=decision.content,
                     steps=steps,
@@ -373,7 +382,7 @@ class AgentRuntime:
                 )
 
             if decision.type != DECISION_TOOL_CALL:  # 防御：契约之外不可达
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -402,7 +411,7 @@ class AgentRuntime:
                         elapsed_ms=_elapsed_ms(self._clock, start),
                     )
                 )
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -427,7 +436,7 @@ class AgentRuntime:
                         elapsed_ms=_elapsed_ms(self._clock, start),
                     )
                 )
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -461,7 +470,7 @@ class AgentRuntime:
                     )
                 )
                 logger.warning("Agent Tool 执行失败: %s", failure)
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -495,7 +504,7 @@ class AgentRuntime:
                         elapsed_ms=_elapsed_ms(self._clock, start),
                     )
                 )
-                return self._build_result(
+                return build_result(
                     status=AGENT_STATUS_FAILED,
                     content=None,
                     steps=steps,
@@ -628,6 +637,7 @@ class AgentRuntime:
     @staticmethod
     def _build_result(
         *,
+        run_id: str,
         status: str,
         content: str | None,
         steps: int,
@@ -638,6 +648,11 @@ class AgentRuntime:
         token_budget_unverifiable: bool,
         records: list[AgentStep],
     ) -> AgentRuntimeResult:
+        """构造 ``AgentRuntimeResult``（``run_id`` 由 :meth:`run` 绑定）。
+
+        Args:
+            run_id: 本次执行身份（Runtime 签发；持久化层只读取）。
+        """
         return AgentRuntimeResult(
             status=status,
             content=content,
@@ -645,6 +660,7 @@ class AgentRuntime:
             tool_calls=tool_calls,
             llm_calls=llm_calls,
             error=error,
+            run_id=run_id,
             tokens_used=tokens_used,
             token_budget_unverifiable=token_budget_unverifiable,
             step_records=tuple(records),

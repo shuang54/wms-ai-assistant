@@ -46,8 +46,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Final, Protocol
 
 from backend.app.agent.capability import AgentCapability
@@ -58,6 +60,7 @@ from backend.app.agent.models import (
     AGENT_STATUS_LIMIT_REACHED,
     AgentRuntimeResult,
 )
+from backend.app.agent.recorder import AgentRunRecorder
 from backend.app.dto.assistant_outcome import (
     AssistantOutcome,
     determine_assistant_outcome,
@@ -364,6 +367,7 @@ class AIOrchestratorService:
         tool_execution_observer: ToolExecutionObserver | None = None,
         tool_argument_extractor: ToolArgumentExtractor | None = None,
         agent_runtime: AgentCapability | None = None,
+        agent_run_recorder: AgentRunRecorder | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
@@ -372,6 +376,13 @@ class AIOrchestratorService:
         Args:
             agent_runtime: Phase 5 Agent Runtime Integration（§29.11 / OD-P5-23）——
                           Agent 能力端口（唯一暴露面：``run()``）。
+            agent_run_recorder:
+                          Phase 5 Agent Persistence（§30.9 / OD-P5-26）——
+                          Agent Run **run-level** 持久化边界（best-effort）。
+                          ``None``（默认）⇒ 不持久化（0 行；行为与 P-2 之前一致）。
+                          由 composition root 注入；Orchestrator 只调用，
+                          **不**生成 run_id / request_id（二者分别来自
+                          AgentRuntime 与 ``execute()``）。
                           **可选注入**：``None``（默认）= Agent 未接线 ⇒
                           ``RouteType.AGENT`` 在执行前被硬校验拒绝
                           （fail-closed；绝不降级为 RAG / TOOL / TEXT_TO_SQL）。
@@ -546,6 +557,15 @@ class AIOrchestratorService:
                 f"（当前: {type(agent_runtime).__name__}）"
             )
         self._agent_runtime = agent_runtime
+        # Phase 5 P-2：Agent Run 持久化边界（可选；形状与其它可选依赖一致）。
+        if agent_run_recorder is not None and not callable(
+            getattr(agent_run_recorder, "record", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_run_recorder 必须提供可调用的 record()"
+                f"（当前: {type(agent_run_recorder).__name__}）"
+            )
+        self._agent_run_recorder = agent_run_recorder
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -575,6 +595,15 @@ class AIOrchestratorService:
     def tool_execution_observer(self) -> ToolExecutionObserver | None:
         """本 Orchestrator 注入的观测出口（None = 不产生 Record）。"""
         return self._tool_execution_observer
+
+    @property
+    def agent_run_recorder(self) -> AgentRunRecorder | None:
+        """本 Orchestrator 注入的 Agent Run 持久化边界（None = 不落盘）。
+
+        Phase 5 P-2：供 composition root / 项目工厂继承同一实例
+        （与 ``tool_execution_observer`` 的继承方式一致）。
+        """
+        return self._agent_run_recorder
 
     # ---------- 主入口 ----------
 
@@ -1110,6 +1139,43 @@ class AIOrchestratorService:
             },
         )
 
+    # ---------- Phase 5 P-2：Agent Run 持久化（best-effort） ----------
+
+    async def _record_agent_run(
+        self,
+        agent_result: AgentRuntimeResult,
+        *,
+        request_id: str,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: float,
+    ) -> None:
+        """Best-effort 持久化一次 Agent Run（**永不**影响业务结果）。
+
+        * ``recorder is None``（默认 / 未接线）⇒ 直接返回（零开销，0 行）；
+        * recorder 自身已 best-effort；本方法再兜一层 try/except，
+          保证任何实现都不会把持久化失败变成 Agent / Assistant 业务失败；
+        * 无 retry / sleep / backoff / queue；不生成 run_id / request_id
+          （run_id 来自 AgentRuntimeResult，request_id 来自 ``execute()``）。
+        """
+        recorder = self._agent_run_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.arecord(
+                agent_result,
+                request_id=request_id,
+                project_id=self._capability_project_id(),
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Run 持久化失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
     # ---------- AGENT 路径（Phase 5 Agent Runtime Integration §29） ----------
 
     async def _run_agent(
@@ -1156,6 +1222,10 @@ class AIOrchestratorService:
                 project_id=self._capability_project_id(),
             )
 
+        # Phase 5 P-2：run-level 计时（§九：Runtime 不额外暴露持久化字段 ⇒
+        # 由本调用点测量；duration 只在这里定义一次，不制造第二套 duration）。
+        started_at = datetime.now(timezone.utc)
+        monotonic_start = time.monotonic()
         try:
             agent_result: AgentRuntimeResult = await agent_runtime.run(
                 question=question,
@@ -1168,6 +1238,19 @@ class AIOrchestratorService:
             raise AIOrchestratorExecutionError(
                 f"Agent 执行失败: {type(exc).__name__}"
             ) from exc
+        duration_ms = (time.monotonic() - monotonic_start) * 1000.0
+        finished_at = datetime.now(timezone.utc)
+
+        # Phase 5 P-2：run-level 持久化（best-effort；失败绝不改变 Agent 结果）。
+        # 终态（COMPLETED / FAILED / LIMIT_REACHED…）**一律**记录：
+        # FAILED 之后本方法仍会抛 ExecutionError，但 run 事实已经发生。
+        await self._record_agent_run(
+            agent_result,
+            request_id=request_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+        )
 
         if not isinstance(agent_result, AgentRuntimeResult):
             raise AIOrchestratorExecutionError(

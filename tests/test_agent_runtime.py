@@ -803,7 +803,14 @@ class TestSecurityBoundary:
         assert "tool_execution.execute(" in source
 
     async def test_agent_package_has_no_db_or_llm_provider_imports(self) -> None:
-        """Agent 包不得依赖 DB / Provider 具体实现（仅允许 llm.tool_schema）。"""
+        """Agent 包不得依赖 DB / Provider 具体实现（仅允许 llm.tool_schema）。
+
+        Phase 5 P-2 例外（**唯一**）：``recorder.py`` 是 Agent Run
+        **持久化边界**（可 import ``backend.app.db.agent_run_repository``）；
+        Agent 执行内核（runtime / llm / decision / models / policy / errors /
+        capability / ids）仍必须 0 DB / 0 Provider 依赖，且不得依赖 recorder
+        （下方显式断言）。
+        """
         forbidden_prefixes = (
             "sqlalchemy",
             "httpx",
@@ -816,6 +823,8 @@ class TestSecurityBoundary:
             "backend.app.services.conversation_service",
         )
         for path in sorted(_AGENT_DIR.glob("*.py")):
+            if path.name == "recorder.py":
+                continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             modules = {
                 node.module
@@ -831,6 +840,16 @@ class TestSecurityBoundary:
                 assert not module.startswith(forbidden_prefixes), (
                     f"{path.name}: {module}"
                 )
+
+        # 执行内核不依赖持久化边界（AgentRuntime = 纯内存执行）
+        runtime_source = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
+        assert "recorder" not in runtime_source
+        for path in sorted(_AGENT_DIR.glob("*.py")):
+            if path.name == "recorder.py":
+                continue
+            source = path.read_text(encoding="utf-8")
+            assert "agent.recorder" not in source, path.name
+            assert "import recorder" not in source, path.name
 
     def test_agent_llm_protocol_shape(self) -> None:
         """AgentLLM 端口（OQ-P5-1）：complete(*, messages, tools) 返回 decision。"""

@@ -69,3 +69,52 @@ def _assistant_outcome_residue_guard() -> Iterator[None]:
                 text(f"DELETE FROM {_OUTCOME_TABLE} WHERE id > :watermark"),
                 {"watermark": watermark},
             )
+
+
+#: Phase 5 P-2：Agent Run 表（只在本守卫中使用；与 outcome 守卫同机制）。
+_AGENT_RUN_TABLE: str = "ai_ops.agent_run"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _agent_run_residue_guard() -> Iterator[None]:
+    """会话级残留守卫：删除**本次会话期间新增**的 agent_run 行。
+
+    为什么需要（与 outcome 守卫同理）：P-2 起生产 Composition Root
+    （``api/orchestrator_chat.py``）在 DB 已配置时注入
+    ``BestEffortAgentRunRecorder``，因此驱动真实 ``POST /api/ai/chat``
+    且命中 AGENT 路由的测试会写一行 run-level 记录；既有测试不感知本表。
+
+    语义（保守）：会话开始记录 ``MAX(id)`` 水位 → 会话结束只删除
+    ``id > 水位`` 的行；不使用 TRUNCATE；不修改表结构 / 索引；
+    表不存在 / DB 不可达 → 静默跳过（守卫本身不影响任何断言）。
+    """
+    from sqlalchemy import text
+
+    from backend.app.db.session import get_engine
+
+    engine = get_engine()
+    if engine is None:
+        yield
+        return
+
+    try:
+        with engine.connect() as conn:
+            watermark = int(
+                conn.execute(
+                    text(
+                        f"SELECT COALESCE(MAX(id), 0) FROM {_AGENT_RUN_TABLE}"
+                    )
+                ).scalar_one()
+            )
+    except Exception:  # noqa: BLE001 —— 表不存在 / DB 不可达 → 不阻断测试
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"DELETE FROM {_AGENT_RUN_TABLE} WHERE id > :watermark"),
+                {"watermark": watermark},
+            )
