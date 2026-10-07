@@ -77,6 +77,7 @@ __all__ = [
     "build_agent_tool_result_recorder",
     "AgentToolResultWritePoint",
     "build_agent_tool_result_write_point",
+    "build_agent_checkpoint_recorder",
     "SENSITIVE_RESULT_MARKERS",
 ]
 
@@ -946,6 +947,33 @@ class BestEffortAgentToolResultRecorder:
                 "tool_name": records[0].tool_name if records else None,
             },
         )
+
+
+def build_agent_checkpoint_recorder() -> Any | None:
+    """生产装配（composition root）：Agent Checkpoint 记录器（Phase 5 P-5）。
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置
+            → ``None``：不注入 Checkpoint 端口（Runtime 零开销跳过；无告警噪声）
+        否则 → ``BestEffortAgentCheckpointRecorder``（写入 ``ai_ops.agent_checkpoint``）
+
+    Note:
+        * 本函数位于**持久化边界**（本模块）：Repository 解析在此完成，
+          域层 ``backend.app.agent.checkpoint`` 保持 0 DB import；
+        * 同一个 recorder 实例同时供 Runtime（Tool Result 之后的 ACTIVE 写点）与
+          Orchestrator（终态 TERMINAL 写点）使用；不新增配置项 / 环境变量。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent checkpoint persistence disabled"
+            "（DATABASE_URL 未配置；不创建 agent checkpoint recorder）"
+        )
+        return None
+    from backend.app.agent.checkpoint import BestEffortAgentCheckpointRecorder
+    from backend.app.db.agent_checkpoint_repository import AgentCheckpointRepository
+
+    return BestEffortAgentCheckpointRecorder(AgentCheckpointRepository())
 
 
 def build_agent_tool_result_recorder() -> BestEffortAgentToolResultRecorder | None:

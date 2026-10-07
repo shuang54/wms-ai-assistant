@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 from typing import Any, Final, Protocol
 
 from backend.app.agent.capability import AgentCapability
+from backend.app.agent.checkpoint import AgentCheckpointRecorder
 from backend.app.agent.errors import AGENT_ERROR_CODES, AGENT_ERROR_FAILED
 from backend.app.agent.models import (
     AGENT_STATUS_COMPLETED,
@@ -369,6 +370,7 @@ class AIOrchestratorService:
         agent_runtime: AgentCapability | None = None,
         agent_run_recorder: AgentRunRecorder | None = None,
         agent_step_recorder: AgentStepRecorder | None = None,
+        agent_checkpoint_recorder: AgentCheckpointRecorder | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
@@ -582,6 +584,21 @@ class AIOrchestratorService:
                 f"（当前: {type(agent_step_recorder).__name__}）"
             )
         self._agent_step_recorder = agent_step_recorder
+        # Phase 5 P-5：Agent Checkpoint 持久化边界（可选；同风格校验）。
+        # 只写**终态** checkpoint（TERMINAL / COMPLETED|FAILED）；ACTIVE checkpoint
+        # 由 AgentRuntime 在 Tool Result 之后直接写（同一 recorder 实例）。
+        if agent_checkpoint_recorder is not None and not (
+            callable(getattr(agent_checkpoint_recorder, "record_terminal", None))
+            or callable(
+                getattr(agent_checkpoint_recorder, "arecord_terminal", None)
+            )
+        ):
+            raise AIOrchestratorInputError(
+                "agent_checkpoint_recorder 必须提供可调用的 record_terminal()"
+                " 或 arecord_terminal()"
+                f"（当前: {type(agent_checkpoint_recorder).__name__}）"
+            )
+        self._agent_checkpoint_recorder = agent_checkpoint_recorder
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -1184,6 +1201,42 @@ class AIOrchestratorService:
                 exc_info=True,
             )
 
+    # ---------- Phase 5 P-5：Agent Checkpoint 持久化（best-effort） ----------
+
+    async def _record_agent_terminal_checkpoint(
+        self, agent_result: AgentRuntimeResult
+    ) -> None:
+        """Best-effort 写**终态** Checkpoint（**永不**影响业务结果）。
+
+        * ``agent_checkpoint_recorder is None``（默认 / 未接线）⇒ 直接返回（0 行）；
+        * 状态映射（§三十五 / §三十六）：``COMPLETED`` ⇒ TERMINAL / COMPLETED；
+          ``FAILED`` / ``LIMIT_REACHED`` ⇒ TERMINAL / FAILED；预留状态
+          （WAITING_APPROVAL / CANCELLED）无 P-5 映射 ⇒ 记录器不写（§三十七）；
+        * ``run_id`` 由记录器从 Agent Run Scope 取（**不**在这里传 run_id）；
+        * 不修改 AgentRun 语义、不做 claim 接管 / 不 retry、无跨表事务。
+        """
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            return
+        kwargs: dict[str, Any] = {
+            "run_id": agent_result.run_id,  # **只读**（不重新生成 / 不推导）
+            "agent_status": agent_result.status,
+            "agent_error": _stable_agent_error_code(agent_result.error),
+        }
+        try:
+            arecord = getattr(recorder, "arecord_terminal", None)
+            if callable(arecord):
+                await arecord(**kwargs)
+                return
+            record = getattr(recorder, "record_terminal", None)
+            if callable(record):
+                record(**kwargs)
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Checkpoint 终态写入失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
     # ---------- Phase 5 P-2：Agent Run 持久化（best-effort） ----------
 
     async def _record_agent_run(
@@ -1312,6 +1365,10 @@ class AIOrchestratorService:
 
         status = agent_result.status
         error_code = _stable_agent_error_code(agent_result.error)
+
+        # Phase 5 P-5：终态 Checkpoint（best-effort；写点必须在 FAILED 抛出之前，
+        # 使 COMPLETED / FAILED / LIMIT_REACHED 都能落 TERMINAL；§三十五 / §三十六）。
+        await self._record_agent_terminal_checkpoint(agent_result)
 
         # FAILED：进入既有 Orchestrator 错误边界（USER turn 保留 /
         # 无 ASSISTANT turn / outcome=FAILED 由 execute() 统一记录）。

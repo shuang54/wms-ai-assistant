@@ -91,7 +91,39 @@ from backend.app.services.tool_execution_service import ToolExecutionService
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AgentRuntime", "AGENT_SYSTEM_INSTRUCTION", "ToolResultSink"]
+__all__ = [
+    "AgentRuntime",
+    "AGENT_SYSTEM_INSTRUCTION",
+    "AgentCheckpointSink",
+    "ToolResultSink",
+]
+
+
+@runtime_checkable
+class AgentCheckpointSink(Protocol):
+    """Checkpoint 控制状态写入端口（Phase 5 P-5；由 composition root 注入）。
+
+    结构契约（本 Runtime **不认识**实现，也不 import 任何持久化模块）：
+
+        await sink.arecord_tool_result_checkpoint(
+            step_index=…,                 # Runtime 当前 step index（**不是** round）
+            tool_result_persisted=bool,   # Tool Result 是否已 durable（决定是否可引用）
+        ) -> Any | None
+
+    实现侧（Agent 包内的 checkpoint 记录器；由 composition root 装配）：
+
+        * run_id 取自 ``current_agent_run_id()``（Agent Run Scope）；无 scope ⇒ 不写；
+        * 状态语义 = ACTIVE / next_action=LLM_DECISION（下一步重新进入决策）；
+        * best-effort：任何失败只记 warning，不改变控制流（无 retry / 无 takeover）。
+    """
+
+    async def arecord_tool_result_checkpoint(
+        self,
+        *,
+        step_index: int,
+        tool_result_persisted: bool,
+    ) -> Any | None:
+        ...
 
 
 @runtime_checkable
@@ -195,6 +227,7 @@ class AgentRuntime:
         allowed_tools: Sequence[str],
         clock: Callable[[], float] | None = None,
         tool_result_sink: Any | None = None,
+        checkpoint_sink: Any | None = None,
     ) -> None:
         if not callable(getattr(llm, "complete", None)):
             raise AgentPolicyError(
@@ -229,6 +262,22 @@ class AgentRuntime:
             )
         self._tool_result_sink = tool_result_sink
 
+        # Phase 5 P-5：Checkpoint 控制状态写入端口（可选注入；同形状校验）。
+        if checkpoint_sink is not None and not (
+            callable(
+                getattr(checkpoint_sink, "arecord_tool_result_checkpoint", None)
+            )
+            or callable(
+                getattr(checkpoint_sink, "record_tool_result_checkpoint", None)
+            )
+        ):
+            raise AgentPolicyError(
+                "checkpoint_sink 必须提供可调用的 arecord_tool_result_checkpoint()"
+                " 或 record_tool_result_checkpoint()"
+                f"（got {type(checkpoint_sink).__name__}）"
+            )
+        self._checkpoint_sink = checkpoint_sink
+
         self._llm = llm
         self._tool_execution = tool_execution
         self._policy = policy
@@ -258,6 +307,11 @@ class AgentRuntime:
     def tool_result_sink(self) -> Any | None:
         """Tool Result 写入端口（None = 未接线；写入失败不影响控制流）。"""
         return self._tool_result_sink
+
+    @property
+    def checkpoint_sink(self) -> Any | None:
+        """Checkpoint 写入端口（None = 未接线；写入失败不影响控制流）。"""
+        return self._checkpoint_sink
 
     # ---------- 装配期校验 ----------
 
@@ -617,12 +671,24 @@ class AgentRuntime:
             # Checkpoint 未落盘、进程崩溃" 的恢复窗口）；best-effort ——
             # 写入失败**不改变**控制流：不 retry Tool / LLM、不 fallback、
             # 不把 Run 变成 FAILED。
-            await self._record_tool_result(
+            tool_result_persisted = (
+                await self._record_tool_result(
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    project_id=execution_project_id,
+                    tool_call_id=tool_call_id,
+                    result=tool_result,
+                )
+                is not None
+            )
+
+            # Phase 5 P-5：Tool Result durable 之后写 Checkpoint 控制状态
+            # （status=ACTIVE / next_action=LLM_DECISION / pending_step_index=next step；
+            # ``pending_tool_result_ref`` 仅当结果**确实** durable 时才建立 ——
+            # 仍早于 Step / Run 落盘、早于下一轮 LLM；best-effort 同 P-4）。
+            await self._record_checkpoint(
                 step_index=step_index,
-                tool_name=tool_name,
-                project_id=execution_project_id,
-                tool_call_id=tool_call_id,
-                result=tool_result,
+                tool_result_persisted=tool_result_persisted,
             )
 
             payload: str | None = None
@@ -789,7 +855,7 @@ class AgentRuntime:
         tool_call_id: str | None,
         result: Any | None,
         error_code: str | None = None,
-    ) -> None:
+    ) -> Any | None:
         """Tool 执行结果 → Tool Result 写入端口（best-effort；不改变控制流）。
 
         契约（Phase 5 P-4 Integration §十六 / §十九 / §二十）：
@@ -817,11 +883,10 @@ class AgentRuntime:
         try:
             arecord = getattr(sink, "arecord_tool_result", None)
             if callable(arecord):
-                await arecord(**kwargs)
-                return
+                return await arecord(**kwargs)
             record = getattr(sink, "record_tool_result", None)
             if callable(record):
-                record(**kwargs)
+                return record(**kwargs)
         except Exception as exc:  # noqa: BLE001 —— best-effort 边界
             logger.warning(
                 "Tool Result 写入失败（best-effort；不影响 Agent 结果）: %s",
@@ -832,6 +897,48 @@ class AgentRuntime:
                     "step_index": step_index,
                 },
             )
+        return None
+
+    async def _record_checkpoint(
+        self,
+        *,
+        step_index: int,
+        tool_result_persisted: bool,
+    ) -> Any | None:
+        """Checkpoint 控制状态 → 写入端口（best-effort；不改变控制流）。
+
+        契约（Phase 5 P-5 §三十二 / §三十三 / §三十八 / §四十六）：
+
+            * 调用点 = Tool Result 写入之后（**早于** Step / Run 落盘、早于下一轮 LLM）；
+            * ``run_id`` 由端口自行从 ``current_agent_run_id()`` 取（本层不传 run_id）；
+            * 端口缺失（未接线 / DATABASE_URL 未配置）⇒ 直接跳过（零开销）；
+            * 任何 ``Exception`` 只记 warning：不 retry、不 fallback、不做 claim 接管、
+              不把 Run 变成 FAILED；``CancelledError`` 不吞（取消优先）。
+        """
+        sink = self._checkpoint_sink
+        if sink is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "step_index": step_index,
+            "tool_result_persisted": tool_result_persisted,
+        }
+        try:
+            arecord = getattr(sink, "arecord_tool_result_checkpoint", None)
+            if callable(arecord):
+                return await arecord(**kwargs)
+            record = getattr(sink, "record_tool_result_checkpoint", None)
+            if callable(record):
+                return record(**kwargs)
+        except Exception as exc:  # noqa: BLE001 —— best-effort 边界
+            logger.warning(
+                "Checkpoint 写入失败（best-effort；不影响 Agent 结果）: %s",
+                type(exc).__name__,
+                extra={
+                    "error_type": type(exc).__name__,
+                    "step_index": step_index,
+                },
+            )
+        return None
 
     def _allowed_tool_definitions(self) -> tuple[Any, ...]:
         """已授权 Tool 的 ``ToolDefinition``（仅用于 schema 暴露）。

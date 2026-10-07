@@ -46,7 +46,10 @@ from backend.app.agent import (
     AgentRuntimePolicy,
     ProviderAgentLLM,
 )
-from backend.app.agent.recorder import build_agent_tool_result_write_point
+from backend.app.agent.recorder import (
+    build_agent_checkpoint_recorder,
+    build_agent_tool_result_write_point,
+)
 from backend.app.agent.recorder import (
     build_agent_run_recorder,
     build_agent_step_recorder,
@@ -298,6 +301,10 @@ def build_orchestrator_for_project(
     resolved_agent_step_recorder: Any | None = getattr(
         base, "agent_step_recorder", None
     )
+    # Phase 5 P-5：Checkpoint 持久化边界（同方式继承 base）。
+    resolved_agent_checkpoint_recorder: Any | None = getattr(
+        base, "agent_checkpoint_recorder", None
+    )
     if agent_enabled:
         resolved_agent_provider = (
             agent_llm_provider
@@ -313,6 +320,11 @@ def build_orchestrator_for_project(
             project_id=project_id,
             observer=resolved_observer,
         )
+        # Phase 5 P-5：Checkpoint 持久化边界（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析：Runtime 直接持有 Checkpoint 写入端口。
+        # 同一实例随后也注入 Orchestrator（终态 TERMINAL 写点）。
+        if resolved_agent_checkpoint_recorder is None:
+            resolved_agent_checkpoint_recorder = build_agent_checkpoint_recorder()
         agent_runtime = AgentRuntime(
             llm=ProviderAgentLLM(resolved_agent_provider),
             tool_execution=shared_tool_execution,
@@ -333,6 +345,9 @@ def build_orchestrator_for_project(
             # **立即**写 agent_tool_result；run_id 取自 Agent Run Scope）。
             # 无 DATABASE_URL ⇒ None（Runtime 零开销跳过；行为与 P-4 之前一致）。
             tool_result_sink=build_agent_tool_result_write_point(),
+            # Phase 5 P-5：Checkpoint 写入端口（Tool Result durable 之后写
+            # ACTIVE / LLM_DECISION 控制状态；与 Orchestrator 共享**同一**实例）。
+            checkpoint_sink=resolved_agent_checkpoint_recorder,
         )
         # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
         # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。
@@ -404,6 +419,8 @@ def build_orchestrator_for_project(
         agent_runtime=agent_runtime,
         # Phase 5 P-2：Agent Run 持久化（None ⇒ 0 行；仅在 AGENT 执行时写入）。
         agent_run_recorder=resolved_agent_run_recorder,
+        # Phase 5 P-5：终态 Checkpoint 写点（best-effort；无 DB ⇒ None）。
+        agent_checkpoint_recorder=resolved_agent_checkpoint_recorder,
         # Phase 5 AgentStep Persistence：Step 投影持久化（独立 best-effort）。
         agent_step_recorder=resolved_agent_step_recorder,
     )
