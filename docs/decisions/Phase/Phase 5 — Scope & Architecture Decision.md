@@ -1055,3 +1055,376 @@ KL-1（AI exactly-once NOT GUARANTEED）· KL-2（duplicate 不重放完整 AI R
 
 产生副作用：无（Production code = 0 · DB = 0 · API = 0 · Prompt = 0）
 ```
+
+---
+
+# 28. OQ-P5-1 Decision — LLM Tool Decision Protocol
+
+> **本节为追加修订（append-only）**：不修改 §1–§27 的任何历史决策文字。
+> 触发：Phase 5 Core Loop MVP 完成后，`AgentLLM` 仍是内部 seam，尚未正式接入 `LLMProvider`。
+> 唯一问题：**Agent Runtime 应该如何从现有 LLM Provider 获得稳定、严格、可验证的 `FINAL / TOOL_CALL` Decision。**
+> 本阶段只做 Architecture Decision：`Production code = 0 · DB = 0 · API = 0 · Prompt = 0 · 真实 LLM = 0`。
+
+## 28.1 事实基线（以代码实测为准，非推断）
+
+| 事实 | 真实情况 | 证据 |
+| ---- | -------- | ---- |
+| Provider 接口 | `LLMProvider.generate(prompt) -> str`；`chat(messages, *, tools=None) -> str \| LLMResponse` | `llm/provider.py` L46–81 |
+| Provider 实现 | `DeepSeekProvider` = **纯 delegation**（参数原样透传、结果原样转发、无重试/fallback） | `llm/deepseek_provider.py` L43–63 |
+| tools 通道 | **已实现**：`_build_payload` 在 `tools` 非空时写入 `payload["tools"]` | `llm/client.py` L427–440 |
+| 单 Tool 约束 | **已强制**：一次响应 >1 个 tool call ⇒ `LLMToolCallFormatError`（"本阶段仅支持单个"） | `llm/client.py` L495–511、L164–171 |
+| ToolCall DTO | `ToolCall{id, name, arguments: dict}`（id/name 非空校验；arguments 必须是 dict） | `llm/client.py` L178–200 |
+| arguments 解析 | JSON 字符串 → dict；空字符串 → `{}`；非法 JSON / 非 object ⇒ 报错（不修复） | `llm/client.py` L495–535；`tests/test_llm_tool_calling.py` |
+| `LLMResponse` | `content` / `tool_calls` / `model` / `finish_reason` / `usage` / `metadata` | `llm/client.py` L244–271 |
+| usage | `LLMUsage{prompt,completion,total}`；允许 `None`（不虚构）；负数/不一致 ⇒ 拒绝 | `llm/client.py` L203–241 |
+| **无 tools 时** | 返回 **纯 `str`**（无 usage / 无 finish_reason）——`tools` 为空或 `[]` 时等同无 tools | `llm/client.py` L288、`tests/test_llm_tool_calling.py::test_chat_without_tools_returns_str_and_payload_has_no_tools` |
+| JSON mode | **不存在** `response_format` / `json_object`（全仓 0 命中）⇒ 本仓库**没有** JSON-mode 能力 | `llm/client.py` 全文件检索 |
+| Tool schema 转换 | **已存在**：`definitions_to_openai_tools()`（深拷贝；只暴露 name/description/parameters；不含 Handler） | `llm/tool_schema.py` L35–72 |
+| 通用结构化解析 | **已存在**：`parse_structured_response(raw, PydanticModel)`（严格、`extra=forbid`、reason 契约、message 不含原文；接受**完整** ```json fence；未接生产路径） | `llm/structured.py` L97–237 |
+| Retry | `llm/retry.py` = **仅分类，不重试**（transport 分类交由 Client 层；无自动重试/退避） | `llm/retry.py` |
+| 既有生产者 | `tool_chat_service.py` **已经在生产使用** `chat(messages, tools=definitions_to_openai_tools(...))` | `tool_chat_service.py` L405、L424 |
+| Agent 侧现状 | `AgentLLM.complete(messages) -> AgentLLMCompletion{text,total_tokens}`（文本 seam）；`parse_agent_decision(raw)` 严格 bare-JSON（拒绝 fence / 自然语言 / 跨类型字段）；`AgentDecision` 已冻结；Runtime 已有 5 类预算 + 双层授权 + 错误码 | `backend/app/agent/*`、`tests/test_agent_runtime.py`（57 passed） |
+
+**结论（事实层）**：Provider **已经**提供 provider-native tool calling（且已被生产路径使用、被单测冻结），但**不提供** JSON mode；无 tools 的文本路径**不返回 usage**。
+
+## 28.2 责任划分（本决策的核心三问）
+
+```text
+问 1：哪一层负责把 LLM 输出约束成 AgentDecision？
+答 1：**Agent 层适配器**（AgentLLM 端口的实现）。
+      LLMProvider 只做通用 transport/response 抽象（content / tool_calls /
+      usage / finish_reason 的严格解析）；**不得**让 Provider 认识
+      AgentDecision / RuntimePolicy / Tool Authorization。
+
+问 2：哪一层负责把 Agent 可用 Tool 描述提供给 LLM？
+答 2：**Agent 层**：授权子集（allowed_tools ∩ ProjectCapabilities.tool_names）
+      → 既有 `definitions_to_openai_tools()` → `tools=` 参数。
+
+问 3：哪一层负责最终验证 LLM 返回的 Tool Name + Arguments？
+答 3：**Runtime 层**：① 授权白名单（TOOL_NOT_ALLOWED）
+      ② `ToolExecutionService` 第二道 capability 校验
+      ③ `ToolRegistry.validate_arguments()` 的真实 schema 校验。
+      Provider 不做业务权限，Handler 不暴露给 LLM。
+```
+
+## 28.3 方案对比（Option A / B / C；文字评估，不做数字评分）
+
+| 维度 | Option A：Structured JSON Decision | Option B：Provider-native Function Calling | Option C：Hybrid（两套并存） |
+| ---- | ---------------------------------- | ------------------------------------------ | ---------------------------- |
+| Provider Contract 改动 | 无 | **无**（`tools=` 通道已存在并已被生产使用） | 无 |
+| Agent Runtime 独立性 | 高（文本进、JSON 出） | 中（需 OpenAI 风格 message 语义：assistant.tool_calls + role=tool 回填） | 高 |
+| Tool Schema | 自行注入 prompt（MVP 已实现 `_tool_definitions_payload`） | **复用** `llm/tool_schema.py`（标准化、深拷贝、零 Handler 泄漏） | 两者 |
+| Tool Authorization | Runtime（不变） | Runtime（不变） | Runtime |
+| DeepSeek 兼容性 | 依赖模型 JSON 遵循；**无 response_format 硬保证**（仓库无 JSON mode） | 通道在生产已被使用 + 单测冻结；**live API 行为本阶段 UNVERIFIED** | 两者 |
+| 严格解析 | 高（自有严格 parser；bare JSON only） | 高（Provider 已严格解析 id/name/arguments/单调用；Agent 层再做 FINAL/TOOL_CALL 判定） | 高 |
+| 多 Provider 未来扩展 | 强（任何能输出 JSON 的 provider） | 中（需 provider 支持 OpenAI tools 语义 —— 主流兼容端点均支持） | 强 |
+| 实现复杂度 | 低（已完成） | 中（adapter + message 语义 + tool_call_id 回填） | 高（两套协议，**本阶段明确禁止**） |
+| 安全边界 | 好；**但 token 预算事实上不可验证**（无 usage ⇒ `max_cost_tokens` 无法执行） | 好；**usage 可得 ⇒ 冻结的 `max_cost_tokens` 可真正执行**；单 Tool 约束原生满足 | — |
+| 当前项目适配度 | 高（Core Loop 已按此实现） | 高（ToolChatService 已用同一通道；schema 转换器已存在） | 低 |
+
+**Option A 的实测缺陷（决定性证据）**：`chat(messages)` 返回 `str` ⇒ **无 usage** ⇒ Phase 5 §6 冻结的 `max_cost_tokens` 退化为"永远 `token_budget_unverifiable`"，即一条**已经冻结的安全预算形同虚设**。
+**Option B 的实测代价**：Agent 层需按 OpenAI 风格构造/回填 `assistant.tool_calls` + `role="tool"` 消息（多一个 `tool_call_id` 回填约束）。
+**Option C**：§六 已明确禁止"为兼容未来现在实现两套"。
+
+## 28.4 Decision（Selected Architecture）
+
+```text
+Selected Option : **Option B —— Provider-native Function Calling**
+Decision        : Agent Runtime 通过 **Agent 侧适配器** 调用既有
+                  `LLMProvider.chat(messages, tools=<已授权 Tool 的 OpenAI schema>)`，
+                  由适配器把 `LLMResponse` **严格映射**为 `AgentDecision`；
+                  Provider contract **不修改**、Provider **不认识** Agent 概念。
+```
+
+Decision Protocol（冻结）：
+
+```text
+provider 返回（tools 路径，恒为 LLMResponse）
+  ├── tool_calls 非空（Provider 已强制 ≤1）
+  │        → AgentDecision(type=TOOL_CALL,
+  │                        tool_name=tool_calls[0].name,
+  │                        arguments=tool_calls[0].arguments,
+  │                        tool_call_id=tool_calls[0].id)
+  │        显式规则：伴随的 content **被丢弃**（不用于 FINAL、不进入历史）
+  │        —— 理由：动作请求明确（tool call 是显式动作），
+  │           丢弃杂散文本不会改变授权/预算/安全边界；**不猜测**语义
+  │
+  └── tool_calls 为空
+           ├── finish_reason == "length" → INVALID_DECISION（截断 ⇒ 不可信）
+           ├── content 非空（strip 后）  → AgentDecision(type=FINAL, content=content)
+           └── content None / 空白       → INVALID_DECISION（不伪造空回答）
+
+provider / 客户端异常映射（不新增错误体系）
+  LLMToolCallFormatError · LLMResponseError · LLMError 家族 → LLM_FAILURE
+```
+
+Why（依据 §28.1 实测事实）：
+
+```text
+1) Provider contract 零改动（`tools=` 已实现、已被 ToolChatService 生产使用、已被单测冻结）；
+2) **恢复 token 预算可执行性**：tools 路径返回 LLMResponse.usage，
+   Phase 5 §6 冻结的 max_cost_tokens 从"不可验证"变为"可执行"；
+3) 单 Tool 约束由既有契约原生保证（>1 tool call 直接报错）——
+   与 §5.2「每轮 0 or 1 Tool 决策」天然一致；
+4) Tool schema 复用既有 `definitions_to_openai_tools()`（结构化暴露，而非拼文本），
+   减少"schema 漂移"风险；
+5) Provider 保持通用（content/tool_calls/usage/finish_reason），
+   Agent-specific 解释全部留在 Agent 层（满足 §16 Provider Contract 保护）；
+6) finish_reason 提供额外可判定信号（stop / length / tool_calls）。
+```
+
+Trade-offs（明确承认）：
+
+```text
+* Agent 层必须构造 OpenAI 风格消息（assistant.tool_calls + role="tool" 回填 tool_call_id）；
+* Tool Result 回填语义从"user 消息文本块"变为"role=tool 数据块"，
+  但**仍为 untrusted data**（标记保留在 content 内，安全优先级不变）；
+* 若未来必须支持"不支持 tools 语义"的 provider，需要额外 fallback 适配器
+  （见 §28.13 Migration Path；**不在本阶段实现**）；
+* live DeepSeek 行为本阶段无法验证（UNVERIFIED，见 §28.11）。
+```
+
+## 28.5 Decision Schema（冻结）
+
+```text
+FINAL
+  { "type": "FINAL", "content": "<非空最终回答>" }
+  * content：Required，非空（strip 后非空）；空字符串 / None ⇒ INVALID_DECISION
+    （与 Core Loop MVP 现行规则完全一致，不放松）
+  * 不得携带 tool_name / arguments（跨类型字段 ⇒ INVALID_DECISION）
+
+TOOL_CALL
+  { "type": "TOOL_CALL", "tool_name": "<已授权 Tool 名>",
+    "arguments": { ... }, "tool_call_id": "<provider 提供的 id>" }
+  * tool_name：Required，非空 str；必须 ∈ Runtime 授权白名单，否则 TOOL_NOT_ALLOWED
+  * arguments：Required，JSON object（允许空对象 {}）；
+    缺失 / null / 非 object ⇒ INVALID_DECISION；
+    允许嵌套任意 JSON（结构合法性由 ToolRegistry schema 终验）；
+    未知字段 / 类型不符 ⇒ TOOL_EXECUTION_FAILURE（由真实 Registry 拒绝）
+  * tool_call_id：**Required（provider 路径）**
+      —— 由 Provider 的 ToolCall.id 原样携带（Provider 已校验非空），
+         用途唯一：回填 role="tool" 消息（协议要求）；
+         Agent 层**不生成 / 不替换 / 不派发**该 ID。
+      ——（未来文本 fallback 协议中为 Optional/忽略：无协议回填需求。）
+  * 不得携带 content（跨类型字段 ⇒ INVALID_DECISION）
+```
+
+## 28.6 Provider Boundary
+
+```text
+LLMProvider = 通用 LLM transport / response 抽象（**不变**）
+    * 知道：messages / tools schema / content / tool_calls / usage / finish_reason
+    * 不知道：AgentDecision · RuntimePolicy · Tool Authorization · Project Permission
+              · Conversation · 预算 · 授权白名单
+禁止：把 AgentDecision / RuntimePolicy / Authorization 塞进 Provider；
+      Provider 不得 import backend.app.agent（方向：Agent → Provider，单向）。
+```
+
+## 28.7 Tool Schema Boundary
+
+```text
+Project Capabilities（ProjectCapabilities.tool_names）
+        ↓ 交集
+Agent Runtime 授权白名单（allowed_tools）
+        ↓ definitions_to_openai_tools(ToolDefinition)
+tools=[ ... ]（只含 name / description / parameters）
+        ↓
+LLM Decision
+```
+
+```text
+硬规则：
+1) 只有**已授权**子集进入 tools=（不暴露项目未启用 / Agent 未授权的 Tool）；
+2) 暴露的 schema 只来自 ToolDefinition 三字段（既有转换器已保证零 Handler 泄漏 / 深拷贝）；
+3) LLM 看到 Tool ≠ LLM 拥有 Tool 权限 —— 权限仍在 Runtime（§28.8）。
+```
+
+## 28.8 Authorization Boundary
+
+```text
+LLM 输出 tool_name
+        ↓ ① Runtime 授权白名单（allowed_tools ⊆ ProjectCapabilities.tool_names）
+        ↓ ② ToolExecutionService（第二道 capability 校验）
+        ↓ ③ ToolRegistry.validate_arguments()（真实 schema 终验）
+        ↓ ④ Handler
+```
+
+```text
+不变式：LLM 返回 delete_inventory（未授权）⇒ TOOL_NOT_ALLOWED，**不执行**；
+       LLM 伪造 arguments 未知字段 ⇒ Registry 拒绝 ⇒ TOOL_EXECUTION_FAILURE；
+       Handler 不直接暴露给 LLM（Agent 层不得持有 / 调用 Handler）。
+```
+
+## 28.9 Error Boundary（复用既有错误码，不新建体系）
+
+| 情形 | 分类 | Agent 错误码 | 结果 |
+| ---- | ---- | ------------ | ---- |
+| provider 抛异常 / `LLMError` 家族（含 `LLMToolCallFormatError`、`LLMResponseError`、非 str content） | LLM failure | `LLM_FAILURE` | FAILED |
+| `finish_reason == "length"` | Decision parse failure | `INVALID_DECISION` | FAILED |
+| content 为空 / 缺失且无 tool_calls | Decision parse failure | `INVALID_DECISION` | FAILED |
+| 跨类型字段（FINAL+tool_name / TOOL_CALL+content） | Decision parse failure | `INVALID_DECISION` | FAILED |
+| 文本 fallback 协议的非法 JSON / 未知 type / 缺字段 / 类型错 | Decision parse failure | `INVALID_DECISION` | FAILED |
+| tool_name 不在授权白名单 | Authorization failure | `TOOL_NOT_ALLOWED` | FAILED（Tool 0 次执行） |
+| arguments 未通过 Registry schema / Handler 失败 / 结果非 JSON-compatible | Tool argument / execution failure | `TOOL_EXECUTION_FAILURE` | FAILED |
+| 任一预算触限 | Runtime limit | `LIMIT_REACHED` | LIMIT_REACHED |
+
+```text
+说明：Provider 的解析异常归 LLM_FAILURE（不是 INVALID_DECISION）——
+      "provider 无法给出可用响应" 与 "模型给出了非法决策" 是两种不同的失败面。
+```
+
+## 28.10 Retry Boundary
+
+```text
+不增加任何 Decision 级自动重试：
+  invalid JSON / invalid decision  → FAILED（**不**重调 LLM）
+  unknown tool                     → TOOL_NOT_ALLOWED（**不**让 LLM 重猜）
+  invalid arguments                → TOOL_EXECUTION_FAILURE（**不**自动修正）
+  Tool 执行失败                     → FAILED（**不**重试 Tool）
+transport 级分类（llm/retry.py：429 / 5xx / 网络）保持**仅分类**语义，本决策不改动其行为。
+```
+
+## 28.11 DeepSeek Compatibility
+
+```text
+VERIFIED（本仓库内，离线实证）：
+  * tools 通道：`payload["tools"]` 由 OpenAICompatibleClient 发送（client.py L438）；
+  * tool_calls 严格解析：id / name 必填；arguments 必须 JSON object；
+    单响应 >1 tool call 直接拒绝（LLMToolCallFormatError）；
+  * content 非 str ⇒ LLMResponseError；
+  * usage / model / finish_reason 进入 LLMResponse；
+  * 生产消费者：tool_chat_service.py 已使用同一通道（L405/L424）。
+
+UNVERIFIED（本阶段禁止真实调用，不得假设）：
+  * live DeepSeek API 对 `tools=` 的实际行为（是否会返回 tool_calls、
+    是否 stable、模型选择对 function calling 的支持度）——**未验证**；
+  * 本仓库**没有** response_format / JSON mode 支持（因此 Option A 也没有硬 JSON 保证）。
+
+后续验证要求（下一阶段，且需要单独授权）：
+  * 离线：FakeProvider 契约测试（映射规则 / usage 透传 / 异常映射）；
+  * 真实：`real_llm` 标记的 smoke（默认 skip，沿用 tests/test_llm_real_smoke.py 既有机制）。
+```
+
+## 28.12 Rejected Alternatives
+
+```text
+Option A（Structured JSON Decision）作为**主协议** —— 否决：
+    原因：tools=None 路径返回纯 str、无 usage ⇒ 冻结的 max_cost_tokens 事实上不可执行；
+         且本仓库无 response_format/JSON mode ⇒ 无硬 JSON 保证，解析失败率不可控。
+    （保留为**文本 fallback 协议**，见 §28.13；其严格解析器 `parse_agent_decision` 继续存在。）
+
+Option C（Hybrid：两套同时实现）—— 否决：
+    原因：§6 明确禁止"为兼容未来现在实现两套"；双协议 = 双解析路径 + 双测试面
+         + 双安全审查面，收益（未来兼容）当前不存在。
+
+"把 AgentDecision 塞进 LLMProvider" —— 否决：
+    原因：违反 §16（Provider 必须保持通用 transport/response 抽象）；
+         Provider 一旦认识 Agent 概念，RAG / Text-to-SQL / ToolChat 等既有消费者
+         都要承担 Agent 语义（依赖方向反转）。
+
+"让 Provider 做 Tool 权限判断" —— 否决：
+    原因：违反 §11 双层授权模型；Provider 不持有 Project Capabilities / 授权白名单。
+```
+
+## 28.13 Migration Path
+
+```text
+阶段 1（下一阶段，需明确授权；实现本 Decision）
+    * Agent 侧适配器：`LLMProvider.chat(messages, tools=...)` → AgentDecision + usage；
+    * AgentLLM 端口形态升级（agent 自有 port，取代 MVP 的纯文本 seam）：
+          decide(*, messages, tools) -> {decision: AgentDecision,
+                                        total_tokens: int | None,
+                                        finish_reason: str | None}
+    * 消息形态：system instruction（改为"可用工具由 tools 参数给出"）+
+                user（question + conversation reference）+
+                assistant.tool_calls + role="tool"（content 内保留
+                `【TOOL RESULT — UNTRUSTED DATA】` 标记，安全语义不变）；
+    * token 预算：usage 可得 ⇒ `max_cost_tokens` 可执行；usage 缺失仍按
+                  既有规则显式记录 `token_budget_unverifiable`（不伪造）。
+
+阶段 2（仅在必须支持"无 tools 语义 provider"时，**需要新的 Architecture Decision**）
+    * 新增文本 fallback 适配器（复用既有 `parse_agent_decision`），
+      实现**同一** AgentLLM 端口；禁止与主协议同时启用（按 provider 能力择一）。
+
+阶段 3（可选，若 provider 提供 response_format / JSON-schema 模式）
+    * 只能在 fallback 适配器内部使用（端口不变）；替换主协议仍需新 Decision。
+
+禁止：在没有新 Decision 的前提下同时启用两套协议 / 让 Agent 直接 import DeepSeek 客户端。
+```
+
+## 28.14 Test Impact（分析；本阶段**不修改**任何测试）
+
+```text
+必须保持（不得修改 / 不得弱化）：
+  * tests/test_llm_provider.py        —— Provider 契约与 delegation 冻结；
+  * tests/test_llm_tool_calling.py    —— tools 通道契约（payload / 单调用 / arguments）；
+  * tests/test_llm_structured.py      —— 通用结构化解析契约（与 Agent 协议无关）；
+  * tests/test_agent_runtime.py       —— 预算（5 类）/ 授权 / 错误码 / Policy 不可变 /
+                                         恶意 Tool Result / 源码安全审计断言
+                                         （**不得**因接入而弱化）；
+                                         其中 prompt 形态断言与 role 无关，
+                                         Option B 下仍成立（untrusted 标记保留在 content 内）。
+
+下一阶段需要适配（仅实现层 seam 形态，不改变语义）：
+  * test_agent_runtime.py 中依赖"文本 seam"的 FakeLLM（complete() 返回文本）→ 改为
+    返回 decision + usage 的 Fake（断言矩阵不变）。
+
+下一阶段必须新增（不得以"已有 Core Loop 测试"替代）：
+  * tests/test_agent_llm_adapter.py（建议名）：
+      - LLMResponse(tool_calls=1) → AgentDecision(TOOL_CALL)（字段逐一对应）
+      - LLMResponse(tool_calls=0, content=...) → FINAL
+      - content 空白 / None → INVALID_DECISION
+      - finish_reason="length" → INVALID_DECISION
+      - content + tool_calls 同时存在 → TOOL_CALL 且 content 被丢弃（显式规则）
+      - usage 透传（total_tokens）/ usage 缺失 → token_budget_unverifiable
+      - LLMToolCallFormatError / LLMResponseError → LLM_FAILURE
+      - tools= 只含授权子集（未授权 Tool 不出现在 schema）
+      - role="tool" 回填含 tool_call_id 与 untrusted 标记
+      - Provider 侧源码审计：backend/app/llm 不 import backend.app.agent
+```
+
+## 28.15 Target Architecture（本 Decision 冻结后的形态）
+
+```text
+AgentRuntime                     ← Agent-specific：Decision / Policy / Authorization / Loop
+      │
+      │ AgentDecision（FINAL | TOOL_CALL{name, arguments, tool_call_id}）
+      ▼
+AgentLLM（agent-owned port；适配器实现）
+      │
+      ▼
+LLMResponse（content / tool_calls / usage / finish_reason / metadata）
+      │
+      ▼
+LLMProvider（通用抽象，**不知道 Agent**）
+      │
+      ▼
+DeepSeekProvider（纯 delegation）
+      │
+      ▼
+OpenAI-compatible HTTP（tools=[...]）
+```
+
+```text
+Provider 不知道：Agent Policy · Tool Authorization · Conversation · Project Permission
+AgentRuntime 负责：Decision · Policy · Authorization · Loop · Tool Result
+```
+
+## 28.16 OQ-P5-1 Status
+
+```text
+OQ-P5-1 = **CLOSED**
+
+冻结内容：
+  Selected Option（B，provider-native function calling）
+  · Decision Protocol（映射规则 / content 丢弃规则 / finish_reason=length 规则）
+  · Decision Schema（FINAL / TOOL_CALL / tool_call_id 归属）
+  · Provider Boundary · Tool Schema Boundary · Authorization Boundary
+  · Error Boundary（复用既有错误码）· Retry Boundary（无 Decision 级重试）
+  · DeepSeek Compatibility（VERIFIED / UNVERIFIED 清单）
+  · Migration Path（阶段 1/2/3 + 禁止事项）· Rejected Alternatives
+
+未改变：Phase 5 §1–§27（含 §5 Tool Loop、§6 Policy、§9 Error Recovery、
+        §OD-P5-02/03/04/07/12）——本决策是对 §5.3 遗留问题（LLM 工具决策协议）的关闭。
+实现状态：仍为 **NOT IMPLEMENTED**（适配器实现属下一阶段，需明确授权）。
+```
