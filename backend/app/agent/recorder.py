@@ -26,24 +26,37 @@ AgentStep（Phase 5 AgentStep Persistence）：
     * ``AgentStepRecord`` 只承载 step identity / type / status / tool_name /
       稳定错误码 / timing（**不含** arguments / output / 正文）；
     * 与 ``agent_run`` 各自独立 best-effort 写入（**不引入**跨表事务 / Unit of Work）。
+
+AgentToolResult（Phase 5 P-4 — Replayable Tool Result Store）：
+    * ``AgentToolResultRecord`` 承载 **execution identity = (run_id, step_index)**
+      + Tool 结果的 **安全序列化体**（或"不可用"标记）+ SHA-256 + 尺寸；
+    * 大小策略（冻结 §15）：≤ 32 KiB 内联；32 KiB–1 MiB / > 1 MiB ⇒ 不存 payload
+      （只留 hash / size / 身份）⇒ 不可 Replay；**不截断**；
+    * 敏感边界（§19/§20）：最小凭证 deny-list 命中 ⇒ 不存 payload（也不存 hash）；
+    * 本模块定义**端口 + 纯映射**；生产写入点接线（Tool handler 之后**立即**写）
+      属独立实现步骤（P-4 接线边界判定见决策 §12 / P-4 报告）。
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from backend.app.agent.errors import (
     AGENT_ERROR_CODES,
     AGENT_ERROR_FAILED,
     AGENT_ERROR_LIMIT_REACHED,
+    AGENT_ERROR_TOOL_EXECUTION_FAILURE,
 )
 from backend.app.agent.models import (
     AGENT_STATUS_LIMIT_REACHED,
     AgentRuntimeResult,
 )
+from backend.app.tools.base import ToolResult
 
 __all__ = [
     "AgentRunRecorder",
@@ -56,6 +69,12 @@ __all__ = [
     "AgentStepRecord",
     "agent_step_records_of",
     "build_agent_step_recorder",
+    "AgentToolResultRecorder",
+    "BestEffortAgentToolResultRecorder",
+    "AgentToolResultRecord",
+    "agent_tool_result_record_of",
+    "build_agent_tool_result_recorder",
+    "SENSITIVE_RESULT_MARKERS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -468,3 +487,353 @@ def _record_kwargs(record: AgentRunRecord) -> dict[str, Any]:
         "finished_at": record.finished_at,
         "duration_ms": record.duration_ms,
     }
+
+
+# ============================================================
+# Agent Tool Result 持久化（Phase 5 P-4 — Replayable Tool Result Store）
+# ============================================================
+
+#: 敏感标记（**最小** deny-list；§19/§20：不是 DLP、不做脱敏、不改写内容）。
+#: 命中 ⇒ 该结果**完全不落盘**（payload 与 hash 都不写）。
+SENSITIVE_RESULT_MARKERS: Final[tuple[str, ...]] = (
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "bearer ",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+    "database_url",
+    "db_url",
+    "postgres://",
+    "postgresql://",
+    "mysql://",
+    "mongodb://",
+    "sk-",
+)
+
+
+@dataclass(frozen=True)
+class AgentToolResultRecord:
+    """一次 Agent Tool 执行的持久化投影（**安全 DTO**；字段 ≡ §6.2 设计）。
+
+    身份：**(run_id, step_index)** —— 不是 ``tool_call_id``、不是 ``request_id``、
+    不是 Conversation ``Idempotency-Key``。
+
+    状态语义（四态，与 ORM Model 一致）：
+
+        success=True,  result_unavailable=False → SUCCEEDED，可 Replay payload
+        success=True,  result_unavailable=True  → SUCCEEDED 但 payload 不可用 ⇒ fail-closed
+        success=False, result_unavailable=False → FAILED（Handler 已执行并返回失败）
+        success=False, result_unavailable=True  → 执行结果不可判定（§23）⇒ fail-closed
+    """
+
+    run_id: str
+    step_index: int
+    tool_name: str
+    success: bool
+    result_size_bytes: int
+    result_truncated: bool
+    result_unavailable: bool
+    project_id: str | None = None
+    error_code: str | None = None
+    result_payload: Any | None = None
+    result_hash: str | None = None
+    result_ref: str | None = None
+    tool_call_id: str | None = None
+
+
+def _payload_limits() -> tuple[int, int]:
+    """大小策略上限（**延迟 import**：模块加载不引入 DB / SQLAlchemy 依赖）。
+
+    单一来源 = ORM Model 常量（``AGENT_TOOL_RESULT_INLINE_MAX_BYTES`` /
+    ``AGENT_TOOL_RESULT_HARD_MAX_BYTES``）。
+    """
+    from backend.app.db.models.agent_tool_result import (
+        AGENT_TOOL_RESULT_HARD_MAX_BYTES,
+        AGENT_TOOL_RESULT_INLINE_MAX_BYTES,
+    )
+
+    return AGENT_TOOL_RESULT_INLINE_MAX_BYTES, AGENT_TOOL_RESULT_HARD_MAX_BYTES
+
+
+def _canonical_json(value: Any) -> str:
+    """规范化 JSON 文本（hash / 尺寸 / 落盘三者共用同一序列化）。
+
+    * ``sort_keys=True`` + 紧凑分隔符 ⇒ **确定性**（same result → same text/hash）；
+    * ``allow_nan=False`` ⇒ NaN / Infinity 视为**不可安全序列化**（不静默改写）；
+    * 非 JSON 兼容对象（Session / ORM model / exception …）⇒ ``TypeError``。
+
+    Raises:
+        TypeError:  值不是 JSON 兼容结构。
+        ValueError: NaN / Infinity 等非法数值。
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _contains_sensitive_marker(text: str) -> bool:
+    """最小凭证 deny-list 命中判定（大小写不敏感；**不**记录命中的标记）。"""
+    lowered = text.lower()
+    return any(marker in lowered for marker in SENSITIVE_RESULT_MARKERS)
+
+
+def _stable_tool_error_code(value: object) -> str:
+    """错误码归一：稳定码白名单原样；其它（自由文本 / 未知）→ ``TOOL_EXECUTION_FAILURE``。"""
+    if isinstance(value, str) and value in AGENT_ERROR_CODES:
+        return value
+    return AGENT_ERROR_TOOL_EXECUTION_FAILURE
+
+
+def agent_tool_result_record_of(
+    *,
+    run_id: str,
+    step_index: int,
+    tool_name: str,
+    result: ToolResult | None = None,
+    error_code: str | None = None,
+    project_id: str | None = None,
+    tool_call_id: str | None = None,
+) -> AgentToolResultRecord:
+    """``(identity, tool_name, ToolResult)`` → 持久化投影（纯函数；无 IO / 无 DB）。
+
+    路径：
+
+        ① ``result is None``（或显式 ``error_code``）
+               → 执行结果**不可判定**（边界异常 / 能力拒绝 / 未知；§23）：
+                 ``success=False`` + 稳定码 + ``result_unavailable=True``（fail-closed）
+        ② ``result.success is False``（Handler 已执行并返回失败）
+               → ``success=False`` + ``TOOL_EXECUTION_FAILURE`` +
+                 ``result_unavailable=False``（failure 事实本身可 Replay；
+                 ToolResult.error 的**自由文本一律丢弃**）
+        ③ ``result.success is True``
+               → 序列化 ``{"tool_name": …, "data": …}``（复用 Runtime 既有结果体；
+                 不含 ``【TOOL RESULT — UNTRUSTED DATA】`` marker 包装）
+               → 敏感标记命中 ⇒ payload / hash 都不落盘（unavailable=True）
+               → ≤ 32 KiB ⇒ 内联 payload + SHA-256 + size（可 Replay）
+               → ≤ 1 MiB / > 1 MiB ⇒ payload=None + SHA-256 + size（不可 Replay）
+
+    恒为 ``result_truncated=False``（**不做截断**：超限直接置不可用）。
+    ``result_ref`` 恒为 ``None``（无 artifact store）。
+    """
+    base: dict[str, Any] = {
+        "run_id": run_id,
+        "step_index": step_index,
+        "tool_name": tool_name,
+        "project_id": project_id,
+        "tool_call_id": tool_call_id,
+        "result_ref": None,
+        "result_truncated": False,
+    }
+
+    # ① 结果不可判定（未执行 / 边界异常 / 能力拒绝 / 未知）
+    if result is None or error_code is not None:
+        return AgentToolResultRecord(
+            **base,
+            success=False,
+            error_code=_stable_tool_error_code(error_code),
+            result_payload=None,
+            result_hash=None,
+            result_size_bytes=0,
+            result_unavailable=True,
+        )
+
+    # ② Handler 已执行，但返回失败
+    if not bool(result.success):
+        return AgentToolResultRecord(
+            **base,
+            success=False,
+            error_code=_stable_tool_error_code(None),
+            result_payload=None,
+            result_hash=None,
+            result_size_bytes=0,
+            result_unavailable=False,
+        )
+
+    # ③ Handler 成功：安全序列化 → 敏感检查 → 尺寸策略 → hash
+    inline_max, _hard_max = _payload_limits()
+    try:
+        text = _canonical_json({"tool_name": tool_name, "data": result.data})
+    except (TypeError, ValueError):
+        # 不可安全序列化（Session / 自定义对象 / NaN …）：不猜、不 str()、不 repr()
+        return AgentToolResultRecord(
+            **base,
+            success=True,
+            error_code=None,
+            result_payload=None,
+            result_hash=None,
+            result_size_bytes=0,
+            result_unavailable=True,
+        )
+
+    size = len(text.encode("utf-8"))
+    if _contains_sensitive_marker(text):
+        # 凭证形状内容：payload 与 hash **都不**落盘（不写入敏感原文）
+        return AgentToolResultRecord(
+            **base,
+            success=True,
+            error_code=None,
+            result_payload=None,
+            result_hash=None,
+            result_size_bytes=size,
+            result_unavailable=True,
+        )
+
+    result_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if size <= inline_max:
+        return AgentToolResultRecord(
+            **base,
+            success=True,
+            error_code=None,
+            # 存 hash 的**同一**结构（保证未来 Replay 重新序列化后 hash 一致）
+            result_payload=json.loads(text),
+            result_hash=result_hash,
+            result_size_bytes=size,
+            result_unavailable=False,
+        )
+    # 32 KiB < size：只保留 hash / size / 身份 ⇒ 不可 Replay。
+    # 中间档与 "> 1 MiB" 档当前**行为相同**（都不落 payload、都不截断）；
+    # ``hard_max`` 是"超过即绝不尝试内联"的硬上界（当前实现天然满足）。
+    return AgentToolResultRecord(
+        **base,
+        success=True,
+        error_code=None,
+        result_payload=None,
+        result_hash=result_hash,
+        result_size_bytes=size,
+        result_unavailable=True,
+    )
+
+
+class AgentToolResultRecorder(Protocol):
+    """Tool Result 持久化端口（**写入点**由上层接线决定；实现必须 best-effort）。"""
+
+    def record(self, record: AgentToolResultRecord) -> int | None:
+        """同步入口（实现必须 **best-effort**：永不抛出）。"""
+        ...
+
+    async def arecord(self, record: AgentToolResultRecord) -> int | None:
+        """异步入口（实现必须 **best-effort**：永不抛出）。"""
+        ...
+
+
+class BestEffortAgentToolResultRecorder:
+    """Best-effort Tool Result 记录器（与 ``BestEffortAgentStepRecorder`` 同风格）。
+
+    契约：
+
+        ``record(...)`` / ``await arecord(...)`` → **永不抛出**
+            成功 → 新行 id；``(run_id, step_index)`` 已存在 → ``None``（幂等跳过）
+            失败 → ``None`` + warning（含 error_type）
+
+    为什么需要它：结果存储属**恢复支撑链路**（不是业务链路）。
+    DB 不可用 / 超时 / 校验失败 / 取消都不得改变已经产生的 Tool / Agent 结果，
+    也不得触发 retry、LLM 重问、Tool 重跑、fallback。
+    """
+
+    def __init__(self, repository: Any | None = None) -> None:
+        """构造记录器（repository=None → 默认仓储，延迟 import）。"""
+        self._repository = repository
+
+    def _get_repository(self) -> Any:
+        if self._repository is not None:
+            return self._repository
+        from backend.app.db.agent_tool_result_repository import (
+            AgentToolResultRepository,
+        )
+
+        self._repository = AgentToolResultRepository()
+        return self._repository
+
+    @property
+    def repository(self) -> Any:
+        """底层仓储（只读暴露，便于测试断言注入关系）。"""
+        return self._repository
+
+    def record(self, record: AgentToolResultRecord) -> int | None:
+        """同步入口（永不抛出）。"""
+        created = self.record_many((record,))
+        return created[0] if created else None
+
+    def record_many(self, records: tuple[AgentToolResultRecord, ...]) -> list[int]:
+        """同步批量入口（永不抛出）。"""
+        try:
+            if not records:
+                return []
+            # 直接传 agent 侧投影（与 ``BestEffortAgentStepRecorder`` 同风格：
+            # Repository 按字段名校验，不要求特定 Row 类型）。
+            return self._get_repository().create_many(list(records))
+        except asyncio.CancelledError:
+            logger.warning(
+                "Agent Tool Result 持久化被取消（不影响已完成的 Tool / Agent 结果）",
+                exc_info=False,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 —— 绝不穿透为业务失败
+            self._log_failure(exc, records)
+            return []
+
+    async def arecord(self, record: AgentToolResultRecord) -> int | None:
+        """异步入口（永不抛出；同步持久化放进 worker 线程）。"""
+        created = await self.arecord_many((record,))
+        return created[0] if created else None
+
+    async def arecord_many(
+        self, records: tuple[AgentToolResultRecord, ...]
+    ) -> list[int]:
+        """异步批量入口（永不抛出）。"""
+        try:
+            return await asyncio.to_thread(self.record_many, records)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Agent Tool Result 持久化被取消（不影响已完成的 Tool / Agent 结果）",
+                exc_info=False,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 —— 兜底（record 本身已 best-effort）
+            self._log_failure(exc, records)
+            return []
+
+    @staticmethod
+    def _log_failure(
+        exc: BaseException, records: tuple[AgentToolResultRecord, ...]
+    ) -> None:
+        """失败只记录**诊断信息**（error_type + 身份字段；不含结果内容）。"""
+        logger.warning(
+            "Agent Tool Result 持久化失败（best-effort；不影响 Tool / Agent 结果）: %s",
+            type(exc).__name__,
+            extra={
+                "error_type": type(exc).__name__,
+                "run_id": records[0].run_id if records else None,
+                "step_index": records[0].step_index if records else None,
+                "tool_name": records[0].tool_name if records else None,
+            },
+        )
+
+
+def build_agent_tool_result_recorder() -> BestEffortAgentToolResultRecorder | None:
+    """生产装配（与 ``build_agent_step_recorder`` 同风格）：
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置 → ``None``（零开销 / 无告警噪声）
+        否则 → ``BestEffortAgentToolResultRecorder``（写入 ``ai_ops.agent_tool_result``）
+
+    Note:
+        本函数只装配 recorder；**写入点接线**（Tool handler 之后立即写）不在本阶段
+        （P-4 接线边界判定见报告）。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent tool result persistence disabled"
+            "（DATABASE_URL 未配置；不创建 agent tool result recorder）"
+        )
+        return None
+    return BestEffortAgentToolResultRecorder()

@@ -19,6 +19,7 @@ from __future__ import annotations
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.agent_run import AgentRun
 from backend.app.db.models.agent_step import AgentStep
+from backend.app.db.models.agent_tool_result import AgentToolResult
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_evidence import ConversationEvidenceRecord
@@ -57,12 +58,16 @@ _MODELS: tuple[type, ...] = (
     # Phase 5 AgentStep Persistence：Agent Step（step projection；ai_ops；
     # **无外键**；UNIQUE(run_id, step_index)）。
     AgentStep,
+    # Phase 5 P-4 Tool Result Store：Agent Tool Result（replayable result；ai_ops；
+    # **无外键**；UNIQUE(run_id, step_index) = Tool Execution Identity）。
+    AgentToolResult,
 )
 
 
 __all__ = [
     "AgentRun",
     "AgentStep",
+    "AgentToolResult",
     "AssistantOutcomeRecord",
     "Conversation",
     "ConversationEvidenceRecord",
