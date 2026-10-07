@@ -1937,3 +1937,432 @@ ConversationRuntime → AIOrchestrator → RouteDecision
                                                      └── ToolExecutionService → ToolRegistry（read-only）
 Provider 不知道 Agent；Agent 不知道 Conversation；Conversation 拥有历史与幂等。
 ```
+
+---
+
+# 30. Agent Persistence Architecture Decision
+
+> **本节为追加修订（append-only）**：不修改 §1–§29 的任何历史决策文字。
+> 触发：Phase 5 Agent Runtime 已接线（§29）但状态仍为 **IN-MEMORY ONLY**；
+> 本阶段只回答"AgentRun / AgentStep 是否需要持久化，以及如何进入既有 ai_ops 数据模型"。
+> 本阶段**只做 Architecture Decision**：
+> `Production code = 0 · DB schema = 0（不 CREATE / 不 ALTER / 不 migration）· API = 0 ·
+>  Prompt = 0 · Tool = 0 · Router = 0 · Orchestrator = 0 · Agent Runtime = 0 ·
+>  Conversation = 0 · Evidence = 0 · Observation = 0 · tests = 0`。
+
+## 30.0 事实基线（代码实测，非推断）
+
+| 事实 | 真实情况 | 证据 |
+| ---- | -------- | ---- |
+| Agent 结果 DTO | `AgentRuntimeResult{status, content, steps, tool_calls, llm_calls, error, tokens_used, token_budget_unverifiable, step_records}`（frozen, in-memory） | `backend/app/agent/models.py` |
+| Agent 步骤 DTO | `AgentStep{step_index, type(LLM_DECISION/TOOL_CALL/FINAL), status, tool_name, arguments, output, error, elapsed_ms}` | 同上 |
+| Agent 终态 | `COMPLETED / FAILED / LIMIT_REACHED` + 预留 `CANCELLED / WAITING_APPROVAL`（**当前不可达**） | `models.py` · §29.8 |
+| Agent 错误码 | 稳定白名单：`LLM_FAILURE / INVALID_DECISION / TOOL_NOT_ALLOWED / TOOL_EXECUTION_FAILURE / LIMIT_REACHED`（+ 跨层归一 `AGENT_FAILED`） | `backend/app/agent/errors.py`（`AGENT_ERROR_CODES`） |
+| Agent 数据访问 | agent 包 **0** 处 DB / httpx / Conversation import（AST 审计）；`run()` 只返回内存结果 | `tests/test_agent_orchestrator_integration.py`（`test_agent_package_has_no_conversation_dependency`）· `tests/test_agent_runtime.py` |
+| request_id | 每次 `AIOrchestrator.execute()` 生成一个（`new_request_id()`），进入 `assistant_trace_scope`，随 `metadata["request_id"]` 透出；ASSISTANT turn 依赖它 | `ai_orchestrator_service.py` L574/L581 |
+| 终态写入先例 | `_record_assistant_outcome(request_id, outcome)`：**BestEffort**（无 recorder ⇒ 直接返回；异常被吞；绝不影响业务） | `ai_orchestrator_service.py` L679–701 |
+| LLM 级记录 | `ai_ops.llm_usage_record`：`request_id`（**Provider 请求 id**，partial UNIQUE where not null）+ `assistant_request_id`（**普通索引**）+ provider/model/tokens（NULL ≠ 0）+ created_at；写入 = accounting sink（生产路径 `get_default_llm_client()`），`assistant_request_id` 取 `current_assistant_request_id()`；存在 `ON CONFLICT DO NOTHING` 幂等插入 | `db/models/llm_usage_record.py` · `services/llm_usage_persistence_service.py` |
+| Tool 级记录 | `ai_ops.tool_execution_record`：`request_id`（**普通索引**）+ `round` + `tool_name` + started/finished/duration + success + project_id + `tool_call_id` + error_code/error_type；**无 FK / 无 UNIQUE**；注释明文"**不做 retention**：无 TTL / 分区 / 自动清理；数据库存长期历史" | `db/models/tool_execution_record.py` · `tool_execution_repository.py` |
+| Assistant 终态记录 | `ai_ops.assistant_outcome_record`：`assistant_request_id` **UNIQUE** + `outcome`（4 态）+ created_at（幂等插入） | `db/models/assistant_outcome_record.py` · `assistant_outcome_repository.py` |
+| RAG 记录先例 | `ai_ops.rag_execution_record`：计数 / 时长 / **chunk_ids / document_ids**（**不存正文**；`context_chars` 仅长度） | `db/models/rag_execution_record.py` |
+| Conversation 记录 | `ai_ops.conversation_turn`：`UNIQUE(conversation_id, idempotency_key)` + `Index(conversation_id, created_at)`；`assistant_request_id String(128) NULL` —— 注释明文"**不是** ForeignKey（correlation）" | `db/models/conversation_turn.py` |
+| Evidence 关系 | `ai_ops.conversation_evidence` = 复合 PK + FK（**reference**，非 ownership）；Phase 4.1 已冻结 | `db/models/conversation_evidence.py` |
+| 生产接线差异 | `/api/ai/chat`（`orchestrator_chat.py`）注入 `_TOOL_EXECUTION_OBSERVER`（Composite：内存 collector + `ToolExecutionPersistenceService`）与 `outcome_recorder`；**会话消息 API**（`ChatApplicationService()` 默认 ⇒ `build_orchestrator_for_project(project_id)`，无 base）**未**注入 observer / outcome recorder | `api/orchestrator_chat.py` L286–299/L470–479 · `api/conversations.py` L116 · `chat_application_service.py` `_default_orchestrator_factory` |
+| 删除能力 | 观测 / 会话 / 证据均**无** delete / prune / retention API（仓库内无 `DELETE FROM` 于生产路径） | 全库 grep |
+
+**结论（事实层）**：Agent 的 **LLM 调用**与 **Tool 调用**今天**已经**在 ai_ops 有记录（`llm_usage_record` / `tool_execution_record`，均以 `request_id` / `assistant_request_id` 关联，且后者**不是 FK**）。
+真正缺的只有 **run 级状态与汇总**（status / limit 区分 / counts）—— 这正是本决策要解决的范围。
+
+## 30.1 Problem
+
+```text
+Agent Run 结束后，除"LLM 调用行"与"Tool 调用行"（若已接线）外，系统**不留**任何
+Agent 事实：
+    * 是否 COMPLETED / FAILED / LIMIT_REACHED（4 态 outcome 把 LIMIT_REACHED 抹成 FAILED）
+    * 本次 run 的 steps / tool_calls / llm_calls 计数
+    * 终止原因（稳定码）、token usage 是否可验证
+    * 起止时间（run 级时间线）
+同时：现状**不能**支持"事后审计一次 Agent 运行"（"为什么只调用了一次 Tool 就结束？"）。
+但：现状**也不需要** run/step 之外的任何能力（无 HITL / 无 cancel / 无 resume）。
+```
+
+## 30.2 Current State
+
+```text
+RouteDecision(AGENT)
+    ↓ AIOrchestrator.execute()（request_id + assistant_trace_scope）
+AgentRuntime.run()（IN-MEMORY：messages / step_records 全部随调用结束丢弃）
+    ↓ AgentRuntimeResult
+AIOrchestrationResult{route, content, data=AgentRuntimeResult, metadata(11 键)}
+    ↓（Conversation 层）ASSISTANT turn（content 非空且 request_id 合法）
+ai_ops 现状（AGENT 路径，取决于接线）：
+    llm_usage_record      : 每次 Agent LLM 调用 1 行（assistant_request_id = trace id）   ← 已存在
+    tool_execution_record : 每次 Tool 执行 1 行（若 observer 已接线）                     ← 已存在（接线依赖）
+    assistant_outcome_record : 1 行（若 outcome recorder 已接线；LIMIT_REACHED ⇒ FAILED）  ← 已存在（接线依赖）
+    agent_run / agent_step : **不存在**
+```
+
+## 30.3 十问速答（§三 必答）
+
+```text
+1. AgentRun 是否持久化？        → YES（MVP 持久化 run 级事实；见 §30.8）
+2. AgentStep 是否持久化？       → NO（MVP 不建 step 表；step 事实已由既有观测表承载；见 §30.10）
+3. 谁拥有这些记录？             → Agent 能力层（run 记录）；**不是** Conversation，**不是** Evidence（见 §30.6）
+4. Conversation 与 AgentRun？   → 无 FK / 无 ownership；仅经 request_id 关联（Option C；见 §30.5）
+5. 三个 ID 如何关联？           → turn_id（消息）· request_id（AI 请求）· run_id（Agent 执行）；不合并（见 §30.7）
+6. ToolExecutionRecord？        → 继续作为**唯一** Tool 级记录（不复制进 AgentRun）
+7. LLMUsageRecord？             → 继续作为**唯一** LLM 级记录（不复制进 AgentRun）
+8. AgentRun 是新 execution aggregate？ → 新 **Agent 专属** aggregate（不吞并 RAG / TOOL / TEXT_TO_SQL）
+9. AgentStep 是新 domain entity？     → 未来是（若 HITL / cancel / resume 立项）；MVP 仅内存 DTO
+10. 状态恢复是否属于本阶段？    → NO（Persistence ≠ Resume；见 §30.17）
+```
+
+## 30.4 边界原则（不可变）
+
+```text
+ConversationTurn = 用户可见消息（Conversation 拥有）
+AgentRun         = 一次 Agent 执行生命周期（Agent 能力拥有）
+AgentStep        = AgentRun 内一次逻辑步骤（Agent Run 内部；MVP 不持久化）
+
+禁止：
+    AgentRuntime 创建 ConversationTurn / 处理 Idempotency-Key / 读写 Conversation DB
+    Conversation 拥有 AgentRun（无级联删除 / 无 FK）
+    AgentRun 复制 LLM usage / Tool 执行明细（与既有观测表重复）
+    AgentRun 承载 Evidence（AgentRun ≠ Evidence；ToolResult ≠ Evidence）
+```
+
+## 30.5 Conversation 关系：三方案比较（§六）
+
+| 维度 | Option A：`conversation_id` + `turn_id` FK | Option B：`request_id` + `conversation_id`（无 turn FK） | Option C：仅 `request_id` |
+| ---- | ---- | ---- | ---- |
+| ownership | ❌ 反向（Conversation 拥有 Agent 记录） | ⚠️ 部分反向（抄一份会话归属） | ✅ Agent 层自洽 |
+| correlation | 强（但需 turn 先存在） | 中（conversation 可能不存在） | ✅ 经 request_id → `conversation_turn.assistant_request_id` |
+| lifecycle | ❌ 绑定 turn 生命周期 | ⚠️ 绑定 conversation 生命周期 | ✅ 独立 |
+| idempotency | ❌ 与 Step 6 幂等语义交叉 | ⚠️ 部分交叉 | ✅ 完全不动 Step 6 |
+| replay | ⚠️ duplicate 无 run 可指 | ⚠️ 同 | ✅ duplicate ⇒ 无 run（本来就没执行） |
+| retention | ❌ 需定义级联 | ⚠️ 需定义 | ✅ 无级联（与观测表一致） |
+| deletion | ❌ 删会话是否删 run？ | ⚠️ 同 | ✅ 互不影响 |
+| 时点可行性 | ❌ **ASSISTANT turn 在 AI 之后才创建**（AgentRun 写入时 turn 可能不存在） | ⚠️ `conversation_id` 在 `/api/ai/chat` 路径不存在 | ✅ 任何路径都成立 |
+| 先例一致性 | ❌ 破坏"correlation 不用 FK"先例 | ⚠️ 半破坏 | ✅ 与 `conversation_turn.assistant_request_id`（非 FK）一致 |
+
+### Decision（OD-P5-25）
+
+```text
+**Option C**：`agent_run` 只持有 `request_id`（AI Runtime request correlation）；
+不存 `conversation_id` / `turn_id`，不加任何 FK。
+
+关联路径（只读推导，不改任何既有表）：
+    agent_run.request_id
+        ↕（等值字符串）
+    conversation_turn.assistant_request_id
+        ↓
+    conversation_turn.conversation_id → conversation
+
+理由：Agent 层不依赖 Conversation 所有权；Conversation 删除不影响 Agent 记录
+（Phase 4.1 ownership 先例）；`/api/ai/chat` 无会话时同样成立；
+且**不改变** `ConversationTurn.assistant_request_id` 已冻结的语义
+（仍为 correlation 字符串，绝不升级为 FK）。
+```
+
+## 30.6 Ownership（§五 / §三十.6）
+
+```text
+ConversationRuntime owns: Conversation · ConversationTurn · Idempotency · Conversation Context
+AgentRuntime      owns: AgentRun（内存）· AgentStep（内存）· Agent Policy · Agent Loop
+Persistence Writer owns: ai_ops.agent_run 行的耐久化（写入实现属未来实现阶段）
+
+读取方（未来）：Agent 观测 / Timeline 读模型（本阶段不实现）
+写入方（未来）：Orchestrator 侧 BestEffort recorder（注入式；⚠️ AgentRuntime 保持 0 DB）
+```
+
+## 30.7 Correlation：turn_id / request_id / run_id（§七）
+
+```text
+conversation_turn.turn_id          = Conversation message identity（Conversation 拥有）
+        │（同一行上的 assistant_request_id，非 FK）
+        ▼
+request_id (= assistant_request_id) = 一次 AI Runtime 请求的 correlation（Orchestrator 生成）
+        │
+        ▼
+agent_run.run_id                    = 一次 Agent Runtime 执行的 identity（Agent 生成）
+        │
+        ├── AgentStep（MVP：内存 step_records；未来：agent_step.run_id）
+        ├── llm_usage_record（每 LLM 调用 1 行；assistant_request_id = request_id）
+        └── tool_execution_record（每 Tool 执行 1 行；request_id = request_id；含 tool_call_id）
+
+tool_call_id = 单轮 LLM ↔ Tool 协议关联（**不**是 trace id；**不**与上述三者互换）
+```
+
+```text
+不变式（冻结）：
+    * request_id：每次 execute() 一个（不在 AgentRun 内新增第二套）；
+    * run_id：仅 Agent 执行身份（**不**替换 request_id / **不**作为 Conversation 关联键）；
+    * turn_id：仅消息身份（Agent 记录中**不出现**）。
+```
+
+## 30.8 表结构：三方案比较与决策（§八）
+
+| 维度 | A：`agent_run` + `agent_step` | B：仅 `agent_run`（step 用 Observation） | C：不新增表（只用既有 3 表） |
+| ---- | ---- | ---- | ---- |
+| recovery（状态恢复） | ✅ 最强（未来 resume 基础） | ⚠️ run 级可恢复；step 级不可 | ❌ 无法恢复 |
+| audit（事后审计） | ✅ step 级 | ✅ run 级（+ 既有观测行） | ⚠️ 缺 run 级状态/计数 |
+| debugging | ✅ 最强 | ⚠️ 需 join 两张观测表 | ❌ 无法区分 LIMIT_REACHED / FAILED |
+| HITL（未来） | ✅ 需要 step state | ⚠️ 需追加 | ❌ |
+| cancellation / resume（未来） | ✅ 需要 step state | ⚠️ 需追加 | ❌ |
+| 安全成本 | ❌ Step 携带 arguments / output 正文 ⇒ 需严格脱敏 | ✅ 只存稳定码 / 计数 | ✅ |
+| 重复观测风险 | ⚠️ 易与 llm_usage / tool_execution 重复 | ✅ 不重复 | ✅ |
+| 当前必要性 | ❌ 无 HITL / cancel / resume 触发源 | ✅ 覆盖真实缺口 | ❌ 关键信息缺失 |
+
+### Decision（OD-P5-26）
+
+```text
+**采纳 B（裁剪版）**：
+    1) 新增 `ai_ops.agent_run`（1 行 = 1 次 Agent Run）—— 承载 run 级状态与汇总；
+    2) **MVP 不创建 `agent_step` 表**：step 级 LLM / Tool 事实已由既有
+       `llm_usage_record` / `tool_execution_record` 承载（按 request_id 关联），
+       run 内 `step_records` 继续作为 **in-memory 结果字段**（不落库）；
+    3) `agent_step` 的**表设计**作为迁移路径冻结（§30.10 / §30.18），
+       仅在未来 HITL / cancel / resume 决策通过后创建。
+```
+
+```text
+为什么需要 agent_run（不可由既有 3 表替代）：
+    * LIMIT_REACHED ≠ FAILED（§30.13）——`assistant_outcome_record` 只有 4 态，
+      LIMIT_REACHED 被映射为 FAILED ⇒ run 级真实终态**只能**由 agent_run 承载；
+    * steps / tool_calls / llm_calls / token_budget_unverifiable 等 run 汇总
+      无法从既有行数推导（Tool 行数 ≠ step 数；LLM 行数在 provider 未回 request_id
+      时无唯一键）；
+    * run 级起止时间（Agent 生命周期）与 LLM/Tool 级时间不可互换。
+```
+
+## 30.9 `ai_ops.agent_run` 设计（只设计，**不创建**）
+
+```text
+ai_ops.agent_run
+    id                        BIGINT      PK（自增；项目既有规范）
+    run_id                    VARCHAR(64) NOT NULL  UNIQUE   ← Agent 执行身份（业务键）
+    request_id                VARCHAR(64) NOT NULL  INDEX    ← = assistant_request_id（correlation）
+    project_id                VARCHAR(64) NULL               ← 授权作用域（与 tool_execution_record 一致）
+    status                    VARCHAR(32) NOT NULL            ← COMPLETED / FAILED / LIMIT_REACHED /（预留 CANCELLED / WAITING_APPROVAL）
+    error_code                VARCHAR(32) NULL                ← 稳定码白名单（AGENT_ERROR_CODES）
+    limit_reason              VARCHAR(64) NULL                ← 稳定码（如 max_steps / max_tool_calls / max_llm_calls / max_cost_tokens / max_execution_time_ms）
+    step_count                INT         NOT NULL            ← AgentRuntimeResult.steps
+    tool_call_count           INT         NOT NULL            ← AgentRuntimeResult.tool_calls
+    llm_call_count            INT         NOT NULL            ← AgentRuntimeResult.llm_calls
+    token_usage_unverifiable  BOOLEAN     NOT NULL            ← 不伪造 token（NULL ≠ 0 的既有精神）
+    started_at / finished_at  TIMESTAMPTZ NOT NULL            ← run 生命周期（UTC）
+    duration_ms               DOUBLE PRECISION NOT NULL       ← 与既有观测表一致（显式，不在查询时算）
+    created_at                TIMESTAMPTZ NOT NULL            ← 写入时间（与观测表一致）
+
+索引：UNIQUE(run_id) · INDEX(request_id) · INDEX(started_at)（时间序，与观测表一致）
+      project_id / status：**不预建**（沿用 tool_execution_record "等真正查询再评估" 的先例）
+外键：**无**（project_id / request_id 均为 correlation 字符串；沿用 conversation_turn 先例）
+幂等插入：`ON CONFLICT DO NOTHING`（唯一键 = run_id）—— 与 llm_usage / assistant_outcome 同构
+```
+
+```text
+为什么需要 / 谁写 / 谁读 / 生命周期 / 删除策略：
+    为什么需要 : 见 §30.8（run 级状态与汇总不可替代）
+    谁写       : Orchestrator 侧 **BestEffort AgentRunRecorder**（注入式；生产由 composition root 装配）
+                 —— AgentRuntime 保持 0 DB（§29.11 禁止项不变）
+    谁读       : 本阶段无读方（未来 Agent Timeline / 观测读模型；OQ-P5-17）
+    生命周期   : 与 Agent Run 同长；run 结束（终态确定）时写入一行；**不更新 / 不重写**
+    删除策略   : append-only；无级联、无 TTL、无分区（见 §30.15）
+```
+
+```text
+**不存**（安全，§30.16）：content 正文 / prompt / messages / conversation_context /
+    tool arguments / tool result / SQL / headers / 任何密钥。
+    （用户可见最终答案的归属 = ConversationTurn（存在时）或响应体；agent_run 不复制正文）
+```
+
+## 30.10 AgentStep：domain state 还是 observation event？（§九 / §十）
+
+```text
+事实判断：
+    * LLM 调用事实  → 已有 `llm_usage_record`（provider/model/tokens；按 request_id 关联）
+    * Tool 调用事实 → 已有 `tool_execution_record`（tool_name / round / success / tool_call_id / 耗时）
+    * AgentStep 中**新增**的信息：step_index / step_type（LLM_DECISION·TOOL_CALL·FINAL）/
+      decision_source / run 内顺序 —— 属于"Agent 逻辑步骤"信息，**不是** LLM/Tool payload 的副本。
+
+性质结论：
+    AgentStep 兼具 **state** 与 **observation** 双重性质；
+    但"哪些 step 状态需要耐久化"取决于终态语义：
+        COMPLETED / FAILED / LIMIT_REACHED → 终态即 run 级（**无需** step 耐久化）
+        WAITING_APPROVAL / CANCELLED       → **当前无触发源**（§29.8 冻结不可达）
+                                            ⇒ 无 step 级状态需要跨请求存活
+```
+
+### Decision（OD-P5-27）
+
+```text
+**MVP：AgentStep 不持久化为表**（`step_records` 保持 in-memory 结果字段）。
+未来迁移路径（冻结设计，**不创建**）：
+    ai_ops.agent_step
+        id BIGINT PK · run_id VARCHAR(64) NOT NULL · step_index INT NOT NULL
+        step_type VARCHAR(16) NOT NULL（LLM_DECISION / TOOL_CALL / FINAL）
+        status VARCHAR(16) NOT NULL · decision_source VARCHAR(16) NULL
+        tool_name VARCHAR(64) NULL · error_code VARCHAR(32) NULL
+        started_at / finished_at / duration_ms
+        UNIQUE(run_id, step_index)
+        **禁止** arguments / output 正文（只允许稳定码 + 名称）
+        （唯一的 CASCADE 候选：agent_run → agent_step，同一 aggregate 内部；见 §30.15）
+
+触发条件（何时创建该表）：HITL / cancel / resume 任一立项 ⇒ 必须同时给出
+    Step State 机（pending / in-flight / done）+ 恢复协议 + Tool 幂等策略（OQ-P5-15）。
+```
+
+## 30.11 State Model（Agent State ≠ Observability）
+
+```text
+Agent State（run 级，MVP 由 agent_run 承载）
+    status · error_code · limit_reason · counts · 起止时间 · project_id
+Agent State（step 级，MVP **不持久化**）
+    current_step · pending tool call · approval pending  ← 仅在未来 HITL / cancel / resume 中存在
+Observability（既有，保持）
+    LLM 调用（llm_usage_record）· Tool 执行（tool_execution_record）· RAG 执行（rag_execution_record）
+    · Assistant 终态（assistant_outcome_record）
+
+⚠️ 不能因为"已有 Observation 表"就认为 Agent State 已解决：
+    Observation 回答"发生了什么调用"，State 回答"这次 Agent 运行处于什么状态"。
+```
+
+## 30.12 Observability Boundary（§九）
+
+```text
+保持不变（0 修改）：
+    * `llm_usage_record` 仍是**唯一** LLM 级记录（agent_run 不复制 tokens / provider / model）；
+    * `tool_execution_record` 仍是**唯一** Tool 级记录（agent_run 不复制 tool_name / 耗时 / tool_call_id）；
+    * `assistant_outcome_record` 语义不变（仍由 Orchestrator 记录；LIMIT_REACHED → FAILED 维持现状）。
+agent_run 与二者的关系：**同源 correlation（request_id），无 FK、无 id 引用**
+    （理由：观测写入是 best-effort ⇒ id 可能不存在；且 llm_usage 的 `request_id` 是
+      Provider 请求 id，并非 assistant_request_id ⇒ 用 record id 关联会产生双重身份）。
+不新增观测表 / 不新增观测列 / 不修改既有 4 张观测表。
+```
+
+## 30.13 Evidence Boundary（§十五）
+
+```text
+保持不变（0 修改）：
+    AgentRun ≠ Evidence · AgentStep ≠ Evidence · ToolResult ≠ Evidence
+    * 不写入 `evidence_record` / `conversation_evidence`；
+    * 不改变 Phase 4.1 identity / provenance；
+    * 未来 "Agent Evidence Candidate" 必须另立 Decision（本决策仅保留该扩展点）。
+```
+
+## 30.14 Idempotency Boundary（§十四）
+
+```text
+保持不变（0 修改）：
+    Idempotency-Key 仍由 ConversationRuntime 独占（Step 6 语义冻结）。
+    duplicate（同 key 同 payload） ⇒ Conversation replay ⇒ **Agent 0 次执行** ⇒ **0 行 agent_run**；
+    conflict（同 key 异 payload） ⇒ 409 ⇒ Agent 0 次执行 ⇒ 0 行；
+    retry（同 key，USER 已存在 / ASSISTANT 缺失） ⇒ 复用 USER turn ⇒ 新 request_id
+                                                    ⇒ Agent 执行一次 ⇒ **新 run_id ⇒ 新行**。
+    agent_run 内**不**新增幂等机制（无 run-level dedupe / 无 tool-level dedupe；
+    `ON CONFLICT DO NOTHING(run_id)` 仅为写入安全，不是业务幂等）。
+```
+
+## 30.15 Retention / Deletion（§十七）
+
+```text
+既有先例（事实）：
+    * tool_execution_record 注释："不做 retention：无 TTL / 分区 / 自动清理；数据库存长期历史"；
+    * 观测 / 会话 / 证据均**无** delete / prune API；
+    * Phase 4.1：Evidence 与 Conversation 不是 ownership（`conversation_evidence` 仅 reference）。
+
+Decision（OD-P5-28）：**append-only + 无跨边界级联**
+    Conversation 删除            → agent_run **保留**（request_id 仍可解析；不 CASCADE）
+    agent_run 删除（未来策略）    → llm_usage / tool_execution / outcome **保留**（不属于 agent_run）
+    agent_run 删除（未来策略）    → agent_step **级联**（**仅**未来同 aggregate 内部允许）
+    TTL / 分区 / 自动清理         → 本阶段**不引入**（retention 策略 = 未来决策 OQ-P5-14）
+```
+
+## 30.16 Security（§十八）
+
+```text
+agent_run / agent_step 禁止持久化：
+    API Key · Authorization · Password · Database URL · System Prompt · 完整 User Prompt ·
+    完整 Conversation Context · 完整 Tool Result · SQL · HTTP Headers · messages / step arguments /
+    step output 正文
+允许持久化：稳定状态 · 稳定错误码 · 计数 · 时间 · correlation id · project_id
+（沿用既有先例：rag_execution_record 只存计数与 chunk/document **id**，不存正文）
+```
+
+## 30.17 Resume Boundary（§十二）
+
+```text
+Agent Persistence ≠ Agent Resume（冻结）：
+    * 本阶段**不**实现 resume / retry-from-step / checkpoint / 状态机推进；
+    * 持久化 run 记录**不**赋予恢复能力（run 行写入发生在 run 结束、终态确定之后）；
+    * 未来 `WAITING_APPROVAL → persist → resume` 链路需要：Step State 表 +
+      审批协议 + Tool 幂等策略 + 恢复幂等键 —— 全部属于**未来独立 Decision**。
+```
+
+## 30.18 Migration Path（§十六 / 未来实施顺序；本阶段均**未授权**）
+
+```text
+P-1（本阶段）      Architecture Decision 冻结（本 §30）
+P-2（未来授权后）  ai_ops.agent_run 实施：
+                     init_db 建表（幂等）· ORM Model · Repository（幂等插入 + get_by_run_id /
+                     list_by_request_id）· BestEffort AgentRunRecorder · Orchestrator 注入点
+                     · metadata 不变（**不**把 run_id 加进 API metadata，除非另行决策）
+P-3（未来授权后）  Step State（agent_step + 状态机）——**前置条件**：HITL / cancel / resume 立项
+P-4（未来授权后）  读模型：Agent Timeline / 观测查询 API（OQ-P5-17）
+禁止：在 P-1 阶段创建任何表 / migration / ORM / repository；禁止把 run_id 混入
+      conversation / evidence / observation 既有语义。
+```
+
+## 30.19 Open Questions（§二十）
+
+```text
+本决策关闭：
+    OQ-P5-2  Agent State Persistence → CLOSED（run 级持久化；step 级 deferred，见 §30.8/§30.10）
+    OQ-P5-10 Run 级汇总落位 → CLOSED（run 汇总归 agent_run；Observation 不承载 run 汇总）
+
+保持 OPEN（不阻塞）：
+    OQ-P5-4  max_cost pricing 来源 · OQ-P5-6 取消触发源 · OQ-P5-9 重复相同 Tool 调用
+    OQ-P5-11 AGENT 规则触发 · OQ-P5-12 AssistantOutcome 专用状态 · OQ-P5-13 context 增量更新
+
+新增：
+    OQ-P5-14 agent_run retention / 清理策略（当前无任何删除能力）
+    OQ-P5-15 agent_step 创建时机与 Step State 机（绑定 HITL / cancel / resume）
+    OQ-P5-16 会话消息路径（`/api/conversations/{id}/messages`）是否补齐 tool observer /
+             outcome recorder（既有事实：该路径未接线；本决策只记录，不修改）
+    OQ-P5-17 Agent 读模型 / API（Timeline / run 查询）与授权范围
+```
+
+## 30.20 Rejected Alternatives
+
+```text
+R-1 AgentRun 加 conversation_id / turn_id FK（Option A）—— 否决：反向 ownership + 级联耦合 +
+    时点不可行（ASSISTANT turn 在 AI 之后创建）+ 破坏"correlation 不用 FK"先例。
+R-2 AgentRun 存 conversation_id（Option B）—— 否决：ownership 混淆、/api/ai/chat 路径为空、
+    与 request_id 关联路径重复。
+R-3 不新增任何表（Option C of §30.8）—— 否决：LIMIT_REACHED / run 计数 / run 时间线**不可恢复**。
+R-4 立即创建 agent_run + agent_step（Option A of §30.8）—— 否决（MVP）：无 HITL/cancel/resume
+    触发源；step 需持久化 arguments/output ⇒ 安全成本高；与既有观测重复。
+R-5 把 step 事实写进 `rag_execution_record` / 复用观测表 —— 否决：语义错配（RAG ≠ Agent），
+    且会污染既有观测契约。
+R-6 agent_run 复制 tokens / provider / model —— 否决：与 llm_usage_record 重复（§九）。
+R-7 agent_run 复制 Tool 明细（tool_name / 耗时 / tool_call_id）—— 否决：与 tool_execution_record 重复。
+R-8 用 FK 关联观测表 record id —— 否决：best-effort 写入 ⇒ id 可能缺失；且 llm_usage.request_id
+    是 Provider 请求 id（与 assistant_request_id 不同身份）。
+R-9 Conversation 删除 → CASCADE 删 agent_run —— 否决：不是 ownership（Phase 4.1 先例）。
+R-10 在 AgentRuntime 内写库 —— 否决：违反 §29.11（Agent 0 DB）与可测试性（离线 57 项）。
+R-11 立即实现 resume / checkpoint —— 否决：Persistence ≠ Resume（§30.17）。
+```
+
+## 30.21 Decision Summary（冻结）
+
+```text
+OD-P5-25 Conversation 关系 = Option C（仅 request_id；无 FK）
+OD-P5-26 表 = agent_run（run 级持久化）；agent_step 表 MVP **不创建**（设计冻结于 §30.10）
+OD-P5-27 AgentStep MVP = in-memory 结果字段（不落库）
+OD-P5-28 Retention = append-only · 无跨边界级联 · 无 TTL（未来 OQ-P5-14）
+不变式：AgentRuntime 0 DB · Conversation 0 修改 · Evidence 0 修改 · Observation 0 修改 ·
+         Idempotency 0 修改 · API 0 修改 · LIMIT_REACHED ≠ FAILED 语义保持
+
+本阶段产出：仅本 §30（文档）。**Agent Persistence Implementation = NOT STARTED**。
+下一步必须等待明确授权（P-2 实施或其它议题）。
+```
