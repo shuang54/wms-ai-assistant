@@ -167,10 +167,17 @@ class SpyService:
         self.registry = service.registry
 
     async def execute(
-        self, tool_name: str, *, arguments: dict[str, Any] | None = None
+        self,
+        tool_name: str,
+        *,
+        arguments: dict[str, Any] | None = None,
+        context: Any | None = None,
     ) -> ToolResult:
+        # Phase 5 S-1：转发 Execution Context（Agent Tool 观测链路）
         self.calls.append((tool_name, dict(arguments or {})))
-        return await self._service.execute(tool_name, arguments=arguments)
+        return await self._service.execute(
+            tool_name, arguments=arguments, context=context
+        )
 
 
 def _tool_definition(name: str = _TOOL_NAME) -> ToolDefinition:

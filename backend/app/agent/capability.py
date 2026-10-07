@@ -37,6 +37,7 @@ class AgentCapability(Protocol):
         *,
         question: str,
         conversation_context: str | None = None,
+        request_id: str | None = None,
     ) -> AgentRuntimeResult:
         """执行一次有界 Agent Run。
 
@@ -45,6 +46,10 @@ class AgentCapability(Protocol):
             conversation_context: 会话上下文（**untrusted reference**；
                 Phase 4.2 契约：由 Conversation 层选择后显式传入，
                 Agent 只读、不查询 Conversation / 不重新选择窗口）。
+            request_id:           Phase 5 S-1 —— AI Runtime 请求 correlation
+                （由 AIOrchestrator 生成并传入；本端口**不生成**）。
+                仅用于复用既有 Tool 观测链路（``ToolExecutionRecord``）；
+                ``None`` ⇒ 0 事件（既有语义）。
 
         Returns:
             :class:`AgentRuntimeResult`（内存结果；无持久化）。

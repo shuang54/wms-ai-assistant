@@ -1230,6 +1230,9 @@ class AIOrchestratorService:
             agent_result: AgentRuntimeResult = await agent_runtime.run(
                 question=question,
                 conversation_context=context,
+                # Phase 5 S-1：请求 correlation（Orchestrator 生成；Agent 不生成）
+                # ⇒ Agent 的 Tool 执行复用既有 ToolExecutionRecord 观测链路。
+                request_id=request_id,
             )
         except AIOrchestratorCapabilityError:
             # 能力拒绝：保持既有 403 语义，不被下方 ExecutionError 包装

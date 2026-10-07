@@ -75,6 +75,7 @@ from backend.app.agent.models import (
     AgentStep,
 )
 from backend.app.agent.policy import AgentRuntimePolicy
+from backend.app.services.tool_execution_context import ToolExecutionContext
 from backend.app.services.tool_execution_service import ToolExecutionService
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,7 @@ class AgentRuntime:
         *,
         question: str,
         conversation_context: str | None = None,
+        request_id: str | None = None,
     ) -> AgentRuntimeResult:
         """执行一次有界 Agent Run（COMPLETED / LIMIT_REACHED / FAILED 终止）。
 
@@ -247,6 +249,14 @@ class AgentRuntime:
                 安全边界）。**只读输入**：整轮 Run 内不重新选择 / 不重新查询
                 Conversation（由 Conversation 层选择后经 AIOrchestrator 显式
                 传入；Phase 5 Integration §29.4）。
+            request_id:           Phase 5 S-1 —— AI Runtime 请求 correlation
+                （由 AIOrchestrator 生成并传入；**本 Runtime 不生成**）。
+                用途**仅**为复用既有 Tool 观测链路：随
+                ``ToolExecutionContext`` 交给 ``ToolExecutionService``，
+                使 Agent 的 Tool 执行产生 ``ToolExecutionRecord``
+                （与 `AgentRun.request_id` / `LLMUsageRecord` 按同一
+                request_id 关联）。``None`` ⇒ 不构造 Context ⇒ 既有
+                "0 事件" 语义（Runtime 独立使用时行为不变）。
 
         Returns:
             :class:`AgentRuntimeResult`（内存结果；无持久化）。
@@ -449,9 +459,16 @@ class AgentRuntime:
                 )
 
             # ---- 执行（唯一通道：ToolExecutionService；第二道 capability 校验） ----
+            # Phase 5 S-1：构造 Execution Context，复用既有 ToolExecutionRecord
+            # 观测链路（Runtime 只传 correlation；不持久化、不接触 DB）。
+            execution_context = self._tool_execution_context(
+                request_id=request_id,
+                step_index=len(records),
+                tool_call_id=tool_call_id,
+            )
             try:
                 tool_result = await self._tool_execution.execute(
-                    tool_name, arguments=arguments
+                    tool_name, arguments=arguments, context=execution_context
                 )
             except Exception as exc:  # noqa: BLE001 —— 归类 FAILED，不 retry
                 failure = AgentToolExecutionFailureError(
@@ -607,6 +624,35 @@ class AgentRuntime:
             {"role": "system", "content": AGENT_SYSTEM_INSTRUCTION},
             {"role": "user", "content": "\n\n".join(parts)},
         ]
+
+    def _tool_execution_context(
+        self,
+        *,
+        request_id: str | None,
+        step_index: int,
+        tool_call_id: str | None,
+    ) -> ToolExecutionContext | None:
+        """构造 Tool 执行上下文（Phase 5 S-1：复用既有观测链路）。
+
+        * ``request_id`` 缺失 ⇒ ``None``（未接线 ⇒ ``ToolExecutionService``
+          既有 "context=None → 0 事件" 语义，行为与 S-1 之前完全一致）；
+        * ``project_id`` 取自**执行边界**（``ToolExecutionService.project_id``）
+          —— 授权作用域的唯一权威来源（服务器端 ProjectContext 解析结果）：
+          不硬编码、不重查 Registry、Runtime 不接触 DB，且天然满足
+          ``_check_context`` 的作用域一致性要求；
+        * ``round = step_index + 1``：既有语义 "one round = one Tool
+          execution · 从 1 起 · 每轮 +1"；Agent 每步至多一次 Tool 执行 ⇒
+          ``Agent step_index(0 起) → round(1 起)``（§七 映射）；
+        * ``tool_call_id`` = Provider/LLM 原值（**不生成 / 不替换**）。
+        """
+        if not isinstance(request_id, str) or not request_id.strip():
+            return None
+        return ToolExecutionContext(
+            request_id=request_id,
+            round=step_index + 1,
+            project_id=getattr(self._tool_execution, "project_id", None),
+            tool_call_id=tool_call_id,
+        )
 
     def _allowed_tool_definitions(self) -> tuple[Any, ...]:
         """已授权 Tool 的 ``ToolDefinition``（仅用于 schema 暴露）。

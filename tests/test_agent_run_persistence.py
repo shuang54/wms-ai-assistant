@@ -136,11 +136,17 @@ class _ScriptedAgent:
     def __init__(self, result: AgentRuntimeResult) -> None:
         self.result = result
         self.calls: list[str] = []
+        self.request_ids: list[str | None] = []
 
     async def run(
-        self, *, question: str, conversation_context: str | None = None
+        self,
+        *,
+        question: str,
+        conversation_context: str | None = None,
+        request_id: str | None = None,
     ) -> AgentRuntimeResult:
         self.calls.append(question)
+        self.request_ids.append(request_id)
         return self.result
 
 

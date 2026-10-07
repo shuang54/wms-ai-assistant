@@ -208,12 +208,19 @@ class RecordingAgentCapability:
     ) -> None:
         self.result = result or _agent_result()
         self.error = error
+        # Phase 5 S-1：记录 (question, context, request_id) 三元组
         self.calls: list[tuple[str, str | None]] = []
+        self.request_ids: list[str | None] = []
 
     async def run(
-        self, *, question: str, conversation_context: str | None = None
+        self,
+        *,
+        question: str,
+        conversation_context: str | None = None,
+        request_id: str | None = None,
     ) -> AgentRuntimeResult:
         self.calls.append((question, conversation_context))
+        self.request_ids.append(request_id)
         if self.error is not None:
             raise self.error
         return self.result
@@ -664,8 +671,14 @@ class TestAgentConversationContext:
             "select_history",
             "build_context",
             "idempotency",
-            "request_id",
+            # Phase 5 S-1：`request_id` 作为 **AI Runtime 请求 correlation**
+            # 由 Orchestrator 显式传入（§29.7 冻结：Agent 不生成），不再作为
+            # 全局禁词；但 Assistant Trace / 会话侧标识仍然禁止
+            # （见下方 ``assistant_request_id`` 的显式断言）。
+            "assistant_request_id",
         )
+        #: S-1 允许出现 `request_id` 的模块（correlation 传入点）
+        _REQUEST_ID_ALLOWED = {"runtime.py", "capability.py"}
         # Phase 5 P-2：``recorder.py`` 是**持久化边界**（agent 包中唯一允许
         # import DB 的模块）；执行内核（runtime / llm / decision / models /
         # policy / errors / capability / ids）仍必须 0 DB 依赖，且**不得**依赖
@@ -689,8 +702,13 @@ class TestAgentConversationContext:
                     )
                 if isinstance(node, ast.Name):
                     assert node.id not in forbidden_names, (path.name, node.id)
+                    # S-1：request_id 只允许作为 correlation 出现在指定模块
+                    if node.id == "request_id":
+                        assert path.name in _REQUEST_ID_ALLOWED, path.name
                 if isinstance(node, ast.Attribute):
                     assert node.attr not in forbidden_names, (path.name, node.attr)
+                    if node.attr == "request_id":
+                        assert path.name in _REQUEST_ID_ALLOWED, path.name
 
         # 执行内核**不依赖**持久化边界（AgentRuntime 保持纯内存执行）
         runtime_source = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
