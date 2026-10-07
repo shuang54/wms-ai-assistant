@@ -27,6 +27,8 @@ __all__ = [
     "AGENT_ERROR_TOOL_NOT_ALLOWED",
     "AGENT_ERROR_TOOL_EXECUTION_FAILURE",
     "AGENT_ERROR_LIMIT_REACHED",
+    "AGENT_ERROR_FAILED",
+    "AGENT_ERROR_CODES",
 ]
 
 #: LLM Provider 调用失败（provider / transport / generation error）。
@@ -44,6 +46,22 @@ AGENT_ERROR_TOOL_EXECUTION_FAILURE: Final[str] = "TOOL_EXECUTION_FAILURE"
 
 #: 达到 RuntimePolicy 预算上限（**不是**失败）。
 AGENT_ERROR_LIMIT_REACHED: Final[str] = "LIMIT_REACHED"
+
+#: 未归类的 Agent 失败（**仅**用于跨层归一化：上层收到的 error 不是
+#: 已知稳定码时使用；不用于 Runtime 内部构造）。
+AGENT_ERROR_FAILED: Final[str] = "AGENT_FAILED"
+
+#: 全部稳定错误码（供上层白名单校验 / 观测归一化使用；**不含**自由文本）。
+AGENT_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        AGENT_ERROR_LLM_FAILURE,
+        AGENT_ERROR_INVALID_DECISION,
+        AGENT_ERROR_TOOL_NOT_ALLOWED,
+        AGENT_ERROR_TOOL_EXECUTION_FAILURE,
+        AGENT_ERROR_LIMIT_REACHED,
+        AGENT_ERROR_FAILED,
+    }
+)
 
 
 class AgentError(Exception):

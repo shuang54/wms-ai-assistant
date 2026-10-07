@@ -25,12 +25,21 @@ __all__ = [
     "AGENT_DEFAULT_MAX_STEPS",
     "AGENT_DEFAULT_MAX_TOOL_CALLS",
     "AGENT_DEFAULT_MAX_LLM_CALLS",
+    "AGENT_DEFAULT_MAX_EXECUTION_TIME_MS",
+    "AGENT_DEFAULT_MAX_COST_TOKENS",
 ]
 
 #: MVP 默认（Phase 5 Decision §6.2：steps = tool_calls = llm_calls = 8）。
 AGENT_DEFAULT_MAX_STEPS: Final[int] = 8
 AGENT_DEFAULT_MAX_TOOL_CALLS: Final[int] = 8
 AGENT_DEFAULT_MAX_LLM_CALLS: Final[int] = 8
+
+#: Composition Root 默认墙钟 / token 预算（Phase 5 Integration §29.11）：
+#: 这两个字段在 ``AgentRuntimePolicy`` 中**无默认值**（必须显式给出），
+#: 生产装配（per-project factory）使用本常量；测试 / 评估可显式覆盖。
+#: 值 = AgentRuntime 文档示例（30s / 50k tokens），**不改变** 8/8/8 默认。
+AGENT_DEFAULT_MAX_EXECUTION_TIME_MS: Final[int] = 30_000
+AGENT_DEFAULT_MAX_COST_TOKENS: Final[int] = 50_000
 
 
 def _validated_int(name: str, value: object) -> int:

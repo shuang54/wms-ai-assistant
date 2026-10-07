@@ -66,11 +66,20 @@ __all__ = [
 # ============================================================
 
 class RouteType(str, Enum):
-    """Router 三种合法路由（显式 enum，禁止 LLM 输出其他值）。"""
+    """Router 四种合法路由（显式 enum，禁止 LLM 输出其他值）。
+
+    Phase 5 Agent Runtime Integration（§29.1 / OD-P5-14）：新增 ``AGENT``
+    （= 受 RuntimePolicy 限制的多步 Tool Calling，read-only）。**默认不可达**：
+    仅当该 Router 显式 ``agent_enabled=True``（且上层已接线 AgentCapability）
+    时，LLM fallback 返回的 ``"agent"`` 才被接受；否则与"禁用 route"一致
+    ⇒ ``AIRouterClassificationError`` ⇒ 保守兜底（绝不静默降级）。
+    合法值集合由本 enum 推导（``valid_routes``）—— 无需修改 prompt 文件。
+    """
 
     RAG = "rag"
     TOOL = "tool"
     TEXT_TO_SQL = "text_to_sql"
+    AGENT = "agent"
 
 
 @dataclass(frozen=True)
@@ -430,6 +439,7 @@ class AIRouterService:
         llm_fallback_enabled: bool | None = None,
         knowledge_enabled: bool = True,
         text_to_sql_enabled: bool = True,
+        agent_enabled: bool = False,
         system_prompt: str | None = None,
         user_prompt_template: str | None = None,
     ) -> None:
@@ -454,6 +464,14 @@ class AIRouterService:
                                   False 时分析类规则跳过 TEXT_TO_SQL，
                                   落到后续知识 / 兜底规则。
                                   默认 True（旧行为不变）。
+            agent_enabled:        Phase 5 Integration（§29.1 / OD-P5-14）——
+                                  AGENT 能力开关。False（默认）时 LLM
+                                  fallback 返回 ``"agent"`` ⇒ 与"禁用
+                                  route"完全一致（classification error ⇒
+                                  保守兜底，**不**静默降级为其它能力）；
+                                  True 时才接受该 route（仍不新增任何
+                                  规则路径触发 —— AGENT 只能由 LLM
+                                  fallback 选择，OQ-P5-11）。
             system_prompt:        覆盖默认 system prompt（测试用）。
             user_prompt_template: 覆盖默认 user prompt 模板（测试用）。
 
@@ -480,8 +498,14 @@ class AIRouterService:
                 "text_to_sql_enabled 必须是 bool"
                 f"（当前: {type(text_to_sql_enabled).__name__}）"
             )
+        if not isinstance(agent_enabled, bool):
+            raise AIRouterInputError(
+                "agent_enabled 必须是 bool"
+                f"（当前: {type(agent_enabled).__name__}）"
+            )
         self._knowledge_enabled = knowledge_enabled
         self._text_to_sql_enabled = text_to_sql_enabled
+        self._agent_enabled = agent_enabled
         self._system_prompt = (
             system_prompt
             if system_prompt is not None
@@ -632,11 +656,15 @@ class AIRouterService:
             )
         # Phase 3.8.2：LLM 选中已被能力开关禁用的 route → 分类失败
         # （落入保守兜底；最终拦截仍由上层编排服务硬校验保证）
+        # Phase 5 Integration §29.1：AGENT 同权 —— agent_enabled=False（默认）
+        # 时该 route 被拒绝（不静默降级为 RAG / TOOL / TEXT_TO_SQL）。
         if (
             route_value == RouteType.RAG.value and not self._knowledge_enabled
         ) or (
             route_value == RouteType.TEXT_TO_SQL.value
             and not self._text_to_sql_enabled
+        ) or (
+            route_value == RouteType.AGENT.value and not self._agent_enabled
         ):
             raise AIRouterClassificationError(
                 f"LLM 输出已被禁用的 route: {route_value!r}"

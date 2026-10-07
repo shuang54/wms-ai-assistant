@@ -6,18 +6,21 @@
     * **不接** AIOrchestrator / Router / Conversation Runtime（后续独立阶段）。
 
 结构：
-    errors.py    —— 错误分类 + 稳定错误码
-    policy.py    —— AgentRuntimePolicy（frozen；fail-closed 校验）
-    decision.py  —— AgentDecision + 严格 JSON 解析（文本 fallback 协议预留）
-    models.py    —— AgentLLM 端口 DTO / AgentStep / AgentRuntimeResult（内存 DTO）
-    llm.py       —— ProviderAgentLLM 适配器（provider-native function calling）
-    runtime.py   —— AgentRuntime 主循环（授权 → ToolExecutionService → 回灌）
+    errors.py     —— 错误分类 + 稳定错误码
+    policy.py     —— AgentRuntimePolicy（frozen；fail-closed 校验）
+    decision.py   —— AgentDecision + 严格 JSON 解析（文本 fallback 协议预留）
+    models.py     —— AgentLLM 端口 DTO / AgentStep / AgentRuntimeResult（内存 DTO）
+    llm.py        —— ProviderAgentLLM 适配器（provider-native function calling）
+    runtime.py    —— AgentRuntime 主循环（授权 → ToolExecutionService → 回灌）
+    capability.py —— AgentCapability Protocol（AIOrchestrator 可见的唯一端口；
+                     Phase 5 Agent Runtime Integration §29.11）
 
 明确不做：Multi-Agent · Planning · Memory · Workflow · LangGraph · MCP ·
 Streaming · Human Approval UI · Agent State 持久化。
 """
 from __future__ import annotations
 
+from backend.app.agent.capability import AgentCapability
 from backend.app.agent.decision import (
     DECISION_FINAL,
     DECISION_TOOL_CALL,
@@ -25,6 +28,8 @@ from backend.app.agent.decision import (
     parse_agent_decision,
 )
 from backend.app.agent.errors import (
+    AGENT_ERROR_CODES,
+    AGENT_ERROR_FAILED,
     AGENT_ERROR_INVALID_DECISION,
     AGENT_ERROR_LIMIT_REACHED,
     AGENT_ERROR_LLM_FAILURE,
@@ -50,14 +55,21 @@ from backend.app.agent.models import (
     AgentStep,
 )
 from backend.app.agent.llm import ProviderAgentLLM
-from backend.app.agent.policy import AgentRuntimePolicy
+from backend.app.agent.policy import (
+    AGENT_DEFAULT_MAX_COST_TOKENS,
+    AGENT_DEFAULT_MAX_EXECUTION_TIME_MS,
+    AgentRuntimePolicy,
+)
 from backend.app.agent.runtime import AGENT_SYSTEM_INSTRUCTION, AgentRuntime
 
 __all__ = [
     "AgentRuntime",
+    "AgentCapability",
     "AGENT_SYSTEM_INSTRUCTION",
     "ProviderAgentLLM",
     "AgentRuntimePolicy",
+    "AGENT_DEFAULT_MAX_EXECUTION_TIME_MS",
+    "AGENT_DEFAULT_MAX_COST_TOKENS",
     "AgentRuntimeResult",
     "AgentStep",
     "AgentLLM",
@@ -78,6 +90,8 @@ __all__ = [
     "AGENT_ERROR_TOOL_NOT_ALLOWED",
     "AGENT_ERROR_TOOL_EXECUTION_FAILURE",
     "AGENT_ERROR_LIMIT_REACHED",
+    "AGENT_ERROR_FAILED",
+    "AGENT_ERROR_CODES",
     "AGENT_STATUS_COMPLETED",
     "AGENT_STATUS_FAILED",
     "AGENT_STATUS_LIMIT_REACHED",

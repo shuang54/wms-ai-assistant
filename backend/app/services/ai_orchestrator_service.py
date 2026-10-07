@@ -50,6 +50,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 
+from backend.app.agent.capability import AgentCapability
+from backend.app.agent.errors import AGENT_ERROR_CODES, AGENT_ERROR_FAILED
+from backend.app.agent.models import (
+    AGENT_STATUS_COMPLETED,
+    AGENT_STATUS_FAILED,
+    AGENT_STATUS_LIMIT_REACHED,
+    AgentRuntimeResult,
+)
 from backend.app.dto.assistant_outcome import (
     AssistantOutcome,
     determine_assistant_outcome,
@@ -355,12 +363,22 @@ class AIOrchestratorService:
         tool_execution_service: ToolExecutionService | None = None,
         tool_execution_observer: ToolExecutionObserver | None = None,
         tool_argument_extractor: ToolArgumentExtractor | None = None,
+        agent_runtime: AgentCapability | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
         """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。
 
         Args:
+            agent_runtime: Phase 5 Agent Runtime Integration（§29.11 / OD-P5-23）——
+                          Agent 能力端口（唯一暴露面：``run()``）。
+                          **可选注入**：``None``（默认）= Agent 未接线 ⇒
+                          ``RouteType.AGENT`` 在执行前被硬校验拒绝
+                          （fail-closed；绝不降级为 RAG / TOOL / TEXT_TO_SQL）。
+                          ProviderAgentLLM / AgentRuntimePolicy /
+                          ToolExecutionService 由 composition root 组装后
+                          注入本层 —— Orchestrator **不**创建它们、
+                          不读 .env、不认识 Provider。
             capabilities: Phase 3.8.2 —— 该项目的能力配置（执行前硬校验）。
                           ``None`` = 不限制（默认 Orchestrator / 旧行为）；
                           工厂 ``build_orchestrator_for_project`` 总是传入
@@ -518,6 +536,16 @@ class AIOrchestratorService:
                 "tool_argument_extractor 必须提供可调用的 extract()"
                 f"（当前: {type(tool_argument_extractor).__name__}）"
             )
+        # Phase 5 Agent Runtime Integration（§29.11）：Agent 能力端口。
+        # 形状校验与其它可选依赖一致（失败更早；本层只 await run()）。
+        if agent_runtime is not None and not callable(
+            getattr(agent_runtime, "run", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_runtime 必须提供可调用的 run()"
+                f"（当前: {type(agent_runtime).__name__}）"
+            )
+        self._agent_runtime = agent_runtime
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -614,6 +642,16 @@ class AIOrchestratorService:
                     )
                 elif decision.route == RouteType.TEXT_TO_SQL:
                     result = await self._run_text_to_sql(
+                        decision,
+                        normalized,
+                        request_id=request_id,
+                        context=context,
+                    )
+                elif decision.route == RouteType.AGENT:
+                    # Phase 5 Agent Runtime Integration（§29.11）：Agent 与
+                    # RAG / TOOL / TEXT_TO_SQL 同级 —— 唯一执行入口仍是本方法
+                    # （Agent **不**回调 Orchestrator / Router / Conversation）。
+                    result = await self._run_agent(
                         decision,
                         normalized,
                         request_id=request_id,
@@ -1072,6 +1110,110 @@ class AIOrchestratorService:
             },
         )
 
+    # ---------- AGENT 路径（Phase 5 Agent Runtime Integration §29） ----------
+
+    async def _run_agent(
+        self,
+        decision: RouteDecision,
+        question: str,
+        *,
+        request_id: str,
+        context: str | None = None,
+    ) -> AIOrchestrationResult:
+        """Agent 路径（Phase 5 Integration §29.2 / §29.8 / §29.11）。
+
+        契约：
+            * **能力硬校验**：``agent_runtime is None``（未接线）⇒ 执行前拒绝
+              （``AIOrchestratorCapabilityError`` = 既有"能力未启用"语义，
+              不降级为 RAG / TOOL / TEXT_TO_SQL）；
+            * ``request_id`` 由 ``execute()`` 生成并透传（本方法**不**生成 ID；
+              Agent 也不生成 —— 同一 request_id 经由 ``assistant_trace_scope``
+              关联 LLM usage / Tool execution）；
+            * ``context`` = Conversation 层选择后的会话上下文（**untrusted
+              reference**，本 Run 只读输入；Agent 不查询 Conversation）；
+            * 结果映射（OD-P5-15）：``route=AGENT`` · ``content`` 原样 ·
+              ``data=AgentRuntimeResult``（frozen 内存 DTO，不转 dict）·
+              ``metadata`` 仅冻结白名单键（见下）；
+            * 失败（FAILED）⇒ ``AIOrchestratorExecutionError``
+              （Conversation 层：USER turn 保留 / 无 ASSISTANT turn）；
+            * LIMIT_REACHED ⇒ **返回 Result**（不抛异常），``outcome=FAILED``
+              + ``agent_status=LIMIT_REACHED`` 显式携带（不伪装成普通失败）。
+
+        metadata 白名单（§29.2；**只含非敏感稳定字段**）：
+            decision_source · route_reason · request_id · outcome ·
+            agent_status · agent_error · agent_steps · agent_tool_calls ·
+            agent_llm_calls · agent_tokens_used · agent_token_budget_unverifiable
+        （**禁止**：step_records / Tool name 列表 / arguments / data /
+          prompt / conversation_context / 异常正文 / 密钥 —— API 层
+          ``metadata=dict(result.metadata)`` 全量透传，故本字典本身即安全 DTO）
+        """
+        # Phase 3.8.2 一致性：Router 只是分类器，执行前硬校验在此层。
+        agent_runtime = self._agent_runtime
+        if agent_runtime is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent 能力（AgentCapability 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        try:
+            agent_result: AgentRuntimeResult = await agent_runtime.run(
+                question=question,
+                conversation_context=context,
+            )
+        except AIOrchestratorCapabilityError:
+            # 能力拒绝：保持既有 403 语义，不被下方 ExecutionError 包装
+            raise
+        except Exception as exc:  # noqa: BLE001 —— Agent 边界外异常归一化
+            raise AIOrchestratorExecutionError(
+                f"Agent 执行失败: {type(exc).__name__}"
+            ) from exc
+
+        if not isinstance(agent_result, AgentRuntimeResult):
+            raise AIOrchestratorExecutionError(
+                "AgentCapability.run() 必须返回 AgentRuntimeResult"
+                f"（当前: {type(agent_result).__name__}）"
+            )
+
+        status = agent_result.status
+        error_code = _stable_agent_error_code(agent_result.error)
+
+        # FAILED：进入既有 Orchestrator 错误边界（USER turn 保留 /
+        # 无 ASSISTANT turn / outcome=FAILED 由 execute() 统一记录）。
+        if status == AGENT_STATUS_FAILED:
+            raise AIOrchestratorExecutionError(
+                f"Agent 执行失败: {error_code or AGENT_ERROR_FAILED}"
+            )
+
+        # Phase 5 Integration §29.8（OD-P5-20）映射表：
+        # COMPLETED            → SUCCESS（content 非空）/ EMPTY（理论不可达）
+        # LIMIT_REACHED        → FAILED + metadata.agent_status 显式保留
+        # WAITING_APPROVAL / CANCELLED（预留不可达）→ FAILED（同 LIMIT_REACHED）
+        outcome = _agent_assistant_outcome(status, agent_result.content)
+
+        return AIOrchestrationResult(
+            route=RouteType.AGENT,
+            content=agent_result.content,
+            data=agent_result,
+            metadata={
+                "decision_source": decision.source,
+                "route_reason": decision.reason,
+                "request_id": request_id,
+                "outcome": outcome,
+                # Agent 状态（稳定字符串；区分 LIMIT / CANCEL / APPROVAL）
+                "agent_status": status,
+                # 稳定错误码（白名单校验后；无自由文本 / 无异常消息）
+                "agent_error": error_code,
+                "agent_steps": agent_result.steps,
+                "agent_tool_calls": agent_result.tool_calls,
+                "agent_llm_calls": agent_result.llm_calls,
+                "agent_tokens_used": agent_result.tokens_used,
+                "agent_token_budget_unverifiable": (
+                    agent_result.token_budget_unverifiable
+                ),
+            },
+        )
+
 
 # ============================================================
 # 内部工具函数（纯函数，便于测试）
@@ -1102,6 +1244,47 @@ def _tool_result_to_content(result: ToolResult) -> str:
     if isinstance(data, Mapping):
         return ", ".join(f"{k}={v}" for k, v in data.items())
     return str(data) if data is not None else ""
+
+
+def _stable_agent_error_code(error: object) -> str | None:
+    """Agent 错误归一化（Phase 5 Integration §29.2 / §29.8 白名单校验）。
+
+    * ``None`` / 空 → ``None``（无错误）；
+    * 命中 ``AGENT_ERROR_CODES`` → 原样返回（稳定码）；
+    * 其它（自由文本 / 异常消息 / 未知实现）→ ``AGENT_ERROR_FAILED``
+      （**绝不**把自由文本透出到 metadata / 错误消息）。
+    """
+    if error is None:
+        return None
+    if isinstance(error, str) and error in AGENT_ERROR_CODES:
+        return error
+    return AGENT_ERROR_FAILED
+
+
+def _agent_assistant_outcome(status: str, content: str | None) -> AssistantOutcome:
+    """Agent 状态 → AssistantOutcome（Phase 5 Integration §29.8 冻结映射）。
+
+         COMPLETED（content 非空）      → SUCCESS
+         COMPLETED（content 空；理论不可达）→ EMPTY
+         LIMIT_REACHED / 其它状态       → FAILED
+
+    说明：
+        * ``AssistantOutcome`` 是**冻结的 4 态契约**（不新增枚举成员）——
+          LIMIT_REACHED 的精确语义由 ``metadata["agent_status"]`` 携带，
+          上层 / 观测仍可区分"出错"与"到达预算边界"（OD-P5-20）；
+        * 只读取 status / content（不读 step_records / 不读 arguments）。
+    """
+    if status == AGENT_STATUS_COMPLETED:
+        return (
+            AssistantOutcome.SUCCESS
+            if isinstance(content, str) and content.strip()
+            else AssistantOutcome.EMPTY
+        )
+    if status == AGENT_STATUS_LIMIT_REACHED:
+        return AssistantOutcome.FAILED
+    # WAITING_APPROVAL / CANCELLED（本阶段不可达）等：一律 FAILED
+    # （不伪装成 SUCCESS；精确状态由 metadata["agent_status"] 保留）。
+    return AssistantOutcome.FAILED
 
 
 def _sql_result_to_content(

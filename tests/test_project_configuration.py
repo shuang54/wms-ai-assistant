@@ -626,11 +626,17 @@ class TestHttpRequestCannotInjectConfiguration:
             datasource="project-b",  # type: ignore[call-arg]
             capabilities="project-b",  # type: ignore[call-arg]
             project_configuration="project-b",  # type: ignore[call-arg]
+            agent_enabled=True,  # type: ignore[call-arg]
+            agent_llm_provider="project-b",  # type: ignore[call-arg]
+            agent_policy="project-b",  # type: ignore[call-arg]
         )
         assert req.project_id == "project-a"
         for field in (
             "knowledge_scope", "semantic", "datasource", "capabilities",
             "project_configuration",
+            # Phase 5 §29.11：Agent 接线同样是**服务器端**组合参数，
+            # HTTP 请求无法注入 / 覆盖
+            "agent_enabled", "agent_llm_provider", "agent_policy",
         ):
             assert not hasattr(req, field)
 
@@ -654,6 +660,10 @@ class TestHttpRequestCannotInjectConfiguration:
             "project_id", "base", "registry", "engine_provider",
             "semantic_provider", "knowledge_provider",
             "configuration_provider",
+            # Phase 5 Agent Runtime Integration（§29.11 / OD-P5-23）：
+            # 服务器端组合参数（与 engine_provider 同性质；默认关闭 ⇒
+            # 旧行为不变），**不是** HTTP request 字段（见上一个用例）。
+            "agent_enabled", "agent_llm_provider", "agent_policy",
         }
 
     @contextmanager
