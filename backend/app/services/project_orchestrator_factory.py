@@ -46,7 +46,10 @@ from backend.app.agent import (
     AgentRuntimePolicy,
     ProviderAgentLLM,
 )
-from backend.app.agent.recorder import build_agent_run_recorder
+from backend.app.agent.recorder import (
+    build_agent_run_recorder,
+    build_agent_step_recorder,
+)
 from backend.app.llm.client import get_default_llm_client
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.configuration import (
@@ -290,6 +293,10 @@ def build_orchestrator_for_project(
     resolved_agent_run_recorder: Any | None = getattr(
         base, "agent_run_recorder", None
     )
+    # Phase 5 AgentStep Persistence：Step 持久化边界（同方式继承 base）。
+    resolved_agent_step_recorder: Any | None = getattr(
+        base, "agent_step_recorder", None
+    )
     if agent_enabled:
         resolved_agent_provider = (
             agent_llm_provider
@@ -328,6 +335,9 @@ def build_orchestrator_for_project(
         # Agent Run 持久化（P-2）：base 未提供时在本装配点创建（唯一允许位置）。
         if resolved_agent_run_recorder is None:
             resolved_agent_run_recorder = build_agent_run_recorder()
+        # Agent Step 持久化：同上（独立边界，独立 best-effort）。
+        if resolved_agent_step_recorder is None:
+            resolved_agent_step_recorder = build_agent_step_recorder()
 
     logger.info(
         "project orchestrator built",
@@ -389,6 +399,8 @@ def build_orchestrator_for_project(
         agent_runtime=agent_runtime,
         # Phase 5 P-2：Agent Run 持久化（None ⇒ 0 行；仅在 AGENT 执行时写入）。
         agent_run_recorder=resolved_agent_run_recorder,
+        # Phase 5 AgentStep Persistence：Step 投影持久化（独立 best-effort）。
+        agent_step_recorder=resolved_agent_step_recorder,
     )
 
 

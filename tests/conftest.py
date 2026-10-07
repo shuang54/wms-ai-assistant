@@ -118,3 +118,50 @@ def _agent_run_residue_guard() -> Iterator[None]:
                 text(f"DELETE FROM {_AGENT_RUN_TABLE} WHERE id > :watermark"),
                 {"watermark": watermark},
             )
+
+
+#: Phase 5 AgentStep Persistence：Agent Step 表（只在本守卫中使用）。
+_AGENT_STEP_TABLE: str = "ai_ops.agent_step"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _agent_step_residue_guard() -> Iterator[None]:
+    """会话级残留守卫：删除**本次会话期间新增**的 agent_step 行。
+
+    为什么需要（与前两个守卫同理）：AgentStep Persistence 起生产
+    Composition Root 注入 ``BestEffortAgentStepRecorder``；驱动真实
+    ``POST /api/ai/chat`` 且命中 AGENT 路由的测试会写 Step 行。
+
+    语义（保守）：记录 ``MAX(id)`` 水位 → 只删除 ``id > 水位`` 的行；
+    不使用 TRUNCATE；不修改表结构 / 索引；表不存在 / DB 不可达 → 静默跳过。
+    """
+    from sqlalchemy import text
+
+    from backend.app.db.session import get_engine
+
+    engine = get_engine()
+    if engine is None:
+        yield
+        return
+
+    try:
+        with engine.connect() as conn:
+            watermark = int(
+                conn.execute(
+                    text(
+                        f"SELECT COALESCE(MAX(id), 0) FROM {_AGENT_STEP_TABLE}"
+                    )
+                ).scalar_one()
+            )
+    except Exception:  # noqa: BLE001 —— 表不存在 / DB 不可达 → 不阻断测试
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"DELETE FROM {_AGENT_STEP_TABLE} WHERE id > :watermark"),
+                {"watermark": watermark},
+            )

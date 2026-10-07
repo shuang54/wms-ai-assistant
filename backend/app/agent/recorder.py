@@ -21,6 +21,11 @@ AIOrchestrator
     * 只落盘 **state / counts / stable codes / timestamps / correlation ids /
       project_id**；绝不落盘 prompt / messages / context / tool_arguments /
       tool_result / SQL / headers / 密钥 / exception message / stack trace。
+
+AgentStep（Phase 5 AgentStep Persistence）：
+    * ``AgentStepRecord`` 只承载 step identity / type / status / tool_name /
+      稳定错误码 / timing（**不含** arguments / output / 正文）；
+    * 与 ``agent_run`` 各自独立 best-effort 写入（**不引入**跨表事务 / Unit of Work）。
 """
 from __future__ import annotations
 
@@ -46,6 +51,11 @@ __all__ = [
     "AgentRunRecord",
     "agent_run_record_of",
     "build_agent_run_recorder",
+    "AgentStepRecorder",
+    "BestEffortAgentStepRecorder",
+    "AgentStepRecord",
+    "agent_step_records_of",
+    "build_agent_step_recorder",
 ]
 
 logger = logging.getLogger(__name__)
@@ -269,6 +279,155 @@ class BestEffortAgentRunRecorder:
                 "agent_status": getattr(result, "status", None),
             },
         )
+
+
+# ============================================================
+# AgentStep 持久化（Phase 5 AgentStep Persistence）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class AgentStepRecord:
+    """Agent Step 的持久化投影（**安全 DTO**：字段 ≡ 最小字段集）。
+
+    注意：不含 arguments / output / prompt / context / tool result /
+    request_id / tool_call_id / provider / tokens
+    （分别属不落盘或既有 observation 表）。
+    """
+
+    run_id: str
+    step_index: int
+    step_type: str
+    status: str
+    tool_name: str | None
+    error_code: str | None
+    elapsed_ms: float | None
+
+
+def agent_step_records_of(result: AgentRuntimeResult) -> tuple[AgentStepRecord, ...]:
+    """``AgentRuntimeResult.step_records`` → 安全持久化投影（逐 Step）。
+
+    * ``step_index`` / ``type`` / ``status`` **原样**映射（不重排 / 不改语义）；
+    * ``tool_name`` 仅 TOOL_CALL 携带（**不写** arguments / output）；
+    * ``error`` → 稳定错误码（异常取类名；自由文本 → ``AGENT_FAILED``）；
+    * ``elapsed_ms`` 原值（``None`` 允许；非法值由 Repository 拒绝 ⇒ best-effort 跳过整批）。
+    """
+    return tuple(
+        AgentStepRecord(
+            run_id=result.run_id,
+            step_index=step.step_index,
+            step_type=step.type,
+            status=step.status,
+            tool_name=step.tool_name,
+            error_code=_stable_error_code(step.error),
+            elapsed_ms=step.elapsed_ms,
+        )
+        for step in result.step_records
+    )
+
+
+class AgentStepRecorder(Protocol):
+    """Agent Step 持久化端口（Orchestrator 只依赖本接口）。"""
+
+    def record(self, result: AgentRuntimeResult) -> list[int]:
+        """同步入口（实现必须 **best-effort**：永不抛出）。"""
+        ...
+
+    async def arecord(self, result: AgentRuntimeResult) -> list[int]:
+        """异步入口（实现必须 **best-effort**：永不抛出）。"""
+        ...
+
+
+class BestEffortAgentStepRecorder:
+    """Best-effort Agent Step 记录器（与 ``BestEffortAgentRunRecorder`` 同风格）。
+
+    契约：
+
+        ``record(result)`` / ``await arecord(result)`` → **永不抛出**
+            成功 → 新建 id 列表（可能为空 = 全部幂等跳过）
+            失败 → ``[]`` + warning（含 error_type）；业务结果不受影响
+
+    为什么需要它：Step 投影属 **run-level 审计**链路；
+    DB 不可用、超时、校验失败、取消都不得改变已经产生的 Agent 结果，
+    也不得触发 retry / LLM 重问 / Tool 重跑。
+    """
+
+    def __init__(self, repository: Any | None = None) -> None:
+        """构造记录器（repository=None → 默认仓储，延迟 import）。"""
+        self._repository = repository
+
+    def _get_repository(self) -> Any:
+        if self._repository is not None:
+            return self._repository
+        from backend.app.db.agent_step_repository import AgentStepRepository
+
+        self._repository = AgentStepRepository()
+        return self._repository
+
+    @property
+    def repository(self) -> Any:
+        """底层仓储（只读暴露，便于测试断言注入关系）。"""
+        return self._repository
+
+    def record(self, result: AgentRuntimeResult) -> list[int]:
+        """同步入口（永不抛出）。"""
+        try:
+            rows = agent_step_records_of(result)
+            if not rows:
+                return []
+            return self._get_repository().create_many(rows)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Agent Step 持久化被取消（不影响已完成的 Agent 结果）",
+                exc_info=False,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 —— 绝不穿透为业务失败
+            self._log_failure(exc, result)
+            return []
+
+    async def arecord(self, result: AgentRuntimeResult) -> list[int]:
+        """异步入口（永不抛出；同步持久化放进 worker 线程）。"""
+        try:
+            return await asyncio.to_thread(self.record, result)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Agent Step 持久化被取消（不影响已完成的 Agent 结果）",
+                exc_info=False,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 —— 兜底（record 本身已 best-effort）
+            self._log_failure(exc, result)
+            return []
+
+    @staticmethod
+    def _log_failure(exc: BaseException, result: AgentRuntimeResult) -> None:
+        """失败只记录**诊断信息**（稳定码 / 状态；不含 run 内容）。"""
+        logger.warning(
+            "Agent Step 持久化失败（best-effort；不影响 Agent 结果）: %s",
+            type(exc).__name__,
+            extra={
+                "error_type": type(exc).__name__,
+                "agent_status": getattr(result, "status", None),
+            },
+        )
+
+
+def build_agent_step_recorder() -> BestEffortAgentStepRecorder | None:
+    """生产装配（与 ``build_agent_run_recorder`` 同风格）：
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置 → ``None``（零开销 / 无告警噪声）
+        否则 → ``BestEffortAgentStepRecorder``（写入 ``ai_ops.agent_step``）
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent step persistence disabled"
+            "（DATABASE_URL 未配置；不创建 agent step recorder）"
+        )
+        return None
+    return BestEffortAgentStepRecorder()
 
 
 def build_agent_run_recorder() -> BestEffortAgentRunRecorder | None:

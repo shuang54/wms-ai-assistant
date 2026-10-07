@@ -18,6 +18,7 @@ from __future__ import annotations
 # 顺序很关键：KnowledgeDocument 必须先于 KnowledgeChunk（虽然 SQLAlchemy 不强制，
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.agent_run import AgentRun
+from backend.app.db.models.agent_step import AgentStep
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_evidence import ConversationEvidenceRecord
@@ -53,11 +54,15 @@ _MODELS: tuple[type, ...] = (
     # Phase 5 P-2：Agent Run（run-level 持久化；ai_ops schema；**无外键**）。
     # 全新表 → 随 create_all 自动创建；既有库首次 init_db() 即补建。
     AgentRun,
+    # Phase 5 AgentStep Persistence：Agent Step（step projection；ai_ops；
+    # **无外键**；UNIQUE(run_id, step_index)）。
+    AgentStep,
 )
 
 
 __all__ = [
     "AgentRun",
+    "AgentStep",
     "AssistantOutcomeRecord",
     "Conversation",
     "ConversationEvidenceRecord",

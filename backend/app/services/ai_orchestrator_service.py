@@ -60,7 +60,7 @@ from backend.app.agent.models import (
     AGENT_STATUS_LIMIT_REACHED,
     AgentRuntimeResult,
 )
-from backend.app.agent.recorder import AgentRunRecorder
+from backend.app.agent.recorder import AgentRunRecorder, AgentStepRecorder
 from backend.app.dto.assistant_outcome import (
     AssistantOutcome,
     determine_assistant_outcome,
@@ -368,6 +368,7 @@ class AIOrchestratorService:
         tool_argument_extractor: ToolArgumentExtractor | None = None,
         agent_runtime: AgentCapability | None = None,
         agent_run_recorder: AgentRunRecorder | None = None,
+        agent_step_recorder: AgentStepRecorder | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
@@ -383,6 +384,12 @@ class AIOrchestratorService:
                           由 composition root 注入；Orchestrator 只调用，
                           **不**生成 run_id / request_id（二者分别来自
                           AgentRuntime 与 ``execute()``）。
+            agent_step_recorder:
+                          Phase 5 AgentStep Persistence —— Agent Step
+                          （``AgentRuntimeResult.step_records``）的持久化边界
+                          （best-effort）。``None``（默认）⇒ 不持久化。
+                          写入顺序：**先 Steps、后 Run**（§十七）；两者相互独立，
+                          Step 写入失败不影响 Run / 业务结果。
                           **可选注入**：``None``（默认）= Agent 未接线 ⇒
                           ``RouteType.AGENT`` 在执行前被硬校验拒绝
                           （fail-closed；绝不降级为 RAG / TOOL / TEXT_TO_SQL）。
@@ -566,6 +573,15 @@ class AIOrchestratorService:
                 f"（当前: {type(agent_run_recorder).__name__}）"
             )
         self._agent_run_recorder = agent_run_recorder
+        # Phase 5 AgentStep Persistence：Step 投影持久化边界（可选；同风格校验）。
+        if agent_step_recorder is not None and not callable(
+            getattr(agent_step_recorder, "record", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_step_recorder 必须提供可调用的 record()"
+                f"（当前: {type(agent_step_recorder).__name__}）"
+            )
+        self._agent_step_recorder = agent_step_recorder
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -604,6 +620,15 @@ class AIOrchestratorService:
         （与 ``tool_execution_observer`` 的继承方式一致）。
         """
         return self._agent_run_recorder
+
+    @property
+    def agent_step_recorder(self) -> AgentStepRecorder | None:
+        """本 Orchestrator 注入的 Agent Step 持久化边界（None = 不落盘）。
+
+        Phase 5 AgentStep Persistence：与 ``agent_run_recorder`` 同样供
+        composition root / 项目工厂继承同一实例。
+        """
+        return self._agent_step_recorder
 
     # ---------- 主入口 ----------
 
@@ -1139,6 +1164,26 @@ class AIOrchestratorService:
             },
         )
 
+    # ---------- Phase 5 AgentStep Persistence（best-effort） ----------
+
+    async def _record_agent_steps(self, agent_result: AgentRuntimeResult) -> None:
+        """Best-effort 持久化本次 Run 的 Step 投影（**永不**影响业务结果）。
+
+        * ``agent_step_recorder is None``（默认 / 未接线）⇒ 直接返回（0 行）；
+        * 只读 ``AgentRuntimeResult.step_records``（不改写 / 不重排 / 不补造）；
+        * 无 retry / fallback / 跨表事务；Step 与 Run 相互独立。
+        """
+        recorder = self._agent_step_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.arecord(agent_result)
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Step 持久化失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
     # ---------- Phase 5 P-2：Agent Run 持久化（best-effort） ----------
 
     async def _record_agent_run(
@@ -1243,6 +1288,10 @@ class AIOrchestratorService:
             ) from exc
         duration_ms = (time.monotonic() - monotonic_start) * 1000.0
         finished_at = datetime.now(timezone.utc)
+
+        # Phase 5 AgentStep Persistence：**先 Steps、后 Run**（§十七）；
+        # 两者均 best-effort，写入失败绝不改变 Agent / Assistant 业务结果。
+        await self._record_agent_steps(agent_result)
 
         # Phase 5 P-2：run-level 持久化（best-effort；失败绝不改变 Agent 结果）。
         # 终态（COMPLETED / FAILED / LIMIT_REACHED…）**一律**记录：
