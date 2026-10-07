@@ -1428,3 +1428,512 @@ OQ-P5-1 = **CLOSED**
         §OD-P5-02/03/04/07/12）——本决策是对 §5.3 遗留问题（LLM 工具决策协议）的关闭。
 实现状态：仍为 **NOT IMPLEMENTED**（适配器实现属下一阶段，需明确授权）。
 ```
+
+---
+
+# 29. Agent Runtime Integration Boundary
+
+> **本节为追加修订（append-only）**：不修改 §1–§28 的任何历史决策文字。
+> 触发：Agent Core Loop 与 Agent LLM Adapter 已实现并验证；但
+> `Router / AIOrchestrator / Conversation Runtime / Idempotency / Observability`
+> 尚未与 Agent Runtime 接线。
+> 本阶段**只做 Architecture Decision**：
+> `Production code = 0 · DB = 0 · API = 0 · Prompt = 0 · 真实 LLM = 0`。
+> 冻结内容：`Agent Integration Contract`（供下一阶段直接实现）。
+
+## 29.0 事实基线（代码实测，非推断）
+
+| 事实 | 真实情况 | 证据 |
+| ---- | -------- | ---- |
+| RouteType | `RouteType(str, Enum)`：`RAG="rag"` / `TOOL="tool"` / `TEXT_TO_SQL="text_to_sql"`（**无 AGENT**） | `ai_router_service.py` L68–73 |
+| RouteDecision | `frozen` DTO：`route / confidence / reason / source("rule"\|"tool_match"\|"llm"\|"fallback") / tool_name` | `ai_router_service.py` L76–98 |
+| Router 接口 | `AIRouter.route(question, *, context=None) -> RouteDecision` | `ai_router_service.py` L182–190 |
+| Router 能力开关 | `AIRouterService.__init__(*, llm_client=None, tool_capabilities=…, knowledge_enabled=True, text_to_sql_enabled=True, …)` | `ai_router_service.py` L422–484 |
+| Router LLM 合法 route | `valid_routes = frozenset(r.value for r in RouteType)`（**由 enum 推导** ⇒ 新增 enum 成员自动进入合法集） | `ai_router_service.py` L628 |
+| 禁用 route 处理 | LLM 命中被禁用 route ⇒ `AIRouterClassificationError`（落入保守兜底；**不**执行） | `ai_router_service.py` L633–643 |
+| Router 边界 | 注释明文："Router 是分类器，**不是安全边界**" | `ai_orchestrator_service.py` L703 |
+| Orchestration Result | `AIOrchestrationResult(route: RouteType, content: str \| None, data: Any, metadata: Mapping)`（frozen） | `ai_orchestrator_service.py`（`class AIOrchestrationResult`） |
+| Orchestrator 入口 | `execute(question, *, context: str \| None = None)`；内部 `request_id = new_request_id()` ⇒ `with assistant_trace_scope(request_id)` ⇒ Router ⇒ 单次执行 | `ai_orchestrator_service.py` L553–649 |
+| Orchestrator 依赖 | `router / rag_service / tool_registry / text_to_sql / sql_executor / table_selector / context_composer / semantic_* / project_context_provider / capabilities / knowledge_scope / tool_execution_service / tool_execution_observer / tool_argument_extractor / max_rows / outcome_recorder` —— **无 LLM Provider 参数** | `ai_orchestrator_service.py` L337+ |
+| Tool 执行边界 | 未注入时 Orchestrator 自建 `ToolExecutionService(registry=self._tools, capabilities=self._capabilities, project_id=…, observer=…)` | `ai_orchestrator_service.py` L501–506 |
+| 失败语义 | RAG/T2SQL/能力禁用 ⇒ `AssistantOutcome.FAILED` + **异常上抛**；未知 route ⇒ `AIOrchestratorRouteError` | `ai_orchestrator_service.py` L622–643 |
+| 成功终态 | 由各路径写入 `metadata["outcome"]` ⇒ `_outcome_of_result()` 只读回放（缺省不猜、跳过持久化） | `ai_orchestrator_service.py` L645–677 |
+| AssistantOutcome | **4 态固定**（`SUCCESS` / `EMPTY` / `REFUSED` / `FAILED`），DTO 明文"不引入 UNKNOWN / PARTIAL / TIMEOUT / **CANCELLED** / RETRYING"；优先级 `REFUSED > FAILED > EMPTY > SUCCESS` | `backend/app/dto/assistant_outcome.py` |
+| outcome 列 | `assistant_outcome_record.outcome` = `String(...)`，**无 enum / CHECK 约束**（新增取值不需 migration，但 DTO 契约另行冻结） | `db/models/assistant_outcome_record.py` |
+| Conversation 消息入口 | `ChatApplicationService.execute_message(*, conversation_id, content, idempotency_key=None) -> AIOrchestrationResult \| MessageReplay` | `chat_application_service.py` L366–372 |
+| Context 来源 | `list_turns()` → **按 `turn_id` 排除 current turn** → `select_history(...)` → `build_context(...)` → `context`（**Conversation 层拥有**） | L428–447 |
+| AI 调用点 | `orchestrator_factory(conversation.project_id).execute(user_turn.content, context=context)` | L451–452 |
+| ASSISTANT Turn 条件 | `_assistant_content(result)` 非空 **且** `metadata["request_id"]` 合法 ⇒ 才 `append_turn(role=ASSISTANT, ..., assistant_request_id=…)`；否则**不创建** | L454–479 |
+| 幂等 | duplicate ⇒ `MessageReplay`（AI = 0）；conflict ⇒ 409；retry ⇒ 复用既有 USER turn | L418–424 + Step 6 |
+| API 投影 | `route=str(route)` · `data=_safe_message_data(result.data)`（仅 JSON 基本类型 Mapping）· `metadata=dict(result.metadata)`（**整体透传**） | `api/conversations.py` L167–170 |
+| API 描述 | `ConversationMessageResponse.route` 描述枚举 "rag / tool / text_to_sql"（**仅描述文本**） | `dto/conversation_api.py` |
+| 项目装配 | `build_orchestrator_for_project()`：per-project `ToolRegistry`（**只注册该项目允许的 Tool**）+ `AIRouterService(tool_capabilities=升级自该 registry, knowledge_enabled, text_to_sql_enabled)` + `AIOrchestratorService(tool_registry=…, capabilities=…)` | `project_orchestrator_factory.py` L268–299 · L337–399 |
+| Agent 现状 | `AgentRuntime.run(*, question, conversation_context=None)`；ctor `(llm, tool_execution, policy, allowed_tools, clock)`；`AgentRuntimeResult{status, content, steps, tool_calls, llm_calls, error, tokens_used, token_budget_unverifiable, step_records}`；状态 `COMPLETED / FAILED / LIMIT_REACHED` + 预留 `CANCELLED / WAITING_APPROVAL` | `backend/app/agent/*` |
+| Agent 依赖边界 | agent 包**不** import Router / Orchestrator / Conversation / DB / httpx / Provider 实现（源码审计测试） | `tests/test_agent_runtime.py` · `test_agent_llm_adapter.py` |
+
+**结论（事实层）**：三处**已具备**接入条件 ——
+① Router 合法 route 集由 enum 推导（新增 `AGENT` **不需要改 prompt 文件**）；
+② Router 已有能力开关 gating 模式（`knowledge_enabled` / `text_to_sql_enabled`）可原样复制；
+③ Orchestrator 已持有 per-project `tool_registry` + `capabilities` + `ToolExecutionService`，
+Agent 所需的 Tool 授权与执行边界**已存在**，无需新建。
+唯一缺口：Orchestrator **不持有 LLM Provider**；Agent 的 LLM 与 Policy 需要**新的注入点**（见 §29.11）。
+
+## 29.1 RouteType.AGENT（OD-P5-14）
+
+### Decision
+
+```text
+1) 新增 RouteType.AGENT = "agent"（与 RAG / TOOL / TEXT_TO_SQL 同级枚举成员）；
+2) 新增能力开关 agent_enabled: bool = False（AIRouterService 构造参数；
+   默认 False ⇒ 既有行为**逐字节等价**）；
+3) 仅当 agent_enabled=True 时，LLM fallback 返回 "agent" 才被接受；
+   False 时 ⇒ 与现有"禁用 route"完全一致 ⇒ AIRouterClassificationError ⇒ 保守兜底；
+4) **AGENT 不由规则路径选择**（MVP 无 AGENT 关键词规则）—— 规则触发属未来 Decision；
+5) AGENT 是 **Capability**，AgentRuntime 是该 Capability 的 Runtime：
+       Router  只决定"进入 AGENT"
+       AgentRuntime 决定"Tool Call / Final / 何时停"
+```
+
+### 关系
+
+```text
+RAG          = 知识问答（检索 + 生成）
+TOOL         = 一次固定能力调用（现有 ToolArgumentExtractor → ToolExecutionService）
+TEXT_TO_SQL  = 单次生成 → Validator → 只读执行
+AGENT        = 受 RuntimePolicy 限制的多步 Tool Calling（read-only）
+```
+
+```text
+禁止：Router → Agent 内部 Tool → Router（递归）
+禁止：Orchestrator → Agent → Orchestrator（递归编排；§OD-P5-02 已冻结）
+```
+
+### Reason
+
+```text
+* enum 推导合法集 ⇒ 零 prompt 改动（prompt 文件受 Phase 3.9.x hash 冻结保护）；
+* 复用既有 capability gating 模式（knowledge_enabled / text_to_sql_enabled）⇒ 语义一致；
+* 规则路径不选 AGENT ⇒ 既有路由行为（含全部回归基线）不受影响；
+* Router 保持分类器语义：不做 Tool 选择 / 不做参数构造 / 不做循环控制。
+```
+
+### Consequences
+
+```text
+* 影响面（下一阶段实现清单，本阶段 0 修改）：
+    - RouteType 新增成员（`ai_router_service.py`）；
+    - `AIRouterService.__init__` 新增 `agent_enabled`（默认 False）+ 禁用 gating 分支；
+    - Orchestrator 新增 `elif decision.route == RouteType.AGENT:` 分支 + AGENT 能力硬校验；
+    - `ConversationMessageResponse.route` **描述文本**登记 "agent"（doc-only）；
+    - 既有 route 的行为、值、契约全部不变。
+* agent_enabled=True 但**未接线 AgentRuntime** ⇒ 配置错误（装配期 fail-closed，见 §29.11），
+  不得静默降级为 RAG / TOOL。
+```
+
+## 29.2 Agent Result Mapping（OD-P5-15 · 关闭 OQ-P5-5）
+
+### Decision
+
+```text
+**复用 AIOrchestrationResult，不新建第二套顶层 AI Result。**
+```
+
+| AgentRuntimeResult | AIOrchestrationResult.route | .content | .data | .metadata |
+| ------------------ | --------------------------- | -------- | ----- | --------- |
+| `COMPLETED` | `RouteType.AGENT` | `result.content`（契约保证非空） | `AgentRuntimeResult`（结构化对象） | `request_id` · `outcome` · `decision_source="llm"` · `agent_status` · 计数器（见下） |
+| `FAILED` | ——（**不返回 Result**） | —— | —— | —— |
+| `LIMIT_REACHED` | `RouteType.AGENT` | `result.content`（可为 `None`） | `AgentRuntimeResult` | 同 COMPLETED + `agent_status="LIMIT_REACHED"` + `agent_limit` |
+| `WAITING_APPROVAL`（预留，本阶段不可达） | `RouteType.AGENT`（若未来实现） | `None`（MVP） | `AgentRuntimeResult` | `agent_status="WAITING_APPROVAL"` |
+| `CANCELLED`（预留，本阶段不可达） | `RouteType.AGENT`（若未来实现） | `None`（MVP） | `AgentRuntimeResult` | `agent_status="CANCELLED"` |
+
+```text
+metadata（AGENT 路径冻结键；全部非敏感）：
+    request_id        : 必须存在（Orchestrator 生成；缺失 ⇒ 上层不创建 ASSISTANT turn）
+    outcome           : AssistantOutcome（由 §29.8 映射给出，**不重新推断**）
+    decision_source   : "llm"（AGENT 仅经 LLM fallback 进入）
+    route_reason      : RouteDecision.reason（可空）
+    agent_status      : AgentRuntimeResult.status（稳定字符串；唯一区分 LIMIT/CANCEL/APPROVAL 的载体）
+    agent_error       : AgentRuntimeResult.error（稳定错误码；**不含**异常消息 / 堆栈）
+    agent_steps / agent_tool_calls / agent_llm_calls : 计数
+    agent_tokens_used : int（usage 计量；未透传 usage 时为 0）
+    agent_token_budget_unverifiable : bool（provider 未返回 usage ⇒ True；不伪造）
+
+metadata **禁止**包含：step_records · Tool name 列表· Tool arguments · Tool data ·
+    prompt / messages · conversation_context · SQL · 异常正文 / traceback · 任何 credential
+```
+
+```text
+data = AgentRuntimeResult（frozen DTO）：
+    API 层按既有 `_safe_message_data()` 规则处理（非 JSON 基本类型 Mapping ⇒ 不透传 ⇒ None）；
+    不转 dict、不重建第二套结构、不把 step_records 序列化给客户端。
+```
+
+### Reason
+
+```text
+* 单一顶层 Result 契约（Constitution：不新建第二套 AI Result）；
+* `metadata` 已是既有透传通道（`dict(result.metadata)`）⇒ Agent 状态无需改 DTO / 改 API；
+* 计数与状态进 metadata ⇒ 上层（观测 / 评估 / 排障）可区分"出错"与"正常到达策略边界"。
+```
+
+## 29.3 Agent Capability Authorization（OD-P5-16）
+
+```text
+ProjectCapabilities.tool_names
+        ↓（装配期：per-project ToolRegistry **只注册**这些 Tool）
+Router capability metadata（tool_match 用；AGENT 不用）
+        ↓
+AGENT（能力开关 agent_enabled）
+        ↓
+AgentRuntime.allowed_tools        ← 必须 ⊆ ProjectCapabilities.tool_names
+        ↓（每步）Runtime 授权白名单
+ToolExecutionService（capability 第二道校验；project_id 作用域）
+        ↓
+ToolRegistry（参数 schema 校验）→ Handler
+```
+
+```text
+硬规则：
+1) Agent 不得因"被路由到 AGENT"而获得项目全部 Tool ⇒ allowed_tools 必须显式传入；
+2) 四层安全不得减少（也不能被 Agent 绕过）：
+       Project Capability → Agent Capability → Runtime Step Authorization
+       → ToolExecutionService Authorization；
+3) AGENT 路径复用**既有** ToolExecutionService 实例（`self._tool_execution_service`，
+   未注入时由 Orchestrator 用 `tool_registry + capabilities + project_id + observer` 自建）
+   —— 不新建第二套执行边界、不绕过 observer；
+4) Tool 参数仍由 ToolRegistry 的真实 schema 校验（LLM arguments 不被信任）；
+5) 本阶段只允许 READ-only Tool；若未来 Tool Registry 出现写 Tool，
+   Agent capability whitelist **默认不授予**（须另立 Decision：Approval + Authorization +
+   Idempotency + Audit + Compensation）。
+```
+
+## 29.4 Conversation Context（OD-P5-17 · 关闭 OQ-P5-8）
+
+### Decision
+
+```text
+Agent **接收** conversation_context（YES），但由 Conversation 层选择、由 Orchestrator 显式传入：
+
+Conversation Runtime
+    ↓ select_history + build_context（Phase 4.2 §7C/§7E/§7F 契约）
+  context（str | None）
+    ↓ AIOrchestrator.execute(question, context=context)
+    ↓ _run_agent(..., context=context)
+AgentRuntime.run(question=..., conversation_context=context)
+```
+
+```text
+Agent **不得**自己查询 ConversationRepository / ConversationTurn / Idempotency / DB。
+```
+
+### Context 在 Agent Loop 中的行为（冻结）
+
+```text
+Agent Run 的第 1 轮：
+    system instruction（固定指令 + capability / safety 规则）
+    user（CONVERSATION REFERENCE 段[untrusted] → CURRENT QUESTION 段）
+第 2..N 轮（Tool 之后）：
+    system（同一条，不重写）
+    user（同一条，不重写）
+    assistant.tool_calls（本轮）
+    role=tool（【TOOL RESULT — UNTRUSTED DATA】）
+```
+
+```text
+1) conversation_context 是**本次 Agent Run 的只读输入**：整轮 Run 内**不重新选择**、
+   不重新查询 Conversation、不重新运行 Selector；
+2) 窗口上限仍由 Conversation 层负责（MAX_TURNS=20 / MAX_CONTEXT_CHARS=12000）；
+   Agent 不做窗口裁剪、不做截断、不做摘要；
+3) 段落可区分（冻结）：CONVERSATION REFERENCE 段位于 CURRENT QUESTION 段**之前**
+   （与 Step 7D 放置契约一致）；两段同处 user 消息，**绝不进入 system instruction**；
+4) Tool Result 与 Conversation Context **信任等级不同**：前者是 Tool 输出（untrusted data），
+   后者是用户历史（untrusted reference）；不得混为同一段、不得互换位置。
+```
+
+## 29.5 Conversation Ownership（OD-P5-18）
+
+```text
+ConversationRuntime（ChatApplicationService）owns：
+    USER turn 创建（含幂等解析）· history 读取 · current-turn exclusion
+    · Selection / Builder · ASSISTANT turn 创建 · Idempotency-Key
+
+AgentRuntime：
+    ❌ 不创建 ConversationTurn        ❌ 不写 Conversation
+    ❌ 不处理 Idempotency-Key         ❌ 不决定 Assistant Turn
+    ❌ 不读 Conversation DB / Repository
+
+AgentRun = **一次 AI execution**，不是 Conversation message。
+```
+
+```text
+AIOrchestrator 仍为唯一 AI 执行入口：Conversation 层与 Agent 层之间**不得**直连。
+ChatApplicationService 的 `execute_message()` 契约（参数 / 返回 / 异常 / 幂等语义）不变。
+```
+
+## 29.6 Idempotency（§29.5 的直接推论）
+
+```text
+POST /conversations/{id}/messages
+    ↓ ChatApplicationService（Idempotency-Key 解析 / duplicate / conflict / retry）
+    ↓ AIOrchestrator（request_id + assistant_trace_scope）
+    ↓ Agent（**不知道** Idempotency-Key 的存在）
+
+completed duplicate  ⇒ MessageReplay（AI = 0 / Selection = 0 / Builder = 0 / Agent = 0）
+conflict（同 key 异 payload）⇒ 409（Agent = 0）
+retry（USER 有 / ASSISTANT 无）⇒ 复用既有 USER turn ⇒ Agent **可执行一次**（新 request_id）
+```
+
+```text
+Agent 内部**不新增**任何幂等机制（无 run-level dedupe / 无 tool-level dedupe）；
+OQ-P5-9（重复相同 Tool 调用）保持 OPEN。
+```
+
+## 29.7 Request ID / Run ID / Tool Call ID（OD-P5-19）
+
+```text
+assistant_request_id（= metadata["request_id"]；Orchestrator.new_request_id() 生成）
+        │  唯一 Trace ID；进入 assistant_trace_scope；ASSISTANT turn 依赖它
+        ├── AgentRun（进程内生命周期）
+        ├── AgentStep
+        ├── LLM usage（既有观测：在 scope 内自动关联同一 request_id）
+        └── Tool execution（既有观测记录 request_id / round / tool_call_id）
+
+AgentRun.run_id
+        └── 仅用于**一次 AgentRuntime.run() 的进程内身份**（step_records / 调试）
+            ❌ 不持久化 ❌ 不进 metadata ❌ 不等于 conversation_id / request_id / idempotency_key
+
+tool_call_id
+        └── 单轮 LLM ↔ Tool 的协议关联（Provider ToolCall.id 原样；role=tool 回填）
+            ❌ 不作为 trace ID ❌ 不替换 / 不生成
+```
+
+```text
+Agent **不生成** assistant_request_id；Orchestrator 是唯一生成点（现状不变）。
+若 Agent 结果缺失 request_id ⇒ 上层按既有规则**不创建** ASSISTANT turn（不伪造 ID）。
+```
+
+## 29.8 Failure / Limit / Approval Semantics（OD-P5-20）
+
+| Agent status | Orchestrator 行为 | AssistantOutcome | ASSISTANT Turn | HTTP |
+| ------------ | ------------------ | ---------------- | -------------- | ---- |
+| `COMPLETED` | 返回 `AIOrchestrationResult` | `SUCCESS` | ✅（content 非空且 request_id 合法） | 200 |
+| `COMPLETED`（content 空，理论不可达） | 返回 Result | `EMPTY` | ❌ | 200 |
+| `FAILED` | **抛 `AIOrchestratorExecutionError`** | `FAILED`（由失败路径写入） | ❌ | 既有错误映射 |
+| `LIMIT_REACHED`（有 content） | 返回 Result | `FAILED`（见下） | ✅ | 200 |
+| `LIMIT_REACHED`（无 content） | 返回 Result | `FAILED` | ❌ | 200 |
+| `WAITING_APPROVAL`（预留不可达） | 返回 Result（若未来实现） | `FAILED` | ❌ | 200（MVP 不实现 HITL） |
+| `CANCELLED`（预留不可达） | 返回 Result（若未来实现） | `FAILED` | ❌ | 200 |
+
+```text
+为什么 LIMIT_REACHED 不用 SUCCESS：
+    SUCCESS 表示"业务完成"，而 LIMIT_REACHED = 达到策略边界（可能只有部分答案）。
+为什么不能新增第 5 态 AssistantOutcome：
+    `assistant_outcome.py` 是**冻结的 4 态契约**（明文禁止引入 CANCELLED 等新态）；
+    扩展它属 DTO 契约变更（需要自己的 Architecture Decision，且影响观测读模型 / 报表）。
+    ⇒ 本阶段保持 4 态；用 `metadata["agent_status"]` / `metadata["agent_error"]`
+      **显式携带**精确状态 ⇒ 上层与观测**可以**区分
+      "Agent 出错（FAILED）" 与 "Agent 正常运行但到达预算边界（LIMIT_REACHED）"，
+      不构成"简单伪装成 FAILED"。
+```
+
+```text
+WAITING_APPROVAL / CANCELLED：
+    * 本阶段**不产生**（AgentRuntimePolicy 无 requires_approval 触发路径；
+      无取消触发源 ⇒ OQ-P5-6 OPEN）——常量与语义保留；
+    * 映射已冻结（上面表格），未来实现 HITL / 取消时**不需要**改本契约；
+    * 禁止声称已支持审批（无 UI / 无恢复协议 / 无持久化）。
+```
+
+## 29.9 Observability Boundary（OD-P5-21）
+
+```text
+本阶段不实现 Agent 观测。仅冻结未来关系（父子 trace）：
+
+assistant_request_id
+        ↓
+    AgentRun          （进程内；MVP 不落库）
+        ↓
+    AgentStep         （LLM_DECISION / TOOL_CALL 步；含 tool_name / status / error 稳定码）
+        ↓
+  LLM Observation / Tool Observation（既有 4 张表，**不新增列 / 不新增表**）
+```
+
+```text
+事实：Agent 在 `assistant_trace_scope(request_id)` 内执行 ⇒
+      既有 LLM usage 持久化与 Tool execution 观测**自动**关联同一 request_id
+      （无需为 Agent 新增观测写入；该行为不在本阶段验证，仅冻结关系）。
+本阶段禁止：新表 · 新列 · migration · AgentObservation DTO · 观测口径变更。
+OQ-P5-10（run 级汇总落 Observation 还是 State）保持 OPEN。
+```
+
+## 29.10 Evidence Boundary（OD-P5-22）
+
+```text
+维持 Phase 4.1：Evidence = Source / Provenance Unit。
+
+AgentRun ≠ Evidence · ToolResult ≠ Evidence · AgentFinalAnswer ≠ Evidence
+本阶段不实现 Agent → Evidence / Tool Result → Evidence；
+Conversation Context 不进入 Evidence identity / provenance；
+Runtime Evidence 仍 DEFERRED；OD-31 / OD-32 保持 OPEN。
+若未来需要 "Agent Evidence Candidate" ⇒ 单独 Architecture Decision。
+```
+
+## 29.11 Orchestrator Boundary（OD-P5-23）
+
+```text
+AIOrchestrator.execute(question, context)
+        ↓ Router.route(question, context) → RouteDecision
+        ↓ route == AGENT
+        ↓ AGENT 能力硬校验（agent_enabled + runtime 已接线；失败 ⇒ 与既有能力禁用一致）
+        ↓ AgentRuntime.run(question=question, conversation_context=context)
+        ↓ AgentRuntimeResult
+        ↓ §29.2 映射 → AIOrchestrationResult
+```
+
+### 注入形态（冻结；下一阶段实现）
+
+```text
+AIOrchestratorService.__init__ 新增**可选**参数：
+    agent_runtime: AgentCapability | None = None      ← Agent 能力的 Protocol（一方法：run）
+    agent_policy / agent_llm **不**直接进 Orchestrator（由 composition root 组装）
+
+装配（composition root / per-project factory）：
+    ProviderAgentLLM(llm_provider)
+        + ToolExecutionService(registry=<per-project registry>, capabilities, project_id, observer)
+        + AgentRuntimePolicy(max_execution_time_ms, max_cost_tokens, steps/tool_calls/llm_calls)
+        + allowed_tools = capabilities.tool_names（⊆ 项目允许）
+        ⇒ AgentRuntime(...) ⇒ 注入 AIOrchestratorService(agent_runtime=...)
+```
+
+```text
+硬性禁止（依赖方向）：
+    AgentRuntime → AIOrchestrator        ❌
+    AgentRuntime → Router                ❌
+    AgentRuntime → ConversationRepository ❌
+    AgentRuntime → DB Session / Engine   ❌
+    AgentRuntime → HTTP client           ❌
+    AgentRuntime → DeepSeekProvider / OpenAIClient ❌（只经 AgentLLM 端口）
+
+Fail-closed 装配规则：
+    agent_enabled=True  且 agent_runtime=None ⇒ **装配期错误**（不得静默降级 / 不得回退 RAG）；
+    agent_enabled=False ⇒ RouteType.AGENT 不可达（Router 拒绝 + Orchestrator 无分支）。
+```
+
+## 29.12 Router Responsibility（冻结）
+
+```text
+Router 只做：
+    Question + Project capabilities（+ LLM fallback 的 conversation context reference）
+        → RouteDecision{route, reason, source, tool_name?, confidence}
+AGENT 时 Router **不**决定：Tool 选择 · Tool arguments · Agent steps · Loop · Final answer
+```
+
+```text
+AGENT 的 Tool 选择完全在 AgentRuntime（LLM Decision + Runtime 授权）；
+Router 不获得任何"Agent 内部状态"，也不感知 Tool 循环次数。
+```
+
+## 29.13 Security Boundary（冻结 · 全链优先级不变）
+
+```text
+Phase 4.2 冻结（跨路由不变）：
+    System / Safety > Capability / Business > Conversation Context > Current Question
+Agent 内部（本决策追加一层，语义同向）：
+    System / Safety > Agent Capability（Policy + 授权 + 预算）
+                     > Conversation Context（untrusted reference）
+                     > Current Question
+                     > Tool Result（untrusted data）
+```
+
+```text
+必须同时成立（不可被 Context / Tool Result 修改）：
+    RuntimePolicy（max_steps / max_tool_calls / max_llm_calls / time / tokens）
+    allowed_tools（Agent 授权集合）
+    project_id / capabilities
+    read-only Tool 政策（无 CREATE / UPDATE / DELETE / DDL / 文件写 / HTTP side effect）
+```
+
+## 29.14 Real LLM Smoke Contract（OD-P5-24；本阶段**不执行**）
+
+```text
+未来（需单独授权）：
+    real_llm marker（默认 skip，沿用既有机制）
+        ↓ Agent
+        ↓ 一个真实 read-only Tool
+        ↓ tool result → 第二次 LLM 调用
+        ↓ final answer
+至少断言：tool_calls / tool_call_id / assistant.tool_calls 回传 / role=tool /
+          usage.total_tokens / finish_reason / 多轮终止
+本阶段：Real LLM Calls = 0（DeepSeek 未调用；无网络）。
+```
+
+## 29.15 Rejected Alternatives
+
+```text
+R-1 新建第二套顶层 Agent Result DTO —— 否决：
+    违反单一 AI Result 契约；且 metadata 通道已可承载全部非敏感状态。
+R-2 扩展 AssistantOutcome 为 5 态（新增 LIMIT_REACHED / CANCELLED）—— 否决：
+    该 DTO 是**冻结的 4 态契约**（明文禁止新增），扩展属契约变更，需独立 Decision；
+    本决策以 metadata.agent_status 保留语义，不触碰契约。
+R-3 Agent 自己读 ConversationRepository / 自己选择 history —— 否决：
+    破坏 Conversation 层所有权与 current-turn exclusion / 窗口契约（Phase 4.2 §7C–§7F）。
+R-4 Router 决定 Agent 内部 Tool 调用 —— 否决：
+    Router 是分类器不是执行器；会引入 Router ↔ Agent 递归与"分类器即安全边界"的错误前提。
+R-5 Agent 自行调用 Orchestrator / Router（递归编排）—— 否决（§OD-P5-02 已禁）。
+R-6 AGENT 由**规则路径**选择 —— 否决（MVP）：
+    会改变既有路由行为与回归基线，且"多步意图"尚无冻结的规则契约；属未来 Decision。
+R-7 Agent 内部新增幂等 / run-level dedupe —— 否决：
+    幂等属 Conversation 层（Step 6 已冻结）；Agent 内再实现会产生两套语义。
+R-8 Agent 写观测表 / 新增 AgentObservation —— 否决：
+    本阶段 DB = 0；run/step 的持久化形态（OQ-P5-2 / OQ-P5-10）未决。
+R-9 Tool Result 与 Conversation Context 合并为一段 —— 否决：
+    二者信任等级不同，合并会削弱注入防护与可审计性。
+R-10 Orchestrator 直接持有 AgentLLM / Policy —— 否决：
+    Orchestrator 不应认识 Provider 与预算细节；由 composition root 组装后注入 runtime。
+```
+
+## 29.16 Open Questions（保持；不可在本阶段安全决定）
+
+```text
+OQ-P5-2  Agent State Persistence（AgentRun / AgentStep 是否持久化及其形态）
+OQ-P5-4  max_cost 货币化 pricing 来源（MVP 仍为 token 预算）
+OQ-P5-6  取消触发源（CANCELLED 由谁触发：客户端 / 超时 / 服务端策略）
+OQ-P5-9  重复相同 Tool 调用的判定与处理（现仅计次）
+OQ-P5-10 Run 级汇总落位（Observation vs State）与 Assistant Timeline 关系
+新增（本阶段识别，均不阻塞接线）：
+OQ-P5-11 AGENT 的规则触发（是否需要关键词 / 意图规则，及其与 LLM fallback 的关系）
+OQ-P5-12 AssistantOutcome 是否需要专用状态（取代 metadata.agent_status 的 4 态折中）
+OQ-P5-13 Agent 的 conversation_context 是否应在多轮间"增量更新"（现冻结为只读整段）
+
+本决策**已关闭**：OQ-P5-1（§28）· OQ-P5-5（§29.2）· OQ-P5-7（§29.1）· OQ-P5-8（§29.4）
+```
+
+## 29.17 下一阶段实施清单（**未授权**；仅登记影响面）
+
+```text
+I-1 RouteType.AGENT 新增 + AIRouterService.agent_enabled（默认 False）+ 禁用 gating
+I-2 Orchestrator AGENT 分支 + AGENT 能力硬校验（agent_enabled / runtime 已接线）
+I-3 可选注入 agent_runtime（Protocol）+ composition root 组装
+    （ProviderAgentLLM + ToolExecutionService + AgentRuntimePolicy + allowed_tools）
+I-4 metadata 冻结键写入（§29.2）+ 失败/触限映射（§29.8）
+I-5 API 描述文本登记 "agent"（doc-only）+ 契约测试同步
+I-6 测试：AGENT 路由（启用 / 禁用 / 未接线 fail-closed）· 授权子集 · 触限映射
+    · 幂等短路（Agent = 0）· context 注入（read-only 单次）· 反向依赖源码审计
+
+禁止：Agent 写库 / 新增观测表 / 修改 Conversation / 修改 Prompt 文件 /
+      修改 Step 6 幂等语义 / 写 Tool / HITL / Streaming / Memory / Planning /
+      Multi-Agent / LangGraph / MCP。
+```
+
+```text
+本决策冻结后的目标形态：
+
+ConversationRuntime → AIOrchestrator → RouteDecision
+                                       ├── RAG
+                                       ├── TOOL
+                                       ├── TEXT_TO_SQL
+                                       └── AGENT → AgentRuntime
+                                                     ├── ProviderAgentLLM → LLMProvider.chat(tools=…)
+                                                     └── ToolExecutionService → ToolRegistry（read-only）
+Provider 不知道 Agent；Agent 不知道 Conversation；Conversation 拥有历史与幂等。
+```
