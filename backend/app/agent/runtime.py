@@ -36,6 +36,17 @@ AgentDecision（FINAL / TOOL_CALL）
 明确不做（后续独立阶段）：Agent State 持久化 · Conversation / Orchestrator /
 Router 接线 · Agent 观测 · Human Approval（WAITING_APPROVAL 行为）·
 Multi-Agent · Planning · Memory · Workflow · LangGraph · MCP · Streaming。
+
+Phase 5 P-4 Integration（Agent Run Scope + Tool Result 立即写入）：
+    * ``run()`` 内以 ``agent_run_scope(run_id)`` 绑定**本次 Run 的身份**
+      （ContextVar；嵌套 / 并发安全），使该 Run 内任意深度的 Tool 执行都能读到
+      ``current_agent_run_id()``；
+    * Tool 执行结果由 **composition root 注入的写入端口**（``tool_result_sink``）
+      在 ``ToolExecutionService.execute()`` 返回/抛出的**紧邻位置立即落库**
+      （早于 Step / Run 落盘、早于下一轮 LLM）；
+    * Runtime 本体**仍不接触 DB**（0 import）—— 端口实现（与 repository /
+      Session）全部在 Agent 包外；端口缺失 ⇒ 直接跳过（零开销）；
+    * 写入失败**不改变**控制流（不 retry Tool / LLM、不 fallback、不 FAILED）。
 """
 from __future__ import annotations
 
@@ -43,7 +54,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from typing import Any, Final
+from typing import Any, Final, Protocol, runtime_checkable
 
 from backend.app.agent.decision import (
     DECISION_FINAL,
@@ -60,7 +71,7 @@ from backend.app.agent.errors import (
     AgentPolicyError,
     AgentToolExecutionFailureError,
 )
-from backend.app.agent.ids import new_agent_run_id
+from backend.app.agent.ids import agent_run_scope, new_agent_run_id
 from backend.app.agent.models import (
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
@@ -80,7 +91,44 @@ from backend.app.services.tool_execution_service import ToolExecutionService
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AgentRuntime", "AGENT_SYSTEM_INSTRUCTION"]
+__all__ = ["AgentRuntime", "AGENT_SYSTEM_INSTRUCTION", "ToolResultSink"]
+
+
+@runtime_checkable
+class ToolResultSink(Protocol):
+    """Tool Result 写入端口（Phase 5 P-4 Integration；由 composition root 注入）。
+
+    结构契约（本 Runtime **不认识**实现，也不 import 任何持久化模块）：
+
+        await sink.arecord_tool_result(
+            step_index=…,              # Runtime 当前 step index（**不是** round）
+            tool_name=…,
+            result=ToolResult | None,  # None ⇒ 执行结果不可判定（§二十三）
+            error_code=…,              # 稳定错误码（result=None 时）
+            project_id=…,              # 执行边界授权作用域（复用）
+            tool_call_id=…,            # Provider 原值（**不**生成）
+        ) -> int | None
+
+    实现侧（Agent 包内的 Tool Result 写入点；由 composition root 装配）：
+
+        * run_id 取自 ``current_agent_run_id()``（Agent Run Scope）——
+          **绝不**从 ToolExecutionContext / request_id 推断；无 scope ⇒ 不写；
+        * best-effort：任何失败只记 warning，不改变控制流。
+
+    同步替身只需提供 ``record_tool_result``（本 Runtime 两者都接受）。
+    """
+
+    async def arecord_tool_result(
+        self,
+        *,
+        step_index: int,
+        tool_name: str,
+        result: Any | None = None,
+        error_code: str | None = None,
+        project_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> int | None:
+        ...
 
 #: Agent 决策 system instruction（Runtime 内部最小指令；**不是**新的 Prompt 版本、
 #: 不修改任何既有 prompt 文件；不授予 LLM 任何权限 / 预算 / 策略权威）。
@@ -146,6 +194,7 @@ class AgentRuntime:
         policy: AgentRuntimePolicy,
         allowed_tools: Sequence[str],
         clock: Callable[[], float] | None = None,
+        tool_result_sink: Any | None = None,
     ) -> None:
         if not callable(getattr(llm, "complete", None)):
             raise AgentPolicyError(
@@ -166,6 +215,19 @@ class AgentRuntime:
 
         if clock is not None and not callable(clock):
             raise AgentPolicyError("clock 必须是可调用对象或 None")
+
+        # Phase 5 P-4 Integration：Tool Result 写入端口（可选注入）。
+        # 形状校验与其它可选依赖一致（失败更早；本层只 await 一个方法）。
+        if tool_result_sink is not None and not (
+            callable(getattr(tool_result_sink, "arecord_tool_result", None))
+            or callable(getattr(tool_result_sink, "record_tool_result", None))
+        ):
+            raise AgentPolicyError(
+                "tool_result_sink 必须提供可调用的 arecord_tool_result()"
+                " 或 record_tool_result()"
+                f"（got {type(tool_result_sink).__name__}）"
+            )
+        self._tool_result_sink = tool_result_sink
 
         self._llm = llm
         self._tool_execution = tool_execution
@@ -191,6 +253,11 @@ class AgentRuntime:
     def tool_execution(self) -> ToolExecutionService:
         """Tool 执行边界（唯一执行通道；Handler 不可直达）。"""
         return self._tool_execution
+
+    @property
+    def tool_result_sink(self) -> Any | None:
+        """Tool Result 写入端口（None = 未接线；写入失败不影响控制流）。"""
+        return self._tool_result_sink
 
     # ---------- 装配期校验 ----------
 
@@ -270,6 +337,33 @@ class AgentRuntime:
         # Phase 5 P-2：本次执行的**身份**（Runtime 签发一次；持久化层只读取，
         # 不重新生成第二个 run_id —— decision §30.7 / §十七）。
         run_id = new_agent_run_id()
+
+        # Phase 5 P-4 Integration：把本次 Run 的身份绑定到 Agent Run Scope
+        # （ContextVar；嵌套 / 并发安全），使 Run 内任意深度的 Tool 执行都能读到
+        # ``current_agent_run_id()`` —— Tool Result 写入端口据此取得 run_id，
+        # **不**改 ToolExecutionContext、**不**经 request_id 传递。
+        with agent_run_scope(run_id):
+            return await self._run_scoped(
+                run_id=run_id,
+                question=question,
+                conversation_context=conversation_context,
+                request_id=request_id,
+            )
+
+    async def _run_scoped(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        conversation_context: str | None,
+        request_id: str | None,
+    ) -> AgentRuntimeResult:
+        """既有主循环（决策 / 授权 / 执行 / 回灌 / 预算**逐行不变**）。
+
+        与 P-4 之前唯一差异 = 增加两处 Tool Result **立即写入**调用点
+        （``self._record_tool_result(...)``）；必须由 :meth:`run` 在
+        Agent Run Scope 内调用（run_id 由 run() 签发并绑定）。
+        """
         start = self._clock()
         messages = self._initial_messages(question, conversation_context)
 
@@ -461,16 +555,35 @@ class AgentRuntime:
             # ---- 执行（唯一通道：ToolExecutionService；第二道 capability 校验） ----
             # Phase 5 S-1：构造 Execution Context，复用既有 ToolExecutionRecord
             # 观测链路（Runtime 只传 correlation；不持久化、不接触 DB）。
+            # Phase 5 P-4 Integration：本步 index = 本次 Tool 执行的 execution identity
+            # （step 身份；``round = step_index + 1`` 仍只用于 ToolExecutionContext）。
+            step_index = len(records)
             execution_context = self._tool_execution_context(
                 request_id=request_id,
-                step_index=len(records),
+                step_index=step_index,
                 tool_call_id=tool_call_id,
+            )
+            # project_id 复用执行边界（授权作用域的唯一权威来源；不从 ContextVar 取）。
+            execution_project_id = (
+                execution_context.project_id
+                if execution_context is not None
+                else getattr(self._tool_execution, "project_id", None)
             )
             try:
                 tool_result = await self._tool_execution.execute(
                     tool_name, arguments=arguments, context=execution_context
                 )
             except Exception as exc:  # noqa: BLE001 —— 归类 FAILED，不 retry
+                # Phase 5 P-4 Integration：执行结果**不可判定**也立即写入
+                # （success=False + unavailable；best-effort，绝不影响控制流）。
+                await self._record_tool_result(
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    project_id=execution_project_id,
+                    tool_call_id=tool_call_id,
+                    result=None,
+                    error_code=AGENT_ERROR_TOOL_EXECUTION_FAILURE,
+                )
                 failure = AgentToolExecutionFailureError(
                     tool_name,
                     f"{AGENT_ERROR_TOOL_EXECUTION_FAILURE}（{type(exc).__name__}）",
@@ -498,6 +611,19 @@ class AgentRuntime:
                     token_budget_unverifiable=token_budget_unverifiable,
                     records=records,
                 )
+
+            # Phase 5 P-4 Integration：Tool handler 返回后**立即**写入 Tool Result
+            # （早于 Step / Run 落盘、早于下一轮 LLM；覆盖 "Tool 已执行、
+            # Checkpoint 未落盘、进程崩溃" 的恢复窗口）；best-effort ——
+            # 写入失败**不改变**控制流：不 retry Tool / LLM、不 fallback、
+            # 不把 Run 变成 FAILED。
+            await self._record_tool_result(
+                step_index=step_index,
+                tool_name=tool_name,
+                project_id=execution_project_id,
+                tool_call_id=tool_call_id,
+                result=tool_result,
+            )
 
             payload: str | None = None
             if tool_result.success:
@@ -653,6 +779,59 @@ class AgentRuntime:
             project_id=getattr(self._tool_execution, "project_id", None),
             tool_call_id=tool_call_id,
         )
+
+    async def _record_tool_result(
+        self,
+        *,
+        step_index: int,
+        tool_name: str,
+        project_id: str | None,
+        tool_call_id: str | None,
+        result: Any | None,
+        error_code: str | None = None,
+    ) -> None:
+        """Tool 执行结果 → Tool Result 写入端口（best-effort；不改变控制流）。
+
+        契约（Phase 5 P-4 Integration §十六 / §十九 / §二十）：
+
+            * 调用点 = ``ToolExecutionService.execute()`` 返回 / 抛出的**紧邻**位置
+              （早于 Step / Run 落盘、早于下一轮 LLM）；
+            * ``run_id`` 由端口自行从 ``current_agent_run_id()``（Agent Run Scope）
+              取得 —— 本层**不**传 run_id、**不**修改 ToolExecutionContext；
+            * 端口缺失（未接线 / DATABASE_URL 未配置）⇒ 直接跳过（零开销）；
+            * 任何 ``Exception`` 只记 warning（error_type；不含 result 内容）：
+              不 retry Tool、不 retry LLM、不 fallback、不把 Run 变成 FAILED；
+            * ``CancelledError``（BaseException）**不吞**：取消优先，正常传播。
+        """
+        sink = self._tool_result_sink
+        if sink is None:
+            return
+        kwargs: dict[str, Any] = {
+            "step_index": step_index,
+            "tool_name": tool_name,
+            "result": result,
+            "error_code": error_code,
+            "project_id": project_id,
+            "tool_call_id": tool_call_id,
+        }
+        try:
+            arecord = getattr(sink, "arecord_tool_result", None)
+            if callable(arecord):
+                await arecord(**kwargs)
+                return
+            record = getattr(sink, "record_tool_result", None)
+            if callable(record):
+                record(**kwargs)
+        except Exception as exc:  # noqa: BLE001 —— best-effort 边界
+            logger.warning(
+                "Tool Result 写入失败（best-effort；不影响 Agent 结果）: %s",
+                type(exc).__name__,
+                extra={
+                    "error_type": type(exc).__name__,
+                    "tool_name": tool_name,
+                    "step_index": step_index,
+                },
+            )
 
     def _allowed_tool_definitions(self) -> tuple[Any, ...]:
         """已授权 Tool 的 ``ToolDefinition``（仅用于 schema 暴露）。

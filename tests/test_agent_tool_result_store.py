@@ -16,7 +16,8 @@
 10 Hash integrity     → same result ⇒ same hash；different result ⇒ different hash
 11 Replay availability→ 只断言**已保存元数据**（无 Replay API；不新增读路径）
 12 Best-effort 隔离   → Repository 抛异常 ⇒ Tool 业务结果不变、Agent 结果不变
-13 无 Replay/Resume/Checkpoint API；无 runtime / Tool 边界改动（接线未落地）
+13 无 Replay/Resume/Checkpoint API；Tool / LLM / 模型层零改动
+   （接线只经 Runtime 注入端口；见 ``tests/test_agent_tool_result_integration.py``）
 ```
 """
 from __future__ import annotations
@@ -691,10 +692,9 @@ class TestToolResultStoreBoundary:
         assert len(AgentToolResult.__table__.foreign_keys) == 0
         assert AGENT_TOOL_RESULT_TABLE == "agent_tool_result"
 
-    def test_no_runtime_or_tool_boundary_changes(self) -> None:
-        """P-4 接线**未**落地（接线边界不足，见报告）：Runtime / Tool 边界零改动。"""
+    def test_tool_boundary_has_no_store_coupling(self) -> None:
+        """P-4 接线只经 Runtime 与注入端口：Tool / LLM / 模型层**零改动**。"""
         for relative in (
-            ("agent", "runtime.py"),
             ("agent", "llm.py"),
             ("agent", "models.py"),
             ("agent", "capability.py"),
@@ -708,6 +708,21 @@ class TestToolResultStoreBoundary:
             )
             assert "agent_tool_result" not in source, relative
             assert "AgentToolResult" not in source, relative
+            assert "tool_result_sink" not in source, relative
+
+    def test_runtime_only_carries_injected_port(self) -> None:
+        """Runtime 持有的只是**注入端口**：不认识 Store / repository / DB。"""
+        source = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
+
+        for forbidden in (
+            "agent_tool_result",
+            "AgentToolResult",
+            "AgentToolResultRepository",
+            "sqlalchemy",
+            "sessionmaker",
+        ):
+            assert forbidden not in source, forbidden
+        assert "tool_result_sink" in source  # 端口存在（P-4 Integration）
 
     def test_runtime_and_tool_boundary_have_no_db_dependency(self) -> None:
         for name in ("runtime.py", "llm.py", "models.py", "capability.py"):

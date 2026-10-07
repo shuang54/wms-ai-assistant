@@ -52,6 +52,7 @@ from backend.app.agent.errors import (
     AGENT_ERROR_LIMIT_REACHED,
     AGENT_ERROR_TOOL_EXECUTION_FAILURE,
 )
+from backend.app.agent.ids import current_agent_run_id
 from backend.app.agent.models import (
     AGENT_STATUS_LIMIT_REACHED,
     AgentRuntimeResult,
@@ -74,6 +75,8 @@ __all__ = [
     "AgentToolResultRecord",
     "agent_tool_result_record_of",
     "build_agent_tool_result_recorder",
+    "AgentToolResultWritePoint",
+    "build_agent_tool_result_write_point",
     "SENSITIVE_RESULT_MARKERS",
 ]
 
@@ -724,6 +727,133 @@ class AgentToolResultRecorder(Protocol):
         ...
 
 
+class AgentToolResultWritePoint:
+    """Agent Run 内的 Tool Result **写入点**（Phase 5 P-4 Integration §十六–§十九）。
+
+    唯一职责：把一次 Tool 执行结果 + **当前 Agent Run Scope** 的 run_id，
+    组合成 :class:`AgentToolResultRecord` 并交给 recorder 落库：
+
+        AgentRuntime
+            ↓ ToolExecutionService.execute()（唯一执行通道）
+        Tool handler → Tool Result
+            ↓ 本写入点（Tool handler 返回/抛出之后**立即**调用）
+            ├── run_id     = current_agent_run_id()   ← Agent Run Scope（**不猜**）
+            ├── step_index = Runtime 当前 step index  （**不用** round）
+            ├── project_id = 执行边界授权作用域（复用，不从 ContextVar 取）
+            ├── tool_call_id = Provider 原值（**不** uuid4）
+            └── result     = ToolResult（成功/失败/None=不可判定）
+            ↓ recorder.record(...)  →  ai_ops.agent_tool_result
+        AgentRuntime continues
+
+    硬契约：
+
+        * **无 Agent Run Scope（run_id 为 None）⇒ 不写**（best-effort；
+          绝不把 request_id / tool_call_id 猜成 run_id —— §三十一）；
+        * **best-effort**：DB 不可用 / 校验失败 / 序列化失败 ⇒ warning
+          （error_type），**不** retry Tool / retry LLM / fallback /
+          不把 Agent Run 变成 FAILED（§二十 / §二十一）；
+        * ``CancelledError`` **不吞**（取消优先：await 点正常传播，不阻断取消）；
+        * 日志**不**输出 result payload / prompt / SQL / 密钥。
+    """
+
+    def __init__(self, recorder: Any | None = None) -> None:
+        """构造写入点。
+
+        Args:
+            recorder: ``AgentToolResultRecorder``（None → 默认
+                ``BestEffortAgentToolResultRecorder``，**延迟** import/解析）。
+        """
+        self._recorder = recorder
+
+    def _get_recorder(self) -> Any:
+        if self._recorder is not None:
+            return self._recorder
+        self._recorder = BestEffortAgentToolResultRecorder()
+        return self._recorder
+
+    @property
+    def recorder(self) -> Any:
+        """底层 recorder（只读暴露，便于测试断言注入关系）。"""
+        return self._recorder
+
+    def record_tool_result(
+        self,
+        *,
+        step_index: int,
+        tool_name: str,
+        result: ToolResult | None = None,
+        error_code: str | None = None,
+        project_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> int | None:
+        """同步入口（永不抛出 ``Exception``；无 scope ⇒ ``None`` 且不写）。"""
+        run_id = current_agent_run_id()
+        if not isinstance(run_id, str) or not run_id.strip():
+            logger.debug(
+                "Tool Result 未写入：无 Agent Run Scope（best-effort；"
+                "绝不猜测 run_id）",
+                extra={"tool_name": tool_name, "step_index": step_index},
+            )
+            return None
+        try:
+            record = agent_tool_result_record_of(
+                run_id=run_id,
+                step_index=step_index,
+                tool_name=tool_name,
+                result=result,
+                error_code=error_code,
+                project_id=project_id,
+                tool_call_id=tool_call_id,
+            )
+            return self._get_recorder().record(record)
+        except Exception as exc:  # noqa: BLE001 —— best-effort：绝不穿透为业务失败
+            self._log_failure(exc, tool_name=tool_name, step_index=step_index)
+            return None
+
+    async def arecord_tool_result(
+        self,
+        *,
+        step_index: int,
+        tool_name: str,
+        result: ToolResult | None = None,
+        error_code: str | None = None,
+        project_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> int | None:
+        """异步入口（永不抛出 ``Exception``；同步持久化放进 worker 线程）。
+
+        ``CancelledError`` 不在此吞掉（取消优先）。
+        """
+        try:
+            return await asyncio.to_thread(
+                self.record_tool_result,
+                step_index=step_index,
+                tool_name=tool_name,
+                result=result,
+                error_code=error_code,
+                project_id=project_id,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 兜底（record 本身已 best-effort）
+            self._log_failure(exc, tool_name=tool_name, step_index=step_index)
+            return None
+
+    @staticmethod
+    def _log_failure(
+        exc: BaseException, *, tool_name: str, step_index: int
+    ) -> None:
+        """失败只记录**诊断信息**（error_type + tool/step；不含结果内容）。"""
+        logger.warning(
+            "Tool Result 写入失败（best-effort；不影响 Tool / Agent 结果）: %s",
+            type(exc).__name__,
+            extra={
+                "error_type": type(exc).__name__,
+                "tool_name": tool_name,
+                "step_index": step_index,
+            },
+        )
+
+
 class BestEffortAgentToolResultRecorder:
     """Best-effort Tool Result 记录器（与 ``BestEffortAgentStepRecorder`` 同风格）。
 
@@ -837,3 +967,24 @@ def build_agent_tool_result_recorder() -> BestEffortAgentToolResultRecorder | No
         )
         return None
     return BestEffortAgentToolResultRecorder()
+
+
+def build_agent_tool_result_write_point() -> AgentToolResultWritePoint | None:
+    """生产装配（composition root）：Tool Result **写入点**。
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置
+            → ``None``：装配期不注入写入点 ⇒ Runtime 零开销跳过（无告警噪声）
+        否则 → ``AgentToolResultWritePoint``（run_id 取自 Agent Run Scope；
+        写入 ``ai_ops.agent_tool_result``）
+
+    不新增配置项 / 环境变量；本函数只装配，不写库 / 不查询。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent tool result write point disabled"
+            "（DATABASE_URL 未配置；不注入 tool result 写入点）"
+        )
+        return None
+    return AgentToolResultWritePoint()

@@ -483,6 +483,202 @@ class TestAgentToolResultSecurity:
             assert token not in values, token
 
 
+class TestAgentToolResultAgentE2E:
+    """§二十八 / §二十九 / §三十：真 Agent → 真 Tool 执行 → 真写入点 → 真仓储 → PG。
+
+    使用 Fake LLM + test-local read-only Handler（**不调用 DeepSeek**；
+    Registry / ToolExecutionService / 写入点 / 仓储全部是生产实现）。
+    """
+
+    async def test_agent_run_persists_tool_result_row(
+        self, engine: Any, cleanup: list[str]
+    ) -> None:
+        from backend.app.agent import (
+            AGENT_STATUS_COMPLETED,
+            DECISION_FINAL,
+            DECISION_TOOL_CALL,
+            AgentDecision,
+            AgentRuntime,
+            AgentRuntimePolicy,
+        )
+        from backend.app.agent.recorder import (
+            AgentToolResultWritePoint,
+            BestEffortAgentToolResultRecorder,
+        )
+        from tests.test_agent_runtime import FakeLLM, _execution_service
+
+        tool_call = AgentDecision(
+            type=DECISION_TOOL_CALL,
+            tool_name=_TOOL_NAME,
+            arguments={"material_code": "MAT001"},
+            tool_call_id="call_db_e2e",
+        )
+        final = AgentDecision(type=DECISION_FINAL, content="库存 120 件。")
+        service, registry, handler = _execution_service()
+        runtime = AgentRuntime(
+            llm=FakeLLM([tool_call, final]),
+            tool_execution=service,
+            policy=AgentRuntimePolicy(
+                max_execution_time_ms=30_000, max_cost_tokens=1_000
+            ),
+            allowed_tools=(_TOOL_NAME,),
+            tool_result_sink=AgentToolResultWritePoint(
+                recorder=BestEffortAgentToolResultRecorder()
+            ),
+        )
+
+        result = await runtime.run(question="查询 MAT001 库存", request_id="req-db-e2e")
+        cleanup.append(result.run_id)
+
+        assert result.status == AGENT_STATUS_COMPLETED
+        assert [name for name, _ in registry.execute_calls] == [_TOOL_NAME]
+        rows = _rows(engine, result.run_id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.step_index == 0
+        assert row.tool_name == _TOOL_NAME
+        assert row.project_id == "phase5-agent-test"
+        assert row.tool_call_id == "call_db_e2e"
+        assert row.success is True
+        assert row.result_unavailable is False
+        assert row.result_payload == {
+            "tool_name": _TOOL_NAME,
+            "data": {"material_code": "MAT001", "quantity": 120},
+        }
+        assert row.result_hash is not None and len(row.result_hash) == 64
+        assert handler.calls == [{"material_code": "MAT001"}]
+
+    async def test_tool_result_durable_before_run_terminal(
+        self, engine: Any, cleanup: list[str]
+    ) -> None:
+        """§二十九 crash window：Tool 已执行、Run 未完成 ⇒ Tool Result 已 durable。"""
+        from backend.app.agent import (
+            AGENT_STATUS_FAILED,
+            DECISION_TOOL_CALL,
+            AgentDecision,
+            AgentRuntime,
+            AgentRuntimePolicy,
+        )
+        from backend.app.agent.recorder import (
+            AgentToolResultWritePoint,
+            BestEffortAgentToolResultRecorder,
+        )
+        from tests.test_agent_runtime import FakeLLM, _execution_service
+
+        tool_call = AgentDecision(
+            type=DECISION_TOOL_CALL,
+            tool_name=_TOOL_NAME,
+            arguments={"material_code": "MAT002"},
+            tool_call_id="call_db_crash",
+        )
+        service, _registry, _handler = _execution_service()
+        runtime = AgentRuntime(
+            llm=FakeLLM([tool_call], error_on_call=2, error=RuntimeError("llm down")),
+            tool_execution=service,
+            policy=AgentRuntimePolicy(
+                max_execution_time_ms=30_000, max_cost_tokens=1_000
+            ),
+            allowed_tools=(_TOOL_NAME,),
+            tool_result_sink=AgentToolResultWritePoint(
+                recorder=BestEffortAgentToolResultRecorder()
+            ),
+        )
+
+        result = await runtime.run(question="查询 MAT002 库存")
+        cleanup.append(result.run_id)
+
+        assert result.status == AGENT_STATUS_FAILED
+        rows = _rows(engine, result.run_id)
+        assert len(rows) == 1  # Checkpoint / Run 未写，Tool Result 已在
+        assert rows[0].step_index == 0
+        assert rows[0].success is True
+        assert rows[0].tool_call_id == "call_db_crash"
+        # 该 Run 没有 agent_step / agent_run 记录（Run 未终态）
+        with engine.connect() as conn:
+            steps = int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM ai_ops.agent_step WHERE run_id = :id"
+                    ),
+                    {"id": result.run_id},
+                ).scalar_one()
+            )
+            runs = int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM ai_ops.agent_run WHERE run_id = :id"
+                    ),
+                    {"id": result.run_id},
+                ).scalar_one()
+            )
+        assert (steps, runs) == (0, 0)
+
+    async def test_duplicate_identity_keeps_single_row(
+        self, engine: Any, cleanup: list[str]
+    ) -> None:
+        """§三十：同一 (run_id, step_index) 两次写入 ⇒ 1 行（持久化身份有效）。"""
+        from backend.app.agent.ids import agent_run_scope
+        from backend.app.agent.recorder import (
+            AgentToolResultWritePoint,
+            BestEffortAgentToolResultRecorder,
+        )
+
+        run_id = _run_id()
+        cleanup.append(run_id)
+        write_point = AgentToolResultWritePoint(
+            recorder=BestEffortAgentToolResultRecorder()
+        )
+        result = ToolResult(
+            tool_name=_TOOL_NAME,
+            success=True,
+            data={"material_code": "MAT001", "quantity": 120},
+        )
+
+        with agent_run_scope(run_id):
+            first = write_point.record_tool_result(
+                step_index=0,
+                tool_name=_TOOL_NAME,
+                result=result,
+                project_id="phase5-tool-result-db",
+                tool_call_id="call_dup",
+            )
+            second = write_point.record_tool_result(
+                step_index=0,
+                tool_name=_TOOL_NAME,
+                result=result,
+                project_id="phase5-tool-result-db",
+                tool_call_id="call_dup",
+            )
+
+        assert first is not None
+        assert second is None  # ON CONFLICT (run_id, step_index) DO NOTHING
+        assert len(_rows(engine, run_id)) == 1
+
+    def test_non_agent_path_writes_nothing(self, engine: Any) -> None:
+        """§三十二：无 Agent Run Scope 时写入点不写（普通 Tool 路径零影响）。"""
+        from backend.app.agent.ids import current_agent_run_id
+        from backend.app.agent.recorder import (
+            AgentToolResultWritePoint,
+            BestEffortAgentToolResultRecorder,
+        )
+
+        write_point = AgentToolResultWritePoint(
+            recorder=BestEffortAgentToolResultRecorder()
+        )
+
+        assert current_agent_run_id() is None
+        assert (
+            write_point.record_tool_result(
+                step_index=0,
+                tool_name=_TOOL_NAME,
+                result=ToolResult(
+                    tool_name=_TOOL_NAME, success=True, data={"qty": 1}
+                ),
+            )
+            is None
+        )
+
+
 class TestAgentToolResultResidue:
     def test_residue_is_zero_after_cleanup(
         self, engine: Any, cleanup: list[str]

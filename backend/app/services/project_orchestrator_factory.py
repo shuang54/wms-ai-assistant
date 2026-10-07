@@ -46,6 +46,7 @@ from backend.app.agent import (
     AgentRuntimePolicy,
     ProviderAgentLLM,
 )
+from backend.app.agent.recorder import build_agent_tool_result_write_point
 from backend.app.agent.recorder import (
     build_agent_run_recorder,
     build_agent_step_recorder,
@@ -328,6 +329,10 @@ def build_orchestrator_for_project(
             # Agent 只能请求项目允许的 Tool（⊆ ProjectCapabilities；
             # Runtime 装配期二次校验，ToolExecutionService 执行期第三次校验）。
             allowed_tools=capabilities.tool_names,
+            # Phase 5 P-4 Integration：Tool Result 写入端口（Tool handler 返回后
+            # **立即**写 agent_tool_result；run_id 取自 Agent Run Scope）。
+            # 无 DATABASE_URL ⇒ None（Runtime 零开销跳过；行为与 P-4 之前一致）。
+            tool_result_sink=build_agent_tool_result_write_point(),
         )
         # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
         # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。
