@@ -48,6 +48,8 @@ from backend.app.agent import (
 )
 from backend.app.agent.recorder import (
     build_agent_checkpoint_recorder,
+    build_agent_decision_store,
+    build_agent_tool_result_reader,
     build_agent_tool_result_write_point,
 )
 from backend.app.agent.recorder import (
@@ -305,6 +307,10 @@ def build_orchestrator_for_project(
     resolved_agent_checkpoint_recorder: Any | None = getattr(
         base, "agent_checkpoint_recorder", None
     )
+    # Phase 5 P-6：Decision Store（同方式继承 base）。
+    resolved_agent_decision_store: Any | None = getattr(
+        base, "agent_decision_store", None
+    )
     if agent_enabled:
         resolved_agent_provider = (
             agent_llm_provider
@@ -320,6 +326,10 @@ def build_orchestrator_for_project(
             project_id=project_id,
             observer=resolved_observer,
         )
+        # Phase 5 P-6：Decision Store（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析（Runtime 直接持有 Decision 写入端口）。
+        if resolved_agent_decision_store is None:
+            resolved_agent_decision_store = build_agent_decision_store()
         # Phase 5 P-5：Checkpoint 持久化边界（base 继承 → 否则在本装配点创建）。
         # 必须在 Runtime 构造前解析：Runtime 直接持有 Checkpoint 写入端口。
         # 同一实例随后也注入 Orchestrator（终态 TERMINAL 写点）。
@@ -348,6 +358,15 @@ def build_orchestrator_for_project(
             # Phase 5 P-5：Checkpoint 写入端口（Tool Result durable 之后写
             # ACTIVE / LLM_DECISION 控制状态；与 Orchestrator 共享**同一**实例）。
             checkpoint_sink=resolved_agent_checkpoint_recorder,
+            # Phase 5 P-6：Resume 所需端口
+            #   checkpoint_store = 同一 recorder（读取 current checkpoint）
+            #   decision_store   = Decision Store（**fail-closed** 写入）
+            #   tool_result_store= P-4 仓储（Resume 专用只读 get）
+            checkpoint_store=resolved_agent_checkpoint_recorder,
+            decision_store=resolved_agent_decision_store,
+            tool_result_store=(
+                build_agent_tool_result_reader() if agent_enabled else None
+            ),
         )
         # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
         # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。

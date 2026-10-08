@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AgentCheckpoint",
     "AgentCheckpointRecorder",
+    "AgentCheckpointStoreError",
     "BestEffortAgentCheckpointRecorder",
     "new_claim_token",
     "tool_result_ref",
@@ -253,6 +254,14 @@ class AgentCheckpoint:
     updated_at: datetime
 
 
+class AgentCheckpointStoreError(Exception):
+    """Checkpoint 读取 / 声明失败（Resume 的 fail-closed 信号）。
+
+    与写路径（best-effort 吞异常）不同：读/声明失败**必须**让 Resume 失败，
+    而不是"当作没有 Checkpoint"继续。
+    """
+
+
 class AgentCheckpointRecorder(Protocol):
     """Checkpoint 写入端口（实现必须 **best-effort**：永不抛出）。"""
 
@@ -266,6 +275,42 @@ class AgentCheckpointRecorder(Protocol):
         self, *, step_index: int, tool_result_persisted: bool
     ) -> AgentCheckpoint | None:
         """异步入口。"""
+        ...
+
+    def record_decision_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        next_action: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """Decision 已持久化后的控制状态（Phase 5 P-6；ACTIVE + pending_decision_ref）。"""
+        ...
+
+    async def arecord_decision_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        next_action: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """异步入口。"""
+        ...
+
+    def get(self, run_id: str) -> AgentCheckpoint | None:
+        """读取 current checkpoint（Resume 专用；**读失败抛异常**）。"""
+        ...
+
+    def claim_for_resume(
+        self,
+        *,
+        run_id: str,
+        expected_state_version: int,
+        claim_token: str,
+    ) -> AgentCheckpoint:
+        """Resume 的乐观并发声明（版本 +1；冲突抛异常；§三十五）。"""
         ...
 
     def record_terminal(
@@ -383,6 +428,104 @@ class BestEffortAgentCheckpointRecorder:
         except Exception as exc:  # noqa: BLE001 —— 兜底（record 本身已 best-effort）
             self._log_failure(exc, run_id=current_agent_run_id())
             return None
+
+    def record_decision_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        next_action: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """Decision 已持久化后的 ACTIVE checkpoint（P-6；同步入口；永不抛出 ``Exception``）。
+
+        * ``pending_step_index`` = 该 Decision 的 step（与 ``decision_ref`` 同 step，
+          满足 §十八 一致性校验）；
+        * ``pending_decision_ref`` = ``"{run_id}:{step_index}"``（§十五）；
+        * ``pending_tool_call_id`` 仅在 ``next_action=TOOL_EXECUTION`` 时非 NULL（§二十二）。
+        """
+        run_id = current_agent_run_id()
+        if not isinstance(run_id, str) or not run_id.strip():
+            logger.debug(
+                "Decision Checkpoint 未写入：无 Agent Run Scope（best-effort）",
+                extra={"step_index": step_index},
+            )
+            return None
+        try:
+            return self._save(
+                run_id=run_id,
+                status=CHECKPOINT_STATUS_ACTIVE,
+                next_action=next_action,
+                pending_step_index=step_index,
+                pending_tool_call_id=tool_call_id,
+                pending_decision_ref=decision_ref,
+                pending_tool_result_ref=None,
+            )
+        except Exception as exc:  # noqa: BLE001 —— best-effort
+            self._log_failure(exc, run_id=run_id)
+            return None
+
+    async def arecord_decision_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        next_action: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """异步入口（``CancelledError`` 不吞）。"""
+        try:
+            return await asyncio.to_thread(
+                self.record_decision_checkpoint,
+                step_index=step_index,
+                decision_ref=decision_ref,
+                next_action=next_action,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 兜底
+            self._log_failure(exc, run_id=current_agent_run_id())
+            return None
+
+    # ---------- 读取 / Resume 声明（P-6；**读失败抛异常** = fail-closed） ----------
+
+    def get(self, run_id: str) -> AgentCheckpoint | None:
+        """读取 current checkpoint（Resume 专用）。
+
+        Note:
+            与写路径（best-effort 吞异常）不同：**读失败向调用方抛出**
+            （``AgentCheckpointRepositoryError``）——Resume 必须 fail closed，
+            而不是"当作不存在"。
+        """
+        return self._repository.get(run_id)
+
+    def claim_for_resume(
+        self,
+        *,
+        run_id: str,
+        expected_state_version: int,
+        claim_token: str,
+    ) -> AgentCheckpoint:
+        """Resume 的乐观并发声明（§三十五）：版本 +1、其余状态不变。
+
+        Raises:
+            AgentCheckpointConflictError: 版本 / claim 不匹配（并发 Resume 失败者）。
+        """
+        current = self._repository.get(run_id)
+        if current is None:
+            raise AgentCheckpointStoreError(
+                f"run_id 没有 current checkpoint: {run_id!r}"
+            )
+        return self._repository.update(
+            run_id=run_id,
+            expected_state_version=expected_state_version,
+            claim_token=claim_token,
+            status=current.status,
+            next_action=current.next_action,
+            pending_step_index=current.pending_step_index,
+            pending_tool_call_id=current.pending_tool_call_id,
+            pending_decision_ref=current.pending_decision_ref,
+            pending_tool_result_ref=current.pending_tool_result_ref,
+        )
 
     def record_terminal(
         self,

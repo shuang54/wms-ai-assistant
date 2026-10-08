@@ -58,6 +58,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Final, Sequence
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -425,6 +426,51 @@ class AgentToolResultRepository:
             ) from exc
         return created_ids
 
-    # 说明：本阶段**不提供**任何读方法（无 find / get / list / timeline /
-    # replay / resume）—— Read / Replay 属 Checkpoint / Resume 阶段；
-    # 测试直接经 SQLAlchemy 查询（不改生产读边界）。
+    # ---------- 读取（Phase 5 P-6 Resume 需要） ----------
+
+    def get(self, run_id: str, step_index: int) -> AgentToolResultRow | None:
+        """按 **执行身份 (run_id, step_index)** 读取一行（无 ⇒ ``None``）。
+
+        仅供 Resume 的 Tool Result Replay 使用（§二十四：唯一 replay identity
+        = ``(run_id, step_index)``，**不是** ``tool_call_id``）；本方法**只读**，
+        不返回写路径之外的任何额外信息，也不暴露给 HTTP / Read API。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        index = validate_step_index(step_index)
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                row = session.execute(
+                    select(AgentToolResult).where(
+                        AgentToolResult.run_id == run_id,
+                        AgentToolResult.step_index == index,
+                    )
+                ).scalar_one_or_none()
+                record = (
+                    AgentToolResultRow(
+                        run_id=row.run_id,
+                        step_index=row.step_index,
+                        tool_name=row.tool_name,
+                        project_id=row.project_id,
+                        success=bool(row.success),
+                        error_code=row.error_code,
+                        result_payload=row.result_payload,
+                        result_hash=row.result_hash,
+                        result_size_bytes=row.result_size_bytes,
+                        result_truncated=bool(row.result_truncated),
+                        result_unavailable=bool(row.result_unavailable),
+                        result_ref=row.result_ref,
+                        tool_call_id=row.tool_call_id,
+                    )
+                    if row is not None
+                    else None
+                )
+        except SQLAlchemyError as exc:
+            raise AgentToolResultRepositoryError(
+                f"Agent Tool Result 读取失败: {type(exc).__name__}"
+            ) from exc
+        return record
+
+    # 说明：除上面这一个**只读**方法（Resume 专用）外，本仓储**不提供**
+    # 其它读模型（无 find / list / timeline / replay）；Read API 属后续阶段。

@@ -51,6 +51,32 @@ AGENT_ERROR_LIMIT_REACHED: Final[str] = "LIMIT_REACHED"
 #: 已知稳定码时使用；不用于 Runtime 内部构造）。
 AGENT_ERROR_FAILED: Final[str] = "AGENT_FAILED"
 
+# ---- Phase 5 P-6（Decision Store / Resume）稳定码 ----
+#: LLM 已给出合法 Decision，但 Decision Store 写入失败 ⇒ **fail closed**
+#: （不执行 Tool、不再调 LLM；§十四）。
+AGENT_ERROR_DECISION_PERSISTENCE_FAILURE: Final[str] = (
+    "AGENT_DECISION_PERSISTENCE_FAILURE"
+)
+#: Checkpoint 的 pending_decision_ref 指向的 Decision 不存在（§十七）。
+AGENT_ERROR_DECISION_NOT_FOUND: Final[str] = "AGENT_DECISION_NOT_FOUND"
+#: Decision 存在但**不可安全 Replay**（arguments 超限 / 含敏感标记）⇒ fail closed。
+AGENT_ERROR_DECISION_UNAVAILABLE: Final[str] = "AGENT_DECISION_UNAVAILABLE"
+#: run_id 没有 current checkpoint ⇒ 无法 Resume（fail closed）。
+AGENT_ERROR_CHECKPOINT_NOT_FOUND: Final[str] = "AGENT_CHECKPOINT_NOT_FOUND"
+#: Checkpoint 与 Decision 不一致（run_id / step_index 不符；§十八）。
+AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH: Final[str] = (
+    "AGENT_CHECKPOINT_DECISION_MISMATCH"
+)
+#: Decision = TOOL_CALL，但 (run_id, step_index) 没有 Tool Result ⇒ fail closed
+#: （**绝不**盲目重跑 Tool；§二十三）。
+AGENT_ERROR_TOOL_RESULT_NOT_FOUND: Final[str] = "AGENT_TOOL_RESULT_NOT_FOUND"
+#: Tool Result 存在但结果体不可 Replay（超限 / 敏感 / 未持久化 payload）。
+AGENT_ERROR_TOOL_RESULT_UNAVAILABLE: Final[str] = "AGENT_TOOL_RESULT_UNAVAILABLE"
+#: 并发 Resume 冲突（state_version 已被其它 worker 推进；§三十五）。
+AGENT_ERROR_RESUME_CONFLICT: Final[str] = "AGENT_RESUME_CONFLICT"
+#: 终态 Resume 但最终内容不可恢复（**不**重新调用 LLM；§三十七）。
+AGENT_ERROR_FINAL_RESULT_UNAVAILABLE: Final[str] = "AGENT_FINAL_RESULT_UNAVAILABLE"
+
 #: 全部稳定错误码（供上层白名单校验 / 观测归一化使用；**不含**自由文本）。
 AGENT_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -60,6 +86,16 @@ AGENT_ERROR_CODES: Final[frozenset[str]] = frozenset(
         AGENT_ERROR_TOOL_EXECUTION_FAILURE,
         AGENT_ERROR_LIMIT_REACHED,
         AGENT_ERROR_FAILED,
+        # Phase 5 P-6
+        AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+        AGENT_ERROR_DECISION_NOT_FOUND,
+        AGENT_ERROR_DECISION_UNAVAILABLE,
+        AGENT_ERROR_CHECKPOINT_NOT_FOUND,
+        AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH,
+        AGENT_ERROR_TOOL_RESULT_NOT_FOUND,
+        AGENT_ERROR_TOOL_RESULT_UNAVAILABLE,
+        AGENT_ERROR_RESUME_CONFLICT,
+        AGENT_ERROR_FINAL_RESULT_UNAVAILABLE,
     }
 )
 

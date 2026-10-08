@@ -18,6 +18,7 @@ from __future__ import annotations
 # 顺序很关键：KnowledgeDocument 必须先于 KnowledgeChunk（虽然 SQLAlchemy 不强制，
 # 但 IDE / 类型检查友好）
 from backend.app.db.models.agent_checkpoint import AgentCheckpoint
+from backend.app.db.models.agent_decision import AgentDecision
 from backend.app.db.models.agent_run import AgentRun
 from backend.app.db.models.agent_step import AgentStep
 from backend.app.db.models.agent_tool_result import AgentToolResult
@@ -65,11 +66,15 @@ _MODELS: tuple[type, ...] = (
     # Phase 5 P-5 Checkpoint Persistence：Agent Checkpoint（recovery control state；
     # ai_ops；**无外键**；UNIQUE(run_id)；**可 UPDATE**）。
     AgentCheckpoint,
+    # Phase 5 P-6 Decision Store：Agent Decision（LLM decision replay data；ai_ops；
+    # **无外键**；UNIQUE(run_id, step_index) + UNIQUE(decision_ref)）。
+    AgentDecision,
 )
 
 
 __all__ = [
     "AgentCheckpoint",
+    "AgentDecision",
     "AgentRun",
     "AgentStep",
     "AgentToolResult",

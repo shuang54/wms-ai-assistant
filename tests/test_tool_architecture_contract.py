@@ -1222,7 +1222,14 @@ class TestC20OrchestratorToolObservability:
         records = collector.records()
         assert len(records) == 2
         assert records[0].request_id != records[1].request_id
-        # 静态：new_request_id() 唯一调用点在 execute() 内（无循环 / 无 retry）
+        # 静态：new_request_id() **唯一**生成点（无循环 / 无 retry）
+        #
+        # Phase 5 P-6 更新：Orchestrator 新增第二个入口点 ``resume_agent_run``
+        # （Resume = 新的请求 correlation），因此把生成点收敛到**唯一** helper
+        # ``_issue_request_id``；两个入口点各调用它一次 ⇒ 不变式保持且更强：
+        #   ① 模块内只有一处 new_request_id 调用；
+        #   ② 该调用位于 AIOrchestratorService 内；
+        #   ③ execute / resume_agent_run 都经该 helper（不在循环内生成）。
         tree = _module_ast("orchestrator")
         calls = [
             node
@@ -1233,18 +1240,29 @@ class TestC20OrchestratorToolObservability:
         ]
         assert len(calls) == 1
         service_cls = _class_node(tree, "AIOrchestratorService")
-        execute_fn = next(
+        id_helper = next(
             node
             for node in service_cls.body
-            if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "execute"
+            if isinstance(node, ast.FunctionDef) and node.name == "_issue_request_id"
         )
         assert any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "new_request_id"
-            for node in ast.walk(execute_fn)
+            for node in ast.walk(id_helper)
         )
+        for entry_name in ("execute", "resume_agent_run"):
+            entry_fn = next(
+                node
+                for node in service_cls.body
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == entry_name
+            )
+            assert any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_issue_request_id"
+                for node in ast.walk(entry_fn)
+            ), entry_name
 
     # ---- C20.3 round == 1 / C20.4 tool_call_id is None ----
 

@@ -399,6 +399,13 @@ class FakeAgentToolResultRepository:
         created = self.create_many([record])
         return created[0] if created else None
 
+    def get(self, run_id: str, step_index: int) -> _FakeRowCapture | None:
+        """Phase 5 P-6：Resume 的 Tool Result Replay 读取（执行身份；§二十四）。"""
+        for row in self.rows:
+            if row.run_id == run_id and row.step_index == step_index:
+                return row
+        return None
+
 
 class TestToolResultRecorder:
     def test_duplicate_identity_writes_single_row(self) -> None:
@@ -643,15 +650,25 @@ class TestToolResultRepositoryValidation:
 
         assert repository.create_many(()) == []
 
-    def test_repository_has_no_read_or_replay_api(self) -> None:
-        """P-4 只建立**写入 Store**（无 find / get / list / timeline / replay / resume）。"""
+    def test_repository_api_surface_is_write_plus_resume_read(self) -> None:
+        """P-4 = **写入 Store**；P-6 只增加**一个**只读方法 ``get``（Resume 专用）。
+
+        仍然**没有** find / list / timeline / replay / resume / Read API。
+        """
         public = {
             name
             for name in dir(AgentToolResultRepository)
             if not name.startswith("_")
         }
 
-        assert public == {"create", "create_many", "build_idempotent_insert"}
+        assert public == {
+            "create",
+            "create_many",
+            "build_idempotent_insert",
+            "get",  # Phase 5 P-6：Resume 的 Tool Result Replay 读取（§二十四）
+        }
+        for forbidden in ("find", "list", "timeline", "replay", "resume"):
+            assert not hasattr(AgentToolResultRepository, forbidden)
 
 
 class TestToolResultStoreBoundary:

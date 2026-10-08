@@ -47,7 +47,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final, Protocol
@@ -670,14 +671,14 @@ class AIOrchestratorService:
         # 随三条成功路径的 ``metadata["request_id"]`` 透出（RAG / Tool /
         # Text-to-SQL），使调用方可用它关联 Tool Execution Observability；
         # 由本方法生成（API 层不生成第二个 ID）。
-        request_id = new_request_id()
+        request_id = self._issue_request_id()
 
         # ---- 1) 路由决策 ----
         # Phase 3.12 Step 36：整个执行（含 Router 的 LLM fallback、RAG /
         # Tool / Text-to-SQL 内部的 LLM 调用）都在同一个 Assistant Trace
         # Scope 内 —— LLM Usage 持久化因此可以把 usage 事实关联到本
         # request_id（不改 LLM Client / RAG / Text-to-SQL 参数签名）。
-        with assistant_trace_scope(request_id):
+        with self._request_trace_scope(request_id):
             try:
                 decision: RouteDecision = await self._router.route(
                     question=normalized, context=context
@@ -1403,6 +1404,135 @@ class AIOrchestratorService:
                 "agent_token_budget_unverifiable": (
                     agent_result.token_budget_unverifiable
                 ),
+            },
+        )
+
+
+    # ---------- 请求 identity（**唯一**生成点；C40/C41/C20/C21 单源审计） ----------
+
+    def _issue_request_id(self) -> str:
+        """请求 correlation 的**唯一**生成点（``execute`` / ``resume_agent_run`` 共用）。
+
+        单源不变式（Phase 3.12 / C40 / C41 / C20 / C21 审计）：本模块只有这一处
+        生成请求 id；每个入口点各生成**一次**、绝不在循环 / retry 内、绝不透传或
+        复用其它请求的 id（run_id 与 request_id 语义独立：前者=Agent 执行身份，
+        后者=请求 correlation）。
+        """
+        return new_request_id()
+
+    @contextmanager
+    def _request_trace_scope(self, request_id: str) -> Iterator[None]:
+        """请求级 Assistant Trace Scope 的**唯一**建立点（C41.4 单源不变式）。
+
+        整个执行（Router / RAG / Tool / Text-to-SQL / Agent，含 LLM 调用）都必须在
+        同一个 scope 内，使 LLM Usage / Tool Execution 观测关联到本 request_id；
+        ``execute`` 与 ``resume_agent_run`` 共用本 helper ⇒ 模块内只有一处绑定。
+        """
+        with assistant_trace_scope(request_id):
+            yield
+
+    # ---------- AGENT Resume 路径（Phase 5 P-6） ----------
+
+    async def resume_agent_run(
+        self,
+        run_id: str,
+        *,
+        question: str,
+        context: str | None = None,
+    ) -> AIOrchestrationResult:
+        """Resume 一个**已存在**的 Agent Run（P-6；独立于 :meth:`execute`）。
+
+        契约：
+
+            * ``run_id`` **不变**（同一 Agent Run）；``request_id`` = **新**请求
+              correlation（§二十八）；Agent 层**不**查询 Conversation / 不重建历史
+              prompt（``question`` 由调用方作为本次输入提供；§三十一 / §三十二）；
+            * 终态 / Replay 路径 **不**调 LLM、**不**执行 Tool（§四十一）；
+            * fail-closed 结果（Decision / Tool Result 缺失、不可用、身份不一致、
+              并发冲突）⇒ ``AIOrchestratorExecutionError``（稳定码在 metadata）；
+            * 不新增 AgentRun / AgentStep / AgentToolResult（§三十八–§四十：
+              分别 best-effort 幂等投影 + 只读 Replay）；
+            * 终态 Checkpoint 仍由本层写（TERMINAL / COMPLETED|FAILED；§三十四）。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AIOrchestratorInputError("run_id 必须是非空 str")
+        if not isinstance(question, str) or not question.strip():
+            raise AIOrchestratorInputError("question 必须是非空 str")
+
+        capability = self._agent_runtime
+        if capability is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent 能力（AgentCapability 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+        resume = getattr(capability, "resume", None)
+        if not callable(resume):
+            raise AIOrchestratorCapabilityError(
+                "Agent 能力未提供 resume()（P-6 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        # Resume 是一次**新的** Runtime 请求（run_id 不变 / request_id 新建；
+        # 生成点与 execute 共用唯一 helper ⇒ 单源不变式不破）
+        request_id = self._issue_request_id()
+        started_at = datetime.now(timezone.utc)
+        monotonic_start = time.monotonic()
+        with self._request_trace_scope(request_id):
+            resume_result = await resume(
+                run_id=run_id,
+                question=question,
+                conversation_context=context,
+                request_id=request_id,
+            )
+        duration_ms = (time.monotonic() - monotonic_start) * 1000.0
+        finished_at = datetime.now(timezone.utc)
+
+        agent_result: AgentRuntimeResult = resume_result.agent_result
+
+        # 既有终态投影（best-effort；幂等：run_id 已存在则不产生第二行）
+        await self._record_agent_steps(agent_result)
+        await self._record_agent_run(
+            agent_result,
+            request_id=request_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_ms=duration_ms,
+        )
+        # 终态 Checkpoint（TERMINAL；经 state_version + claim_token 更新；§三十四）
+        await self._record_agent_terminal_checkpoint(agent_result)
+
+        if resume_result.status == AGENT_STATUS_FAILED:
+            raise AIOrchestratorExecutionError(
+                f"Agent Resume 失败: {resume_result.error_code or AGENT_ERROR_FAILED}"
+            )
+
+        outcome = _agent_assistant_outcome(
+            resume_result.status, resume_result.content
+        )
+        return AIOrchestrationResult(
+            route=RouteType.AGENT,
+            content=resume_result.content,
+            data=agent_result,
+            metadata={
+                "request_id": request_id,
+                "outcome": outcome,
+                "agent_status": resume_result.status,
+                "agent_error": resume_result.error_code,
+                "agent_steps": agent_result.steps,
+                "agent_tool_calls": agent_result.tool_calls,
+                "agent_llm_calls": agent_result.llm_calls,
+                "agent_tokens_used": agent_result.tokens_used,
+                "agent_token_budget_unverifiable": (
+                    agent_result.token_budget_unverifiable
+                ),
+                # Resume 专属（稳定 / 非敏感；不含 claim_token / payload）
+                "resume_run_id": resume_result.run_id,
+                "resume_replayed_step_index": resume_result.replayed_step_index,
+                "resume_llm_calls": resume_result.llm_calls,
+                "resume_tool_calls": resume_result.tool_calls,
+                "resume_error": resume_result.error_code,
             },
         )
 

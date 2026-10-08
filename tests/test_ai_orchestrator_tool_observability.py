@@ -865,7 +865,13 @@ class TestStaticBoundaries:
             ), forbidden
 
     def test_request_id_created_once_per_execute(self) -> None:
-        """``new_request_id()`` 只在 execute() 顶层调用一次（无循环 / 无 retry）。"""
+        """``new_request_id()`` 模块内只有**一个**生成点（无循环 / 无 retry）。
+
+        Phase 5 P-6 更新：Orchestrator 增加第二个请求入口 ``resume_agent_run``
+        （Resume = 新的 request correlation），生成点因此收敛到**唯一** helper
+        ``_issue_request_id``（execute / resume_agent_run 各调用一次）——
+        不变式保持：模块内只有一个 new_request_id 调用、且不在循环体内生成。
+        """
         with open(
             os.path.join(REPO_ROOT, *_ORCHESTRATOR_MODULE.split("/")),
             encoding="utf-8",
@@ -878,25 +884,38 @@ class TestStaticBoundaries:
             ) and node.func.id == "new_request_id":
                 callers.append(node.func.id)
         assert len(callers) == 1          # 唯一调用点
-        # 该调用位于 AIOrchestratorService.execute() 内（而非 _run_tool / 循环体）
+        # 该调用位于 AIOrchestratorService._issue_request_id()（唯一生成 helper；
+        # 两个入口点各调用它一次，绝不逐轮 / 逐 Tool 生成）
         service_cls = next(
             node
             for node in tree.body
             if isinstance(node, ast.ClassDef)
             and node.name == "AIOrchestratorService"
         )
-        execute_fn = next(
+        helper_fn = next(
             node
             for node in service_cls.body
-            if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "execute"
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_issue_request_id"
         )
         assert any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "new_request_id"
-            for node in ast.walk(execute_fn)
+            for node in ast.walk(helper_fn)
         )
+        for entry_name in ("execute", "resume_agent_run"):
+            entry_fn = next(
+                node
+                for node in service_cls.body
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == entry_name
+            )
+            assert any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_issue_request_id"
+                for node in ast.walk(entry_fn)
+            ), entry_name
 
     def test_context_construction_is_single_and_literal(self) -> None:
         """ToolExecutionContext 只在一处构造（round=1 / tool_call_id=None）。"""

@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from backend.app.agent.models import AgentRuntimeResult
+from backend.app.agent.resume import AgentResumeResult
 
 __all__ = ["AgentCapability"]
 
@@ -53,5 +54,28 @@ class AgentCapability(Protocol):
 
         Returns:
             :class:`AgentRuntimeResult`（内存结果；无持久化）。
+        """
+        ...
+
+    async def resume(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        conversation_context: str | None = None,
+        request_id: str | None = None,
+    ) -> "AgentResumeResult":
+        """Resume 一个**已存在**的 Agent Run（Phase 5 P-6；独立于 ``run()``）。
+
+        Args:
+            run_id:               既有 Agent Run 身份（**不变**；唯一业务身份）。
+            question:             本次请求的用户输入（调用方持有；Agent **不**
+                                  查询 Conversation / DB 重建历史 prompt）。
+            conversation_context: 会话上下文（untrusted reference；同 ``run``）。
+            request_id:           本次 resume 的请求 correlation（**新**值；
+                                  由 AIOrchestrator 生成）。
+
+        Returns:
+            :class:`AgentResumeResult`（含 Replay 证据与可供上层投影的 Runtime 结果）。
         """
         ...

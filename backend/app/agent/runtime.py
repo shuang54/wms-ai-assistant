@@ -50,6 +50,7 @@ Phase 5 P-4 Integration（Agent Run Scope + Tool Result 立即写入）：
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -71,7 +72,34 @@ from backend.app.agent.errors import (
     AgentPolicyError,
     AgentToolExecutionFailureError,
 )
+from backend.app.agent.checkpoint import (
+    CHECKPOINT_NEXT_ACTION_COMPLETED,
+    CHECKPOINT_NEXT_ACTION_LLM_DECISION,
+    CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION,
+    CHECKPOINT_STATUS_ACTIVE,
+    CHECKPOINT_STATUS_TERMINAL,
+)
+from backend.app.agent.decision_store import (
+    assert_decision_ref_matches,
+    decision_ref,
+)
+from backend.app.agent.errors import (
+    AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH,
+    AGENT_ERROR_CHECKPOINT_NOT_FOUND,
+    AGENT_ERROR_DECISION_NOT_FOUND,
+    AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+    AGENT_ERROR_DECISION_UNAVAILABLE,
+    AGENT_ERROR_FINAL_RESULT_UNAVAILABLE,
+    AGENT_ERROR_RESUME_CONFLICT,
+    AGENT_ERROR_TOOL_RESULT_NOT_FOUND,
+    AGENT_ERROR_TOOL_RESULT_UNAVAILABLE,
+)
 from backend.app.agent.ids import agent_run_scope, new_agent_run_id
+from backend.app.agent.resume import (
+    AgentResumeResult,
+    decision_mismatch_code,
+    resume_result_of_agent_result,
+)
 from backend.app.agent.models import (
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
@@ -95,8 +123,36 @@ __all__ = [
     "AgentRuntime",
     "AGENT_SYSTEM_INSTRUCTION",
     "AgentCheckpointSink",
+    "AgentDecisionStorePort",
     "ToolResultSink",
 ]
+
+
+@runtime_checkable
+class AgentDecisionStorePort(Protocol):
+    """LLM Decision 持久化端口（Phase 5 P-6；由 composition root 注入）。
+
+    与其它端口不同：Decision 缺失即无法安全恢复 ⇒ 本端口**fail-closed**
+    （写失败抛异常 / 返回 ``None`` ⇒ Runtime FAILED；**不**吞异常、**不**重试）：
+
+        record = await store.asave(run_id=…, step_index=…, decision=…, finish_reason=…)
+        store.get_by_ref(ref)      -> AgentDecisionRecord | None
+        store.get_latest(run_id)   -> AgentDecisionRecord | None
+
+    实现侧（Agent 包内的 Decision Store；由 composition root 装配）：
+    run_id 由调用方传入（Runtime 持有本次 Run 身份）；写发生在**任何** Tool
+    执行之前（§十三）。
+    """
+
+    async def asave(
+        self,
+        *,
+        run_id: str,
+        step_index: int,
+        decision: Any,
+        finish_reason: str | None = None,
+    ) -> Any:
+        ...
 
 
 @runtime_checkable
@@ -228,6 +284,9 @@ class AgentRuntime:
         clock: Callable[[], float] | None = None,
         tool_result_sink: Any | None = None,
         checkpoint_sink: Any | None = None,
+        checkpoint_store: Any | None = None,
+        decision_store: Any | None = None,
+        tool_result_store: Any | None = None,
     ) -> None:
         if not callable(getattr(llm, "complete", None)):
             raise AgentPolicyError(
@@ -278,6 +337,33 @@ class AgentRuntime:
             )
         self._checkpoint_sink = checkpoint_sink
 
+        # Phase 5 P-6：Resume 所需的**只读**端口（形状校验同其它可选依赖）。
+        if checkpoint_store is not None and not callable(
+            getattr(checkpoint_store, "get", None)
+        ):
+            raise AgentPolicyError(
+                "checkpoint_store 必须提供可调用的 get()"
+                f"（got {type(checkpoint_store).__name__}）"
+            )
+        self._checkpoint_store = checkpoint_store
+        if decision_store is not None and not (
+            callable(getattr(decision_store, "save", None))
+            or callable(getattr(decision_store, "asave", None))
+        ):
+            raise AgentPolicyError(
+                "decision_store 必须提供可调用的 save() 或 asave()"
+                f"（got {type(decision_store).__name__}）"
+            )
+        self._decision_store = decision_store
+        if tool_result_store is not None and not callable(
+            getattr(tool_result_store, "get", None)
+        ):
+            raise AgentPolicyError(
+                "tool_result_store 必须提供可调用的 get()"
+                f"（got {type(tool_result_store).__name__}）"
+            )
+        self._tool_result_store = tool_result_store
+
         self._llm = llm
         self._tool_execution = tool_execution
         self._policy = policy
@@ -312,6 +398,21 @@ class AgentRuntime:
     def checkpoint_sink(self) -> Any | None:
         """Checkpoint 写入端口（None = 未接线；写入失败不影响控制流）。"""
         return self._checkpoint_sink
+
+    @property
+    def checkpoint_store(self) -> Any | None:
+        """Checkpoint 只读端口（Resume 专用；None = Resume 不可用）。"""
+        return self._checkpoint_store
+
+    @property
+    def decision_store(self) -> Any | None:
+        """Decision 端口（None = 未接线 ⇒ 不持久化 Decision；P-6 之前行为）。"""
+        return self._decision_store
+
+    @property
+    def tool_result_store(self) -> Any | None:
+        """Tool Result 只读端口（Resume 专用；None = Resume 不可用）。"""
+        return self._tool_result_store
 
     # ---------- 装配期校验 ----------
 
@@ -411,15 +512,21 @@ class AgentRuntime:
         question: str,
         conversation_context: str | None,
         request_id: str | None,
+        step_base: int = 0,
+        resumed_messages: Sequence[dict[str, Any]] = (),
     ) -> AgentRuntimeResult:
         """既有主循环（决策 / 授权 / 执行 / 回灌 / 预算**逐行不变**）。
 
-        与 P-4 之前唯一差异 = 增加两处 Tool Result **立即写入**调用点
-        （``self._record_tool_result(...)``）；必须由 :meth:`run` 在
-        Agent Run Scope 内调用（run_id 由 run() 签发并绑定）。
+        * ``run()``：``step_base=0`` / 无 resume 前缀（行为与之前完全一致）；
+        * ``resume()``：``step_base`` = 待继续的 step（历史逻辑步数；
+          **不**伪造历史 Step）、``resumed_messages`` = Replay 出来的
+          ``assistant.tool_calls`` + ``role=tool`` 前缀（来自 Decision Store /
+          Tool Result Store 的**历史事实**，不重新问 LLM、不重跑 Tool）。
         """
         start = self._clock()
         messages = self._initial_messages(question, conversation_context)
+        if resumed_messages:
+            messages.extend(dict(message) for message in resumed_messages)
 
         def build_result(**kwargs: Any) -> AgentRuntimeResult:
             """绑定本次 run_id 的结果构造器（避免每处重复传参 / 避免共享可变状态）。"""
@@ -428,7 +535,9 @@ class AgentRuntime:
         # 已授权 Tool 的 Definition（仅 schema 暴露；授权判断仍在本 Runtime）
         tool_definitions = self._allowed_tool_definitions()
         records: list[AgentStep] = []
-        steps = 0
+        # P-6：resume 时 ``steps`` 从 ``step_base`` 起算（预算仍约束**整个 Run**；
+        # ``llm_calls`` / ``tool_calls`` 只统计**本次**执行的真实调用 ⇒ §四十一）。
+        steps = step_base
         tool_calls = 0
         llm_calls = 0
         tokens_used = 0
@@ -517,10 +626,60 @@ class AgentRuntime:
             decision = completion.decision
             steps += 1
 
+            # Phase 5 P-6：本步 index（0-based；含 resume 偏移）—— Decision 与
+            # Tool 执行共享同一 step identity（§二十六）。
+            step_index = step_base + len(records)
+
+            # Phase 5 P-6 §十三 / §十四：**先持久化 Decision，再执行**；
+            # 写失败 ⇒ fail closed（不执行 Tool、不再调 LLM、不重试）。
+            if self._decision_store is not None:
+                decision_ref_value = await self._persist_decision(
+                    run_id=run_id,
+                    step_index=step_index,
+                    decision=decision,
+                    finish_reason=completion.finish_reason,
+                )
+                if decision_ref_value is None:
+                    records.append(
+                        AgentStep(
+                            step_index=step_index,
+                            type=(
+                                AGENT_STEP_FINAL
+                                if decision.type == DECISION_FINAL
+                                else AGENT_STEP_TOOL_CALL
+                            ),
+                            status=AGENT_STEP_STATUS_FAILED,
+                            tool_name=decision.tool_name,
+                            error=AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+                            elapsed_ms=_elapsed_ms(self._clock, start),
+                        )
+                    )
+                    return build_result(
+                        status=AGENT_STATUS_FAILED,
+                        content=None,
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        llm_calls=llm_calls,
+                        error=AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+                        tokens_used=tokens_used,
+                        token_budget_unverifiable=token_budget_unverifiable,
+                        records=records,
+                    )
+            else:
+                decision_ref_value = None
+
             if decision.type == DECISION_FINAL:
+                # P-6：终态 Decision 也落 Checkpoint（§四十六 崩溃窗口：
+                # Decision + Checkpoint 已 durable、Run 未终态 ⇒ Resume 可 Replay）
+                if decision_ref_value is not None:
+                    await self._record_decision_checkpoint(
+                        step_index=step_index,
+                        decision_ref=decision_ref_value,
+                        next_action=CHECKPOINT_NEXT_ACTION_COMPLETED,
+                    )
                 records.append(
                     AgentStep(
-                        step_index=len(records),
+                        step_index=step_index,
                         type=AGENT_STEP_FINAL,
                         status=AGENT_STEP_STATUS_OK,
                         output={"content": decision.content},
@@ -560,7 +719,7 @@ class AgentRuntime:
             if not isinstance(tool_call_id, str) or not tool_call_id.strip():
                 records.append(
                     AgentStep(
-                        step_index=len(records),
+                        step_index=step_index,
                         type=AGENT_STEP_TOOL_CALL,
                         status=AGENT_STEP_STATUS_FAILED,
                         tool_name=tool_name,
@@ -585,7 +744,7 @@ class AgentRuntime:
             if tool_name not in self._allowed_tools:
                 records.append(
                     AgentStep(
-                        step_index=len(records),
+                        step_index=step_index,
                         type=AGENT_STEP_TOOL_CALL,
                         status=AGENT_STEP_STATUS_FAILED,
                         tool_name=tool_name,
@@ -606,12 +765,22 @@ class AgentRuntime:
                     records=records,
                 )
 
+            # Phase 5 P-6：Decision 已 durable + Runtime 授权通过 ⇒ 先落控制状态
+            # （ACTIVE / next_action=TOOL_EXECUTION + pending_decision_ref），
+            # **再**执行 Tool（§十三：Tool 执行前 Decision 必须已持久化）。
+            if decision_ref_value is not None:
+                await self._record_decision_checkpoint(
+                    step_index=step_index,
+                    decision_ref=decision_ref_value,
+                    next_action=CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION,
+                    tool_call_id=tool_call_id,
+                )
+
             # ---- 执行（唯一通道：ToolExecutionService；第二道 capability 校验） ----
             # Phase 5 S-1：构造 Execution Context，复用既有 ToolExecutionRecord
             # 观测链路（Runtime 只传 correlation；不持久化、不接触 DB）。
             # Phase 5 P-4 Integration：本步 index = 本次 Tool 执行的 execution identity
             # （step 身份；``round = step_index + 1`` 仍只用于 ToolExecutionContext）。
-            step_index = len(records)
             execution_context = self._tool_execution_context(
                 request_id=request_id,
                 step_index=step_index,
@@ -644,7 +813,7 @@ class AgentRuntime:
                 )
                 records.append(
                     AgentStep(
-                        step_index=len(records),
+                        step_index=step_index,
                         type=AGENT_STEP_TOOL_CALL,
                         status=AGENT_STEP_STATUS_FAILED,
                         tool_name=tool_name,
@@ -704,7 +873,7 @@ class AgentRuntime:
             if payload is None:
                 records.append(
                     AgentStep(
-                        step_index=len(records),
+                        step_index=step_index,
                         type=AGENT_STEP_TOOL_CALL,
                         status=AGENT_STEP_STATUS_FAILED,
                         tool_name=tool_name,
@@ -728,7 +897,7 @@ class AgentRuntime:
             tool_calls += 1
             records.append(
                 AgentStep(
-                    step_index=len(records),
+                    step_index=step_index,
                     type=AGENT_STEP_TOOL_CALL,
                     status=AGENT_STEP_STATUS_OK,
                     tool_name=tool_name,
@@ -939,6 +1108,480 @@ class AgentRuntime:
                 },
             )
         return None
+
+    # ---------- Phase 5 P-6：Decision 持久化（fail-closed） ----------
+
+    async def _persist_decision(
+        self,
+        *,
+        run_id: str,
+        step_index: int,
+        decision: Any,
+        finish_reason: str | None,
+    ) -> str | None:
+        """Decision → Decision Store（**fail-closed**；返回 ``decision_ref`` 或 ``None``）。
+
+        与其它 best-effort 端口不同：写失败 ⇒ 调用方必须让 Run **FAILED**
+        （``DECISION_PERSISTENCE_FAILURE``），**不**执行 Tool、**不**再调 LLM（§十四）。
+        """
+        store = self._decision_store
+        if store is None:
+            return None
+        try:
+            asave = getattr(store, "asave", None)
+            if callable(asave):
+                record = await asave(
+                    run_id=run_id,
+                    step_index=step_index,
+                    decision=decision,
+                    finish_reason=finish_reason,
+                )
+            else:
+                record = await asyncio.to_thread(
+                    store.save,
+                    run_id=run_id,
+                    step_index=step_index,
+                    decision=decision,
+                    finish_reason=finish_reason,
+                )
+        except Exception as exc:  # noqa: BLE001 —— fail-closed（不吞）
+            logger.warning(
+                "Decision 持久化失败（fail-closed；不执行 Tool）: %s",
+                type(exc).__name__,
+                extra={
+                    "error_type": type(exc).__name__,
+                    "run_id": run_id,
+                    "step_index": step_index,
+                },
+            )
+            return None
+        ref = getattr(record, "decision_ref", None)
+        if not isinstance(ref, str) or not ref.strip():
+            return None
+        try:
+            assert_decision_ref_matches(ref, run_id=run_id, step_index=step_index)
+        except ValueError:
+            logger.warning(
+                "Decision Store 返回的 decision_ref 与执行身份不一致（fail-closed）",
+                extra={"run_id": run_id, "step_index": step_index},
+            )
+            return None
+        return ref
+
+    async def _record_decision_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        next_action: str,
+        tool_call_id: str | None = None,
+    ) -> Any | None:
+        """Decision 已 durable → Checkpoint 控制状态（best-effort；不改变控制流）。
+
+        写失败**不**回滚 Decision，也**不**阻止执行（Resume 会因缺少
+        Checkpoint / ref 而 fail-closed）；仅记录 warning。
+        """
+        sink = self._checkpoint_sink
+        if sink is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "step_index": step_index,
+            "decision_ref": decision_ref,
+            "next_action": next_action,
+            "tool_call_id": tool_call_id,
+        }
+        try:
+            arecord = getattr(sink, "arecord_decision_checkpoint", None)
+            if callable(arecord):
+                return await arecord(**kwargs)
+            record = getattr(sink, "record_decision_checkpoint", None)
+            if callable(record):
+                return record(**kwargs)
+        except Exception as exc:  # noqa: BLE001 —— best-effort 边界
+            logger.warning(
+                "Decision Checkpoint 写入失败（best-effort；不影响 Agent 结果）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "step_index": step_index},
+            )
+        return None
+
+    # ---------- Phase 5 P-6：Resume / Replay ----------
+
+    async def resume(
+        self,
+        *,
+        run_id: str,
+        question: str | None = None,
+        conversation_context: str | None = None,
+        request_id: str | None = None,
+    ) -> AgentResumeResult:
+        """Resume 一个**已存在**的 Agent Run（Phase 5 P-6；独立于 :meth:`run`）。
+
+        契约（§十六–§三十七）：
+
+            * ``run_id`` **不变**（同一 Agent Run）；``request_id`` 由调用方新建
+              （本次 resume 请求的 correlation）；
+            * ``TERMINAL`` checkpoint ⇒ 直接返回历史终态（``LLM = 0`` / ``Tool = 0``；
+              最终内容只能从 Decision Store 安全恢复，否则
+              ``AGENT_FINAL_RESULT_UNAVAILABLE``）；
+            * ``ACTIVE`` + ``pending_decision_ref`` ⇒ **Decision Replay**（**不**重新
+              调用 LLM）→ ``FINAL`` 直接返回；``TOOL_CALL`` ⇒ **Tool Result Replay**
+              （**不**重跑 handler）→ 继续下一次 LLM；
+            * ``ACTIVE`` + 无 ref ⇒ 下一步 = 新的 LLM Decision（该决策从未发生）；
+            * 任何不确定（Checkpoint / Decision / Tool Result 缺失、身份不一致、
+              不可用、并发冲突）⇒ **fail closed**（``status=FAILED`` + 稳定码）；
+            * 需要继续执行时必须提供 ``question``（调用方持有的**新请求输入**；
+              Agent **不**查询 Conversation / DB 还原历史 prompt；§三十一 / §三十二）。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        if (
+            self._checkpoint_store is None
+            or self._decision_store is None
+            or self._tool_result_store is None
+        ):
+            raise AgentPolicyError(
+                "resume 需要 checkpoint_store / decision_store / tool_result_store "
+                "全部接线（未接线 ⇒ 不允许 Resume）"
+            )
+
+        checkpoint = await self._load_checkpoint(run_id)
+        if checkpoint is None:
+            return self._failed_resume(run_id, AGENT_ERROR_CHECKPOINT_NOT_FOUND)
+
+        if getattr(checkpoint, "status", None) == CHECKPOINT_STATUS_TERMINAL:
+            return await self._terminal_resume(run_id, checkpoint)
+
+        pending_ref = getattr(checkpoint, "pending_decision_ref", None)
+        if pending_ref is None:
+            # 没有待 Replay 的 Decision：下一步只能是新的 LLM Decision
+            if getattr(checkpoint, "next_action", None) != (
+                CHECKPOINT_NEXT_ACTION_LLM_DECISION
+            ):
+                return self._failed_resume(
+                    run_id, AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH
+                )
+            claim_error = await self._claim_for_resume(run_id, checkpoint)
+            if claim_error is not None:
+                return self._failed_resume(run_id, claim_error)
+            step_base = getattr(checkpoint, "pending_step_index", None) or 0
+            return await self._continue_run(
+                run_id=run_id,
+                question=question,
+                conversation_context=conversation_context,
+                request_id=request_id,
+                step_base=step_base,
+                resumed_messages=(),
+                replayed_step_index=None,
+            )
+
+        decision = await self._load_decision(pending_ref)
+        if decision is None:
+            return self._failed_resume(run_id, AGENT_ERROR_DECISION_NOT_FOUND)
+        mismatch = decision_mismatch_code(decision, checkpoint)
+        if mismatch is not None:
+            return self._failed_resume(run_id, mismatch)
+        if bool(getattr(decision, "decision_unavailable", False)):
+            return self._failed_resume(run_id, AGENT_ERROR_DECISION_UNAVAILABLE)
+
+        step_index = int(getattr(decision, "step_index"))
+        claim_error = await self._claim_for_resume(run_id, checkpoint)
+        if claim_error is not None:
+            return self._failed_resume(run_id, claim_error)
+
+        if getattr(decision, "decision_type", None) == DECISION_FINAL:
+            # Decision Replay（FINAL）：不调用 LLM、不执行 Tool（§十九）
+            return AgentResumeResult(
+                run_id=run_id,
+                status=AGENT_STATUS_COMPLETED,
+                content=getattr(decision, "content", None),
+                error_code=None,
+                replayed_step_index=step_index,
+                llm_calls=0,
+                tool_calls=0,
+                steps=step_index + 1,
+                agent_result=self._replay_only_result(
+                    run_id=run_id,
+                    status=AGENT_STATUS_COMPLETED,
+                    content=getattr(decision, "content", None),
+                    error=None,
+                    steps=step_index + 1,
+                ),
+            )
+
+        tool_row = await self._load_tool_result(run_id, step_index)
+        if tool_row is None or getattr(tool_row, "tool_name", None) != getattr(
+            decision, "tool_name", None
+        ):
+            return self._failed_resume(run_id, AGENT_ERROR_TOOL_RESULT_NOT_FOUND)
+        if bool(getattr(tool_row, "result_unavailable", False)):
+            # payload 不可 Replay（超限 / 敏感 / 未持久化）⇒ **不**重跑 Tool（§五十六）
+            return self._failed_resume(run_id, AGENT_ERROR_TOOL_RESULT_UNAVAILABLE)
+        if not bool(getattr(tool_row, "success", False)):
+            # Replay failure（§二十二）：本阶段**不**自动重试 Tool
+            return AgentResumeResult(
+                run_id=run_id,
+                status=AGENT_STATUS_FAILED,
+                content=None,
+                error_code=AGENT_ERROR_TOOL_EXECUTION_FAILURE,
+                replayed_step_index=step_index,
+                llm_calls=0,
+                tool_calls=0,
+                steps=step_index + 1,
+                agent_result=self._replay_only_result(
+                    run_id=run_id,
+                    status=AGENT_STATUS_FAILED,
+                    content=None,
+                    error=AGENT_ERROR_TOOL_EXECUTION_FAILURE,
+                    steps=step_index + 1,
+                ),
+            )
+
+        return await self._continue_run(
+            run_id=run_id,
+            question=question,
+            conversation_context=conversation_context,
+            request_id=request_id,
+            step_base=step_index + 1,
+            resumed_messages=tuple(
+                self._replay_messages(decision=decision, tool_row=tool_row)
+            ),
+            replayed_step_index=step_index,
+        )
+
+    # ---- Resume 内部实现 ----
+
+    async def _load_checkpoint(self, run_id: str) -> Any | None:
+        """读取 current checkpoint（读失败 ⇒ ``None`` ⇒ fail-closed）。"""
+        try:
+            return await asyncio.to_thread(self._checkpoint_store.get, run_id)
+        except Exception as exc:  # noqa: BLE001 —— fail-closed
+            logger.warning(
+                "Checkpoint 读取失败（fail-closed）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+            return None
+
+    async def _load_decision(self, ref: str) -> Any | None:
+        """按 ``decision_ref`` 读取 Decision（读失败 ⇒ ``None`` ⇒ fail-closed）。"""
+        try:
+            return await asyncio.to_thread(self._decision_store.get_by_ref, ref)
+        except Exception as exc:  # noqa: BLE001 —— fail-closed
+            logger.warning(
+                "Decision 读取失败（fail-closed）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__},
+            )
+            return None
+
+    async def _load_latest_decision(self, run_id: str) -> Any | None:
+        """读取该 Run 最后一条 Decision（仅终态内容恢复；失败 ⇒ ``None``）。"""
+        try:
+            return await asyncio.to_thread(self._decision_store.get_latest, run_id)
+        except Exception:  # noqa: BLE001 —— 内容恢复失败 ⇒ UNAVAILABLE（不重问 LLM）
+            return None
+
+    async def _load_tool_result(self, run_id: str, step_index: int) -> Any | None:
+        """按 **执行身份 (run_id, step_index)** 读取 Tool Result（§二十四）。"""
+        try:
+            return await asyncio.to_thread(
+                self._tool_result_store.get, run_id, step_index
+            )
+        except Exception as exc:  # noqa: BLE001 —— fail-closed
+            logger.warning(
+                "Tool Result 读取失败（fail-closed）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+            return None
+
+    async def _claim_for_resume(self, run_id: str, checkpoint: Any) -> str | None:
+        """乐观并发声明（§三十五）：成功 ⇒ ``None``；失败 ⇒ 稳定错误码。"""
+        sink = self._checkpoint_sink
+        if sink is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "run_id": run_id,
+            "expected_state_version": getattr(checkpoint, "state_version", None),
+            "claim_token": getattr(checkpoint, "claim_token", None),
+        }
+        try:
+            aclaim = getattr(sink, "aclaim_for_resume", None)
+            if callable(aclaim):
+                await aclaim(**kwargs)
+                return None
+            claim = getattr(sink, "claim_for_resume", None)
+            if callable(claim):
+                await asyncio.to_thread(claim, **kwargs)
+                return None
+        except Exception as exc:  # noqa: BLE001 —— 并发冲突 / 声明失败 ⇒ fail-closed
+            logger.warning(
+                "Resume claim 失败（fail-closed）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+            return AGENT_ERROR_RESUME_CONFLICT
+        return None
+
+    async def _terminal_resume(
+        self, run_id: str, checkpoint: Any
+    ) -> AgentResumeResult:
+        """终态 Resume（§十九 / §三十六 / §三十七）：**不**调 LLM、**不**执行 Tool。"""
+        next_action = getattr(checkpoint, "next_action", None)
+        completed = next_action == CHECKPOINT_NEXT_ACTION_COMPLETED
+        status = AGENT_STATUS_COMPLETED if completed else AGENT_STATUS_FAILED
+        content: str | None = None
+        error_code: str | None = None
+        steps = 0
+        if completed:
+            latest = await self._load_latest_decision(run_id)
+            if (
+                latest is not None
+                and getattr(latest, "decision_type", None) == DECISION_FINAL
+                and not bool(getattr(latest, "decision_unavailable", False))
+                and isinstance(getattr(latest, "content", None), str)
+            ):
+                content = latest.content
+                steps = int(getattr(latest, "step_index", 0)) + 1
+            else:
+                # 终态已知，但最终内容不可安全恢复 ⇒ 明确返回（**不**重新调 LLM）
+                error_code = AGENT_ERROR_FINAL_RESULT_UNAVAILABLE
+        return AgentResumeResult(
+            run_id=run_id,
+            status=status,
+            content=content,
+            error_code=error_code,
+            replayed_step_index=None,
+            llm_calls=0,
+            tool_calls=0,
+            steps=steps,
+            agent_result=self._replay_only_result(
+                run_id=run_id,
+                status=status,
+                content=content,
+                error=error_code,
+                steps=steps,
+            ),
+        )
+
+    async def _continue_run(
+        self,
+        *,
+        run_id: str,
+        question: str | None,
+        conversation_context: str | None,
+        request_id: str | None,
+        step_base: int,
+        resumed_messages: tuple[dict[str, Any], ...],
+        replayed_step_index: int | None,
+    ) -> AgentResumeResult:
+        """在 Agent Run Scope 内继续既有循环（历史 Step 不重放为"假 Step"；§三十八）。"""
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError(
+                "resume 继续执行需要 question（调用方持有的本次请求输入；"
+                "Agent 不查询 Conversation / DB 还原历史 prompt）"
+            )
+        with agent_run_scope(run_id):
+            agent_result = await self._run_scoped(
+                run_id=run_id,
+                question=question,
+                conversation_context=conversation_context,
+                request_id=request_id,
+                step_base=step_base,
+                resumed_messages=resumed_messages,
+            )
+        return resume_result_of_agent_result(
+            run_id=run_id,
+            agent_result=agent_result,
+            replayed_step_index=replayed_step_index,
+        )
+
+    def _replay_messages(
+        self, *, decision: Any, tool_row: Any
+    ) -> list[dict[str, Any]]:
+        """Replay 的协议前缀：``assistant.tool_calls`` + ``role=tool``（UNTRUSTED DATA）。
+
+        * ``tool_call_id`` = Decision 记录的 Provider 原值（不生成）；
+        * Tool Result 内容从 P-4 结果体重建并**保留** ``【TOOL RESULT — UNTRUSTED DATA】``
+          标记（信任等级不变）。
+        """
+        tool_name = getattr(decision, "tool_name", None)
+        tool_call_id = getattr(decision, "tool_call_id", None)
+        arguments = dict(getattr(decision, "arguments", None) or {})
+        payload = getattr(tool_row, "result_payload", None)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        body = _serialize_tool_data({"tool_name": tool_name, "data": data})
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": _serialize_tool_data(arguments),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": f"{TOOL_RESULT_MARKER}\n{body}",
+            },
+        ]
+
+    def _failed_resume(self, run_id: str, error_code: str) -> AgentResumeResult:
+        """Fail-closed Resume 结果（**不**调 LLM、**不**执行 Tool；§十七 / §十八 / §二十三）。"""
+        logger.info(
+            "Resume fail-closed: %s", error_code, extra={"run_id": run_id}
+        )
+        return AgentResumeResult(
+            run_id=run_id,
+            status=AGENT_STATUS_FAILED,
+            content=None,
+            error_code=error_code,
+            replayed_step_index=None,
+            llm_calls=0,
+            tool_calls=0,
+            steps=0,
+            agent_result=self._replay_only_result(
+                run_id=run_id,
+                status=AGENT_STATUS_FAILED,
+                content=None,
+                error=error_code,
+                steps=0,
+            ),
+        )
+
+    def _replay_only_result(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        content: str | None,
+        error: str | None,
+        steps: int,
+    ) -> AgentRuntimeResult:
+        """纯 Replay 路径的合成 Runtime 结果（供上层写 Step / Run / 终态 checkpoint）。
+
+        注意：**不**伪造 Step / Tool Result / AgentRun（``step_records=()``）。
+        """
+        return type(self)._build_result(
+            run_id=run_id,
+            status=status,
+            content=content,
+            steps=steps,
+            tool_calls=0,
+            llm_calls=0,
+            error=error,
+            tokens_used=0,
+            token_budget_unverifiable=True,
+            records=(),
+        )
 
     def _allowed_tool_definitions(self) -> tuple[Any, ...]:
         """已授权 Tool 的 ``ToolDefinition``（仅用于 schema 暴露）。

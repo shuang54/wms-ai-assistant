@@ -53,6 +53,10 @@ from backend.app.agent.errors import (
     AGENT_ERROR_TOOL_EXECUTION_FAILURE,
 )
 from backend.app.agent.ids import current_agent_run_id
+from backend.app.agent.sensitive import (
+    SENSITIVE_RESULT_MARKERS as SENSITIVE_RESULT_MARKERS_SHARED,
+    contains_sensitive_marker,
+)
 from backend.app.agent.models import (
     AGENT_STATUS_LIMIT_REACHED,
     AgentRuntimeResult,
@@ -78,6 +82,8 @@ __all__ = [
     "AgentToolResultWritePoint",
     "build_agent_tool_result_write_point",
     "build_agent_checkpoint_recorder",
+    "build_agent_decision_store",
+    "build_agent_tool_result_reader",
     "SENSITIVE_RESULT_MARKERS",
 ]
 
@@ -499,24 +505,8 @@ def _record_kwargs(record: AgentRunRecord) -> dict[str, Any]:
 
 #: 敏感标记（**最小** deny-list；§19/§20：不是 DLP、不做脱敏、不改写内容）。
 #: 命中 ⇒ 该结果**完全不落盘**（payload 与 hash 都不写）。
-SENSITIVE_RESULT_MARKERS: Final[tuple[str, ...]] = (
-    "api_key",
-    "apikey",
-    "api-key",
-    "authorization",
-    "bearer ",
-    "password",
-    "passwd",
-    "secret",
-    "credential",
-    "database_url",
-    "db_url",
-    "postgres://",
-    "postgresql://",
-    "mysql://",
-    "mongodb://",
-    "sk-",
-)
+#: 权威定义在 ``backend.app.agent.sensitive``（P-6 起与 Decision arguments 共享）。
+SENSITIVE_RESULT_MARKERS: Final[tuple[str, ...]] = SENSITIVE_RESULT_MARKERS_SHARED
 
 
 @dataclass(frozen=True)
@@ -584,9 +574,8 @@ def _canonical_json(value: Any) -> str:
 
 
 def _contains_sensitive_marker(text: str) -> bool:
-    """最小凭证 deny-list 命中判定（大小写不敏感；**不**记录命中的标记）。"""
-    lowered = text.lower()
-    return any(marker in lowered for marker in SENSITIVE_RESULT_MARKERS)
+    """最小凭证 deny-list 命中判定（大小写不敏感；委托 ``agent.sensitive``）。"""
+    return contains_sensitive_marker(text)
 
 
 def _stable_tool_error_code(value: object) -> str:
@@ -1016,3 +1005,51 @@ def build_agent_tool_result_write_point() -> AgentToolResultWritePoint | None:
         )
         return None
     return AgentToolResultWritePoint()
+
+
+def build_agent_decision_store() -> Any | None:
+    """生产装配（composition root）：Agent Decision Store（Phase 5 P-6）。
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置
+            → ``None``：不注入 Decision Store ⇒ Runtime 不持久化 Decision
+              （P-6 之前的行为；写入点整体跳过）
+        否则 → ``AgentDecisionStore``（写入 ``ai_ops.agent_decision``）
+
+    Note:
+        * 本函数位于**持久化边界**（本模块）：Repository 解析在此完成，
+          域层 ``backend.app.agent.decision_store`` 保持 0 DB import；
+        * Decision 写入是 **fail-closed**（写失败 ⇒ Runtime FAILED）。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent decision store disabled"
+            "（DATABASE_URL 未配置；不创建 agent decision store）"
+        )
+        return None
+    from backend.app.agent.decision_store import AgentDecisionStore
+    from backend.app.db.agent_decision_repository import AgentDecisionRepository
+
+    return AgentDecisionStore(AgentDecisionRepository())
+
+
+def build_agent_tool_result_reader() -> Any | None:
+    """生产装配（composition root）：Tool Result **只读**端口（P-6 Resume 专用）。
+
+        ``get_engine() is None`` → ``None``（不接线；Resume 不可用）
+        否则 → ``AgentToolResultRepository``（唯一只读方法 = ``get``）
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent tool result reader disabled"
+            "（DATABASE_URL 未配置；Resume 不可用）"
+        )
+        return None
+    from backend.app.db.agent_tool_result_repository import (
+        AgentToolResultRepository,
+    )
+
+    return AgentToolResultRepository()
