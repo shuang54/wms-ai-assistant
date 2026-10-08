@@ -51,6 +51,7 @@ from typing import Any, Final, Protocol
 
 from backend.app.agent.ids import current_agent_run_id
 from backend.app.agent.models import (
+    AGENT_STATUS_CANCELLED,
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
     AGENT_STATUS_LIMIT_REACHED,
@@ -78,6 +79,7 @@ __all__ = [
     "CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL",
     "CHECKPOINT_NEXT_ACTION_COMPLETED",
     "CHECKPOINT_NEXT_ACTION_FAILED",
+    "CHECKPOINT_NEXT_ACTION_CANCELLED",
     "CHECKPOINT_NEXT_ACTIONS",
     "CHECKPOINT_RUN_ID_MAX_LENGTH",
     "CHECKPOINT_CLAIM_TOKEN_MAX_LENGTH",
@@ -102,15 +104,19 @@ CHECKPOINT_STATUSES: Final[frozenset[str]] = frozenset(
     }
 )
 
-#: ``next_action``（§十九）：NONE / LLM_DECISION / TOOL_EXECUTION /
-#: WAITING_APPROVAL（预留）/ COMPLETED / FAILED。
-#: **禁止**新增 APPROVED / REJECTED / CANCELLED / LIMIT_REACHED（§十九 / §三十六）。
+#: ``next_action``（§十九；P-7 §三十五 最小扩展）：
+#: NONE / LLM_DECISION / TOOL_EXECUTION / WAITING_APPROVAL / COMPLETED /
+#: FAILED / **CANCELLED**。
+#: **禁止**新增 APPROVED / REJECTED / LIMIT_REACHED（HITL 裁决不写 Checkpoint；
+#: LIMIT_REACHED 归入 FAILED；§十九 / §三十六 —— CANCELLED 由 P-7 §三十五 明确要求，
+#: 不得用 FAILED 冒充取消）。
 CHECKPOINT_NEXT_ACTION_NONE: Final[str] = "NONE"
 CHECKPOINT_NEXT_ACTION_LLM_DECISION: Final[str] = "LLM_DECISION"
 CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION: Final[str] = "TOOL_EXECUTION"
 CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL: Final[str] = "WAITING_APPROVAL"
 CHECKPOINT_NEXT_ACTION_COMPLETED: Final[str] = "COMPLETED"
 CHECKPOINT_NEXT_ACTION_FAILED: Final[str] = "FAILED"
+CHECKPOINT_NEXT_ACTION_CANCELLED: Final[str] = "CANCELLED"
 
 CHECKPOINT_NEXT_ACTIONS: Final[frozenset[str]] = frozenset(
     {
@@ -120,6 +126,7 @@ CHECKPOINT_NEXT_ACTIONS: Final[frozenset[str]] = frozenset(
         CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
         CHECKPOINT_NEXT_ACTION_COMPLETED,
         CHECKPOINT_NEXT_ACTION_FAILED,
+        CHECKPOINT_NEXT_ACTION_CANCELLED,
     }
 )
 
@@ -217,11 +224,12 @@ def checkpoint_terminal_state_of(agent_status: str) -> tuple[str, str] | None:
         COMPLETED      → TERMINAL / COMPLETED
         FAILED         → TERMINAL / FAILED
         LIMIT_REACHED  → TERMINAL / FAILED（**不**新增 LIMIT_REACHED 作为 next_action）
+        CANCELLED      → TERMINAL / CANCELLED（P-7 §三十五；**不**用 FAILED 冒充取消）
 
     Returns:
-        ``(status, next_action)``；预留且本阶段不可达的状态
-        （``WAITING_APPROVAL`` / ``CANCELLED``）→ ``None``（不猜、不产生 checkpoint；
-        HITL / 取消属后续阶段：§三十七）。
+        ``(status, next_action)``；``WAITING_APPROVAL`` → ``None``
+        （**暂停不是终态**：Run 尚未有终态记录，Checkpoint 为 PAUSED /
+        WAITING_APPROVAL —— 由 :meth:`record_waiting_approval_checkpoint` 写入）。
 
     Note:
         本函数**不修改** AgentRun 语义（AgentRun 仍是最终 execution record）。
@@ -230,6 +238,8 @@ def checkpoint_terminal_state_of(agent_status: str) -> tuple[str, str] | None:
         return (CHECKPOINT_STATUS_TERMINAL, CHECKPOINT_NEXT_ACTION_COMPLETED)
     if agent_status in (AGENT_STATUS_FAILED, AGENT_STATUS_LIMIT_REACHED):
         return (CHECKPOINT_STATUS_TERMINAL, CHECKPOINT_NEXT_ACTION_FAILED)
+    if agent_status == AGENT_STATUS_CANCELLED:
+        return (CHECKPOINT_STATUS_TERMINAL, CHECKPOINT_NEXT_ACTION_CANCELLED)
     return None
 
 
@@ -252,6 +262,9 @@ class AgentCheckpoint:
     pending_tool_result_ref: str | None
     created_at: datetime
     updated_at: datetime
+    # ---- Phase 5 P-7：协作式取消信号（**信号**，不是 status 枚举成员；§二十八）----
+    cancel_requested: bool = False
+    cancel_requested_at: datetime | None = None
 
 
 class AgentCheckpointStoreError(Exception):
@@ -299,8 +312,45 @@ class AgentCheckpointRecorder(Protocol):
         """异步入口。"""
         ...
 
+    def record_waiting_approval_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """HITL 暂停写点（Phase 5 P-7）：PAUSED / WAITING_APPROVAL（§十四）。
+
+        字段契约（已冻结）：``pending_step_index = step_index`` ·
+        ``pending_decision_ref = decision_ref`` · ``pending_tool_call_id = tool_call_id`` ·
+        ``pending_tool_result_ref = NULL``（Tool **尚未执行**）。
+        """
+        ...
+
+    async def arecord_waiting_approval_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """异步入口。"""
+        ...
+
     def get(self, run_id: str) -> AgentCheckpoint | None:
         """读取 current checkpoint（Resume 专用；**读失败抛异常**）。"""
+        ...
+
+    def request_cancel(self, run_id: str) -> AgentCheckpoint:
+        """协作式取消信号 CAS（Phase 5 P-7；**fail-closed**，与 get / claim 同类）。
+
+        ``UPDATE … WHERE run_id = ? AND cancel_requested = false AND status != TERMINAL
+          SET cancel_requested = true, cancel_requested_at = now(),
+              state_version = state_version + 1``
+
+        与所有控制状态转换共用 ``state_version`` 域（HITL / Resume / 终态写入
+        天然互斥；§三十六 / §五十四）。
+        """
         ...
 
     def claim_for_resume(
@@ -486,6 +536,61 @@ class BestEffortAgentCheckpointRecorder:
             self._log_failure(exc, run_id=current_agent_run_id())
             return None
 
+    def record_waiting_approval_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """HITL 暂停写点（P-7；同步入口；永不抛出 ``Exception``）。
+
+        * ``status = PAUSED``（**不是** TERMINAL：Run 尚未终态，§十六）；
+        * ``next_action = WAITING_APPROVAL``；
+        * ``pending_step_index = step_index``（该 Tool Call 的 execution identity）；
+        * ``pending_decision_ref`` = 已持久化的 TOOL_CALL Decision（Resume 依据）；
+        * ``pending_tool_result_ref = NULL``（Tool **未**执行 ⇒ 无结果，§十五）。
+        """
+        run_id = current_agent_run_id()
+        if not isinstance(run_id, str) or not run_id.strip():
+            logger.debug(
+                "WAITING_APPROVAL Checkpoint 未写入：无 Agent Run Scope（best-effort）",
+                extra={"step_index": step_index},
+            )
+            return None
+        try:
+            return self._save(
+                run_id=run_id,
+                status=CHECKPOINT_STATUS_PAUSED,
+                next_action=CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
+                pending_step_index=step_index,
+                pending_tool_call_id=tool_call_id,
+                pending_decision_ref=decision_ref,
+                pending_tool_result_ref=None,
+            )
+        except Exception as exc:  # noqa: BLE001 —— best-effort（审批行已 durable，可重算）
+            self._log_failure(exc, run_id=run_id)
+            return None
+
+    async def arecord_waiting_approval_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        tool_call_id: str | None = None,
+    ) -> AgentCheckpoint | None:
+        """异步入口（``CancelledError`` 不吞）。"""
+        try:
+            return await asyncio.to_thread(
+                self.record_waiting_approval_checkpoint,
+                step_index=step_index,
+                decision_ref=decision_ref,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 兜底
+            self._log_failure(exc, run_id=current_agent_run_id())
+            return None
+
     # ---------- 读取 / Resume 声明（P-6；**读失败抛异常** = fail-closed） ----------
 
     def get(self, run_id: str) -> AgentCheckpoint | None:
@@ -527,6 +632,23 @@ class BestEffortAgentCheckpointRecorder:
             pending_tool_result_ref=current.pending_tool_result_ref,
         )
 
+    def request_cancel(self, run_id: str) -> AgentCheckpoint:
+        """协作式取消信号 CAS（P-7；**fail-closed**：冲突 / 失败抛异常）。
+
+        Note:
+            与写路径（best-effort）不同：取消是**控制状态转换**，调用方
+            （``AgentCancellationCoordinator``）必须能区分"已置位 / 竞争 /
+            不可取消"，因此本方法**不**吞异常（与 ``get`` / ``claim_for_resume``
+            同类）。
+
+        Raises:
+            ValueError: run_id 非法。
+            AgentCheckpointNotFoundError / AgentCheckpointConflictError /
+            AgentCheckpointRepositoryError: 见 Repository（未找到 / 已终态 /
+            其它转换先赢）。
+        """
+        return self._repository.request_cancel(run_id=run_id)
+
     def record_terminal(
         self,
         *,
@@ -565,6 +687,10 @@ class BestEffortAgentCheckpointRecorder:
                 pending_tool_call_id=None,
                 pending_decision_ref=None,
                 pending_tool_result_ref=None,
+                # Phase 5 P-7：CANCELLED 是**不可逆**终态（§三十三 / §三十四）——
+                # 取消之后到达的失败写入（例如并行 Resume 竞争失败）**不得**把它
+                # 改写成 FAILED / COMPLETED（"最后写入者获胜"在取消语义下是错的）。
+                terminal_agent_status=agent_status,
             )
         except Exception as exc:  # noqa: BLE001 —— best-effort
             self._log_failure(exc, run_id=run_id)
@@ -601,14 +727,32 @@ class BestEffortAgentCheckpointRecorder:
         pending_tool_call_id: str | None,
         pending_decision_ref: str | None,
         pending_tool_result_ref: str | None,
+        terminal_agent_status: str | None = None,
     ) -> AgentCheckpoint:
         """读取当前 Checkpoint → create（首次）或 update（乐观并发）。
+
+        ``terminal_agent_status``（P-7，可选）：仅 :meth:`record_terminal` 传入 ——
+        若当前 Checkpoint 已是 ``TERMINAL / CANCELLED`` 而本次终态**不是**取消，
+        则**跳过**写入（取消终态不可逆；复用本次读取，不增加额外 IO）。
 
         注意：``get`` 只用于**选择 create / update 并取得 expected version**；
         版本判定本身在 UPDATE 的 WHERE 条件里（§二十八：绝不 SELECT-then-compare）。
         """
         repository = self._repository
         current = repository.get(run_id)
+        if (
+            current is not None
+            and terminal_agent_status is not None
+            and terminal_agent_status != AGENT_STATUS_CANCELLED
+            and getattr(current, "status", None) == CHECKPOINT_STATUS_TERMINAL
+            and getattr(current, "next_action", None)
+            == CHECKPOINT_NEXT_ACTION_CANCELLED
+        ):
+            logger.info(
+                "取消终态不可逆：跳过非 CANCELLED 的终态写入",
+                extra={"run_id": run_id, "agent_status": terminal_agent_status},
+            )
+            return current
         if current is None:
             return repository.create(
                 run_id=run_id,

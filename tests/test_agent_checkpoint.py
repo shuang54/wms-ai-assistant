@@ -24,11 +24,13 @@ from typing import Any
 import pytest
 
 from backend.app.agent import (
+    AGENT_STATUS_CANCELLED,
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
     AGENT_STATUS_LIMIT_REACHED,
 )
 from backend.app.agent.checkpoint import (
+    CHECKPOINT_NEXT_ACTION_CANCELLED,
     CHECKPOINT_INITIAL_STATE_VERSION,
     CHECKPOINT_NEXT_ACTION_COMPLETED,
     CHECKPOINT_NEXT_ACTION_FAILED,
@@ -201,6 +203,9 @@ class TestAgentCheckpointContract:
             "pending_tool_result_ref",
             "created_at",
             "updated_at",
+            # Phase 5 P-7：协作式取消信号（**信号**，不是 status 枚举成员）
+            "cancel_requested",
+            "cancel_requested_at",
         ]
 
     def test_dto_rejects_mutation(self) -> None:
@@ -235,9 +240,12 @@ class TestAgentCheckpointContract:
             CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
             CHECKPOINT_NEXT_ACTION_COMPLETED,
             CHECKPOINT_NEXT_ACTION_FAILED,
+            # Phase 5 P-7 §三十五：取消必须表达为 CANCELLED（**不**用 FAILED 冒充）
+            CHECKPOINT_NEXT_ACTION_CANCELLED,
         }
-        # §十九 / §三十六：禁止新增其它 action
-        for forbidden in ("APPROVED", "REJECTED", "CANCELLED", "LIMIT_REACHED", "RESUME"):
+        # §十九 / §三十六：禁止新增其它 action（HITL 裁决不进 Checkpoint：
+        # 审批状态在 agent_approval；LIMIT_REACHED 归入 FAILED）
+        for forbidden in ("APPROVED", "REJECTED", "LIMIT_REACHED", "RESUME"):
             assert forbidden not in CHECKPOINT_NEXT_ACTIONS
 
     def test_claim_token_is_cryptographically_random(self) -> None:
@@ -324,10 +332,17 @@ class TestAgentCheckpointTerminalMapping:
         )
         assert "LIMIT_REACHED" not in CHECKPOINT_NEXT_ACTIONS
 
-    def test_reserved_statuses_have_no_mapping(self) -> None:
-        # §三十七：WAITING_APPROVAL / CANCELLED 不产生 checkpoint（HITL 属后续阶段）
+    def test_cancelled_maps_to_terminal_cancelled(self) -> None:
+        """P-7 §三十五：CANCELLED ⇒ TERMINAL / CANCELLED（**不**映射成 FAILED）。"""
+        assert checkpoint_terminal_state_of(AGENT_STATUS_CANCELLED) == (
+            CHECKPOINT_STATUS_TERMINAL,
+            CHECKPOINT_NEXT_ACTION_CANCELLED,
+        )
+
+    def test_paused_status_has_no_terminal_mapping(self) -> None:
+        # WAITING_APPROVAL 是**暂停**（非终态）：不产生终态 checkpoint；
+        # 未知状态同样不猜（fail-closed）。
         assert checkpoint_terminal_state_of("WAITING_APPROVAL") is None
-        assert checkpoint_terminal_state_of("CANCELLED") is None
         assert checkpoint_terminal_state_of("UNKNOWN") is None
 
 
@@ -582,7 +597,7 @@ class TestAgentCheckpointRepositoryValidation:
             {"status": "RUNNING"},
             {"status": "ACTIVE "},
             {"next_action": "LIMIT_REACHED"},
-            {"next_action": "CANCELLED"},
+            {"next_action": "APPROVED"},
             {"state_version": 0},
             {"state_version": True},
             {"pending_step_index": -1},
@@ -649,7 +664,14 @@ class TestAgentCheckpointRepositoryValidation:
             name for name in dir(AgentCheckpointRepository) if not name.startswith("_")
         }
 
-        assert public == {"create", "get", "update", "delete_for_test"}
+        # Phase 5 P-7：+ request_cancel（取消信号 CAS；fail-closed）
+        assert public == {
+            "create",
+            "get",
+            "update",
+            "request_cancel",
+            "delete_for_test",
+        }
         assert not hasattr(AgentCheckpointRepository, "delete")
         # 无 Resume / Replay / Claim / 读模型
         for forbidden in ("resume", "replay", "claim", "list", "timeline", "restore"):

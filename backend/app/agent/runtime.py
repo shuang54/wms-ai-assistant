@@ -54,7 +54,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Final, Protocol, runtime_checkable
 
 from backend.app.agent.decision import (
@@ -72,11 +72,19 @@ from backend.app.agent.errors import (
     AgentPolicyError,
     AgentToolExecutionFailureError,
 )
+from backend.app.agent.approval import (
+    APPROVAL_STATUS_APPROVED,
+    APPROVAL_STATUS_PENDING,
+    APPROVAL_STATUS_REJECTED,
+)
 from backend.app.agent.checkpoint import (
+    CHECKPOINT_NEXT_ACTION_CANCELLED,
     CHECKPOINT_NEXT_ACTION_COMPLETED,
     CHECKPOINT_NEXT_ACTION_LLM_DECISION,
     CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION,
+    CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
     CHECKPOINT_STATUS_ACTIVE,
+    CHECKPOINT_STATUS_PAUSED,
     CHECKPOINT_STATUS_TERMINAL,
 )
 from backend.app.agent.decision_store import (
@@ -84,6 +92,13 @@ from backend.app.agent.decision_store import (
     decision_ref,
 )
 from backend.app.agent.errors import (
+    AGENT_ERROR_APPROVAL_CONFLICT,
+    AGENT_ERROR_APPROVAL_NOT_FOUND,
+    AGENT_ERROR_APPROVAL_REJECTED,
+    AGENT_ERROR_APPROVAL_REQUIRED,
+    AGENT_ERROR_APPROVAL_STORE_FAILURE,
+    AGENT_ERROR_CANCEL_REQUESTED,
+    AGENT_ERROR_CANCELLED,
     AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH,
     AGENT_ERROR_CHECKPOINT_NOT_FOUND,
     AGENT_ERROR_DECISION_NOT_FOUND,
@@ -91,6 +106,8 @@ from backend.app.agent.errors import (
     AGENT_ERROR_DECISION_UNAVAILABLE,
     AGENT_ERROR_FINAL_RESULT_UNAVAILABLE,
     AGENT_ERROR_RESUME_CONFLICT,
+    AGENT_ERROR_RUN_NOT_RESUMABLE,
+    AGENT_ERROR_TOOL_AUTHORIZATION_FAILED,
     AGENT_ERROR_TOOL_RESULT_NOT_FOUND,
     AGENT_ERROR_TOOL_RESULT_UNAVAILABLE,
 )
@@ -101,9 +118,11 @@ from backend.app.agent.resume import (
     resume_result_of_agent_result,
 )
 from backend.app.agent.models import (
+    AGENT_STATUS_CANCELLED,
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
     AGENT_STATUS_LIMIT_REACHED,
+    AGENT_STATUS_WAITING_APPROVAL,
     AGENT_STEP_FINAL,
     AGENT_STEP_STATUS_FAILED,
     AGENT_STEP_STATUS_OK,
@@ -287,6 +306,8 @@ class AgentRuntime:
         checkpoint_store: Any | None = None,
         decision_store: Any | None = None,
         tool_result_store: Any | None = None,
+        approval_port: Any | None = None,
+        approval_required_tools: Sequence[str] = (),
     ) -> None:
         if not callable(getattr(llm, "complete", None)):
             raise AgentPolicyError(
@@ -307,6 +328,30 @@ class AgentRuntime:
 
         if clock is not None and not callable(clock):
             raise AgentPolicyError("clock 必须是可调用对象或 None")
+
+        # Phase 5 P-7：HITL 审批策略（Tool 执行前的人工审批门；§四十）。
+        # 策略来源 = Runtime 装配（**不**修改 ToolDefinition contract）；
+        # 声明必须 ⊆ allowed_tools（不得给未授权 Tool 挂审批），且必须接线端口
+        # （否则暂停无法持久化 / 无法 Resume ⇒ 装配期 fail-closed）。
+        validated_approval_tools = self._validate_approval_required_tools(
+            approval_required_tools, allowed_tools=validated_tools
+        )
+        if validated_approval_tools and approval_port is None:
+            raise AgentPolicyError(
+                "approval_required_tools 非空时必须注入 approval_port"
+                "（否则 WAITING_APPROVAL 无法持久化 / 无法 Resume；fail-closed）"
+            )
+        if approval_port is not None and not (
+            callable(getattr(approval_port, "arequest_approval", None))
+            or callable(getattr(approval_port, "request_approval", None))
+        ):
+            raise AgentPolicyError(
+                "approval_port 必须提供可调用的 arequest_approval()"
+                " 或 request_approval()"
+                f"（got {type(approval_port).__name__}）"
+            )
+        self._approval_port = approval_port
+        self._approval_required_tools = validated_approval_tools
 
         # Phase 5 P-4 Integration：Tool Result 写入端口（可选注入）。
         # 形状校验与其它可选依赖一致（失败更早；本层只 await 一个方法）。
@@ -414,6 +459,16 @@ class AgentRuntime:
         """Tool Result 只读端口（Resume 专用；None = Resume 不可用）。"""
         return self._tool_result_store
 
+    @property
+    def approval_port(self) -> Any | None:
+        """HITL 审批端口（None = 不暂停；approval_required_tools 为空时的合法装配）。"""
+        return self._approval_port
+
+    @property
+    def approval_required_tools(self) -> tuple[str, ...]:
+        """需要人工审批的 Tool（⊆ allowed_tools；Tool **执行前**暂停）。"""
+        return self._approval_required_tools
+
     # ---------- 装配期校验 ----------
 
     @staticmethod
@@ -431,6 +486,40 @@ class AgentRuntime:
                 raise AgentPolicyError("allowed_tools 每项必须是非空 str")
             if name in seen:
                 raise AgentPolicyError(f"allowed_tools 存在重复项: {name!r}")
+            seen.append(name)
+        return tuple(seen)
+
+    @staticmethod
+    def _validate_approval_required_tools(
+        approval_required_tools: Sequence[str], *, allowed_tools: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """校验 HITL 策略（tuple/list[str]；无重复；⊆ allowed_tools）。
+
+        Raises:
+            AgentPolicyError: 类型非法 / 重复 / 含未授权 Tool（不得扩权）。
+        """
+        if isinstance(approval_required_tools, str) or not isinstance(
+            approval_required_tools, (tuple, list)
+        ):
+            raise AgentPolicyError(
+                "approval_required_tools 必须是 tuple/list[str]"
+                f"（got {type(approval_required_tools).__name__}）"
+            )
+        seen: list[str] = []
+        for name in approval_required_tools:
+            if not isinstance(name, str) or not name.strip():
+                raise AgentPolicyError(
+                    "approval_required_tools 每项必须是非空 str"
+                )
+            if name in seen:
+                raise AgentPolicyError(
+                    f"approval_required_tools 存在重复项: {name!r}"
+                )
+            if name not in allowed_tools:
+                raise AgentPolicyError(
+                    f"approval_required_tools 含未授权 Tool: {name!r}"
+                    "（审批不得绕过 Authorization）"
+                )
             seen.append(name)
         return tuple(seen)
 
@@ -513,6 +602,7 @@ class AgentRuntime:
         conversation_context: str | None,
         request_id: str | None,
         step_base: int = 0,
+        tool_calls_base: int = 0,
         resumed_messages: Sequence[dict[str, Any]] = (),
     ) -> AgentRuntimeResult:
         """既有主循环（决策 / 授权 / 执行 / 回灌 / 预算**逐行不变**）。
@@ -532,18 +622,44 @@ class AgentRuntime:
             """绑定本次 run_id 的结果构造器（避免每处重复传参 / 避免共享可变状态）。"""
             return type(self)._build_result(run_id=run_id, **kwargs)
 
+        def build_cancelled() -> AgentRuntimeResult:
+            """协作式取消结果（Tool Result 已保留；**不**继续 LLM / Tool；§二十五 / §三十一）。
+
+            * ``status = CANCELLED``（**不**映射成 FAILED；§三十四）；
+            * ``error = AGENT_CANCEL_REQUESTED``（稳定码；精确原因）；
+            * 已完成的工作（Step / Tool Result / Checkpoint）全部保留、不回滚。
+            """
+            return build_result(
+                status=AGENT_STATUS_CANCELLED,
+                content=None,
+                steps=steps,
+                tool_calls=tool_calls,
+                llm_calls=llm_calls,
+                error=AGENT_ERROR_CANCEL_REQUESTED,
+                tokens_used=tokens_used,
+                token_budget_unverifiable=token_budget_unverifiable,
+                records=records,
+            )
+
         # 已授权 Tool 的 Definition（仅 schema 暴露；授权判断仍在本 Runtime）
         tool_definitions = self._allowed_tool_definitions()
         records: list[AgentStep] = []
         # P-6：resume 时 ``steps`` 从 ``step_base`` 起算（预算仍约束**整个 Run**；
         # ``llm_calls`` / ``tool_calls`` 只统计**本次**执行的真实调用 ⇒ §四十一）。
         steps = step_base
-        tool_calls = 0
+        # P-7：Resume 前已发生的**真实** Tool 调用（例如"审批通过后立即执行"
+        # 的那一次）计入本次执行计数（§四十一：只算真实调用，不算 Replay）。
+        tool_calls = tool_calls_base
         llm_calls = 0
         tokens_used = 0
         token_budget_unverifiable = False
 
         while True:
+            # ---- Phase 5 P-7：协作式取消（LLM 调用前的安全边界；§二十五 / §二十九）----
+            # 取消信号读取失败 ⇒ 视为"未请求"（可用性优先；取消是协作信号，不是安全边界）。
+            if await self._cancel_requested(run_id):
+                return build_cancelled()
+
             limit = self._check_limits(
                 start=start,
                 steps=steps,
@@ -625,6 +741,11 @@ class AgentRuntime:
 
             decision = completion.decision
             steps += 1
+
+            # Phase 5 P-7：取消（LLM 已返回 ⇒ 不强制中断网络请求；§六十二）。
+            # 该 Decision **不**持久化、**不**执行（Run 已 CANCELLED ⇒ 不可 Resume）。
+            if await self._cancel_requested(run_id):
+                return build_cancelled()
 
             # Phase 5 P-6：本步 index（0-based；含 resume 偏移）—— Decision 与
             # Tool 执行共享同一 step identity（§二十六）。
@@ -740,6 +861,10 @@ class AgentRuntime:
                     records=records,
                 )
 
+            # ---- Phase 5 P-7：协作式取消（Authorization / Tool 执行前；§三十）----
+            if await self._cancel_requested(run_id):
+                return build_cancelled()
+
             # ---- Runtime 授权（第一道；Tool 0 次执行即拒绝） ----
             if tool_name not in self._allowed_tools:
                 records.append(
@@ -763,6 +888,93 @@ class AgentRuntime:
                     tokens_used=tokens_used,
                     token_budget_unverifiable=token_budget_unverifiable,
                     records=records,
+                )
+
+            # ---- Phase 5 P-7：HITL 审批门（Tool **执行前**；§七 / §十四 / §十五）----
+            # 顺序（冻结）：LLM Decision → Tool Authorization → Approval Required?
+            # → WAITING_APPROVAL（Tool Handler calls = 0）。审批**不是**授权：
+            # 批准后的执行前必须**重新** Authorization（Resume 路径，§二十 / §四十一）。
+            if tool_name in self._approval_required_tools:
+                if decision_ref_value is None:
+                    # 无 durable Decision ⇒ 暂停不可恢复（Resume 无从取得 arguments）
+                    # ⇒ fail-closed：不创建审批、不暂停、不执行 Tool。
+                    records.append(
+                        AgentStep(
+                            step_index=step_index,
+                            type=AGENT_STEP_TOOL_CALL,
+                            status=AGENT_STEP_STATUS_FAILED,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            error=AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+                            elapsed_ms=_elapsed_ms(self._clock, start),
+                        )
+                    )
+                    return build_result(
+                        status=AGENT_STATUS_FAILED,
+                        content=None,
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        llm_calls=llm_calls,
+                        error=AGENT_ERROR_DECISION_PERSISTENCE_FAILURE,
+                        tokens_used=tokens_used,
+                        token_budget_unverifiable=token_budget_unverifiable,
+                        records=records,
+                    )
+                approval_row = await self._request_approval(
+                    run_id=run_id,
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                )
+                if approval_row is None:
+                    # 审批无法持久化 ⇒ fail-closed（不暂停：无请求可裁决；不执行 Tool）
+                    records.append(
+                        AgentStep(
+                            step_index=step_index,
+                            type=AGENT_STEP_TOOL_CALL,
+                            status=AGENT_STEP_STATUS_FAILED,
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            error=AGENT_ERROR_APPROVAL_STORE_FAILURE,
+                            elapsed_ms=_elapsed_ms(self._clock, start),
+                        )
+                    )
+                    return build_result(
+                        status=AGENT_STATUS_FAILED,
+                        content=None,
+                        steps=steps,
+                        tool_calls=tool_calls,
+                        llm_calls=llm_calls,
+                        error=AGENT_ERROR_APPROVAL_STORE_FAILURE,
+                        tokens_used=tokens_used,
+                        token_budget_unverifiable=token_budget_unverifiable,
+                        records=records,
+                    )
+                # Checkpoint = PAUSED / WAITING_APPROVAL（best-effort；§十四）：
+                # pending_step_index / pending_decision_ref / pending_tool_call_id 已冻结；
+                # pending_tool_result_ref = NULL（Tool 未执行 ⇒ 无结果）。
+                await self._record_waiting_approval_checkpoint(
+                    step_index=step_index,
+                    decision_ref=decision_ref_value,
+                    tool_call_id=tool_call_id,
+                )
+                logger.info(
+                    "Agent Run 等待人工审批（WAITING_APPROVAL；Tool 未执行）",
+                    extra={"tool_name": tool_name, "step_index": step_index},
+                )
+                # **不**追加 Step（Tool 未执行 ⇒ 不伪造 ToolExecution 步；§四十九）；
+                # **不**写 AgentRun（Run 尚未终态；§十六）。
+                return build_result(
+                    status=AGENT_STATUS_WAITING_APPROVAL,
+                    content=None,
+                    steps=steps,
+                    tool_calls=tool_calls,
+                    llm_calls=llm_calls,
+                    error=AGENT_ERROR_APPROVAL_REQUIRED,
+                    tokens_used=tokens_used,
+                    token_budget_unverifiable=token_budget_unverifiable,
+                    records=records,
+                    approval_id=getattr(approval_row, "approval_id", None),
                 )
 
             # Phase 5 P-6：Decision 已 durable + Runtime 授权通过 ⇒ 先落控制状态
@@ -1205,6 +1417,175 @@ class AgentRuntime:
             )
         return None
 
+    # ---------- Phase 5 P-7：HITL 审批 / 协作式取消（端口调用） ----------
+
+    async def _cancel_requested(self, run_id: str) -> bool:
+        """读取协作式取消信号（Checkpoint 行上的 cancel_requested；§二十五）。
+
+        * 端口未接线 ⇒ ``False``（未接线 = 无取消能力；行为与 P-6 一致）；
+        * **读取失败 ⇒ False**（取消是**协作信号**，不是安全边界：不允许
+          瞬时 DB 故障把每个 Run 都变成 CANCELLED）；
+        * 信号与 ``state_version`` 同一 CAS 域 ⇒ 与 Resume / Approval 裁决天然互斥。
+        """
+        store = self._checkpoint_store
+        if store is None:
+            return False
+        try:
+            checkpoint = await asyncio.to_thread(store.get, run_id)
+        except Exception as exc:  # noqa: BLE001 —— 取消信号读取失败 ⇒ 不取消
+            logger.warning(
+                "取消信号读取失败（视为未请求；取消为协作信号）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+            return False
+        return bool(getattr(checkpoint, "cancel_requested", False))
+
+    async def _request_approval(
+        self,
+        *,
+        run_id: str,
+        step_index: int,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> Any | None:
+        """创建审批请求（**fail-closed**：``None`` ⇒ 调用方不得暂停 / 不得执行 Tool）。
+
+        与 Decision 写点同类：审批请求是"之后能否继续"的前提，
+        写失败 ⇒ 既不能暂停（无请求可裁决）也不能执行（未经审批）。
+        """
+        port = self._approval_port
+        if port is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "run_id": run_id,
+            "step_index": step_index,
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+        }
+        try:
+            arequest = getattr(port, "arequest_approval", None)
+            if callable(arequest):
+                return await arequest(**kwargs)
+            request = getattr(port, "request_approval", None)
+            if callable(request):
+                return await asyncio.to_thread(request, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— fail-closed（不吞成"已创建"）
+            logger.warning(
+                "Approval 请求失败（fail-closed；不暂停、不执行 Tool）: %s",
+                type(exc).__name__,
+                extra={
+                    "error_type": type(exc).__name__,
+                    "tool_name": tool_name,
+                    "step_index": step_index,
+                },
+            )
+            return None
+        return None
+
+    async def _load_approval(self, run_id: str, step_index: int) -> Any | None:
+        """读取该 step 的审批行（读取失败 ⇒ ``None`` ⇒ Resume fail-closed）。"""
+        port = self._approval_port
+        if port is None:
+            return None
+        try:
+            aget = getattr(port, "aget_for_step", None)
+            if callable(aget):
+                return await aget(run_id=run_id, step_index=step_index)
+            get_for_step = getattr(port, "get_for_step", None)
+            if callable(get_for_step):
+                return await asyncio.to_thread(
+                    get_for_step, run_id=run_id, step_index=step_index
+                )
+        except Exception as exc:  # noqa: BLE001 —— fail-closed
+            logger.warning(
+                "Approval 读取失败（fail-closed）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+            return None
+        return None
+
+    async def _record_waiting_approval_checkpoint(
+        self,
+        *,
+        step_index: int,
+        decision_ref: str,
+        tool_call_id: str | None,
+    ) -> Any | None:
+        """WAITING_APPROVAL 控制状态（PAUSED；best-effort，不改变控制流；§十四）。"""
+        sink = self._checkpoint_sink
+        if sink is None:
+            return None
+        kwargs: dict[str, Any] = {
+            "step_index": step_index,
+            "decision_ref": decision_ref,
+            "tool_call_id": tool_call_id,
+        }
+        try:
+            arecord = getattr(sink, "arecord_waiting_approval_checkpoint", None)
+            if callable(arecord):
+                return await arecord(**kwargs)
+            record = getattr(sink, "record_waiting_approval_checkpoint", None)
+            if callable(record):
+                return record(**kwargs)
+        except Exception as exc:  # noqa: BLE001 —— best-effort 边界
+            logger.warning(
+                "WAITING_APPROVAL Checkpoint 写入失败（best-effort）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "step_index": step_index},
+            )
+        return None
+
+    async def _finalize_cancelled_checkpoint(self, run_id: str) -> None:
+        """把取消的 Run 终态化（TERMINAL / CANCELLED；best-effort）。"""
+        sink = self._checkpoint_sink
+        if sink is None:
+            return
+        kwargs: dict[str, Any] = {
+            "run_id": run_id,
+            "agent_status": AGENT_STATUS_CANCELLED,
+        }
+        try:
+            arecord = getattr(sink, "arecord_terminal", None)
+            if callable(arecord):
+                await arecord(**kwargs)
+                return
+            record = getattr(sink, "record_terminal", None)
+            if callable(record):
+                await asyncio.to_thread(record, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— best-effort
+            logger.warning(
+                "取消终态 Checkpoint 写入失败（best-effort）: %s",
+                type(exc).__name__,
+                extra={"error_type": type(exc).__name__, "run_id": run_id},
+            )
+
+    def _cancelled_resume(self, run_id: str) -> AgentResumeResult:
+        """CANCELLED 的 Run **拒绝** Resume（§三十三 / §六十五）：LLM = 0 / Tool = 0。
+
+        * ``status = CANCELLED``（不是 FAILED；§三十四）；
+        * ``error_code = AGENT_RUN_NOT_RESUMABLE``；
+        * 调用方（Orchestrator）据此终态化 Checkpoint 并向上抛拒绝错误。
+        """
+        return AgentResumeResult(
+            run_id=run_id,
+            status=AGENT_STATUS_CANCELLED,
+            content=None,
+            error_code=AGENT_ERROR_RUN_NOT_RESUMABLE,
+            replayed_step_index=None,
+            llm_calls=0,
+            tool_calls=0,
+            steps=0,
+            agent_result=self._replay_only_result(
+                run_id=run_id,
+                status=AGENT_STATUS_CANCELLED,
+                content=None,
+                error=AGENT_ERROR_RUN_NOT_RESUMABLE,
+                steps=0,
+            ),
+        )
+
     # ---------- Phase 5 P-6：Resume / Replay ----------
 
     async def resume(
@@ -1251,6 +1632,27 @@ class AgentRuntime:
 
         if getattr(checkpoint, "status", None) == CHECKPOINT_STATUS_TERMINAL:
             return await self._terminal_resume(run_id, checkpoint)
+
+        # ---- Phase 5 P-7：CANCELLED 的 Run 禁止 Resume（§三十三 / §六十五）----
+        # （终态分支已处理 TERMINAL/CANCELLED；此处处理"信号已置位但仍未终态"：
+        #  CANCELLED → 拒绝 + 终态化；**绝不** CANCELLED → ACTIVE）
+        if bool(getattr(checkpoint, "cancel_requested", False)):
+            await self._finalize_cancelled_checkpoint(run_id)
+            return self._cancelled_resume(run_id)
+
+        # ---- Phase 5 P-7：HITL 暂停（PAUSED / WAITING_APPROVAL）----
+        if (
+            getattr(checkpoint, "status", None) == CHECKPOINT_STATUS_PAUSED
+            and getattr(checkpoint, "next_action", None)
+            == CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL
+        ):
+            return await self._resume_waiting_approval(
+                run_id=run_id,
+                checkpoint=checkpoint,
+                question=question,
+                conversation_context=conversation_context,
+                request_id=request_id,
+            )
 
         pending_ref = getattr(checkpoint, "pending_decision_ref", None)
         if pending_ref is None:
@@ -1427,8 +1829,14 @@ class AgentRuntime:
     async def _terminal_resume(
         self, run_id: str, checkpoint: Any
     ) -> AgentResumeResult:
-        """终态 Resume（§十九 / §三十六 / §三十七）：**不**调 LLM、**不**执行 Tool。"""
+        """终态 Resume（§十九 / §三十六 / §三十七）：**不**调 LLM、**不**执行 Tool。
+
+        Phase 5 P-7 扩展：``next_action = CANCELLED`` ⇒ ``status = CANCELLED`` +
+        ``AGENT_RUN_NOT_RESUMABLE``（§三十三 / §六十五；**不**映射成 FAILED）。
+        """
         next_action = getattr(checkpoint, "next_action", None)
+        if next_action == CHECKPOINT_NEXT_ACTION_CANCELLED:
+            return self._cancelled_resume(run_id)
         completed = next_action == CHECKPOINT_NEXT_ACTION_COMPLETED
         status = AGENT_STATUS_COMPLETED if completed else AGENT_STATUS_FAILED
         content: str | None = None
@@ -1465,6 +1873,280 @@ class AgentRuntime:
             ),
         )
 
+    async def _resume_waiting_approval(
+        self,
+        *,
+        run_id: str,
+        checkpoint: Any,
+        question: str | None,
+        conversation_context: str | None,
+        request_id: str | None,
+    ) -> AgentResumeResult:
+        """WAITING_APPROVAL 的 Resume（§十七 / §十八 / §二十 / §二十一 / §二十二 / §五十五）。
+
+            读 Control State（pending_step_index / pending_decision_ref）
+                  ↓ Decision Replay（**不**重新调用 LLM）
+            读 Approval（(run_id, step_index)）
+                  ├── PENDING   ⇒ 仍 WAITING_APPROVAL（幂等；LLM = 0 / Tool = 0）
+                  ├── REJECTED  ⇒ FAILED + AGENT_APPROVAL_REJECTED（Tool = 0；
+                  │                **不**重问 LLM / **不**换 Tool / **不**生成 Tool Result）
+                  └── APPROVED  ⇒ **重新 Authorization** ⇒ Tool 执行
+                                  ⇒ Tool Result 持久化 ⇒ Checkpoint ACTIVE / LLM_DECISION
+                                  ⇒ 续跑下一次 LLM
+
+        Note:
+            **Approval ≠ Authorization**：即使 APPROVED，执行前仍必须重新做 Runtime
+            授权（capability / policy 可能已变化）；失败 ⇒
+            ``AGENT_TOOL_AUTHORIZATION_FAILED``（Tool = 0）。
+        """
+        step_index = getattr(checkpoint, "pending_step_index", None)
+        pending_ref = getattr(checkpoint, "pending_decision_ref", None)
+        if (
+            not isinstance(step_index, int)
+            or isinstance(step_index, bool)
+            or step_index < 0
+            or not isinstance(pending_ref, str)
+            or not pending_ref.strip()
+        ):
+            return self._failed_resume(
+                run_id, AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH
+            )
+
+        decision = await self._load_decision(pending_ref)
+        if decision is None:
+            return self._failed_resume(run_id, AGENT_ERROR_DECISION_NOT_FOUND)
+        mismatch = decision_mismatch_code(decision, checkpoint)
+        if mismatch is not None:
+            return self._failed_resume(run_id, mismatch)
+        if bool(getattr(decision, "decision_unavailable", False)):
+            return self._failed_resume(run_id, AGENT_ERROR_DECISION_UNAVAILABLE)
+        if getattr(decision, "decision_type", None) != DECISION_TOOL_CALL:
+            # 暂停只能由 TOOL_CALL 产生 ⇒ FINAL / 未知 ⇒ 身份不一致（fail-closed）
+            return self._failed_resume(
+                run_id, AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH
+            )
+
+        approval = await self._load_approval(run_id, step_index)
+        if approval is None:
+            return self._failed_resume(run_id, AGENT_ERROR_APPROVAL_NOT_FOUND)
+        approval_id = getattr(approval, "approval_id", None)
+        if getattr(approval, "tool_name", None) != getattr(decision, "tool_name", None):
+            return self._failed_resume(run_id, AGENT_ERROR_APPROVAL_CONFLICT)
+        approval_call_id = getattr(approval, "tool_call_id", None)
+        decision_call_id = getattr(decision, "tool_call_id", None)
+        if approval_call_id not in (None, decision_call_id):
+            return self._failed_resume(run_id, AGENT_ERROR_APPROVAL_CONFLICT)
+
+        approval_status = getattr(approval, "status", None)
+        if approval_status == APPROVAL_STATUS_PENDING:
+            # 幂等：审批仍待决 ⇒ Run 仍在 WAITING_APPROVAL（LLM = 0 / Tool = 0）
+            return AgentResumeResult(
+                run_id=run_id,
+                status=AGENT_STATUS_WAITING_APPROVAL,
+                content=None,
+                error_code=AGENT_ERROR_APPROVAL_REQUIRED,
+                replayed_step_index=None,
+                llm_calls=0,
+                tool_calls=0,
+                steps=step_index + 1,
+                agent_result=self._replay_only_result(
+                    run_id=run_id,
+                    status=AGENT_STATUS_WAITING_APPROVAL,
+                    content=None,
+                    error=AGENT_ERROR_APPROVAL_REQUIRED,
+                    steps=step_index + 1,
+                ),
+                approval_id=approval_id,
+            )
+        if approval_status == APPROVAL_STATUS_REJECTED:
+            # 人工拒绝：Agent FAILED（Tool = 0；无 Tool Result；§二十一 / §二十二）
+            return AgentResumeResult(
+                run_id=run_id,
+                status=AGENT_STATUS_FAILED,
+                content=None,
+                error_code=AGENT_ERROR_APPROVAL_REJECTED,
+                replayed_step_index=None,
+                llm_calls=0,
+                tool_calls=0,
+                steps=step_index + 1,
+                agent_result=self._replay_only_result(
+                    run_id=run_id,
+                    status=AGENT_STATUS_FAILED,
+                    content=None,
+                    error=AGENT_ERROR_APPROVAL_REJECTED,
+                    steps=step_index + 1,
+                ),
+                approval_id=approval_id,
+            )
+        if approval_status != APPROVAL_STATUS_APPROVED:
+            return self._failed_resume(run_id, AGENT_ERROR_APPROVAL_CONFLICT)
+
+        # ---- APPROVED：并发声明 → 取消检查 → 重新授权 → 执行 ----
+        claim_error = await self._claim_for_resume(run_id, checkpoint)
+        if claim_error is not None:
+            return self._failed_resume(run_id, claim_error)
+        if await self._cancel_requested(run_id):
+            await self._finalize_cancelled_checkpoint(run_id)
+            return self._cancelled_resume(run_id)
+        tool_name = getattr(decision, "tool_name", None) or ""
+        if tool_name not in self._allowed_tools:
+            # Approval ≠ Authorization（§二十 / §四十一）：批准后仍必须重新授权
+            return self._failed_resume(
+                run_id, AGENT_ERROR_TOOL_AUTHORIZATION_FAILED
+            )
+        return await self._execute_approved_tool(
+            run_id=run_id,
+            step_index=step_index,
+            decision=decision,
+            question=question,
+            conversation_context=conversation_context,
+            request_id=request_id,
+            approval_id=approval_id,
+        )
+
+    async def _execute_approved_tool(
+        self,
+        *,
+        run_id: str,
+        step_index: int,
+        decision: Any,
+        question: str | None,
+        conversation_context: str | None,
+        request_id: str | None,
+        approval_id: str | None,
+    ) -> AgentResumeResult:
+        """执行已批准的 Tool Call（Resume 分支；§二十 / §二十三 / §三十一 / §五十五）。
+
+        与主循环同一执行通道（``ToolExecutionService.execute`` —— 第二道
+        capability 校验）、同一写入顺序：Tool Result **先**落盘，再写 Checkpoint
+        控制状态，然后**继续**下一次 LLM（Step 由续跑循环产出，**不**伪造）。
+        """
+        tool_name = getattr(decision, "tool_name", None) or ""
+        arguments = dict(getattr(decision, "arguments", None) or {})
+        tool_call_id = getattr(decision, "tool_call_id", None)
+        execution_context = self._tool_execution_context(
+            request_id=request_id,
+            step_index=step_index,
+            tool_call_id=tool_call_id,
+        )
+        execution_project_id = (
+            execution_context.project_id
+            if execution_context is not None
+            else getattr(self._tool_execution, "project_id", None)
+        )
+        # **Agent Run Scope**：Tool Result 写点 / Checkpoint 写点都按 run_id 落盘
+        # （与主循环同一身份；Resume 的 run_id **不变**）。
+        with agent_run_scope(run_id):
+            try:
+                tool_result = await self._tool_execution.execute(
+                    tool_name, arguments=arguments, context=execution_context
+                )
+            except Exception as exc:  # noqa: BLE001 —— 归类 FAILED，不 retry
+                # 结果不可判定：仍然持久化"不可用"事实（不丢失执行痕迹；§三十一）
+                await self._record_tool_result(
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    project_id=execution_project_id,
+                    tool_call_id=tool_call_id,
+                    result=None,
+                    error_code=AGENT_ERROR_TOOL_EXECUTION_FAILURE,
+                )
+                logger.warning(
+                    "已批准的 Tool 执行失败: %s",
+                    type(exc).__name__,
+                    extra={"tool_name": tool_name, "step_index": step_index},
+                )
+                return self._failed_resume(
+                    run_id, AGENT_ERROR_TOOL_EXECUTION_FAILURE
+                )
+
+            tool_result_persisted = (
+                await self._record_tool_result(
+                    step_index=step_index,
+                    tool_name=tool_name,
+                    project_id=execution_project_id,
+                    tool_call_id=tool_call_id,
+                    result=tool_result,
+                )
+                is not None
+            )
+            # Tool Result 已 durable ⇒ 控制状态推进（ACTIVE / LLM_DECISION；§三十一）
+            await self._record_checkpoint(
+                step_index=step_index,
+                tool_result_persisted=tool_result_persisted,
+            )
+
+        payload: str | None = None
+        if tool_result.success:
+            try:
+                payload = _serialize_tool_data(
+                    {"tool_name": tool_name, "data": tool_result.data}
+                )
+            except ValueError as exc:
+                logger.warning("Agent Tool Result 不可序列化: %s", exc)
+                payload = None
+        if payload is None:
+            # 失败 / 不可序列化 ⇒ FAILED（Tool Result 已落盘；不重试；与主循环同语义）
+            return self._failed_resume(
+                run_id, AGENT_ERROR_TOOL_EXECUTION_FAILURE
+            )
+
+        return await self._continue_run(
+            run_id=run_id,
+            question=question,
+            conversation_context=conversation_context,
+            request_id=request_id,
+            step_base=step_index + 1,
+            resumed_messages=tuple(
+                self._tool_messages(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    arguments=arguments,
+                    payload=payload,
+                )
+            ),
+            replayed_step_index=step_index,
+            approval_id=approval_id,
+            # 审批通过后**已真实执行**一次 Tool ⇒ 计入本次 Resume 的 tool_calls
+            tool_calls_base=1,
+        )
+
+    @staticmethod
+    def _tool_messages(
+        *,
+        tool_name: str,
+        tool_call_id: str | None,
+        arguments: Mapping[str, Any],
+        payload: str,
+    ) -> list[dict[str, Any]]:
+        """刚执行完的 Tool Call → 协议消息（与主循环回灌逐字段同形）。
+
+        * ``assistant.tool_calls``：保留 Provider 原 ``tool_call_id`` / name /
+          arguments（不生成、不改写）；
+        * ``role=tool``：Tool Result 仍是 **untrusted data**（标记保留）。
+        """
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": _serialize_tool_data(arguments),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": f"{TOOL_RESULT_MARKER}\n{payload}",
+            },
+        ]
+
     async def _continue_run(
         self,
         *,
@@ -1475,6 +2157,8 @@ class AgentRuntime:
         step_base: int,
         resumed_messages: tuple[dict[str, Any], ...],
         replayed_step_index: int | None,
+        approval_id: str | None = None,
+        tool_calls_base: int = 0,
     ) -> AgentResumeResult:
         """在 Agent Run Scope 内继续既有循环（历史 Step 不重放为"假 Step"；§三十八）。"""
         if not isinstance(question, str) or not question.strip():
@@ -1489,12 +2173,14 @@ class AgentRuntime:
                 conversation_context=conversation_context,
                 request_id=request_id,
                 step_base=step_base,
+                tool_calls_base=tool_calls_base,
                 resumed_messages=resumed_messages,
             )
         return resume_result_of_agent_result(
             run_id=run_id,
             agent_result=agent_result,
             replayed_step_index=replayed_step_index,
+            approval_id=approval_id,
         )
 
     def _replay_messages(
@@ -1622,6 +2308,7 @@ class AgentRuntime:
         tokens_used: int,
         token_budget_unverifiable: bool,
         records: list[AgentStep],
+        approval_id: str | None = None,
     ) -> AgentRuntimeResult:
         """构造 ``AgentRuntimeResult``（``run_id`` 由 :meth:`run` 绑定）。
 
@@ -1639,4 +2326,5 @@ class AgentRuntime:
             tokens_used=tokens_used,
             token_budget_unverifiable=token_budget_unverifiable,
             step_records=tuple(records),
+            approval_id=approval_id,
         )

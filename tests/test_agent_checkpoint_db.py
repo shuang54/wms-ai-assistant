@@ -222,6 +222,10 @@ class TestAgentCheckpointTable:
             "pending_tool_result_ref",
             "created_at",
             "updated_at",
+            # Phase 5 P-7：协作式取消信号（P-7 §二十七 最小扩展；
+            # ``cancel_requested`` 布尔信号 + 置位时间）
+            "cancel_requested",
+            "cancel_requested_at",
         }
         assert columns["id"] == "bigint"
         assert columns["run_id"] == "character varying"
@@ -235,6 +239,9 @@ class TestAgentCheckpointTable:
         assert columns["pending_tool_result_ref"] == "character varying"
         assert columns["created_at"] == "timestamp with time zone"
         assert columns["updated_at"] == "timestamp with time zone"
+        # Phase 5 P-7：取消信号（boolean NOT NULL / 置位时间 TIMESTAMPTZ NULL）
+        assert columns["cancel_requested"] == "boolean"
+        assert columns["cancel_requested_at"] == "timestamp with time zone"
 
     def test_identity_index_is_unique_on_run_id_only(self, engine: Any) -> None:
         """§十：UNIQUE(run_id)（**不是** UNIQUE(run_id, state_version)）。"""

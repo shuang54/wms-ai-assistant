@@ -40,6 +40,7 @@ RETURNING <row>
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Final
 
 from sqlalchemy import func, select, update
@@ -50,6 +51,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from backend.app.agent.checkpoint import (
     CHECKPOINT_INITIAL_STATE_VERSION,
     CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION,
+    CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
+    CHECKPOINT_STATUS_TERMINAL,
     AgentCheckpoint,
     parse_tool_result_ref,
 )
@@ -76,6 +79,7 @@ __all__ = [
     "CHECKPOINT_CONFLICT",
     "CHECKPOINT_VERSION_CONFLICT",
     "CHECKPOINT_NOT_FOUND",
+    "CHECKPOINT_CANCEL_CONFLICT",
     "validate_state_version",
     "validate_pending_step_index",
 ]
@@ -85,6 +89,8 @@ CHECKPOINT_ALREADY_EXISTS: Final[str] = "CHECKPOINT_ALREADY_EXISTS"
 CHECKPOINT_CONFLICT: Final[str] = "CHECKPOINT_CONFLICT"
 CHECKPOINT_VERSION_CONFLICT: Final[str] = "CHECKPOINT_VERSION_CONFLICT"
 CHECKPOINT_NOT_FOUND: Final[str] = "CHECKPOINT_NOT_FOUND"
+#: P-7：取消信号 CAS 未命中（已取消 / 已终态 / 其它转换先赢；**不**force update）。
+CHECKPOINT_CANCEL_CONFLICT: Final[str] = "CHECKPOINT_CANCEL_CONFLICT"
 
 
 class AgentCheckpointRepositoryError(Exception):
@@ -179,6 +185,31 @@ def _validated_optional_text(
     return value
 
 
+def _validated_cancel_requested(value: object) -> bool:
+    """校验取消信号（严格 bool；拒绝 truthy 非 bool —— 不隐式转换）。"""
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"cancel_requested 必须是 bool（当前: {type(value).__name__}）"
+        )
+    return value
+
+
+def _validated_cancel_requested_at(
+    value: object, *, cancel_requested: bool
+) -> datetime | None:
+    """校验取消时间（None 或 datetime；信号为 false ⇒ 必须为 None）。"""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        raise ValueError(
+            "cancel_requested_at 必须是 datetime 或 None"
+            f"（当前: {type(value).__name__}）"
+        )
+    if not cancel_requested:
+        raise ValueError("cancel_requested_at 只在 cancel_requested=true 时允许")
+    return value
+
+
 def _to_checkpoint(row: Any) -> AgentCheckpoint:
     """ORM 行 → 内部 DTO（**事务内**调用；含 claim_token，绝不外泄）。"""
     return AgentCheckpoint(
@@ -193,6 +224,8 @@ def _to_checkpoint(row: Any) -> AgentCheckpoint:
         pending_tool_result_ref=row.pending_tool_result_ref,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        cancel_requested=bool(getattr(row, "cancel_requested", False)),
+        cancel_requested_at=getattr(row, "cancel_requested_at", None),
     )
 
 
@@ -249,11 +282,23 @@ class AgentCheckpointRepository:
             field="pending_tool_call_id",
             max_length=AGENT_CHECKPOINT_PENDING_TOOL_CALL_ID_MAX_LENGTH,
         )
-        if tool_call_id is not None and (
-            normalized_next_action != CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION
+        # Phase 5 P-7 最小扩展：HITL 暂停（PAUSED / WAITING_APPROVAL）同样必须
+        # 携带 pending_tool_call_id（§十四：等待审批的就是**那一次** Tool Call）。
+        if tool_call_id is not None and normalized_next_action not in (
+            CHECKPOINT_NEXT_ACTION_TOOL_EXECUTION,
+            CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL,
         ):
             raise ValueError(
-                "pending_tool_call_id 仅在 next_action=TOOL_EXECUTION 时允许（§二十二）"
+                "pending_tool_call_id 仅在 next_action=TOOL_EXECUTION 或"
+                " WAITING_APPROVAL 时允许（§二十二 / P-7 §十四）"
+            )
+        if (
+            normalized_next_action == CHECKPOINT_NEXT_ACTION_WAITING_APPROVAL
+            and tool_call_id is None
+        ):
+            raise ValueError(
+                "next_action=WAITING_APPROVAL 必须携带 pending_tool_call_id"
+                "（P-7 §十四：暂停绑定具体 Tool Call）"
             )
         decision_ref = _validated_optional_text(
             pending_decision_ref,
@@ -297,6 +342,8 @@ class AgentCheckpointRepository:
         pending_tool_call_id: str | None = None,
         pending_decision_ref: str | None = None,
         pending_tool_result_ref: str | None = None,
+        cancel_requested: bool = False,
+        cancel_requested_at: datetime | None = None,
     ) -> AgentCheckpoint:
         """新建 current checkpoint（``state_version`` 必须 = 1；§十一 / §二十九）。
 
@@ -325,9 +372,19 @@ class AgentCheckpointRepository:
             pending_decision_ref=pending_decision_ref,
             pending_tool_result_ref=pending_tool_result_ref,
         )
+        cancel_flag = _validated_cancel_requested(cancel_requested)
+        cancel_at = _validated_cancel_requested_at(
+            cancel_requested_at, cancel_requested=cancel_flag
+        )
         statement = (
             postgresql_insert(AgentCheckpointModel)
-            .values(state_version=version, claim_token=token, **values)
+            .values(
+                state_version=version,
+                claim_token=token,
+                cancel_requested=cancel_flag,
+                cancel_requested_at=cancel_at,
+                **values,
+            )
             # 重复 run_id ⇒ 0 行（不静默覆盖；§二十九）
             .on_conflict_do_nothing(index_elements=("run_id",))
             .returning(AgentCheckpointModel)
@@ -446,6 +503,73 @@ class AgentCheckpointRepository:
                 run_id=values["run_id"],
                 expected_state_version=expected,
                 claim_token=token,
+            )
+        return checkpoint
+
+    def request_cancel(self, run_id: str) -> AgentCheckpoint:
+        """**单条 SQL** 置位取消信号（P-7；CAS；**不**强杀 / **不**重试）。
+
+        ``UPDATE … WHERE run_id = ? AND cancel_requested = false
+                        AND status != 'TERMINAL'
+          SET cancel_requested = true, cancel_requested_at = now(),
+              state_version = state_version + 1, updated_at = now()``
+
+        与 ``update`` 共用 ``state_version`` 域 ⇒ 取消 / Resume claim / 终态写入
+        彼此互斥（§三十六 / §五十四）。
+
+        Returns:
+            更新后的 :class:`AgentCheckpoint`（``cancel_requested=true``）。
+
+        Raises:
+            ValueError: run_id 非法。
+            AgentCheckpointNotFoundError: 该 run_id 无 checkpoint（``CHECKPOINT_NOT_FOUND``）。
+            AgentCheckpointConflictError: 未命中（已取消 / 已终态 / 被其它转换先赢；
+                ``CHECKPOINT_CANCEL_CONFLICT``）—— 调用方按幂等 / no-op / conflict 判定，
+                **绝不**force update。
+            AgentCheckpointRepositoryError: DB 未配置或写入失败。
+        """
+        normalized_run_id = _validated_run_id(run_id)
+        statement = (
+            update(AgentCheckpointModel)
+            .where(
+                AgentCheckpointModel.run_id == normalized_run_id,
+                AgentCheckpointModel.cancel_requested.is_(False),
+                AgentCheckpointModel.status != CHECKPOINT_STATUS_TERMINAL,
+            )
+            .values(
+                cancel_requested=True,
+                cancel_requested_at=func.now(),
+                state_version=AgentCheckpointModel.state_version + 1,
+                updated_at=func.now(),
+            )
+            .returning(AgentCheckpointModel)
+        )
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                row = session.execute(statement).scalars().one_or_none()
+                checkpoint = _to_checkpoint(row) if row is not None else None
+        except SQLAlchemyError as exc:
+            raise AgentCheckpointRepositoryError(
+                f"Agent Checkpoint 取消信号写入失败: {type(exc).__name__}"
+            ) from exc
+        if checkpoint is None:
+            current = self.get(normalized_run_id)
+            if current is None:
+                raise AgentCheckpointNotFoundError(
+                    "run_id 没有 current checkpoint"
+                    f"（{CHECKPOINT_NOT_FOUND}）: {normalized_run_id!r}"
+                )
+            raise AgentCheckpointConflictError(
+                "取消信号未置位（已取消 / 已终态 / 其它转换先赢；不做 force update）",
+                code=CHECKPOINT_CANCEL_CONFLICT,
+                reason=(
+                    "terminal"
+                    if current.status == CHECKPOINT_STATUS_TERMINAL
+                    else "already_requested"
+                    if current.cancel_requested
+                    else "version"
+                ),
             )
         return checkpoint
 

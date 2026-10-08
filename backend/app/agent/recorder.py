@@ -1034,6 +1034,31 @@ def build_agent_decision_store() -> Any | None:
     return AgentDecisionStore(AgentDecisionRepository())
 
 
+def build_agent_approval_store() -> Any | None:
+    """生产装配（composition root）：HITL 审批存储（Phase 5 P-7）。
+
+        ``get_engine() is None`` ⇔ DATABASE_URL 未配置
+            → ``None``：装配期不注入审批端口 ⇒ Runtime 不暂停
+              （``approval_required_tools`` 为空时的合法装配）
+        否则 → :class:`AgentApprovalStore`（写入 ``ai_ops.agent_approval``）
+
+    不新增配置项 / 环境变量；本函数只装配，不写库 / 不查询。
+    """
+    from backend.app.db.session import get_engine
+
+    if get_engine() is None:
+        logger.info(
+            "agent approval persistence disabled"
+            "（DATABASE_URL 未配置；不创建 approval store）"
+        )
+        return None
+    from backend.app.agent.approval import AgentApprovalStore
+    from backend.app.db.agent_approval_repository import AgentApprovalRepository
+
+    # Repository 解析在**持久化边界**完成（域层 approval.py 保持 0 DB import）
+    return AgentApprovalStore(AgentApprovalRepository())
+
+
 def build_agent_tool_result_reader() -> Any | None:
     """生产装配（composition root）：Tool Result **只读**端口（P-6 Resume 专用）。
 

@@ -15,8 +15,12 @@
     capability.py —— AgentCapability Protocol（AIOrchestrator 可见的唯一端口；
                      Phase 5 Agent Runtime Integration §29.11）
 
+Phase 5 P-7（HITL / 协作式取消）新增：
+    approval.py      —— 审批域（PENDING → APPROVED | REJECTED；**不**存 arguments）
+    cancellation.py  —— 协作式取消（信号 + 协调器；**不**强杀运行中的 Tool）
+
 明确不做：Multi-Agent · Planning · Memory · Workflow · LangGraph · MCP ·
-Streaming · Human Approval UI · Agent State 持久化。
+Streaming · Human Approval UI · Agent Read API（审批/取消只经内部 Service API）。
 """
 from __future__ import annotations
 
@@ -27,7 +31,31 @@ from backend.app.agent.decision import (
     AgentDecision,
     parse_agent_decision,
 )
+from backend.app.agent.approval import (
+    APPROVAL_DECISIONS,
+    APPROVAL_STATUS_APPROVED,
+    APPROVAL_STATUS_PENDING,
+    APPROVAL_STATUS_REJECTED,
+    AgentApprovalRequest,
+    AgentApprovalResolution,
+    AgentApprovalStore,
+    approval_request_of,
+    new_approval_id,
+)
+from backend.app.agent.cancellation import (
+    AgentCancellationCoordinator,
+    AgentCancellationError,
+    AgentCancellationResult,
+)
 from backend.app.agent.errors import (
+    AGENT_ERROR_APPROVAL_CONFLICT,
+    AGENT_ERROR_APPROVAL_NOT_FOUND,
+    AGENT_ERROR_APPROVAL_REJECTED,
+    AGENT_ERROR_APPROVAL_REQUIRED,
+    AGENT_ERROR_APPROVAL_STORE_FAILURE,
+    AGENT_ERROR_CANCELLED,
+    AGENT_ERROR_CANCELLATION_CONFLICT,
+    AGENT_ERROR_CANCEL_REQUESTED,
     AGENT_ERROR_CHECKPOINT_DECISION_MISMATCH,
     AGENT_ERROR_CHECKPOINT_NOT_FOUND,
     AGENT_ERROR_CODES,
@@ -36,6 +64,9 @@ from backend.app.agent.errors import (
     AGENT_ERROR_DECISION_UNAVAILABLE,
     AGENT_ERROR_FINAL_RESULT_UNAVAILABLE,
     AGENT_ERROR_RESUME_CONFLICT,
+    AGENT_ERROR_RUN_NOT_CANCELLABLE,
+    AGENT_ERROR_RUN_NOT_RESUMABLE,
+    AGENT_ERROR_TOOL_AUTHORIZATION_FAILED,
     AGENT_ERROR_TOOL_RESULT_NOT_FOUND,
     AGENT_ERROR_TOOL_RESULT_UNAVAILABLE,
     AGENT_ERROR_FAILED,
@@ -69,6 +100,7 @@ from backend.app.agent.policy import (
     AGENT_DEFAULT_MAX_EXECUTION_TIME_MS,
     AgentRuntimePolicy,
 )
+from backend.app.agent.resume import AgentResumeResult
 from backend.app.agent.runtime import AGENT_SYSTEM_INSTRUCTION, AgentRuntime
 
 __all__ = [
@@ -115,4 +147,28 @@ __all__ = [
     "AGENT_STATUS_LIMIT_REACHED",
     "AGENT_STATUS_CANCELLED",
     "AGENT_STATUS_WAITING_APPROVAL",
+    "AgentResumeResult",
+    "AGENT_ERROR_APPROVAL_REQUIRED",
+    "AGENT_ERROR_APPROVAL_NOT_FOUND",
+    "AGENT_ERROR_APPROVAL_CONFLICT",
+    "AGENT_ERROR_APPROVAL_REJECTED",
+    "AGENT_ERROR_APPROVAL_STORE_FAILURE",
+    "AGENT_ERROR_TOOL_AUTHORIZATION_FAILED",
+    "AGENT_ERROR_CANCEL_REQUESTED",
+    "AGENT_ERROR_CANCELLED",
+    "AGENT_ERROR_RUN_NOT_CANCELLABLE",
+    "AGENT_ERROR_RUN_NOT_RESUMABLE",
+    "AGENT_ERROR_CANCELLATION_CONFLICT",
+    "AgentApprovalStore",
+    "AgentApprovalRequest",
+    "AgentApprovalResolution",
+    "approval_request_of",
+    "new_approval_id",
+    "APPROVAL_DECISIONS",
+    "APPROVAL_STATUS_PENDING",
+    "APPROVAL_STATUS_APPROVED",
+    "APPROVAL_STATUS_REJECTED",
+    "AgentCancellationCoordinator",
+    "AgentCancellationResult",
+    "AgentCancellationError",
 ]

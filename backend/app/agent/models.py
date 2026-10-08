@@ -9,7 +9,8 @@
 
 Status（Phase 5 Decision §8）：
     COMPLETED / FAILED / LIMIT_REACHED 为本阶段**实现**的状态；
-    CANCELLED / WAITING_APPROVAL **仅保留常量**（不实现业务行为）。
+    CANCELLED（Phase 5 P-7 协作式取消；**不**映射成 FAILED）与
+    WAITING_APPROVAL（Phase 5 P-7 HITL 暂停；**不**写 AgentRun 终态）已实现。
 """
 from __future__ import annotations
 
@@ -42,8 +43,8 @@ __all__ = [
 AGENT_STATUS_COMPLETED: Final[str] = "COMPLETED"
 AGENT_STATUS_FAILED: Final[str] = "FAILED"
 AGENT_STATUS_LIMIT_REACHED: Final[str] = "LIMIT_REACHED"
-AGENT_STATUS_CANCELLED: Final[str] = "CANCELLED"  # 预留（本阶段不产生）
-AGENT_STATUS_WAITING_APPROVAL: Final[str] = "WAITING_APPROVAL"  # 预留（不产生）
+AGENT_STATUS_CANCELLED: Final[str] = "CANCELLED"  # P-7 协作式取消（终态）
+AGENT_STATUS_WAITING_APPROVAL: Final[str] = "WAITING_APPROVAL"  # P-7 HITL 暂停（非终态）
 
 #: Step 类型。
 AGENT_STEP_FINAL: Final[str] = "FINAL"
@@ -184,3 +185,10 @@ class AgentRuntimeResult:
     tokens_used: int = 0
     token_budget_unverifiable: bool = False
     step_records: tuple[AgentStep, ...] = field(default_factory=tuple)
+    approval_id: str | None = None
+    """Phase 5 P-7：本次 Run **暂停等待人工审批**时的审批身份（否则 ``None``）。
+
+    ``status = WAITING_APPROVAL`` ⇒ 该 Run 尚未终态（不写 AgentRun）：调用方
+    用它裁决（``resolve_agent_approval(approval_id, decision)``）后再
+    ``resume()``。**不**含 arguments / prompt（审批只回答"是否允许"）。
+    """

@@ -37,7 +37,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Final
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.app.agent.checkpoint import (
@@ -135,14 +144,15 @@ class AgentCheckpoint(Base):
     status: Mapped[str] = mapped_column(
         String(AGENT_CHECKPOINT_STATUS_MAX_LENGTH),
         nullable=False,
-        comment="ACTIVE / PAUSED（预留）/ TERMINAL",
+        comment="ACTIVE / PAUSED（HITL 暂停；P-7 生产）/ TERMINAL",
     )
     next_action: Mapped[str] = mapped_column(
         String(AGENT_CHECKPOINT_NEXT_ACTION_MAX_LENGTH),
         nullable=False,
         comment=(
-            "NONE / LLM_DECISION / TOOL_EXECUTION / WAITING_APPROVAL（预留）/ "
-            "COMPLETED / FAILED（**不新增** LIMIT_REACHED / CANCELLED）"
+            "NONE / LLM_DECISION / TOOL_EXECUTION / WAITING_APPROVAL / "
+            "COMPLETED / FAILED / CANCELLED（P-7 §三十五；**不新增** "
+            "APPROVED / REJECTED / LIMIT_REACHED）"
         ),
     )
     pending_step_index: Mapped[int | None] = mapped_column(
@@ -172,6 +182,24 @@ class AgentCheckpoint(Base):
         comment=(
             "P-4 结果引用 '{run_id}:{step_index}'（逻辑定位 agent_tool_result；"
             "**不**新增 result_ref API、**不**复制 result body）"
+        ),
+    )
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=(
+            "Phase 5 P-7 协作式取消**信号**（不是 status 枚举成员；§二十八）："
+            "true ⇒ Runtime 在安全边界观察到后 CANCELLED（**不**强杀运行中的 Tool）；"
+            "只由 request_cancel 的 CAS 置位，**绝不**被 update() 覆盖"
+        ),
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "取消信号置位时间（UTC；审计用；**不**存 reason / 自由文本 —— "
+            "本阶段取消身份 = run_id，§五十三）"
         ),
     )
     created_at: Mapped[datetime] = mapped_column(

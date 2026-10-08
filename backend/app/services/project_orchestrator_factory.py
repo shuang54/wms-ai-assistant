@@ -47,6 +47,7 @@ from backend.app.agent import (
     ProviderAgentLLM,
 )
 from backend.app.agent.recorder import (
+    build_agent_approval_store,
     build_agent_checkpoint_recorder,
     build_agent_decision_store,
     build_agent_tool_result_reader,
@@ -311,6 +312,10 @@ def build_orchestrator_for_project(
     resolved_agent_decision_store: Any | None = getattr(
         base, "agent_decision_store", None
     )
+    # Phase 5 P-7：HITL 审批存储（同方式继承 base；无 DB ⇒ None）。
+    resolved_agent_approval_store: Any | None = getattr(
+        base, "agent_approval_store", None
+    )
     if agent_enabled:
         resolved_agent_provider = (
             agent_llm_provider
@@ -330,6 +335,11 @@ def build_orchestrator_for_project(
         # 必须在 Runtime 构造前解析（Runtime 直接持有 Decision 写入端口）。
         if resolved_agent_decision_store is None:
             resolved_agent_decision_store = build_agent_decision_store()
+        # Phase 5 P-7：HITL 审批存储（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析：Runtime 直接持有审批端口
+        # （请求写入 + Resume 读取）；Orchestrator 用同一实例裁决。
+        if resolved_agent_approval_store is None:
+            resolved_agent_approval_store = build_agent_approval_store()
         # Phase 5 P-5：Checkpoint 持久化边界（base 继承 → 否则在本装配点创建）。
         # 必须在 Runtime 构造前解析：Runtime 直接持有 Checkpoint 写入端口。
         # 同一实例随后也注入 Orchestrator（终态 TERMINAL 写点）。
@@ -367,6 +377,12 @@ def build_orchestrator_for_project(
             tool_result_store=(
                 build_agent_tool_result_reader() if agent_enabled else None
             ),
+            # Phase 5 P-7：HITL 审批端口（Tool **执行前**暂停；人工裁决后 Resume）。
+            # 生产默认 **没有** Tool 需要审批（现有只读 Tool 不需 HITL；§四十）：
+            # ``approval_required_tools=()`` ⇒ 审批门永不触发（行为与 P-6 一致）；
+            # 未来在 ProjectCapabilities / 策略层声明后，仅需在此传入工具名。
+            approval_port=resolved_agent_approval_store,
+            approval_required_tools=(),
         )
         # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
         # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。
@@ -440,6 +456,9 @@ def build_orchestrator_for_project(
         agent_run_recorder=resolved_agent_run_recorder,
         # Phase 5 P-5：终态 Checkpoint 写点（best-effort；无 DB ⇒ None）。
         agent_checkpoint_recorder=resolved_agent_checkpoint_recorder,
+        # Phase 5 P-7：HITL 审批裁决（resolve_agent_approval）与取消
+        # （cancel_agent_run）经由同一 Checkpoint recorder / Approval store。
+        agent_approval_store=resolved_agent_approval_store,
         # Phase 5 AgentStep Persistence：Step 投影持久化（独立 best-effort）。
         agent_step_recorder=resolved_agent_step_recorder,
     )

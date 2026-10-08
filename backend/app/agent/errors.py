@@ -28,6 +28,17 @@ __all__ = [
     "AGENT_ERROR_TOOL_EXECUTION_FAILURE",
     "AGENT_ERROR_LIMIT_REACHED",
     "AGENT_ERROR_FAILED",
+    "AGENT_ERROR_APPROVAL_REQUIRED",
+    "AGENT_ERROR_APPROVAL_NOT_FOUND",
+    "AGENT_ERROR_APPROVAL_CONFLICT",
+    "AGENT_ERROR_APPROVAL_REJECTED",
+    "AGENT_ERROR_APPROVAL_STORE_FAILURE",
+    "AGENT_ERROR_TOOL_AUTHORIZATION_FAILED",
+    "AGENT_ERROR_CANCEL_REQUESTED",
+    "AGENT_ERROR_CANCELLED",
+    "AGENT_ERROR_RUN_NOT_CANCELLABLE",
+    "AGENT_ERROR_RUN_NOT_RESUMABLE",
+    "AGENT_ERROR_CANCELLATION_CONFLICT",
     "AGENT_ERROR_CODES",
 ]
 
@@ -77,6 +88,31 @@ AGENT_ERROR_RESUME_CONFLICT: Final[str] = "AGENT_RESUME_CONFLICT"
 #: 终态 Resume 但最终内容不可恢复（**不**重新调用 LLM；§三十七）。
 AGENT_ERROR_FINAL_RESULT_UNAVAILABLE: Final[str] = "AGENT_FINAL_RESULT_UNAVAILABLE"
 
+# ---- Phase 5 P-7（HITL / 协作式取消）稳定码 ----
+#: Tool 需要人工审批 ⇒ Run 暂停（WAITING_APPROVAL；**不**写 AgentRun 终态）。
+#: 同时用于 Resume 时 Approval 仍为 PENDING 的返回码（幂等暂停）。
+AGENT_ERROR_APPROVAL_REQUIRED: Final[str] = "AGENT_APPROVAL_REQUIRED"
+#: 该 step 没有 Approval 记录（身份不一致 / 未创建 / 读取失败）⇒ fail closed。
+AGENT_ERROR_APPROVAL_NOT_FOUND: Final[str] = "AGENT_APPROVAL_NOT_FOUND"
+#: Approval 与 Run / Decision 状态冲突（并发裁决、已终态、身份不符）⇒ fail closed。
+AGENT_ERROR_APPROVAL_CONFLICT: Final[str] = "AGENT_APPROVAL_CONFLICT"
+#: 人工明确拒绝 ⇒ Agent Run FAILED（**不**重问 LLM / **不**换 Tool / Tool = 0）。
+AGENT_ERROR_APPROVAL_REJECTED: Final[str] = "AGENT_APPROVAL_REJECTED"
+#: Approval 无法持久化（写失败 / Decision 未 durable）⇒ 不暂停、不执行 Tool。
+AGENT_ERROR_APPROVAL_STORE_FAILURE: Final[str] = "AGENT_APPROVAL_STORE_FAILURE"
+#: 审批通过后的**再次**授权失败（Approval ≠ Authorization；§二十 / §四十一）。
+AGENT_ERROR_TOOL_AUTHORIZATION_FAILED: Final[str] = "AGENT_TOOL_AUTHORIZATION_FAILED"
+#: Agent 在安全边界观察到取消请求 ⇒ Run CANCELLED（Tool Result 保留；§二十五 / §三十一）。
+AGENT_ERROR_CANCEL_REQUESTED: Final[str] = "AGENT_CANCEL_REQUESTED"
+#: 取消请求已生效（幂等重复取消 / 已取消的 Run）。
+AGENT_ERROR_CANCELLED: Final[str] = "AGENT_CANCELLED"
+#: Run 已终态（COMPLETED / FAILED / LIMIT_REACHED）⇒ 取消为 **no-op**（§三十八）。
+AGENT_ERROR_RUN_NOT_CANCELLABLE: Final[str] = "AGENT_RUN_NOT_CANCELLABLE"
+#: CANCELLED 的 Run **禁止** Resume（§三十三 / §六十五）。
+AGENT_ERROR_RUN_NOT_RESUMABLE: Final[str] = "AGENT_RUN_NOT_RESUMABLE"
+#: 取消与其它控制状态转换竞争且无法确定唯一赢家 ⇒ fail closed（§三十六 / §五十四）。
+AGENT_ERROR_CANCELLATION_CONFLICT: Final[str] = "AGENT_CANCELLATION_CONFLICT"
+
 #: 全部稳定错误码（供上层白名单校验 / 观测归一化使用；**不含**自由文本）。
 AGENT_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
@@ -96,6 +132,18 @@ AGENT_ERROR_CODES: Final[frozenset[str]] = frozenset(
         AGENT_ERROR_TOOL_RESULT_UNAVAILABLE,
         AGENT_ERROR_RESUME_CONFLICT,
         AGENT_ERROR_FINAL_RESULT_UNAVAILABLE,
+        # Phase 5 P-7
+        AGENT_ERROR_APPROVAL_REQUIRED,
+        AGENT_ERROR_APPROVAL_NOT_FOUND,
+        AGENT_ERROR_APPROVAL_CONFLICT,
+        AGENT_ERROR_APPROVAL_REJECTED,
+        AGENT_ERROR_APPROVAL_STORE_FAILURE,
+        AGENT_ERROR_TOOL_AUTHORIZATION_FAILED,
+        AGENT_ERROR_CANCEL_REQUESTED,
+        AGENT_ERROR_CANCELLED,
+        AGENT_ERROR_RUN_NOT_CANCELLABLE,
+        AGENT_ERROR_RUN_NOT_RESUMABLE,
+        AGENT_ERROR_CANCELLATION_CONFLICT,
     }
 )
 

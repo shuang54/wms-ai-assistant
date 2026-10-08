@@ -21,6 +21,7 @@ from backend.app.db.models.agent_checkpoint import AgentCheckpoint
 from backend.app.db.models.agent_decision import AgentDecision
 from backend.app.db.models.agent_run import AgentRun
 from backend.app.db.models.agent_step import AgentStep
+from backend.app.db.models.agent_approval import AgentApproval
 from backend.app.db.models.agent_tool_result import AgentToolResult
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
@@ -69,6 +70,9 @@ _MODELS: tuple[type, ...] = (
     # Phase 5 P-6 Decision Store：Agent Decision（LLM decision replay data；ai_ops；
     # **无外键**；UNIQUE(run_id, step_index) + UNIQUE(decision_ref)）。
     AgentDecision,
+    # Phase 5 P-7 HITL: Agent Approval (human approval request; ai_ops; no FK;
+    # UNIQUE(approval_id) + UNIQUE(run_id, step_index)).
+    AgentApproval,
 )
 
 
@@ -78,6 +82,7 @@ __all__ = [
     "AgentRun",
     "AgentStep",
     "AgentToolResult",
+    "AgentApproval",
     "AssistantOutcomeRecord",
     "Conversation",
     "ConversationEvidenceRecord",

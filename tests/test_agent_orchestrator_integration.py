@@ -126,6 +126,9 @@ _FROZEN_METADATA_KEYS = {
     "agent_llm_calls",
     "agent_tokens_used",
     "agent_token_budget_unverifiable",
+    # Phase 5 P-7（HITL）：暂停待审批时的审批身份（稳定 / 非敏感；
+    # None = 本次未涉及审批）
+    "agent_approval_id",
 }
 
 #: 恶意注入样例（只能作为 untrusted 数据出现，不得改变任何授权 / 预算）

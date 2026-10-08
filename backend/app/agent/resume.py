@@ -77,6 +77,8 @@ class AgentResumeResult:
     tool_calls: int
     steps: int
     agent_result: AgentRuntimeResult
+    approval_id: str | None = None
+    """Phase 5 P-7：本次 Resume 涉及的审批身份（HITL 路径；否则 ``None``）。"""
 
 
 def decision_mismatch_code(decision: Any, checkpoint: Any) -> str | None:
@@ -101,7 +103,11 @@ def decision_mismatch_code(decision: Any, checkpoint: Any) -> str | None:
 
 
 def resume_result_of_agent_result(
-    *, run_id: str, agent_result: AgentRuntimeResult, replayed_step_index: int | None
+    *,
+    run_id: str,
+    agent_result: AgentRuntimeResult,
+    replayed_step_index: int | None,
+    approval_id: str | None = None,
 ) -> AgentResumeResult:
     """``AgentRuntimeResult`` → ``AgentResumeResult``（续跑路径；纯映射）。"""
     return AgentResumeResult(
@@ -114,4 +120,5 @@ def resume_result_of_agent_result(
         tool_calls=agent_result.tool_calls,
         steps=agent_result.steps,
         agent_result=agent_result,
+        approval_id=approval_id,
     )

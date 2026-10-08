@@ -54,12 +54,33 @@ from datetime import datetime, timezone
 from typing import Any, Final, Protocol
 
 from backend.app.agent.capability import AgentCapability
-from backend.app.agent.checkpoint import AgentCheckpointRecorder
-from backend.app.agent.errors import AGENT_ERROR_CODES, AGENT_ERROR_FAILED
+from backend.app.agent.approval import (
+    AgentApprovalResolution,
+    approval_conflict_code,
+    is_valid_approval_decision,
+)
+from backend.app.agent.cancellation import (
+    AgentCancellationCoordinator,
+    AgentCancellationError,
+    AgentCancellationResult,
+)
+from backend.app.agent.checkpoint import (
+    CHECKPOINT_STATUS_TERMINAL,
+    AgentCheckpointRecorder,
+)
+from backend.app.agent.errors import (
+    AGENT_ERROR_APPROVAL_CONFLICT,
+    AGENT_ERROR_APPROVAL_NOT_FOUND,
+    AGENT_ERROR_CODES,
+    AGENT_ERROR_FAILED,
+    AGENT_ERROR_RUN_NOT_RESUMABLE,
+)
 from backend.app.agent.models import (
+    AGENT_STATUS_CANCELLED,
     AGENT_STATUS_COMPLETED,
     AGENT_STATUS_FAILED,
     AGENT_STATUS_LIMIT_REACHED,
+    AGENT_STATUS_WAITING_APPROVAL,
     AgentRuntimeResult,
 )
 from backend.app.agent.recorder import AgentRunRecorder, AgentStepRecorder
@@ -372,6 +393,7 @@ class AIOrchestratorService:
         agent_run_recorder: AgentRunRecorder | None = None,
         agent_step_recorder: AgentStepRecorder | None = None,
         agent_checkpoint_recorder: AgentCheckpointRecorder | None = None,
+        agent_approval_store: Any | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
@@ -600,6 +622,18 @@ class AIOrchestratorService:
                 f"（当前: {type(agent_checkpoint_recorder).__name__}）"
             )
         self._agent_checkpoint_recorder = agent_checkpoint_recorder
+        # Phase 5 P-7：HITL 审批存储（可选；None ⇒ resolve_agent_approval 不可用）。
+        # Orchestrator 只做**控制状态裁决**（不执行 Agent Loop / 不解析 Tool Call /
+        # 不直接执行 Tool；§四十五 / §二十三）。
+        if agent_approval_store is not None and not (
+            callable(getattr(agent_approval_store, "aresolve", None))
+            or callable(getattr(agent_approval_store, "resolve", None))
+        ):
+            raise AIOrchestratorInputError(
+                "agent_approval_store 必须提供可调用的 aresolve() 或 resolve()"
+                f"（当前: {type(agent_approval_store).__name__}）"
+            )
+        self._agent_approval_store = agent_approval_store
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -1275,6 +1309,159 @@ class AIOrchestratorService:
                 exc_info=True,
             )
 
+    # ---------- Phase 5 P-7：HITL 审批裁决 / 协作式取消（内部 Service API） ----------
+
+    async def resolve_agent_approval(
+        self, approval_id: str, *, decision: str
+    ) -> AgentApprovalResolution:
+        """裁决一次 HITL 审批（**只改控制状态**；执行由 :meth:`resume_agent_run` 承担）。
+
+        契约（§十三 / §十七 / §十八 / §十九 / §二十三 / §三十二）：
+
+            * ``decision`` ∈ {``APPROVED``, ``REJECTED``} —— **不**接受
+              retry / modify / edit_tool / change_arguments / change_tool；
+            * **幂等**：同一裁决重复提交 ⇒ 返回既有终态，**不**再次执行 Tool；
+            * **冲突**：不同裁决（或 Run 已终态，含 CANCELLED）⇒
+              ``AGENT_APPROVAL_CONFLICT`` + fail-closed（**不**覆盖、**不**重试）；
+            * **不**调用 LLM / ToolExecutionService / Resume（§二十三）；
+            * ``Approval ≠ Authorization``：批准后执行前仍必须**重新**授权（§四十一）。
+
+        Returns:
+            :class:`AgentApprovalResolution`（``error_code`` 非空 ⇒ 未发生转换）。
+        """
+        if not isinstance(approval_id, str) or not approval_id.strip():
+            raise AIOrchestratorInputError("approval_id 必须是非空 str")
+        if not is_valid_approval_decision(decision):
+            raise AIOrchestratorInputError(
+                "decision 只接受 APPROVED / REJECTED"
+                f"（当前: {decision!r}）"
+            )
+        store = self._agent_approval_store
+        if store is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 HITL 审批（agent_approval_store 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        record = await self._call_approval(
+            store, ("aget", "get"), approval_id=approval_id
+        )
+        if record is None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=None,
+                status=None,
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_NOT_FOUND,
+            )
+        run_id = getattr(record, "run_id", None)
+        # 已终态 Run（含 CANCELLED）：审批**不得**复活执行（§三十二：fail-closed）
+        if await self._approval_run_is_terminal(run_id):
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=run_id if isinstance(run_id, str) else None,
+                status=getattr(record, "status", None),
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_CONFLICT,
+            )
+
+        resolved = await self._call_approval(
+            store,
+            ("aresolve", "resolve"),
+            approval_id=approval_id,
+            decision=decision,
+        )
+        if resolved is not None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=getattr(resolved, "run_id", None),
+                status=getattr(resolved, "status", None),
+                decision=getattr(resolved, "decision", None),
+                error_code=None,
+            )
+        # 无转换（条件 UPDATE 未命中）：读回判定"幂等"或"冲突"（绝不 force）
+        current = await self._call_approval(
+            store, ("aget", "get"), approval_id=approval_id
+        )
+        if current is None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=run_id if isinstance(run_id, str) else None,
+                status=None,
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_NOT_FOUND,
+            )
+        existing = getattr(current, "status", None)
+        conflict = approval_conflict_code(existing, decision)
+        return AgentApprovalResolution(
+            approval_id=approval_id,
+            run_id=getattr(current, "run_id", None),
+            status=existing,
+            decision=decision if conflict is None else None,
+            error_code=conflict,
+        )
+
+    async def cancel_agent_run(self, run_id: str) -> AgentCancellationResult:
+        """请求取消一个 Agent Run（**协作式**；内部 Service API；§四十三）。
+
+        契约（§二十四–§三十八）：
+
+            * 只设置**持久化控制状态**（Checkpoint.cancel_requested = true，CAS）；
+              运行中的 Agent 在安全边界（LLM 前 / Tool 前 / Tool 返回后）停止；
+            * **不强杀**运行中的 Tool：等它返回 ⇒ Tool Result 保留 ⇒ CANCELLED；
+            * 暂停中的 Run（PAUSED / WAITING_APPROVAL）没有活着的循环 ⇒ 直接终态化
+              （Checkpoint = TERMINAL / CANCELLED；Tool = 0）；
+            * 终态 Run ⇒ **no-op**（``AGENT_RUN_NOT_CANCELLABLE``）；
+            * 重复取消 ⇒ **幂等**（返回当前状态；不再调 LLM / Tool）；
+            * **不**调用 LLM / ToolExecutionService / Resume。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AIOrchestratorInputError("run_id 必须是非空 str")
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent Checkpoint（无法取消：无控制状态）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+        coordinator = AgentCancellationCoordinator(checkpoints=recorder)
+        try:
+            return await asyncio.to_thread(coordinator.cancel, run_id)
+        except AgentCancellationError as exc:
+            raise AIOrchestratorExecutionError(
+                f"取消 Agent Run 失败（fail-closed）: {type(exc).__name__}"
+            ) from exc
+
+    async def _call_approval(
+        self, store: Any, names: tuple[str, str], *args: Any, **kwargs: Any
+    ) -> Any | None:
+        """调用审批存储的异步入口（``aget``/``aresolve``，否则同步入口放进线程）。"""
+        async_name, sync_name = names
+        call = getattr(store, async_name, None)
+        if callable(call):
+            return await call(*args, **kwargs)
+        sync_call = getattr(store, sync_name, None)
+        if callable(sync_call):
+            return await asyncio.to_thread(sync_call, *args, **kwargs)
+        return None
+
+    async def _approval_run_is_terminal(self, run_id: Any) -> bool:
+        """该 Run 的 Checkpoint 是否已终态（**读失败 ⇒ True = fail-closed**）。"""
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            return False
+        if not isinstance(run_id, str) or not run_id.strip():
+            return True
+        try:
+            checkpoint = await asyncio.to_thread(recorder.get, run_id)
+        except Exception:  # noqa: BLE001 —— 不可判定 ⇒ fail-closed（不裁决）
+            logger.warning("审批裁决前无法读取 Checkpoint（fail-closed）")
+            return True
+        if checkpoint is None:
+            return False
+        return getattr(checkpoint, "status", None) == CHECKPOINT_STATUS_TERMINAL
+
     # ---------- AGENT 路径（Phase 5 Agent Runtime Integration §29） ----------
 
     async def _run_agent(
@@ -1350,13 +1537,20 @@ class AIOrchestratorService:
         # Phase 5 P-2：run-level 持久化（best-effort；失败绝不改变 Agent 结果）。
         # 终态（COMPLETED / FAILED / LIMIT_REACHED…）**一律**记录：
         # FAILED 之后本方法仍会抛 ExecutionError，但 run 事实已经发生。
-        await self._record_agent_run(
-            agent_result,
-            request_id=request_id,
-            started_at=started_at,
-            finished_at=finished_at,
-            duration_ms=duration_ms,
-        )
+        # Phase 5 P-7：WAITING_APPROVAL ⇒ Run **尚未终态** ⇒ **不写** AgentRun
+        #（§十六：既不能写 WAITING_APPROVAL，也不能把它映射成 FAILED；
+        #  终态记录留给审批后的 resume 路径）。
+        if (
+            getattr(agent_result, "status", None)
+            != AGENT_STATUS_WAITING_APPROVAL
+        ):
+            await self._record_agent_run(
+                agent_result,
+                request_id=request_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
 
         if not isinstance(agent_result, AgentRuntimeResult):
             raise AIOrchestratorExecutionError(
@@ -1368,8 +1562,11 @@ class AIOrchestratorService:
         error_code = _stable_agent_error_code(agent_result.error)
 
         # Phase 5 P-5：终态 Checkpoint（best-effort；写点必须在 FAILED 抛出之前，
-        # 使 COMPLETED / FAILED / LIMIT_REACHED 都能落 TERMINAL；§三十五 / §三十六）。
-        await self._record_agent_terminal_checkpoint(agent_result)
+        # 使 COMPLETED / FAILED / LIMIT_REACHED / CANCELLED 都能落 TERMINAL；
+        # §三十五 / §三十六 / P-7 §三十四–§三十五）。
+        # P-7：WAITING_APPROVAL 不是终态 ⇒ 不写（Checkpoint 由 Runtime 写 PAUSED）。
+        if status != AGENT_STATUS_WAITING_APPROVAL:
+            await self._record_agent_terminal_checkpoint(agent_result)
 
         # FAILED：进入既有 Orchestrator 错误边界（USER turn 保留 /
         # 无 ASSISTANT turn / outcome=FAILED 由 execute() 统一记录）。
@@ -1404,6 +1601,9 @@ class AIOrchestratorService:
                 "agent_token_budget_unverifiable": (
                     agent_result.token_budget_unverifiable
                 ),
+                # Phase 5 P-7（HITL）：暂停待审批时的审批身份（否则 None；
+                # 稳定 / 非敏感；不含 arguments / claim_token）
+                "agent_approval_id": getattr(agent_result, "approval_id", None),
             },
         )
 
@@ -1491,17 +1691,31 @@ class AIOrchestratorService:
 
         agent_result: AgentRuntimeResult = resume_result.agent_result
 
-        # 既有终态投影（best-effort；幂等：run_id 已存在则不产生第二行）
-        await self._record_agent_steps(agent_result)
-        await self._record_agent_run(
-            agent_result,
-            request_id=request_id,
-            started_at=started_at,
-            finished_at=finished_at,
-            duration_ms=duration_ms,
-        )
-        # 终态 Checkpoint（TERMINAL；经 state_version + claim_token 更新；§三十四）
-        await self._record_agent_terminal_checkpoint(agent_result)
+        # Phase 5 P-7：CANCELLED 的 Run **拒绝** Resume（§三十三 / §六十五）：
+        # 不写 Step / 不写 AgentRun（该 Run 没有本次请求的执行记录）；
+        # 只把控制状态终态化（TERMINAL / CANCELLED）后抛拒绝错误。
+        if resume_result.error_code == AGENT_ERROR_RUN_NOT_RESUMABLE:
+            await self._record_agent_terminal_checkpoint(agent_result)
+            raise AIOrchestratorExecutionError(
+                f"Agent Resume 拒绝: {AGENT_ERROR_RUN_NOT_RESUMABLE}"
+            )
+
+        # Phase 5 P-7：WAITING_APPROVAL ⇒ Run 仍未终态：不写 Step / Run / 终态
+        # Checkpoint（§十六）；把审批身份透出给调用方（§四十二）。
+        paused = resume_result.status == AGENT_STATUS_WAITING_APPROVAL
+        if not paused:
+            # 既有终态投影（best-effort；幂等：run_id 已存在则不产生第二行）
+            await self._record_agent_steps(agent_result)
+            await self._record_agent_run(
+                agent_result,
+                request_id=request_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+            # 终态 Checkpoint（TERMINAL；COMPLETED / FAILED / CANCELLED；
+            # 经 state_version + claim_token 更新；§三十四）
+            await self._record_agent_terminal_checkpoint(agent_result)
 
         if resume_result.status == AGENT_STATUS_FAILED:
             raise AIOrchestratorExecutionError(
@@ -1533,6 +1747,9 @@ class AIOrchestratorService:
                 "resume_llm_calls": resume_result.llm_calls,
                 "resume_tool_calls": resume_result.tool_calls,
                 "resume_error": resume_result.error_code,
+                # Phase 5 P-7（HITL）：暂停待审批 / 已裁决时的审批身份（否则 None）
+                "agent_approval_id": getattr(resume_result, "approval_id", None)
+                or getattr(agent_result, "approval_id", None),
             },
         )
 
