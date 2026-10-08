@@ -73,6 +73,20 @@ _TOOL_CALL = AgentDecision(
 _FINAL = AgentDecision(type=DECISION_FINAL, content="库存 120 件。")
 
 
+class _RecordingRunRecorder:
+    """记录 AgentRun 写入（best-effort 端口；仅断言"是否写过"）。"""
+
+    def __init__(self) -> None:
+        self.statuses: list[str] = []
+
+    def record(self, agent_result: Any, **kwargs: Any) -> int | None:
+        self.statuses.append(str(getattr(agent_result, "status", None)))
+        return 1
+
+    async def arecord(self, agent_result: Any, **kwargs: Any) -> int | None:
+        return self.record(agent_result, **kwargs)
+
+
 def _orchestrator(
     env: Any,
     *,
@@ -387,6 +401,32 @@ class TestOrchestratorCancellationApi:
         )
         assert resolution.error_code == AGENT_ERROR_APPROVAL_CONFLICT
         assert env.approvals.get(paused.approval_id).status == "PENDING"
+
+    async def test_execute_pause_projection_skips_run_write(self) -> None:
+        """``execute()`` 的暂停投影（§十五 / §十六）：Tool = 0 且**不写** AgentRun。
+
+        * ``metadata.agent_status = WAITING_APPROVAL``（Run 尚未终态）；
+        * ``metadata.agent_approval_id`` = 待裁决审批身份（§四十二）；
+        * AgentRun 记录器**零调用**（暂停不是 COMPLETED / FAILED）。
+        """
+        env = _env(FakeLLM([_TOOL_CALL, _FINAL]))
+        run_recorder = _RecordingRunRecorder()
+        orchestrator = AIOrchestratorService(
+            router=_AgentRouteRouter(),  # type: ignore[arg-type]
+            agent_runtime=env.runtime,
+            agent_approval_store=env.approval_store,
+            agent_checkpoint_recorder=env.checkpoint_recorder,
+            agent_run_recorder=run_recorder,
+        )
+
+        result = await orchestrator.execute("查询 MAT001 库存")
+
+        assert result.metadata["agent_status"] == AGENT_STATUS_WAITING_APPROVAL
+        assert result.metadata["agent_error"] == "AGENT_APPROVAL_REQUIRED"
+        assert result.metadata["agent_approval_id"]
+        assert run_recorder.statuses == []  # §十六：暂停不写终态执行记录
+        assert env.registry.execute_calls == []  # §十五：Tool Handler = 0
+        assert result.data.approval_id == result.metadata["agent_approval_id"]
 
     async def test_paused_run_metadata_exposes_approval_id(self) -> None:
         """§四十二：暂停结果只透出非敏感审批身份（供未来 Read API / UI）。"""
