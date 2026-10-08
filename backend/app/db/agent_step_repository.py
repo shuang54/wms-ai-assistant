@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, Sequence
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -57,6 +59,7 @@ __all__ = [
     "AgentStepRepository",
     "AgentStepRepositoryError",
     "AgentStepRow",
+    "AgentStepRead",
     "AGENT_STEP_TYPES",
     "AGENT_STEP_STATUSES",
     "validate_step_type",
@@ -92,6 +95,39 @@ class AgentStepRow:
     tool_name: str | None = None
     error_code: str | None = None
     elapsed_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class AgentStepRead:
+    """Step 的**只读**投影（Phase 5 P-8 Read Model）。
+
+    比写入行 ``AgentStepRow`` 多 ``created_at``（Timeline 排序 / ``occurred_at``
+    的唯一时间来源）；字段仍严格限于已落盘列 —— **不含** arguments / output /
+    prompt / tool result 正文。
+    """
+
+    run_id: str
+    step_index: int
+    step_type: str
+    status: str
+    tool_name: str | None
+    error_code: str | None
+    elapsed_ms: float | None
+    created_at: datetime
+
+
+def _to_read(row: Any) -> AgentStepRead:
+    """ORM 行 → ``AgentStepRead``（**显式逐字段映射**；不透传 ORM）。"""
+    return AgentStepRead(
+        run_id=row.run_id,
+        step_index=row.step_index,
+        step_type=row.step_type,
+        status=row.status,
+        tool_name=row.tool_name,
+        error_code=row.error_code,
+        elapsed_ms=row.elapsed_ms,
+        created_at=row.created_at,
+    )
 
 
 def validate_step_type(value: object) -> str:
@@ -195,6 +231,36 @@ class AgentStepRepository:
             "error_code": row.error_code,
             "elapsed_ms": validate_elapsed_ms(row.elapsed_ms),
         }
+
+    # ---------- 读取（Phase 5 P-8 Read Model） ----------
+
+    def list_for_run(self, run_id: str) -> list[AgentStepRead]:
+        """该 Run 的**全部** Step（按 ``step_index`` 升序、``id`` 兜底）。
+
+        Phase 5 P-8：Read Model 列表查询（**只读**；显式 ORDER BY ⇒ 不依赖 DB
+        自然顺序）；一次查询取全量（Run 内 Step 有界，避免 N+1）。
+
+        Raises:
+            ValueError:               run_id 非法（触达 DB 之前拦截）。
+            AgentStepRepositoryError: DB 未配置或读取失败。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = list(
+                    session.execute(
+                        select(AgentStep)
+                        .where(AgentStep.run_id == run_id)
+                        .order_by(AgentStep.step_index.asc(), AgentStep.id.asc())
+                    ).scalars()
+                )
+                return [_to_read(row) for row in rows]
+        except SQLAlchemyError as exc:
+            raise AgentStepRepositoryError(
+                f"Agent Step 读取失败: {type(exc).__name__}"
+            ) from exc
 
     # ---------- 写入 ----------
 

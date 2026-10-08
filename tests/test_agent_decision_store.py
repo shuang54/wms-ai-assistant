@@ -455,6 +455,10 @@ class TestDecisionRepositoryValidation:
             validate_decision_type("PLAN")
 
     def test_repository_api_surface(self) -> None:
+        """Phase 5 P-8 扩展：+ ``list_for_run``（Read Model 的**只读**列表查询）。
+
+        仍然**没有** delete / resume / replay / timeline / 写更新。
+        """
         public = {
             name for name in dir(AgentDecisionRepository) if not name.startswith("_")
         }
@@ -464,9 +468,10 @@ class TestDecisionRepositoryValidation:
             "get",
             "get_by_ref",
             "get_latest",
+            "list_for_run",  # Phase 5 P-8：Read API / Timeline 的只读列表
             "delete_for_test",
         }
-        for forbidden in ("delete", "resume", "replay", "list", "timeline"):
+        for forbidden in ("delete", "resume", "replay", "timeline", "update"):
             assert not hasattr(AgentDecisionRepository, forbidden)
 
 

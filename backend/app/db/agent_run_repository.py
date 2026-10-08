@@ -23,9 +23,14 @@
 
 不做（MVP 边界）：
 
-    * 不新增 update / delete / list / aggregate（本阶段无 Agent Run 读 API）；
-    * 不新增 ``find_by_run_id``（无调用方；§十二 明确"不要为了完整而新增"）；
+    * 不新增 update / delete / list / aggregate；
     * 不做 SELECT-then-INSERT / upsert / in-memory 去重。
+
+Phase 5 P-8（Agent Read API / Timeline）新增：
+
+    get(run_id)   —— **只读**单行查询（Read Model 的唯一 Run 入口）
+                     字段 ≡ 写入字段（不新增列 / 不聚合内容 / prompt / context）；
+                     显式 ``WHERE run_id = …``（run_id UNIQUE ⇒ 至多 1 行）。
 
 失败语义：``SQLAlchemyError`` → ``AgentRunRepositoryError``（事务已回滚），
 由调用方（BestEffort recorder）收敛为 warning —— **绝不影响 Agent 业务结果**。
@@ -35,10 +40,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Final
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from backend.app.agent.recorder import AgentRunRecord
 from backend.app.db.models import AgentRun
 from backend.app.db.models.agent_run import (
     AGENT_RUN_CODE_MAX_LENGTH,
@@ -52,6 +59,7 @@ from backend.app.db.session import get_session_factory
 __all__ = [
     "AgentRunRepository",
     "AgentRunRepositoryError",
+    "AgentRunRecord",
     "AGENT_RUN_STATUSES",
     "validate_agent_run_id",
     "validate_agent_status",
@@ -106,8 +114,27 @@ def validate_stable_code(value: object, *, field: str) -> str | None:
     return value
 
 
+def _to_record(row: Any) -> AgentRunRecord:
+    """ORM 行 → ``AgentRunRecord``（**显式逐字段映射**；不透传 ORM）。"""
+    return AgentRunRecord(
+        run_id=row.run_id,
+        request_id=row.request_id,
+        project_id=row.project_id,
+        status=row.status,
+        error_code=row.error_code,
+        limit_reason=row.limit_reason,
+        step_count=row.step_count,
+        tool_call_count=row.tool_call_count,
+        llm_call_count=row.llm_call_count,
+        token_usage_unverifiable=row.token_usage_unverifiable,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        duration_ms=row.duration_ms,
+    )
+
+
 class AgentRunRepository:
-    """``ai_ops.agent_run`` 的最小仓储（MVP：仅幂等写入）。"""
+    """``ai_ops.agent_run`` 的最小仓储（幂等写入 + P-8 只读单行）。"""
 
     def __init__(
         self,
@@ -131,6 +158,33 @@ class AgentRunRepository:
         if factory is None:
             raise AgentRunRepositoryError("DATABASE_URL 未配置，无法持久化 Agent Run")
         return factory
+
+    # ---------- 读取（Phase 5 P-8 Read Model） ----------
+
+    def get(self, run_id: str) -> AgentRunRecord | None:
+        """按 ``run_id`` 读取一条 Agent Run（**只读**；无 ⇒ ``None``）。
+
+        Phase 5 P-8：Read Model 的唯一 Run 读取入口（run_id UNIQUE ⇒ 至多 1 行）。
+        返回写入字段的投影；**不**读取 / 聚合内容、prompt、context、tool 明细。
+
+        Raises:
+            ValueError:              run_id 非法（触达 DB 之前拦截）。
+            AgentRunRepositoryError: DB 未配置或读取失败。
+        """
+        validated_run_id = validate_agent_run_id(run_id, field="run_id")
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                row = session.execute(
+                    select(AgentRun).where(AgentRun.run_id == validated_run_id)
+                ).scalar_one_or_none()
+                if row is None:
+                    return None
+                return _to_record(row)
+        except SQLAlchemyError as exc:
+            raise AgentRunRepositoryError(
+                f"Agent Run 读取失败: {type(exc).__name__}"
+            ) from exc
 
     # ---------- 写入 ----------
 

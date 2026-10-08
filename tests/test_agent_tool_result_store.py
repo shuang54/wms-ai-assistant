@@ -650,10 +650,12 @@ class TestToolResultRepositoryValidation:
 
         assert repository.create_many(()) == []
 
-    def test_repository_api_surface_is_write_plus_resume_read(self) -> None:
-        """P-4 = **写入 Store**；P-6 只增加**一个**只读方法 ``get``（Resume 专用）。
+    def test_repository_api_surface_is_write_plus_two_reads(self) -> None:
+        """P-4 = **写入 Store**；P-6 增加 ``get``（Resume 专用）。
 
-        仍然**没有** find / list / timeline / replay / resume / Read API。
+        Phase 5 P-8 增加 ``list_for_run``（Read Model / Timeline 的**只读**元数据
+        列表；**不**读 payload）。仍然**没有** find / timeline / replay / resume /
+        delete。
         """
         public = {
             name
@@ -666,8 +668,9 @@ class TestToolResultRepositoryValidation:
             "create_many",
             "build_idempotent_insert",
             "get",  # Phase 5 P-6：Resume 的 Tool Result Replay 读取（§二十四）
+            "list_for_run",  # Phase 5 P-8：Read Model 元数据列表（不含 payload）
         }
-        for forbidden in ("find", "list", "timeline", "replay", "resume"):
+        for forbidden in ("find", "timeline", "replay", "resume", "update"):
             assert not hasattr(AgentToolResultRepository, forbidden)
 
 

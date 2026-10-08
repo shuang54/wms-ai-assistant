@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.app.api import (
+    agent_read,
     assistant_timeline,
     assistant_trace,
     chat,
@@ -61,6 +62,9 @@ def create_app() -> FastAPI:
     app.include_router(
         conversations.router, prefix="/api", tags=["conversations"]
     )
+    # Phase 5 P-8：Agent Read API（**只读** Query 边界：
+    # GET /api/agent/runs/{run_id} + /timeline；不触发 Resume / Approve / Cancel）。
+    app.include_router(agent_read.router, prefix="/api", tags=["agent"])
     return app
 
 

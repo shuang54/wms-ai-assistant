@@ -359,6 +359,33 @@ class AgentDecisionRepository:
             ) from exc
         return record
 
+    def list_for_run(self, run_id: str) -> list[AgentDecisionRecord]:
+        """该 Run 的**全部** Decision（按 ``step_index`` 升序；Phase 5 P-8）。
+
+        只读列表查询（Read Model / Timeline 数据源）：显式 ORDER BY ⇒ 不依赖 DB
+        自然顺序；一次查询取全量（Run 内 Decision 有界，避免 N+1）。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = list(
+                    session.execute(
+                        select(AgentDecisionModel)
+                        .where(AgentDecisionModel.run_id == run_id)
+                        .order_by(
+                            AgentDecisionModel.step_index.asc(),
+                            AgentDecisionModel.id.asc(),
+                        )
+                    ).scalars()
+                )
+        except SQLAlchemyError as exc:
+            raise AgentDecisionRepositoryError(
+                f"Agent Decision 读取失败: {type(exc).__name__}"
+            ) from exc
+        return [_to_record(row) for row in rows]
+
     # ---------- 删除（**仅**测试 / cleanup） ----------
 
     def delete_for_test(self, run_id: str) -> int:

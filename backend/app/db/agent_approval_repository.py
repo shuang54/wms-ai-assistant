@@ -31,6 +31,8 @@ delete_for_test(...)        —— **仅**测试 / cleanup（生产路径无 del
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final
 
 from sqlalchemy import func, select, update
@@ -55,9 +57,46 @@ from backend.app.db.session import get_session_factory
 __all__ = [
     "AgentApprovalRepository",
     "AgentApprovalRepositoryError",
+    "AgentApprovalRead",
     "validate_step_index",
     "validate_decision",
 ]
+
+
+@dataclass(frozen=True)
+class AgentApprovalRead:
+    """审批的**只读**安全投影（Phase 5 P-8 Read Model）。
+
+    刻意**不含** tool arguments / prompt / context / claim_token —— 审批是
+    控制状态（"是否允许执行"），不是 Tool Result（P-7 §八 / §十一）。
+    """
+
+    approval_id: str
+    run_id: str
+    step_index: int
+    tool_call_id: str | None
+    tool_name: str
+    status: str
+    decision: str | None
+    reason_code: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+def _to_read(row: Any) -> AgentApprovalRead:
+    """ORM 行 → ``AgentApprovalRead``（**显式逐字段映射**；不读 arguments）。"""
+    return AgentApprovalRead(
+        approval_id=row.approval_id,
+        run_id=row.run_id,
+        step_index=row.step_index,
+        tool_call_id=row.tool_call_id,
+        tool_name=row.tool_name,
+        status=row.status,
+        decision=row.decision,
+        reason_code=row.reason_code,
+        created_at=row.created_at,
+        resolved_at=row.resolved_at,
+    )
 
 
 class AgentApprovalRepositoryError(Exception):
@@ -250,6 +289,32 @@ class AgentApprovalRepository:
                 f"Agent Approval 读取失败: {type(exc).__name__}"
             ) from exc
         return row
+
+    def list_for_run(self, run_id: str) -> list[AgentApprovalRead]:
+        """该 Run 的**全部**审批（按 ``step_index`` / ``id`` 升序；Phase 5 P-8）。
+
+        只读列表查询（Read Model / Timeline 数据源）；显式 ORDER BY。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = list(
+                    session.execute(
+                        select(AgentApprovalModel)
+                        .where(AgentApprovalModel.run_id == run_id)
+                        .order_by(
+                            AgentApprovalModel.step_index.asc(),
+                            AgentApprovalModel.id.asc(),
+                        )
+                    ).scalars()
+                )
+        except SQLAlchemyError as exc:
+            raise AgentApprovalRepositoryError(
+                f"Agent Approval 读取失败: {type(exc).__name__}"
+            ) from exc
+        return [_to_read(row) for row in rows]
 
     # ---------- 裁决（条件 UPDATE；终态不可逆） ----------
 

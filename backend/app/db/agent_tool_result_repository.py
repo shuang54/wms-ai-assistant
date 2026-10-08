@@ -56,6 +56,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, Sequence
 
 from sqlalchemy import select
@@ -79,6 +80,7 @@ __all__ = [
     "AgentToolResultRepository",
     "AgentToolResultRepositoryError",
     "AgentToolResultRow",
+    "AgentToolResultRead",
     "validate_step_index",
     "validate_result_size_bytes",
     "validate_flag",
@@ -115,6 +117,50 @@ _ALLOWED_PAYLOAD_FIELDS: Final[frozenset[str]] = frozenset(
         "tool_call_id",
     }
 )
+
+
+@dataclass(frozen=True)
+class AgentToolResultRead:
+    """Tool Result 的**只读**元数据投影（Phase 5 P-8 Read Model）。
+
+    刻意**不含** ``result_payload`` / ``result_ref``：
+
+        * Tool Result 是 **untrusted data**（可能含敏感信息 / 大量数据 /
+          prompt injection）；
+        * 完整结果属于未来独立设计的 Artifact / Result Detail 能力（P-8 不做）；
+        * 最小权限：读模型**从不读取** payload ⇒ API 层不可能泄漏它。
+    """
+
+    run_id: str
+    step_index: int
+    tool_name: str
+    project_id: str | None
+    success: bool
+    error_code: str | None
+    result_hash: str | None
+    result_size_bytes: int
+    result_truncated: bool
+    result_unavailable: bool
+    tool_call_id: str | None
+    created_at: datetime
+
+
+def _to_read(row: Any) -> "AgentToolResultRead":
+    """ORM 行 → ``AgentToolResultRead``（**显式逐字段映射**；不读 payload）。"""
+    return AgentToolResultRead(
+        run_id=row.run_id,
+        step_index=row.step_index,
+        tool_name=row.tool_name,
+        project_id=row.project_id,
+        success=bool(row.success),
+        error_code=row.error_code,
+        result_hash=row.result_hash,
+        result_size_bytes=row.result_size_bytes,
+        result_truncated=bool(row.result_truncated),
+        result_unavailable=bool(row.result_unavailable),
+        tool_call_id=row.tool_call_id,
+        created_at=row.created_at,
+    )
 
 
 class AgentToolResultRepositoryError(Exception):
@@ -426,7 +472,7 @@ class AgentToolResultRepository:
             ) from exc
         return created_ids
 
-    # ---------- 读取（Phase 5 P-6 Resume 需要） ----------
+    # ---------- 读取（Phase 5 P-6 Resume + P-8 Read Model） ----------
 
     def get(self, run_id: str, step_index: int) -> AgentToolResultRow | None:
         """按 **执行身份 (run_id, step_index)** 读取一行（无 ⇒ ``None``）。
@@ -472,5 +518,39 @@ class AgentToolResultRepository:
             ) from exc
         return record
 
-    # 说明：除上面这一个**只读**方法（Resume 专用）外，本仓储**不提供**
-    # 其它读模型（无 find / list / timeline / replay）；Read API 属后续阶段。
+    def list_for_run(self, run_id: str) -> list[AgentToolResultRead]:
+        """该 Run 的**全部** Tool Result **元数据**（按 ``step_index`` 升序）。
+
+        Phase 5 P-8 Read Model：只读；**不**读取 ``result_payload`` /
+        ``result_ref``（见 :class:`AgentToolResultRead`）；显式 ORDER BY ⇒
+        不依赖 DB 自然顺序；一次查询取全量（Run 内 Tool Result 有界，避免 N+1）。
+
+        Raises:
+            ValueError:                      run_id 非法（触达 DB 之前拦截）。
+            AgentToolResultRepositoryError:  DB 未配置或读取失败。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id 必须是非空 str")
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = list(
+                    session.execute(
+                        select(AgentToolResult)
+                        .where(AgentToolResult.run_id == run_id)
+                        .order_by(
+                            AgentToolResult.step_index.asc(),
+                            AgentToolResult.id.asc(),
+                        )
+                    ).scalars()
+                )
+        except SQLAlchemyError as exc:
+            raise AgentToolResultRepositoryError(
+                f"Agent Tool Result 读取失败: {type(exc).__name__}"
+            ) from exc
+        return [_to_read(row) for row in rows]
+
+    # 说明（Phase 5 P-8）：本仓储提供两个**只读**方法 —— ``get``（Resume 的
+    # Tool Result Replay 专用，含 payload 供 Runtime 回灌）与 ``list_for_run``
+    # （Read Model / Timeline 专用，**只**元数据、不含 payload）。
+    # 无 delete / 无 update；Timeline 由 Read Service 组合生成，**不是**新表。
