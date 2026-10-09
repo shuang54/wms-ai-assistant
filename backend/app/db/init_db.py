@@ -40,6 +40,19 @@ from backend.app.db.models.llm_usage_record import (
     LLM_USAGE_REQUEST_ID_PREDICATE,
     LLM_USAGE_SCHEMA,
 )
+from backend.app.db.models.workflow_approval import (
+    WORKFLOW_APPROVAL_SCHEMA,
+    WORKFLOW_APPROVAL_TABLE,
+)
+from backend.app.db.models.workflow_node_run import (
+    WORKFLOW_NODE_RUN_SCHEMA,
+    WORKFLOW_NODE_RUN_TABLE,
+)
+from backend.app.db.models.workflow_run import (
+    WORKFLOW_RUN_PROJECT_ID_MAX_LENGTH,
+    WORKFLOW_RUN_SCHEMA,
+    WORKFLOW_RUN_TABLE,
+)
 from backend.app.db.session import get_engine
 
 logger = logging.getLogger(__name__)
@@ -284,6 +297,119 @@ def ensure_conversation_turn_idempotency_unique_index(conn: Any) -> bool:
     return True
 
 
+# Phase 6 Step 2 F-1：Workflow 子表 project_id 冗余列（ADR §16 I1/I4）。
+#
+# 与 request_id / assistant_request_id / idempotency_key 同理：
+# `Base.metadata.create_all(checkfirst=True)` 对**已存在**的表整体跳过，
+# 不会补建后来新增的列 → 已存在的库必须显式补齐；全新库由 ORM 随表创建
+# （列定义已是 NOT NULL）。
+#
+# 与既有先例的唯一差异：该列**不得**保持 NULL（模型为 NOT NULL），且其值有
+# **唯一可信来源** = 所属 workflow_run.project_id（服务器端解析结果）。
+# 因此顺序为：ADD COLUMN（可空）→ 从父行回填 → 校验无 NULL → SET NOT NULL。
+# **不**删除 / 不重建表 / 不清空数据；无法解析（父行缺失）⇒ 停止并报告。
+_WORKFLOW_RUN_TABLE_FQ: Final[str] = (
+    f"{WORKFLOW_RUN_SCHEMA}.{WORKFLOW_RUN_TABLE}"
+)
+_WORKFLOW_NODE_RUN_TABLE_FQ: Final[str] = (
+    f"{WORKFLOW_NODE_RUN_SCHEMA}.{WORKFLOW_NODE_RUN_TABLE}"
+)
+_WORKFLOW_APPROVAL_TABLE_FQ: Final[str] = (
+    f"{WORKFLOW_APPROVAL_SCHEMA}.{WORKFLOW_APPROVAL_TABLE}"
+)
+
+# 注：下列 SQL 用 {table} 占位（同一逻辑服务两张子表，由 .format 传入表名）。
+_ADD_PROJECT_ID_COLUMN_SQL: Final[str] = (
+    "ALTER TABLE {table} "
+    "ADD COLUMN IF NOT EXISTS project_id "
+    f"VARCHAR({WORKFLOW_RUN_PROJECT_ID_MAX_LENGTH})"
+)
+_BACKFILL_PROJECT_ID_SQL: Final[str] = (
+    "UPDATE {table} AS c SET project_id = r.project_id "
+    f"FROM {_WORKFLOW_RUN_TABLE_FQ} AS r "
+    "WHERE c.workflow_run_id = r.workflow_run_id AND c.project_id IS NULL"
+)
+_COUNT_NULL_PROJECT_ID_SQL: Final[str] = (
+    "SELECT COUNT(*) FROM {table} WHERE project_id IS NULL"
+)
+_SET_PROJECT_ID_NOT_NULL_SQL: Final[str] = (
+    "ALTER TABLE {table} ALTER COLUMN project_id SET NOT NULL"
+)
+
+
+def _ensure_workflow_child_project_id_column(
+    conn: Any, *, table_fq: str, table_name: str, schema: str
+) -> bool:
+    """共享实现：确保一张 Workflow 子表的 ``project_id`` 冗余列存在且对齐。
+
+    顺序（每步幂等）：ADD COLUMN（可空）→ 从 ``workflow_run`` 回填
+    （**唯一可信来源**）→ 校验无 NULL → ``SET NOT NULL``。
+    **不**删除 / 不重建表 / 不清空数据；回填后仍存在 NULL ⇒ 停止并报告。
+    """
+    if not inspect(conn).has_table(table_name, schema=schema):
+        # 表还不存在：create_all 会连同 Model 里的 NOT NULL 列一起创建
+        return False
+
+    conn.execute(text(_ADD_PROJECT_ID_COLUMN_SQL.format(table=table_fq)))
+    conn.execute(text(_BACKFILL_PROJECT_ID_SQL.format(table=table_fq)))
+    remaining = int(
+        conn.execute(
+            text(_COUNT_NULL_PROJECT_ID_SQL.format(table=table_fq))
+        ).scalar_one()
+    )
+    if remaining:
+        raise RuntimeError(
+            f"无法将 {table_fq}.project_id SET NOT NULL："
+            f"仍有 {remaining} 行未能从 workflow_run 解析 project_id。"
+            "本阶段不会自动删除 / 重建 / 清空任何数据——"
+            "请先人工确认 FK 完整性后重试。"
+        )
+    conn.execute(text(_SET_PROJECT_ID_NOT_NULL_SQL.format(table=table_fq)))
+    logger.info("%s.project_id column ensured (F-1)", table_fq)
+    return True
+
+
+def ensure_workflow_node_run_project_id_column(conn: Any) -> bool:
+    """确保 `ai_ops.workflow_node_run.project_id` 列存在（Phase 6 Step 2 F-1）。
+
+    语义：ADR §16 I1/I4 —— 子表**冗余携带** project_id（读侧独立归属证明）；
+    值 = 所属 ``workflow_run.project_id``（服务器端解析结果；**不**信任调用方）。
+
+    幂等行为：列已存在且非空约束成立 → ADD / 回填 / SET 均为 no-op；
+    旧库（列缺失）⇒ 补列 + 从父行回填 + SET NOT NULL；
+    **不**删除 / 不重建表 / 不清空数据。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  列已存在或本次成功补齐。
+        False: 表还不存在（由 `Base.metadata.create_all()` 随表创建）。
+
+    Raises:
+        RuntimeError: 回填后仍存在无法解析 project_id 的行（需要人工处理）。
+    """
+    return _ensure_workflow_child_project_id_column(
+        conn,
+        table_fq=_WORKFLOW_NODE_RUN_TABLE_FQ,
+        table_name=WORKFLOW_NODE_RUN_TABLE,
+        schema=WORKFLOW_NODE_RUN_SCHEMA,
+    )
+
+
+def ensure_workflow_approval_project_id_column(conn: Any) -> bool:
+    """确保 `ai_ops.workflow_approval.project_id` 列存在（Phase 6 Step 2 F-1）。
+
+    同 :func:`ensure_workflow_node_run_project_id_column`（对称实现）。
+    """
+    return _ensure_workflow_child_project_id_column(
+        conn,
+        table_fq=_WORKFLOW_APPROVAL_TABLE_FQ,
+        table_name=WORKFLOW_APPROVAL_TABLE,
+        schema=WORKFLOW_APPROVAL_SCHEMA,
+    )
+
+
 def init_db() -> None:
     """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引 / 关联列。
 
@@ -298,6 +424,9 @@ def init_db() -> None:
         - conversation_turn.idempotency_key 列已存在 → 不报错（IF NOT EXISTS，
           Phase 4.2 Step 6；历史行保持 NULL，不 backfill）
         - 幂等唯一索引已存在 → 不报错（IF NOT EXISTS，Phase 4.2 Step 6）
+        - workflow_node_run / workflow_approval.project_id 列已存在 → 不报错
+          （IF NOT EXISTS，Phase 6 Step 2 F-1；旧行从 workflow_run 回填，
+          不重建表 / 不清数据）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
@@ -348,6 +477,12 @@ def init_db() -> None:
             #      历史行保持 NULL · 不 backfill · 不清理数据）
             ensure_conversation_turn_idempotency_key_column(conn)
             ensure_conversation_turn_idempotency_unique_index(conn)
+
+            # 9. Phase 6 Step 2 F-1：Workflow 子表 project_id 冗余列
+            #    （ADR §16 I1/I4；ADD COLUMN → 从 workflow_run 回填 →
+            #     校验无 NULL → SET NOT NULL；不删列 / 不重建表 / 不清数据）
+            ensure_workflow_node_run_project_id_column(conn)
+            ensure_workflow_approval_project_id_column(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -379,6 +514,8 @@ __all__ = [
     "ensure_assistant_request_id_index",
     "ensure_conversation_turn_idempotency_key_column",
     "ensure_conversation_turn_idempotency_unique_index",
+    "ensure_workflow_node_run_project_id_column",
+    "ensure_workflow_approval_project_id_column",
 ]
 
 

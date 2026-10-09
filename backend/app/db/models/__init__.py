@@ -34,6 +34,9 @@ from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
 from backend.app.db.models.rag_execution_record import RagExecutionRecordModel
 from backend.app.db.models.tool_execution_record import ToolExecutionRecordModel
+from backend.app.db.models.workflow_approval import WorkflowApproval
+from backend.app.db.models.workflow_node_run import WorkflowNodeRun
+from backend.app.db.models.workflow_run import WorkflowRun
 
 _MODELS: tuple[type, ...] = (
     KnowledgeDocument,
@@ -73,6 +76,12 @@ _MODELS: tuple[type, ...] = (
     # Phase 5 P-7 HITL: Agent Approval (human approval request; ai_ops; no FK;
     # UNIQUE(approval_id) + UNIQUE(run_id, step_index)).
     AgentApproval,
+    # Phase 6 Step 2：Workflow Persistence（ai_ops；独立 3 表 —— Discovery §10）。
+    # WorkflowRun **必须**先于 WorkflowNodeRun / WorkflowApproval
+    # （后两者有指向它的域内 FK；create_all 亦会自动拓扑排序）。
+    WorkflowRun,
+    WorkflowNodeRun,
+    WorkflowApproval,
 )
 
 
@@ -94,6 +103,9 @@ __all__ = [
     "LLMUsageRecord",
     "RagExecutionRecordModel",
     "ToolExecutionRecordModel",
+    "WorkflowRun",
+    "WorkflowNodeRun",
+    "WorkflowApproval",
 ]
 
 
