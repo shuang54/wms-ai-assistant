@@ -73,6 +73,7 @@ from backend.app.db.workflow_run_repository import (
     validate_next_action,
     validate_run_status,
     validate_state_version,
+    validate_input_json,
 )
 from backend.app.workflow.errors import (
     WF_ERROR_NODE_EXECUTION_FAILURE,
@@ -106,6 +107,7 @@ class TestOrmMetadata:
             "workflow_version",
             "request_id",
             "project_id",
+            "input",
             "status",
             "state_version",
             "current_node_id",
@@ -156,6 +158,9 @@ class TestOrmMetadata:
         assert _NODE_RUN_TABLE.columns["project_id"].nullable is False
         assert _APPROVAL_TABLE.columns["project_id"].nullable is False
         assert _RUN_TABLE.columns["workflow_version"].nullable is False
+        # input（GAP-1 · D1）：nullable TEXT；None = 无输入
+        assert _RUN_TABLE.columns["input"].nullable is True
+        assert _RUN_TABLE.columns["input"].type.__class__.__name__ == "Text"
         # run 控制状态指针与时间戳允许 NULL
         assert _RUN_TABLE.columns["current_node_id"].nullable is True
         assert _RUN_TABLE.columns["started_at"].nullable is True
@@ -354,6 +359,40 @@ class TestRepositoryInputValidation:
             repo.create(**{**base, "next_action": "BOGUS"})
         with pytest.raises(ValueError):
             repo.create(**{**base, "workflow_run_id": "x" * 65})
+
+    def test_run_create_rejects_invalid_input_json(self) -> None:
+        """GAP-1：input 必须通过域层 JSON-safe 规则（解析 + 结构 + 边界）。"""
+        repo = WorkflowRunRepository()
+        base = dict(
+            workflow_run_id="r1",
+            workflow_id="wf",
+            workflow_version="v1",
+            request_id="req",
+            project_id="proj",
+        )
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": "{bad json"})  # 非法 JSON
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": "   "})  # 空白文本
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": {"a": 1}})  # 非 str（不接受任意对象）
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": "x" * 33000})  # 超长非 JSON
+        deep = "[" * 9 + "1" + "]" * 9  # 深度 9 > JSON_VALUE_MAX_DEPTH
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": deep})
+        big = '{"x":"' + "a" * (JSON_VALUE_MAX_BYTES + 10) + '"}'  # 超 32 KiB
+        with pytest.raises(ValueError):
+            repo.create(**{**base, "input": big})
+
+    def test_input_validator_accepts_and_normalizes(self) -> None:
+        """GAP-1：合法输入 ⇒ 规范化 JSON 文本（域 serialize 产物）；None 兼容。"""
+        assert validate_input_json(None) is None
+        assert validate_input_json('{"b": 1, "a": [2, 3]}') == (
+            '{"b":1,"a":[2,3]}'
+        )
+        assert validate_input_json("true") == "true"
+        assert validate_input_json("null") == "null"
 
     def test_run_update_cas_rejects_invalid_inputs(self) -> None:
         repo = WorkflowRunRepository()

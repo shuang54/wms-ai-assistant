@@ -1,23 +1,26 @@
-"""Phase 5 P-8 Agent Read API —— **HTTP 契约**测试（离线；Fake 服务注入；零 DB）。
+"""Phase 5 P-8 / Phase 6 S8A Agent Read API —— **HTTP 契约**测试（离线；零 DB）。
 
-覆盖（任务书 §十九 / §二十 / §二十三 / §二十七 / §二十九 / §三十 / §三十四）：
+Phase 6 Step 8A 更新：两个端点已接入 **X-API-Key 认证 + 服务端项目作用域**
+（``agent_read_auth.require_agent_read_scope``）；``project_id`` 查询参数
+**已移除**（授权作用域仅来自服务端配置）。本文件测试**认证通过后**的响应
+契约；认证 / 越权 / 未配置等安全语义见
+``tests/test_agent_read_api_security.py``。
+
+覆盖（任务书 §十九 / §二十 / §二十三 / §二十七 / §二十九 / §三十 / §三十四 + S8A 适配）：
 
 ```text
 1  200            GET /api/agent/runs/{run_id}（Run 摘要 + 四个视图；字段集精确）
                  GET /api/agent/runs/{run_id}/timeline（list[事件]）
 2  分页           limit=1/10/100 ⇒ 200；limit=0/101/-1 ⇒ 400；offset=-1 ⇒ 400
-3  404            不存在 / 跨 project ⇒ **同一**固定文案（不泄露存在性）
+3  404            不存在 / 跨项目（不在授权作用域）⇒ **同一**固定文案（不泄露存在性）
 4  422            路径参数长度越界（FastAPI Path 校验）
 5  400            纯空白 run_id（服务层校验）
 6  502 / 500      持久化读边界不可用 / 未预期错误（不暴露内部细节）
 7  只读面形        OpenAPI 中这两个路径**只有 GET**；/api/agent 下无写方法
 8  安全           响应 JSON **递归**键扫描：无 claim_token / arguments / content /
                  payload / prompt / SQL / 凭据
-9  默认 project    省略 project_id ⇒ 项目默认（不猜）
+9  授权作用域      来自服务端配置（非 Query、非项目默认回退；RecordingService 证）
 ```
-
-注入方式沿用既有 ``test_assistant_timeline_api`` 范式：
-``monkeypatch.setattr(module, "get_agent_read_service", …)`` + ``TestClient(app)``。
 """
 from __future__ import annotations
 
@@ -29,7 +32,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.api import agent_read as agent_read_module
-from backend.app.config import settings
+from backend.app.api import agent_read_auth as agent_auth_module
+from backend.app.config import AgentReadSettings, settings
 from backend.app.db.agent_approval_repository import AgentApprovalRepositoryError
 from backend.app.db.agent_tool_result_repository import (
     AgentToolResultRepositoryError,
@@ -66,9 +70,14 @@ __all__ = [
     "TestAgentReadApiSurface",
 ]
 
-#: 数据归属 project = 项目默认 project（省略 project_id 时按默认读取）。
-_PROJECT_A = settings.project.project_id
+#: 授权作用域（服务端配置；**故意** ≠ settings.project.project_id，
+#: 以证明授权不是"项目默认回退"）。
+_AUTH_PROJECT = "proj-agent-s8a-auth"
 _RUN_ID = "run-p8-read"
+
+#: 测试专用凭据（**非**生产凭据；仅存在于测试进程内 monkeypatch 配置）。
+_TEST_API_KEY = "agent-api-suite-key-NOT-A-PRODUCTION-CREDENTIAL"
+_HEADERS = {"X-API-Key": _TEST_API_KEY}
 
 _FORBIDDEN_KEYS = {
     "claim_token",
@@ -92,7 +101,7 @@ _FORBIDDEN_KEYS = {
 
 
 class _RecordingService:
-    """委托真实 Service + 记录 (method, args, kwargs)（用于默认 project 断言）。"""
+    """委托真实 Service + 记录 (method, args, kwargs)（用于作用域断言）。"""
 
     def __init__(self, inner: AgentReadService) -> None:
         self._inner = inner
@@ -107,13 +116,15 @@ class _RecordingService:
         return self._inner.get_timeline(run_id, project_id, **kwargs)
 
 
-def _full_read_service() -> AgentReadService:
+def _full_read_service(
+    *, project_id: str = _AUTH_PROJECT
+) -> AgentReadService:
     service, _repositories = build_service(
-        run=FakeRunRepository({_RUN_ID: run_record(project_id=_PROJECT_A)}),
+        run=FakeRunRepository({_RUN_ID: run_record(project_id=project_id)}),
         step=FakeStepRepository([step_read(step_index=0)]),
         decision=FakeDecisionRepository([decision_record(step_index=0)]),
         tool_result=FakeToolResultRepository(
-            [replace(tool_result_read(step_index=0), project_id=_PROJECT_A)]
+            [replace(tool_result_read(step_index=0), project_id=project_id)]
         ),
         checkpoint=FakeCheckpointRepository({_RUN_ID: checkpoint_dto()}),
         approval=FakeApprovalRepository([approval_read(step_index=0)]),
@@ -121,11 +132,25 @@ def _full_read_service() -> AgentReadService:
     return service
 
 
-def _client(monkeypatch: pytest.MonkeyPatch, service: Any) -> TestClient:
+def _client(
+    monkeypatch: pytest.MonkeyPatch,
+    service: Any,
+    *,
+    auth_settings: AgentReadSettings | None = None,
+) -> TestClient:
+    """认证通过后的契约客户端（默认注入测试凭据 header）。"""
     monkeypatch.setattr(
         agent_read_module, "get_agent_read_service", lambda: service
     )
-    return TestClient(app)
+    monkeypatch.setattr(
+        agent_auth_module,
+        "get_agent_read_settings",
+        lambda: auth_settings
+        or AgentReadSettings(
+            api_key=_TEST_API_KEY, api_project_id=_AUTH_PROJECT
+        ),
+    )
+    return TestClient(app, headers=_HEADERS)
 
 
 def _keys(payload: Any) -> set[str]:
@@ -157,7 +182,7 @@ class TestAgentReadApiRun:
         assert set(payload) == set(AGENT_RUN_RESPONSE_FIELDS)
         assert payload["run_id"] == _RUN_ID
         assert payload["request_id"] == "req-p8-1"
-        assert payload["project_id"] == _PROJECT_A
+        assert payload["project_id"] == _AUTH_PROJECT
         assert payload["status"] == "COMPLETED"
         assert payload["step_count"] == 2
         assert payload["token_usage_unverifiable"] is False
@@ -177,7 +202,7 @@ class TestAgentReadApiRun:
     def test_run_without_terminal_record_has_null_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
         service, _repositories = build_service(
             tool_result=FakeToolResultRepository(
-                [replace(tool_result_read(), project_id=_PROJECT_A)]
+                [replace(tool_result_read(), project_id=_AUTH_PROJECT)]
             ),
             checkpoint=FakeCheckpointRepository({_RUN_ID: checkpoint_dto()}),
         )
@@ -191,33 +216,43 @@ class TestAgentReadApiRun:
         assert payload["checkpoint"]["status"] == "ACTIVE"
         assert payload["checkpoint"]["next_action"] == "LLM_DECISION"
 
-    def test_project_id_is_passed_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_authorized_scope_comes_from_server_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """S8A：project_id 来自服务端认证配置——非 Query、非项目默认回退。"""
+        assert _AUTH_PROJECT != settings.project.project_id  # 非默认
+        recording = _RecordingService(_full_read_service())
+        client = _client(monkeypatch, recording)
+
+        response = client.get(f"/api/agent/runs/{_RUN_ID}")  # 无任何参数
+
+        assert response.status_code == 200
+        assert recording.calls == [("get_run", (_RUN_ID, _AUTH_PROJECT), {})]
+
+    def test_cross_project_is_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """数据属他项目（不在授权作用域）⇒ 404（与不存在同构）。"""
+        client = _client(
+            monkeypatch, _full_read_service(project_id="project-B")
+        )
+
+        response = client.get(f"/api/agent/runs/{_RUN_ID}")
+
+        assert response.status_code == 404
+
+    def test_client_project_id_query_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """客户端 project_id 参数**不**参与授权（被忽略——作用域不可扩宽）。"""
         recording = _RecordingService(_full_read_service())
         client = _client(monkeypatch, recording)
 
         response = client.get(
-            f"/api/agent/runs/{_RUN_ID}", params={"project_id": _PROJECT_A}
+            f"/api/agent/runs/{_RUN_ID}",
+            params={"project_id": "attacker-project"},  # 未知参数 ⇒ 忽略
         )
 
         assert response.status_code == 200
-        assert recording.calls == [("get_run", (_RUN_ID, _PROJECT_A), {})]
-
-    def test_project_id_defaults_to_settings_project(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        recording = _RecordingService(_full_read_service())
-        client = _client(monkeypatch, recording)
-
-        client.get(f"/api/agent/runs/{_RUN_ID}")
-
-        assert recording.calls[0][1] == (_RUN_ID, settings.project.project_id)
-
-    def test_cross_project_is_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        client = _client(monkeypatch, _full_read_service())
-
-        response = client.get(
-            f"/api/agent/runs/{_RUN_ID}", params={"project_id": "project-B"}
-        )
-
-        assert response.status_code == 404
+        assert recording.calls == [("get_run", (_RUN_ID, _AUTH_PROJECT), {})]
 
 
 # ============================================================
@@ -284,7 +319,7 @@ class TestAgentReadApiTimeline:
         )
         assert response.status_code == 400
 
-    def test_timeline_project_id_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_timeline_passes_authorized_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recording = _RecordingService(_full_read_service())
         client = _client(monkeypatch, recording)
 
@@ -292,7 +327,7 @@ class TestAgentReadApiTimeline:
 
         method, args, kwargs = recording.calls[0]
         assert method == "get_timeline"
-        assert args == (_RUN_ID, settings.project.project_id)
+        assert args == (_RUN_ID, _AUTH_PROJECT)  # 服务端作用域
         assert kwargs == {"limit": 5, "offset": 0}
 
 
@@ -317,11 +352,12 @@ class TestAgentReadApiErrors:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         client = _client(monkeypatch, _full_read_service())
+        foreign_client = _client(
+            monkeypatch, _full_read_service(project_id="project-B")
+        )
 
         missing = client.get("/api/agent/runs/run-unknown")
-        foreign = client.get(
-            f"/api/agent/runs/{_RUN_ID}", params={"project_id": "project-B"}
-        )
+        foreign = foreign_client.get(f"/api/agent/runs/{_RUN_ID}")
 
         assert missing.status_code == foreign.status_code == 404
         assert missing.json() in (
@@ -437,8 +473,8 @@ class TestAgentReadApiSurface:
             calls.append(1)
             return _full_read_service()
 
+        client = _client(monkeypatch, _RecordingService(_full_read_service()))
         monkeypatch.setattr(agent_read_module, "get_agent_read_service", _factory)
-        client = TestClient(app)
         client.get(f"/api/agent/runs/{_RUN_ID}")
         client.get(f"/api/agent/runs/{_RUN_ID}")
 

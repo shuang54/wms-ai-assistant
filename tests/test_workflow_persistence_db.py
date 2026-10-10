@@ -136,6 +136,7 @@ def _create_run(
     workflow_version: str = "v1",
     current_node_id: str | None = None,
     next_action: str = "NONE",
+    input: str | None = None,
 ) -> str:
     """创建一条本模块 run（返回 run_id）。"""
     run_id = _run_id()
@@ -145,6 +146,7 @@ def _create_run(
         workflow_version=workflow_version,
         request_id=f"{_RUN_PREFIX}req",
         project_id=project_id,
+        input=input,
         status=status,
         current_node_id=current_node_id,
         next_action=next_action,
@@ -210,6 +212,36 @@ class TestWorkflowRunPersistenceDb:
         assert row.cancel_requested_at is None
         assert row.started_at is None
         assert row.completed_at is None
+
+    def test_input_roundtrip_and_null_compatibility(self, engine: Any) -> None:
+        """GAP-1（D1）：input 写入 → 规范化读回；NULL 兼容（无输入语义）。
+
+        先验证 schema：列存在、nullable、无长度限制（TEXT）。
+        """
+        with engine.connect() as conn:
+            resolved = conn.execute(
+                text(
+                    "SELECT data_type, is_nullable, character_maximum_length "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'ai_ops' "
+                    "AND table_name = 'workflow_run' "
+                    "AND column_name = 'input'"
+                )
+            ).one_or_none()
+        assert resolved is not None, "workflow_run.input 列不存在（GAP-1 未生效）"
+        assert resolved[0] == "text"
+        assert resolved[1] == "YES"  # nullable
+        assert resolved[2] is None  # 无长度限制
+
+        run_id = _create_run(input='{"b": 1, "a": [2]}')
+        row = _run_repo().get(run_id)
+        assert row is not None
+        assert row.input == '{"b":1,"a":[2]}'  # 域层规范化产物（紧凑文本）
+
+        plain_id = _create_run()
+        plain = _run_repo().get(plain_id)
+        assert plain is not None
+        assert plain.input is None  # None = 无输入（D1；历史行语义一致）
 
     def test_duplicate_create_rejected(self) -> None:
         run_id = _create_run()

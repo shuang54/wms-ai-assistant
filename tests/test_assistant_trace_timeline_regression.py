@@ -44,6 +44,8 @@ from typing import Literal, Mapping
 
 import pytest
 
+from tests import observability_residue_contract as _residue_contract
+
 # Step 95：生产 CI Adapter（**唯一**实现）+ 唯一退出码映射；测试侧复用，不复制。
 from backend.app.services.matrix_ci_adapter import (  # noqa: E402
     CI_ADAPTER_EXIT_CODES as _PROD_CI_ADAPTER_EXIT_CODES,
@@ -929,40 +931,22 @@ def _offline_execution_summary() -> RegressionExecutionSummary:
 
 
 #: 四张观测表（与各表 request 关联列）—— 只读残留计数使用。
+#: **单一来源**：``tests/observability_residue_contract``（conftest 的会话收尾
+#: 零残留检查引用同一常量；本模块不再定义副本——Phase 6 Step 8B-1 §4.4）。
 _RESIDUE_TABLES: tuple[tuple[str, str], ...] = (
-    ("llm_usage_record", "assistant_request_id"),
-    ("tool_execution_record", "request_id"),
-    ("rag_execution_record", "request_id"),
-    ("assistant_outcome_record", "assistant_request_id"),
+    _residue_contract.OBSERVABILITY_RESIDUE_TABLES
 )
 
 
-@lru_cache(maxsize=1)
 def _db_residue_total() -> int | None:
-    """四张观测表总行数（只读）；DB 不可用 → ``None``（不猜测）。
+    """四张观测表总行数（**会话内缓存**）；DB 不可用 → ``None``（不猜测）。
 
-    函数内延迟 import（模块顶层保持无 DB 依赖）；不保存任何连接 / Session。
+    实现已迁移至 ``tests/observability_residue_contract.cached_residue_total``
+    （Phase 6 Step 8B-1：与 conftest 的会话收尾检查**单一来源**）。
+    **会话收尾检查**使用其中的 ``fresh_residue_total``（每次重新查询）——
+    不复用本函数的会话内缓存（§4.3）。
     """
-    available, _ = _db_execution_available()
-    if not available:
-        return None
-
-    from sqlalchemy import text
-
-    from backend.app.db.session import get_engine
-
-    engine = get_engine()
-    if engine is None:                      # pragma: no cover - 与 available 一致
-        return None
-    with engine.connect() as conn:
-        return sum(
-            int(
-                conn.execute(
-                    text(f"SELECT COUNT(*) FROM ai_ops.{table}")
-                ).scalar_one()
-            )
-            for table, _ in _RESIDUE_TABLES
-        )
+    return _residue_contract.cached_residue_total()
 
 
 def _current_matrix_baseline() -> MatrixExecutionBaseline | None:
@@ -2389,12 +2373,28 @@ class TestMatrixExecutionBaseline:
         ).matrix_status == "FAIL"
 
     def test_db_residue_is_zero(self) -> None:
-        residue = _db_residue_total()
+        """会话收尾零残留**契约**（Phase 6 Step 8B-1：运行时检查已**迁移**）。
 
-        if residue is None:
-            pytest.skip(f"DB 不可用（{_db_execution_available()[1]}）")
-        assert residue == 0
-        assert MATRIX_EXECUTION_BASELINE.db_residue == residue
+        原实现在**会话中途**对全库四表断言 "= 0"——与 outcome 表的会话级
+        清理（conftest 守卫）时点错位 ⇒ 顶层全量顺序下的结构性失败。
+        运行时断言现由 ``tests/conftest.py::_observability_residue_check``
+        在**三个清理守卫完成之后**执行（新鲜查询、不复用缓存；见该 fixture）。
+
+        本测试保留**与顺序无关**的契约部分（不触 DB、可独立运行）：
+          ① 四表定义 = 共享单一来源（conftest 收尾检查使用同一常量）；
+          ② 期望残留 = Step 89 baseline 记录值 = 共享期望常量（= 0）；
+          ③ 新鲜查询语义（每次重新读库、不复用缓存）由
+             ``tests/test_observability_residue_lifecycle.py`` 以注入
+             fake engine 的查询计数验证。
+        """
+        assert _RESIDUE_TABLES is (
+            _residue_contract.OBSERVABILITY_RESIDUE_TABLES
+        )  # 单一来源（同一对象）
+        assert (
+            MATRIX_EXECUTION_BASELINE.db_residue
+            == _residue_contract.EXPECTED_RESIDUE_AFTER_CLEANUP
+        )
+        assert _residue_contract.EXPECTED_RESIDUE_AFTER_CLEANUP == 0
         assert isinstance(MATRIX_EXECUTION_BASELINE.db_residue, int)
 
     def test_baseline_does_not_modify_offline_snapshot(self) -> None:

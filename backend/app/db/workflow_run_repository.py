@@ -35,6 +35,7 @@ retry / node 执行逻辑 —— 本层只提供持久化原语。
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Final
 
@@ -63,6 +64,11 @@ from backend.app.db.session import get_session_factory
 from backend.app.workflow.errors import (
     WF_ERROR_RUN_NOT_FOUND,
     WF_ERROR_STATE_CONFLICT,
+    WorkflowOutputError,
+)
+from backend.app.workflow.models import (
+    serialize_json_value,
+    validate_json_value,
 )
 from backend.app.workflow.states import (
     WORKFLOW_STATUS_PENDING,
@@ -80,6 +86,7 @@ __all__ = [
     "validate_run_status",
     "validate_next_action",
     "validate_attempt_count",
+    "validate_input_json",
 ]
 
 #: Repository 特有稳定码（创建冲突；不在域层 WF_ERROR_CODES —— 对齐
@@ -192,6 +199,42 @@ def validate_attempt_count(value: object, *, field: str = "attempt_count") -> in
     return value
 
 
+def validate_input_json(value: object) -> str | None:
+    """校验并规范化启动输入（D1；**复用域层 JSON-safe 规则**——单一实现点）。
+
+    与域层 ``serialize_json_value`` 同源：合法 JSON 值 + 非 NaN/Infinity +
+    ``dict`` 键为 str + 嵌套深度 ≤ 8 + 序列化 ≤ 32 KiB（fail-closed 不截断）。
+    不接受任意对象 / 不信任调用方已序列化；非法内容**绝不**写入数据库。
+
+    Args:
+        value: None 或 JSON 文本（str）。
+
+    Returns:
+        None，或**规范化** JSON 文本（域 ``serialize_json_value`` 产物）。
+
+    Raises:
+        ValueError: 非 str / 非法 JSON / 深度超限 / 序列化超界
+            （触达 DB 之前拦截）。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"input 必须是 JSON 文本或 None（当前: {type(value).__name__}）"
+        )
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("input 不是合法 JSON 文本") from None
+    try:
+        validate_json_value(parsed)
+        return serialize_json_value(parsed)
+    except WorkflowOutputError as exc:
+        raise ValueError(
+            "input 超过 JSON 安全边界（深度 / 大小；fail-closed 不截断）"
+        ) from exc
+
+
 def _optional_datetime(value: object, *, field: str) -> datetime | None:
     """可选 datetime（None 或 datetime）。"""
     if value is None:
@@ -243,6 +286,7 @@ class WorkflowRunRepository:
         workflow_version: str,
         request_id: str,
         project_id: str,
+        input: str | None = None,
         status: str = WORKFLOW_STATUS_PENDING,
         current_node_id: str | None = None,
         next_action: str = WORKFLOW_NEXT_ACTION_NONE,
@@ -255,6 +299,10 @@ class WorkflowRunRepository:
             workflow_version: Definition 版本（**必须**持久化 —— resume 按它解析）。
             request_id:       调用 / correlation identity（≠ workflow_run_id）。
             project_id:       项目作用域（**NOT NULL**；服务器端解析结果）。
+            input:            启动输入（D1：JSON 文本或 None）；经域层
+                              ``serialize_json_value`` 规则**解析 + 校验 +
+                              规范化**（≤ 32 KiB / 深度 ≤ 8）；非法 / 超界
+                              ⇒ ``ValueError``（**不**写入数据库）。
             status:           初始状态（仅 PENDING / RUNNING；默认 PENDING）。
             current_node_id:  初始节点指针（可 None）。
             next_action:      初始推进语义（白名单；默认 NONE）。
@@ -305,6 +353,7 @@ class WorkflowRunRepository:
             max_length=WORKFLOW_RUN_NODE_ID_MAX_LENGTH,
         )
         action = validate_next_action(next_action)
+        input_text = validate_input_json(input)
 
         statement = (
             postgresql_insert(WorkflowRunModel)
@@ -314,6 +363,7 @@ class WorkflowRunRepository:
                 workflow_version=version,
                 request_id=request,
                 project_id=project,
+                input=input_text,
                 status=validated_status,
                 state_version=WORKFLOW_RUN_INITIAL_STATE_VERSION,
                 current_node_id=node,

@@ -410,6 +410,46 @@ def ensure_workflow_approval_project_id_column(conn: Any) -> bool:
     )
 
 
+# Phase 6 Step 5 GAP-1：workflow_run.input（D1 —— 结构化启动输入）。
+#
+# 与 F-1 相同的 schema 演进纪律：``create_all(checkfirst=True)`` 对**已存在**
+# 的表整体跳过、不会补列 ⇒ 已存在的库必须显式补齐（全新库由 ORM 随表创建）。
+# 本列 nullable、无默认值、**不**回填——历史行自然读取为 NULL
+# （D1：None = 无输入；与"无输入"语义一致，无需人工处理）。
+# **不**删除 / 不重建表 / 不清空数据。
+_ADD_WORKFLOW_RUN_INPUT_COLUMN_SQL: Final[str] = (
+    f"ALTER TABLE {_WORKFLOW_RUN_TABLE_FQ} "
+    "ADD COLUMN IF NOT EXISTS input TEXT"
+)
+
+
+def ensure_workflow_run_input_column(conn: Any) -> bool:
+    """确保 `ai_ops.workflow_run.input` 列存在（Phase 6 Step 5 GAP-1）。
+
+    语义（D1）：启动输入 = 结构化 JSON 文本（应用层
+    ``serialize_json_value`` 强边界：≤ 32 KiB / 深度 ≤ 8；None = 无输入；
+    创建后**不可变**）。
+
+    幂等行为：列已存在 → ADD 为 no-op；旧库（列缺失）⇒ 补 nullable TEXT 列，
+    历史行保持 NULL（**不** backfill）；**不**删除 / 不重建表 / 不清空数据。
+    表不存在 ⇒ ``False``（由 ``Base.metadata.create_all()`` 随表创建）。
+
+    Args:
+        conn: 已开启事务的 SQLAlchemy Connection。
+
+    Returns:
+        True:  列已存在或本次成功补齐。
+        False: 表还不存在。
+    """
+    if not inspect(conn).has_table(
+        WORKFLOW_RUN_TABLE, schema=WORKFLOW_RUN_SCHEMA
+    ):
+        return False
+    conn.execute(text(_ADD_WORKFLOW_RUN_INPUT_COLUMN_SQL))
+    logger.info("%s.input column ensured (GAP-1)", _WORKFLOW_RUN_TABLE_FQ)
+    return True
+
+
 def init_db() -> None:
     """启用 pgvector extension + 创建 ORM 表 + 确保幂等索引 / 关联列。
 
@@ -427,6 +467,8 @@ def init_db() -> None:
         - workflow_node_run / workflow_approval.project_id 列已存在 → 不报错
           （IF NOT EXISTS，Phase 6 Step 2 F-1；旧行从 workflow_run 回填，
           不重建表 / 不清数据）
+        - workflow_run.input 列已存在 → 不报错（IF NOT EXISTS，
+          Phase 6 Step 5 GAP-1；历史行保持 NULL，不 backfill）
 
     Raises:
         RuntimeError: DATABASE_URL 未配置。
@@ -483,6 +525,11 @@ def init_db() -> None:
             #     校验无 NULL → SET NOT NULL；不删列 / 不重建表 / 不清数据）
             ensure_workflow_node_run_project_id_column(conn)
             ensure_workflow_approval_project_id_column(conn)
+
+            # 10. Phase 6 Step 5 GAP-1：workflow_run.input（D1）
+            #     （ADD COLUMN IF NOT EXISTS，nullable TEXT；**不** backfill /
+            #      不删列 / 不重建表 / 不清数据——历史行保持 NULL）
+            ensure_workflow_run_input_column(conn)
     except SQLAlchemyError as exc:
         logger.exception("Failed to initialize database")
         raise RuntimeError(
@@ -516,6 +563,7 @@ __all__ = [
     "ensure_conversation_turn_idempotency_unique_index",
     "ensure_workflow_node_run_project_id_column",
     "ensure_workflow_approval_project_id_column",
+    "ensure_workflow_run_input_column",
 ]
 
 

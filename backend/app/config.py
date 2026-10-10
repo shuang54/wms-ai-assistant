@@ -287,6 +287,78 @@ class ProjectSettings:
 
 
 # ============================================================
+# Workflow Read API 认证配置（Phase 6 Step 7.2；fail closed）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class WorkflowReadSettings:
+    """Workflow Read API 最小认证配置（Phase 6 Step 7.2）。
+
+    **不提供任何默认凭据**：两项默认均为空字符串 ⇒ 视为"未配置" ⇒
+    ``/api/workflow-runs*`` 与 ``/api/workflow-approvals*`` 一律拒绝访问
+    （503，**绝不**退化为匿名可访问——S7.2 §4.1 fail closed）。
+
+    安全边界（与完整身份系统的差别，如实记录）：
+        API Key 仅代表**持有该凭据的调用方**（单凭据 / 单项目模型）；
+        它不是用户身份系统、不含 RBAC、不能表达"多用户多项目"。
+
+    字段：
+        api_key:        服务端共享 API Key（环境变量 ``WORKFLOW_READ_API_KEY``；
+                        默认空 = 未配置）。**不得**写入源码 / 测试默认值 /
+                        文档 / 日志 / 响应体。
+        api_project_id: 该凭据**唯一**授权的项目作用域（环境变量
+                        ``WORKFLOW_READ_API_PROJECT_ID``；默认空 = 未配置）。
+                        这是授权作用域的**唯一来源**——客户端的 Query /
+                        Header / Body 参数**不能**覆盖或扩宽它。
+    """
+
+    api_key: str = field(
+        default_factory=lambda: _get_str("WORKFLOW_READ_API_KEY", "")
+    )
+    api_project_id: str = field(
+        default_factory=lambda: _get_str("WORKFLOW_READ_API_PROJECT_ID", "")
+    )
+
+
+# ============================================================
+# Agent Read API 认证配置（Phase 6 Step 8A；fail closed）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class AgentReadSettings:
+    """Agent Read API 最小认证配置（Phase 6 Step 8A；与 Workflow 对称）。
+
+    背景：Phase 5 的 ``GET /api/agent/runs/{run_id}(+/timeline)`` 为无认证
+    只读面（客户端可任意主张 ``project_id``）；S7.1 审计确认的 T1/T2 缺口
+    在 Agent 侧由本配置 + ``agent_read_auth`` 依赖修复（**安全例外解冻**：
+    仅访问控制，Agent 其余契约不变）。
+
+    **不提供任何默认凭据**：两项默认均为空字符串 ⇒ 视为"未配置" ⇒
+    Agent 读取端点一律拒绝访问（503，**绝不**匿名放行 / 不回退默认项目）。
+
+    凭据独立性：本配置与 ``WorkflowReadSettings`` **独立**（可分别轮换；
+    部署者可将两者配置为相同值——由部署层决定，代码不耦合两域）。
+
+    字段：
+        api_key:        服务端共享 API Key（环境变量 ``AGENT_READ_API_KEY``；
+                        默认空 = 未配置）。不得写入源码 / 测试默认值 / 文档。
+        api_project_id: 该凭据**唯一**授权的项目作用域（环境变量
+                        ``AGENT_READ_API_PROJECT_ID``；默认空 = 未配置）——
+                        授权作用域的**唯一来源**；客户端 Query / Header /
+                        Body 不能覆盖或扩宽。
+    """
+
+    api_key: str = field(
+        default_factory=lambda: _get_str("AGENT_READ_API_KEY", "")
+    )
+    api_project_id: str = field(
+        default_factory=lambda: _get_str("AGENT_READ_API_PROJECT_ID", "")
+    )
+
+
+# ============================================================
 # Tool Calling 配置（Phase 3.6.3）
 # ============================================================
 
@@ -555,6 +627,10 @@ class Settings:
         default_factory=WorkOrderToolSettings
     )
     project: ProjectSettings = field(default_factory=ProjectSettings)
+    workflow_read: WorkflowReadSettings = field(
+        default_factory=WorkflowReadSettings
+    )
+    agent_read: AgentReadSettings = field(default_factory=AgentReadSettings)
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
     ai_router: AIRouterSettings = field(default_factory=AIRouterSettings)
@@ -573,6 +649,8 @@ __all__ = [
     "InventoryToolSettings",
     "WorkOrderToolSettings",
     "ProjectSettings",
+    "WorkflowReadSettings",
+    "AgentReadSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",
     "AIRouterSettings",

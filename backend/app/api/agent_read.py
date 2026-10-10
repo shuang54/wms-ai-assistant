@@ -1,9 +1,11 @@
-"""Agent Read API（Phase 5 P-8）—— **只读** HTTP 边界。
+"""Agent Read API（Phase 5 P-8；Phase 6 Step 8A 加认证）—— **只读** HTTP 边界。
 
 ```text
 HTTP GET /api/agent/runs/{run_id}
-        ↓
-AgentReadService.get_run(run_id, project_id)
+HTTP GET /api/agent/runs/{run_id}/timeline
+        ↓  X-API-Key（服务端配置比对；恒定时间）
+        ↓  授权 project_id（**仅**来自服务端配置——S8A）
+AgentReadService.get_run / get_timeline（run_id, project_id, …）
         ↓
 AgentRunView（内部 frozen 读模型）
         ↓ 显式逐字段映射（to_api_run / to_api_event）
@@ -16,20 +18,33 @@ JSON
 
 * **Query only**：不调用 LLM / Tool / Resume / Approve / Cancel；
   不写任何表（不触碰 Checkpoint / Approval / Cancellation 状态机）；
-* 不接触 DB：不 import Repository / SQLAlchemy / Engine / Session ——
-  只调用 ``AgentReadService``（§二十四）；
+* 不接触 ORM 会话对象：API 层经 ``AgentReadService`` 调用仓储
+  （§二十四）——不向调用方暴露 Session / Connection；
 * 不推断状态：``status`` 只来自 ``ai_ops.agent_run``；Checkpoint 的
   ``next_action`` **不**冒充 Run status（§八）；
 * 不吞异常：下游持久化故障呈现为 502（不是 200 + 空视图）；
-* 不缓存、不 streaming、不做 RBAC（§三十四 / §二十二）。
+* 不缓存、不 streaming（§二十二）。
+
+认证与授权（Phase 6 Step 8A —— 修复 Recovery Audit R1 缺口）：
+* 两个端点**全部**挂载
+  :func:`backend.app.api.agent_read_auth.require_agent_read_scope`
+  （FastAPI ``Security``）——认证发生在任何数据读取**之前**；
+* 授权 ``project_id`` **仅**来自服务端配置（``AGENT_READ_API_PROJECT_ID``）
+  ——本 API **不再接受**客户端 ``project_id`` 查询参数（未知名被忽略）；
+* fail closed：未配置 key / 未配置 project ⇒ 503（绝不匿名放行、绝不
+  回退项目默认）；缺失 / 错误凭据 ⇒ 401（固定文案）；
+* 本次为**安全例外解冻**：仅访问控制变化；Agent 其余契约（DTO 字段集、
+  只读面形、无写路径、无缓存的语义）**零修改**（测试双证）。
 
 错误契约（沿用既有 Trace / Timeline API 风格；§二十三）：
 
 ```text
-400  run_id / project_id / limit / offset 非法（服务层校验）
-404  Run 不存在 **或** 不属于当前 project（**故意同码**，不泄露存在性）
+400  run_id 非法（服务层校验）/ limit / offset 非法
+401  缺少或无效的 X-API-Key（固定文案；不泄露目标资源是否存在）
+404  Run 不存在 **或** 不属于授权项目（**故意同码**，不泄露存在性）
 422  路径参数长度越界（FastAPI Path 校验）
 502  持久化读边界不可用（DATABASE_URL 未配置 / 查询失败）
+503  服务端认证 / 作用域未配置（fail closed）
 500  其它未预期错误（不暴露 traceback / SQL / 凭据 / 内部模块路径）
 ```
 
@@ -37,19 +52,21 @@ JSON
 ``offset``（``>= 0``）。**server-side cap** 在服务层强制执行 ⇒ 绝不把
 ``limit=1000000`` 透传给数据库。
 
-项目隔离（§二十一 / §二十二）：``project_id`` 由请求显式提供（省略 ⇒
-项目默认 ``settings.project.project_id``，与既有 Chat API 的默认语义一致）；
-归属判定在**服务层**完成（``get_run(run_id, project_id)``）—— API 层
-**不猜** project、**不**做自己的隔离判断。
+部署状态（如实记录）：应用层认证与项目作用域授权已实现（本模块 +
+``agent_read_auth``）；HTTPS = NOT VERIFIED · 网络边界 = NOT VERIFIED ⇒
+``PRODUCTION_DEPLOYMENT`` 仍为 **BLOCKED**（与 Workflow Read API 一致）。
 """
 from __future__ import annotations
 
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, status
+from fastapi import APIRouter, HTTPException, Path, Query, Security, status
 
-from backend.app.config import settings
+from backend.app.api.agent_read_auth import (
+    AgentReadScope,
+    require_agent_read_scope,
+)
 from backend.app.db.agent_approval_repository import (
     AgentApprovalRepository,
     AgentApprovalRepositoryError,
@@ -104,7 +121,16 @@ router = APIRouter()
 #: 固定错误文案（**不**回传 DB 异常文本 / SQL / 路径 / 凭据）。
 _UNAVAILABLE_DETAIL: str = "Agent Run 读取数据源不可用"
 _NOT_FOUND_DETAIL: str = "Agent Run 不存在"
-_DEFAULT_PROJECT_ID: str = str(settings.project.project_id)
+
+#: 两个端点共享的 responses 片段（认证 / 授权错误声明）。
+_AUTH_RESPONSES: dict[int | str, dict[str, object]] = {
+    401: {
+        "description": (
+            "缺少或无效的 X-API-Key（固定文案；不泄露目标资源是否存在）"
+        )
+    },
+    503: {"description": "服务端认证 / 作用域未配置（fail closed）"},
+}
 
 
 def get_agent_read_service() -> AgentReadService:
@@ -251,7 +277,7 @@ def to_api_event(event: AgentTimelineEvent) -> AgentTimelineEventResponse:
 
 
 # ============================================================
-# 端点
+# 端点（**只读 + 认证**）
 # ============================================================
 
 
@@ -260,11 +286,11 @@ def to_api_event(event: AgentTimelineEvent) -> AgentTimelineEventResponse:
     response_model=AgentRunResponse,
     responses={
         200: {"description": "Agent Run 只读视图（Run 摘要 + Checkpoint / Approval / Step / Decision / ToolResult）"},
-        400: {"description": "run_id / project_id 非法"},
-        404: {"description": "Run 不存在**或**不属于当前 project（不泄露存在性）"},
+        400: {"description": "run_id 非法"},
+        404: {"description": "Run 不存在**或**不属于授权项目（不泄露存在性）"},
         422: {"description": "路径参数校验失败（长度越界）"},
         502: {"description": "持久化读边界不可用（DB 未配置 / 查询失败）"},
-        500: {"description": "Agent Run 读取数据源不可用"},
+        **_AUTH_RESPONSES,
     },
 )
 async def get_agent_run(
@@ -276,30 +302,19 @@ async def get_agent_run(
             description="Agent Run 身份（ai_ops.agent_run.run_id；不得为纯空白）",
         ),
     ],
-    project_id: Annotated[
-        str | None,
-        Query(
-            max_length=128,
-            description=(
-                "当前 project（§二十一：服务层据此做归属校验）；"
-                "省略 ⇒ 项目默认 project_id"
-            ),
-        ),
-    ] = None,
+    scope: Annotated[AgentReadScope, Security(require_agent_read_scope)],
 ) -> AgentRunResponse:
-    """读取一次 Agent Run 的**只读**视图（Query only）。
+    """读取一次 Agent Run 的**只读**视图（Query only；认证作用域内）。
 
     语义：``status`` 只来自 ``ai_ops.agent_run``（尚无终态记录 ⇒ ``null``）；
     ``checkpoint`` 表达"从哪恢复"（**不含** claim_token）；``approval`` 是该 Run
     的最后一条审批；``decisions`` / ``tool_results`` 只含**元数据**
     （**无** arguments / content / payload）。**不**触发 Resume / Approve / Cancel。
+    授权范围仅来自服务端的已认证作用域（``scope.project_id``）。
     """
     service = get_agent_read_service()
-    resolved_project_id = (
-        _DEFAULT_PROJECT_ID if project_id is None else project_id
-    )
     try:
-        view = service.get_run(run_id, resolved_project_id)
+        view = service.get_run(run_id, scope.project_id)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -340,11 +355,11 @@ async def get_agent_run(
     response_model=list[AgentTimelineEventResponse],
     responses={
         200: {"description": "该 Run 的 Timeline（deterministic 排序；可分页）"},
-        400: {"description": "run_id / project_id / limit / offset 非法"},
-        404: {"description": "Run 不存在**或**不属于当前 project（不泄露存在性）"},
+        400: {"description": "run_id / limit / offset 非法"},
+        404: {"description": "Run 不存在**或**不属于授权项目（不泄露存在性）"},
         422: {"description": "路径参数校验失败（长度越界）"},
         502: {"description": "持久化读边界不可用（DB 未配置 / 查询失败）"},
-        500: {"description": "Agent Run 读取数据源不可用"},
+        **_AUTH_RESPONSES,
     },
 )
 async def get_agent_run_timeline(
@@ -356,10 +371,7 @@ async def get_agent_run_timeline(
             description="Agent Run 身份（ai_ops.agent_run.run_id；不得为纯空白）",
         ),
     ],
-    project_id: Annotated[
-        str | None,
-        Query(max_length=128, description="当前 project；省略 ⇒ 项目默认"),
-    ] = None,
+    scope: Annotated[AgentReadScope, Security(require_agent_read_scope)],
     limit: Annotated[
         int | None,
         Query(description="每页条数（默认 50；**1..100**；超过 100 ⇒ 400）"),
@@ -378,13 +390,10 @@ async def get_agent_run_timeline(
     ``sequence`` 是**投影下标**（分页不重新编号）。
     """
     service = get_agent_read_service()
-    resolved_project_id = (
-        _DEFAULT_PROJECT_ID if project_id is None else project_id
-    )
     try:
         events = service.get_timeline(
             run_id,
-            resolved_project_id,
+            scope.project_id,
             limit=limit,
             offset=offset,
         )

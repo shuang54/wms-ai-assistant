@@ -44,6 +44,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     func,
     text,
 )
@@ -194,6 +195,14 @@ class WorkflowRun(Base):
         String(WORKFLOW_RUN_PROJECT_ID_MAX_LENGTH),
         nullable=False,
         comment="项目作用域（服务器端解析结果；**NOT NULL**；非 FK）",
+    )
+    input: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment=(
+            "启动输入（D1：结构化 JSON 文本；应用层 serialize_json_value 边界 "
+            "≤ 32 KiB / 深度 ≤ 8；None = 无输入；创建后**不可变**）"
+        ),
     )
     status: Mapped[str] = mapped_column(
         String(WORKFLOW_RUN_STATUS_MAX_LENGTH),

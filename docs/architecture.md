@@ -6149,3 +6149,41 @@ AI 理解
     ↓
 安全地辅助用户完成工作
 ```
+
+---
+
+## Appendix · Phase 5 / Phase 6 —— Agent 与 Workflow Runtime（真实实现索引）
+
+> 本节为**索引性增补**（Phase 6 Step 8 文档同步；不修改上文历史设计叙述）。
+> 详细决策：`docs/decisions/Phase/Phase 5*.md`、`Phase 6 — Workflow Runtime
+> Architecture Decision.md`；退出审计：`docs/roadmap/Phase-6-Exit-Audit.md`。
+
+```text
+对话链（HTTP）:  /api/chat · /api/rag/answer · /api/orchestrator/chat · /api/conversations
+   → AIOrchestratorService.execute → AIRouterService(RAG | TOOL | TEXT_TO_SQL | AGENT)
+   → Agent 分支：AgentRuntime（bounded loop；生产 HTTP 入口默认 agent_enabled=False）
+
+Agent Runtime（Phase 5；ai_ops.agent_* 六表）
+   Run / Step / Decision 持久化 · Checkpoint / Resume（claim + replay）·
+   Tool 授权（capabilities + allowed_tools）· Tool Result 持久化 / Replay ·
+   HITL Approval · 协作式取消（cooperative）
+   只读 API: GET /api/agent/runs/{run_id} · .../timeline
+             **X-API-Key 认证（Phase 6 S8A）**；授权 project_id 仅来自服务端配置
+             （AGENT_READ_API_PROJECT_ID）；未配置 ⇒ 503 fail closed
+
+Workflow Runtime（Phase 6；ai_ops.workflow_run / workflow_node_run / workflow_approval）
+   Domain（definition / states / policy）→ Ports → Binding → NodeExecutor
+   （CONDITION / TOOL / AI / APPROVAL）→ WorkflowRuntime（CAS 单赢 + UNKNOWN fail-closed）
+   → Factory / Store Adapters（真实 Repository 装配）
+   只读 API: GET /api/workflow-runs/{run_id}(+/nodes | /timeline) ·
+             GET /api/workflow-approvals/{approval_id}
+             **X-API-Key 认证（Phase 6 S7.2）**；授权 project_id 仅来自服务端配置
+             （WORKFLOW_READ_API_PROJECT_ID）；未配置 ⇒ 503 fail closed
+   命令面（start / advance / cancel / approve 的 HTTP 入口）：**尚未实现**（进程内 API 可用）
+
+认证与部署边界（如实）
+   · 两域只读 API 均要求 X-API-Key（恒定时间比较；缺失/错误 ⇒ 401；未配置 ⇒ 503；
+     跨项目 ⇒ 404 与"不存在"同构——不泄露存在性）
+   · 客户端不可能通过 Query / 普通 Header / Body 指定或扩宽授权项目
+   · HTTPS = NOT VERIFIED · 网络边界 = NOT VERIFIED ⇒ PRODUCTION_DEPLOYMENT = BLOCKED
+```
