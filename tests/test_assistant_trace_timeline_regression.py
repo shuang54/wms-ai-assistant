@@ -945,14 +945,57 @@ def _db_residue_total() -> int | None:
     （Phase 6 Step 8B-1：与 conftest 的会话收尾检查**单一来源**）。
     **会话收尾检查**使用其中的 ``fresh_residue_total``（每次重新查询）——
     不复用本函数的会话内缓存（§4.3）。
+
+    Phase 6 Step 8F：本函数**不再**参与 ``_current_matrix_baseline`` 的
+    ``db_residue`` 计算（保留为只读工具函数：全库绝对计数语义）。
     """
     return _residue_contract.cached_residue_total()
 
 
+#: Phase 6 Step 8F：矩阵 DB 套件执行的**净新增**观测表残留
+#: （``_db_suite_execution`` 首次执行时以 fresh 前后读数差值记录；
+#: ``lru_cache`` 语义 ⇒ 会话内只测量一次）。``None`` = 未测量 / DB 不可用。
+_matrix_db_residue_delta: int | None = None
+
+
+def _residue_delta(before: int | None, after: int | None) -> int | None:
+    """DB 套件执行前后的**净新增**残留（纯函数；单调保护）。
+
+    语义（Phase 6 Step 8F —— 矩阵 ``db_residue`` 的正确归因）：
+
+        * ``before`` = 执行前全库读数：执行前**已存在**的（本会话其他测试
+          写入、将在各自清理点/会话收尾被清理的）合法临时记录；
+        * ``after`` = 执行后全库读数；
+        * 返回值 = ``max(0, after - before)``——**执行本身**造成的净残留：
+
+            - 执行前已在、执行后仍在的合法在途记录 ⇒ 差值恒 0
+              （不误报 baseline 漂移——Step 8F 根因）；
+            - 执行真正新增未清理的残留 ⇒ 正值（gate 仍会拒绝——
+              安全检查**未**弱化）；
+            - 执行顺带清理更早的在途记录（after < before）⇒ 0
+              （库更干净不构成违规）；
+        * 任一读数为 ``None``（DB 不可用 / 表缺失）⇒ ``None``
+          （不猜测、**不**伪造 0）。
+
+    全库绝对残留的会话边界检查仍由
+    ``tests/conftest.py::_observability_residue_check`` 承担（本函数**不**替换它）。
+    """
+    if before is None or after is None:
+        return None
+    return max(0, after - before)
+
+
 def _current_matrix_baseline() -> MatrixExecutionBaseline | None:
-    """当前实际执行对应的 Baseline 视图（复用 Step 89 summary；DB 不可用 → None）。"""
+    """当前实际执行对应的 Baseline 视图（复用 Step 89 summary；DB 不可用 → None）。
+
+    Phase 6 Step 8F：``db_residue`` = **矩阵 DB 套件执行的净新增残留**
+    （``_matrix_db_residue_delta``，由 ``_db_suite_execution`` 首次执行时以
+    fresh 前后读数记录）——**不再**读取"会话中途的全库绝对残留"（后者会把
+    其他测试写入、将在各自清理点被清理的合法临时记录误判为 baseline 漂移：
+    全量分片顺序下的结构性失败，见 Step 8E 报告）。
+    """
     matrix = _matrix_execution_summary()
-    residue = _db_residue_total()
+    residue = _matrix_db_residue_delta
     if matrix.db is None or residue is None:
         return None
     return MatrixExecutionBaseline(
@@ -983,8 +1026,21 @@ def _db_execution_available() -> tuple[bool, str]:
 
 @lru_cache(maxsize=1)
 def _db_suite_execution() -> subprocess.CompletedProcess[str]:
-    """执行一次 DB suite（``RUN_DB_TESTS=1``；会话内缓存，只跑一次）。"""
-    return _run_pytest(_db_suite(), with_db=True)
+    """执行一次 DB suite（``RUN_DB_TESTS=1``；会话内缓存，只跑一次）。
+
+    Phase 6 Step 8F：本函数是 DB 套件执行的**唯一**入口（``lru_cache``），
+    因此净残留测量绑定在此——首次执行**前**读取 fresh 全库读数（``before``，
+    含本会话此前测试的合法在途记录），执行后再次读取（``after``），以
+    ``_residue_delta`` 记录"执行本身造成的净新增残留"到
+    ``_matrix_db_residue_delta``（供矩阵 baseline 的 ``db_residue`` 使用）。
+    无论哪个测试先触发执行，测量结果一致且只测一次。
+    """
+    global _matrix_db_residue_delta
+    before = _residue_contract.fresh_residue_total()
+    result = _run_pytest(_db_suite(), with_db=True)
+    after = _residue_contract.fresh_residue_total()
+    _matrix_db_residue_delta = _residue_delta(before, after)
+    return result
 
 
 @lru_cache(maxsize=1)
@@ -2552,6 +2608,71 @@ class TestMatrixExecutionBaseline:
         for module in module_level:
             for prefix in ("backend.app.db", "sqlalchemy", "httpx", "requests"):
                 assert not module.startswith(prefix), module
+
+
+class TestMatrixResidueDeltaSemantics:
+    """Phase 6 Step 8F：矩阵 ``db_residue`` 的**净增量**语义（顺序无关）。
+
+    背景（Step 8E 实测）：旧实现读取"会话中途全库绝对残留"——分片 2 顺序下
+    前序测试写入的合法在途记录（将在各自清理点/会话收尾被清理）被误判为
+    baseline 漂移（0 != 15 ⇒ DRIFT）。修复后：``db_residue`` =
+    ``max(0, 执行后读数 - 执行前读数)``——只归因**矩阵 DB 套件执行**本身。
+    """
+
+    def test_pre_existing_inflight_records_do_not_trigger_drift(self) -> None:
+        """合法会话内临时记录（执行前已在、执行后仍在）⇒ 0（Step 8E 场景 15/15）。"""
+        assert _residue_delta(15, 15) == 0
+
+    def test_true_uncleaned_residue_is_still_detected(self) -> None:
+        """执行真正新增未清理残留 ⇒ 正值（安全检查未弱化）。"""
+        assert _residue_delta(0, 1) == 1
+        assert _residue_delta(3, 7) == 4
+
+    def test_delta_is_monotonic_when_execution_cleans_earlier_rows(self) -> None:
+        """执行顺带清理更早的在途记录（after < before）⇒ 0（库更干净不算违规）。"""
+        assert _residue_delta(15, 12) == 0
+
+    def test_delta_none_when_either_reading_unavailable(self) -> None:
+        """读数不可用（DB 不可达 / 表缺失）⇒ None（不猜测、不伪造 0）。"""
+        assert _residue_delta(None, 0) is None
+        assert _residue_delta(0, None) is None
+        assert _residue_delta(None, None) is None
+
+    def test_current_baseline_uses_execution_delta_not_absolute_residue(self) -> None:
+        """源码级：current baseline 的 residue 来源 = 执行净增量（非绝对读数）。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == (
+                "_current_matrix_baseline"
+            ):
+                body = ast.unparse(node)
+
+        assert body, "未找到 _current_matrix_baseline 实现"
+        assert "_matrix_db_residue_delta" in body
+        assert "_db_residue_total()" not in body
+
+    def test_execution_entry_measures_fresh_readings_once(self) -> None:
+        """执行入口（唯一）在首跑前后各取一次 fresh 读数（lru_cache ⇒ 一次）。"""
+        tree = ast.parse(_source(_SELF))
+        body = ""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_db_suite_execution":
+                body = ast.unparse(node)
+
+        assert body, "未找到 _db_suite_execution 实现"
+        assert body.count("fresh_residue_total") == 2
+        assert "_matrix_db_residue_delta" in body
+        info = _db_suite_execution.cache_info()
+        assert info.maxsize == 1  # 会话内一次（执行与测量绑定）
+
+    def test_db_residue_contract_of_shared_expectation_unchanged(self) -> None:
+        """``test_db_residue_is_zero`` 的既有契约不受本修复影响（不弱化）。"""
+        assert (
+            MATRIX_EXECUTION_BASELINE.db_residue
+            == _residue_contract.EXPECTED_RESIDUE_AFTER_CLEANUP
+            == 0
+        )
 
 
 # ============================================================
