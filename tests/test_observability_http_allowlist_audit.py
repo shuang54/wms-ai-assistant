@@ -416,6 +416,13 @@ class TestSecurityAudit:
             "/api/conversations",
             "/api/conversations/{conversation_id}/archive",
             "/api/conversations/{conversation_id}/messages",
+            # ---- Workflow Command API（Phase 7 Step 1；精确路由，无 wildcard）----
+            # 启动（start）· 推进（advance）· 取消（cancel）· 审批裁决（decision）；
+            # 全部挂载 require_workflow_command_scope（X-API-Key + 服务端作用域）。
+            "/api/workflow-runs",
+            "/api/workflow-runs/{run_id}/advance",
+            "/api/workflow-runs/{run_id}/cancel",
+            "/api/workflow-approvals/{approval_id}/decision",
         }, write_routes
         for route in discover_routes():
             if route.method.lower() in _WRITE_METHODS:

@@ -24,6 +24,7 @@ from backend.app.api import (
     tool_chat,
     tool_observability,
     usage,
+    workflow_command,
     workflow_read,
 )
 from backend.app.config import settings
@@ -72,6 +73,15 @@ def create_app() -> FastAPI:
     # 不触发 start / advance / request_cancel / 审批裁决）。
     app.include_router(
         workflow_read.router, prefix="/api", tags=["workflow"]
+    )
+    # Phase 7 Step 1：Workflow Command API（**认证 + 项目作用域** 写边界：
+    # POST /api/workflow-runs（start）+ /{run_id}/advance|cancel +
+    # POST /api/workflow-approvals/{approval_id}/decision；
+    # 经既有 WorkflowRuntime 命令面（start/advance/request_cancel/
+    # submit_approval_decision）；不新增认证机制——与 read 面同形同语义，
+    # 凭据独立（WORKFLOW_COMMAND_API_KEY）可分别轮换）。
+    app.include_router(
+        workflow_command.router, prefix="/api", tags=["workflow"]
     )
     return app
 

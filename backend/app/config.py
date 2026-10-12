@@ -359,6 +359,42 @@ class AgentReadSettings:
 
 
 # ============================================================
+# Workflow Command API 认证配置（Phase 7 Step 1；fail closed）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class WorkflowCommandSettings:
+    """Workflow **命令** API（start / advance / cancel / approve-reject）认证配置。
+
+    与 ``WorkflowReadSettings`` / ``AgentReadSettings`` **同形同机制**
+    （X-API-Key + 服务端唯一授权作用域；不引入新的认证机制），但**独立凭据**
+    （读写最小权限分离：读取凭据泄露不影响写面；可分别轮换——部署层可
+    配置为相同值，代码不耦合）。
+
+    **不提供任何默认凭据**：两项默认均为空字符串 ⇒ 视为"未配置" ⇒
+    命令端点一律拒绝访问（503，**绝不**退化为匿名可访问、
+    **绝不**回退默认项目）。
+
+    字段：
+        api_key:        服务端共享 API Key（环境变量
+                        ``WORKFLOW_COMMAND_API_KEY``；默认空 = 未配置）。
+                        不得写入源码 / 测试默认值 / 文档 / 日志 / 响应体。
+        api_project_id: 该凭据**唯一**授权的项目作用域（环境变量
+                        ``WORKFLOW_COMMAND_API_PROJECT_ID``；默认空 = 未配置）——
+                        授权作用域的**唯一来源**；客户端 Query / Header /
+                        Body 参数不能覆盖或扩宽。
+    """
+
+    api_key: str = field(
+        default_factory=lambda: _get_str("WORKFLOW_COMMAND_API_KEY", "")
+    )
+    api_project_id: str = field(
+        default_factory=lambda: _get_str("WORKFLOW_COMMAND_API_PROJECT_ID", "")
+    )
+
+
+# ============================================================
 # Tool Calling 配置（Phase 3.6.3）
 # ============================================================
 
@@ -631,6 +667,9 @@ class Settings:
         default_factory=WorkflowReadSettings
     )
     agent_read: AgentReadSettings = field(default_factory=AgentReadSettings)
+    workflow_command: WorkflowCommandSettings = field(
+        default_factory=WorkflowCommandSettings
+    )
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
     ai_router: AIRouterSettings = field(default_factory=AIRouterSettings)
@@ -651,6 +690,7 @@ __all__ = [
     "ProjectSettings",
     "WorkflowReadSettings",
     "AgentReadSettings",
+    "WorkflowCommandSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",
     "AIRouterSettings",
