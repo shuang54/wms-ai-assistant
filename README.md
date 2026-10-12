@@ -283,12 +283,29 @@ HTTP POST /api/chat
 ## 后续开发路线
 
 ```text
-Phase 1 项目骨架          ← 已完成
-Phase 2 LLM API + Chat   ← 当前
-Phase 3 RAG + Embedding + pgvector
-Phase 4 Tool Calling
-Phase 5 WMS API 集成
-Phase 6 Agent / LangGraph / 权限 / 写操作 / 私有化部署
+Phase 1  项目骨架                        ← 已完成
+Phase 2  LLM API + Chat                  ← 已完成
+Phase 3  RAG / Embedding / pgvector / Tool Calling / Text-to-SQL / 评测  ← 已完成
+Phase 4  Conversation Runtime / Evidence ← 已完成（已提交）
+Phase 5  Agent Runtime（持久化 / 恢复 / HITL / 取消 / Read API）          ← 已完成（已提交）
+Phase 6  Workflow Runtime（Domain → Runtime → Factory → Read API + 认证） ← 进行中（S1–S8A 已实现；
+                                                                            退出审计见 docs/roadmap/）
+后续     部署验证（HTTPS / 网络边界）· Workflow 命令面 · 真实业务验收
 ```
 
 **任何未来能力都必须建立在真实需求基础上**，不为技术炫技提前复杂化。
+
+## Read API 认证（Phase 6 Step 7.2 / 8A）
+
+Agent 与 Workflow 的只读 HTTP API 均要求 **`X-API-Key`**；授权项目仅来自
+服务端配置（客户端 `project_id` 参数被忽略）。未配置凭据 ⇒ 503 fail closed；
+缺 / 错凭据 ⇒ 401；跨项目 ⇒ 404（与不存在同构）。配置项（均无默认值，见
+`.env.example`）：
+
+```text
+WORKFLOW_READ_API_KEY / WORKFLOW_READ_API_PROJECT_ID
+AGENT_READ_API_KEY    / AGENT_READ_API_PROJECT_ID
+```
+
+> **部署门禁（如实）**：HTTPS = NOT VERIFIED · 网络边界 = NOT VERIFIED ⇒
+> `PRODUCTION_DEPLOYMENT = BLOCKED`，直到部署层完成独立验证。

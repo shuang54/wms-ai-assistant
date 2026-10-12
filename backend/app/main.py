@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.app.api import (
+    agent_read,
     assistant_timeline,
     assistant_trace,
     chat,
@@ -23,6 +24,7 @@ from backend.app.api import (
     tool_chat,
     tool_observability,
     usage,
+    workflow_read,
 )
 from backend.app.config import settings
 
@@ -60,6 +62,16 @@ def create_app() -> FastAPI:
     # （4 个端点；不含 message POST —— Chat/Application Layer 属后续阶段）。
     app.include_router(
         conversations.router, prefix="/api", tags=["conversations"]
+    )
+    # Phase 5 P-8：Agent Read API（**只读** Query 边界：
+    # GET /api/agent/runs/{run_id} + /timeline；不触发 Resume / Approve / Cancel）。
+    app.include_router(agent_read.router, prefix="/api", tags=["agent"])
+    # Phase 6 Step 7：Workflow Read API（**只读** Query 边界：
+    # GET /api/workflow-runs/{run_id}(+/nodes | /timeline) +
+    # GET /api/workflow-approvals/{approval_id}；
+    # 不触发 start / advance / request_cancel / 审批裁决）。
+    app.include_router(
+        workflow_read.router, prefix="/api", tags=["workflow"]
     )
     return app
 

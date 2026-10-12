@@ -107,3 +107,34 @@ LLM 仅负责"提议调用哪个能力"，**不负责决定权限与业务校验
   - 引入 JWT 鉴权
   - 引入 Tool 调用审计表
   - 完善 CORS、HTTPS、限流
+
+---
+
+## 7. Workflow Read API 认证（Phase 6 Step 7.2；已实现）
+
+四个只读端点（`GET /api/workflow-runs/{run_id}`、`…/nodes`、`…/timeline`、
+`GET /api/workflow-approvals/{approval_id}`）采用**最小单凭据绑定单项目**模型
+（背景与审计证据：`docs/security/Phase-6-Step-7.1-Workflow-Read-API-Security-Audit.md`）：
+
+| 项 | 配置 / 行为 |
+| --- | --- |
+| 认证头 | `X-API-Key`（`secrets.compare_digest` 恒定时间比较） |
+| 凭据配置 | `WORKFLOW_READ_API_KEY`（环境变量；**无任何默认值**） |
+| 授权作用域 | `WORKFLOW_READ_API_PROJECT_ID`（该凭据**唯一**授权的项目） |
+| 未配置 | 任一为空/空白 ⇒ 四个端点一律 **503 fail closed**（绝不匿名放行；**不**回退默认项目） |
+| 缺 / 错凭据 | **401**（固定文案；不泄露目标资源是否存在；日志与响应不记录原始凭据） |
+| 客户端 project_id | **被忽略**——作用域只来自服务端配置（不接受 Query / 普通 Header / Body，`workflow_read.py` 已移除该查询参数） |
+| 跨项目资源 | 404（与"不存在"同构——不泄露存在性） |
+
+明确边界（**不**宣称已达成）：
+- API Key ≠ 用户身份系统（无用户 / 角色 / RBAC；多项目映射与凭据轮换属后续阶段）；
+- HTTPS = **NOT VERIFIED**、网络边界 = **NOT VERIFIED**（仓库内无网关 / 反向代理
+  / TLS 配置）⇒ **PRODUCTION_DEPLOYMENT 仍为 BLOCKED**，直到部署层完成独立验证
+  （外部客户端不可绕过网关 / 只有可信网关可传递身份 / 网关覆盖而非盲信客户端身份头）。
+
+配置示例（写入 `.env`，值**不得**提交到 Git；变量名见 `.env.example` 占位）：
+
+```text
+WORKFLOW_READ_API_KEY=<服务端生成的强随机值>
+WORKFLOW_READ_API_PROJECT_ID=vietnam-wms
+```

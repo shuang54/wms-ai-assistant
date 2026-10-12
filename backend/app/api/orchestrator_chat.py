@@ -461,6 +461,42 @@ def _build_outcome_recorder() -> Any:
     return build_assistant_outcome_recorder()
 
 
+def _build_agent_run_recorder() -> Any:
+    """Phase 5 P-2：Agent Run 持久化装配（**进程级单实例**）。
+
+    语义与 Step 64 的 outcome 接线一致：
+
+        * ``get_engine() is None``（DATABASE_URL 未配置）→ **None**
+          （不注入 → Orchestrator 零开销跳过持久化；**无告警噪声**）；
+        * DB 已配置 → recorder（run-level 写入 ``ai_ops.agent_run``）。
+
+    边界：recorder 自身 best-effort（失败只 warning）→ Agent Run 持久化
+    **绝不**变成 Agent / Assistant 业务失败，也不触发 retry；
+    DB 可用性判断在 Service / Agent 层（组合根**只组合**，不接触
+    Engine / Session / DB）。
+    """
+    from backend.app.agent.recorder import build_agent_run_recorder
+
+    return build_agent_run_recorder()
+
+
+def _build_agent_step_recorder() -> Any:
+    """Phase 5 AgentStep Persistence：Agent Step 持久化装配（**进程级单实例**）。
+
+    语义与 Agent Run 接线一致：
+
+        * ``get_engine() is None``（DATABASE_URL 未配置）→ **None**
+          （不注入 → Orchestrator 零开销跳过；**无告警噪声**）；
+        * DB 已配置 → recorder（step projection 写入 ``ai_ops.agent_step``）。
+
+    边界：recorder 自身 best-effort（失败只 warning）→ Step 持久化
+    **绝不**变成 Agent / Assistant 业务失败，也不触发 retry。
+    """
+    from backend.app.agent.recorder import build_agent_step_recorder
+
+    return build_agent_step_recorder()
+
+
 _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     router=AIRouterService(
         tool_capabilities=ToolRegistryCapabilityAdapter(_TOOL_REGISTRY),
@@ -476,6 +512,11 @@ _default_orchestrator: AIOrchestratorService = AIOrchestratorService(
     # Phase 3.12 Step 64：Assistant 终态（Outcome）持久化接线 ——
     # 判定仍在 Orchestrator（Step 63），本参数只提供持久化边界
     # （进程级单实例；无 DATABASE_URL → None，行为与 Step 63 之前一致）。
+    # Phase 5 P-2：Agent Run（run-level）持久化接线 ——
+    # 仅在 AGENT 路由实际执行时写入；默认（未启用 Agent）0 行。
+    agent_run_recorder=_build_agent_run_recorder(),
+    # Phase 5 AgentStep Persistence：Step 投影（先 Steps、后 Run；各自 best-effort）。
+    agent_step_recorder=_build_agent_step_recorder(),
     outcome_recorder=_build_outcome_recorder(),
 )
 

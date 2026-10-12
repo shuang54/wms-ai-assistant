@@ -46,10 +46,44 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Final, Protocol
 
+from backend.app.agent.capability import AgentCapability
+from backend.app.agent.approval import (
+    AgentApprovalResolution,
+    approval_conflict_code,
+    is_valid_approval_decision,
+)
+from backend.app.agent.cancellation import (
+    AgentCancellationCoordinator,
+    AgentCancellationError,
+    AgentCancellationResult,
+)
+from backend.app.agent.checkpoint import (
+    CHECKPOINT_STATUS_TERMINAL,
+    AgentCheckpointRecorder,
+)
+from backend.app.agent.errors import (
+    AGENT_ERROR_APPROVAL_CONFLICT,
+    AGENT_ERROR_APPROVAL_NOT_FOUND,
+    AGENT_ERROR_CODES,
+    AGENT_ERROR_FAILED,
+    AGENT_ERROR_RUN_NOT_RESUMABLE,
+)
+from backend.app.agent.models import (
+    AGENT_STATUS_CANCELLED,
+    AGENT_STATUS_COMPLETED,
+    AGENT_STATUS_FAILED,
+    AGENT_STATUS_LIMIT_REACHED,
+    AGENT_STATUS_WAITING_APPROVAL,
+    AgentRuntimeResult,
+)
+from backend.app.agent.recorder import AgentRunRecorder, AgentStepRecorder
 from backend.app.dto.assistant_outcome import (
     AssistantOutcome,
     determine_assistant_outcome,
@@ -355,12 +389,39 @@ class AIOrchestratorService:
         tool_execution_service: ToolExecutionService | None = None,
         tool_execution_observer: ToolExecutionObserver | None = None,
         tool_argument_extractor: ToolArgumentExtractor | None = None,
+        agent_runtime: AgentCapability | None = None,
+        agent_run_recorder: AgentRunRecorder | None = None,
+        agent_step_recorder: AgentStepRecorder | None = None,
+        agent_checkpoint_recorder: AgentCheckpointRecorder | None = None,
+        agent_approval_store: Any | None = None,
         max_rows: int = DEFAULT_MAX_ROWS,
         outcome_recorder: "AssistantOutcomeRecorder | None" = None,
     ) -> None:
         """构造 Orchestrator（全部依赖可注入，**不**创建基础设施）。
 
         Args:
+            agent_runtime: Phase 5 Agent Runtime Integration（§29.11 / OD-P5-23）——
+                          Agent 能力端口（唯一暴露面：``run()``）。
+            agent_run_recorder:
+                          Phase 5 Agent Persistence（§30.9 / OD-P5-26）——
+                          Agent Run **run-level** 持久化边界（best-effort）。
+                          ``None``（默认）⇒ 不持久化（0 行；行为与 P-2 之前一致）。
+                          由 composition root 注入；Orchestrator 只调用，
+                          **不**生成 run_id / request_id（二者分别来自
+                          AgentRuntime 与 ``execute()``）。
+            agent_step_recorder:
+                          Phase 5 AgentStep Persistence —— Agent Step
+                          （``AgentRuntimeResult.step_records``）的持久化边界
+                          （best-effort）。``None``（默认）⇒ 不持久化。
+                          写入顺序：**先 Steps、后 Run**（§十七）；两者相互独立，
+                          Step 写入失败不影响 Run / 业务结果。
+                          **可选注入**：``None``（默认）= Agent 未接线 ⇒
+                          ``RouteType.AGENT`` 在执行前被硬校验拒绝
+                          （fail-closed；绝不降级为 RAG / TOOL / TEXT_TO_SQL）。
+                          ProviderAgentLLM / AgentRuntimePolicy /
+                          ToolExecutionService 由 composition root 组装后
+                          注入本层 —— Orchestrator **不**创建它们、
+                          不读 .env、不认识 Provider。
             capabilities: Phase 3.8.2 —— 该项目的能力配置（执行前硬校验）。
                           ``None`` = 不限制（默认 Orchestrator / 旧行为）；
                           工厂 ``build_orchestrator_for_project`` 总是传入
@@ -518,6 +579,61 @@ class AIOrchestratorService:
                 "tool_argument_extractor 必须提供可调用的 extract()"
                 f"（当前: {type(tool_argument_extractor).__name__}）"
             )
+        # Phase 5 Agent Runtime Integration（§29.11）：Agent 能力端口。
+        # 形状校验与其它可选依赖一致（失败更早；本层只 await run()）。
+        if agent_runtime is not None and not callable(
+            getattr(agent_runtime, "run", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_runtime 必须提供可调用的 run()"
+                f"（当前: {type(agent_runtime).__name__}）"
+            )
+        self._agent_runtime = agent_runtime
+        # Phase 5 P-2：Agent Run 持久化边界（可选；形状与其它可选依赖一致）。
+        if agent_run_recorder is not None and not callable(
+            getattr(agent_run_recorder, "record", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_run_recorder 必须提供可调用的 record()"
+                f"（当前: {type(agent_run_recorder).__name__}）"
+            )
+        self._agent_run_recorder = agent_run_recorder
+        # Phase 5 AgentStep Persistence：Step 投影持久化边界（可选；同风格校验）。
+        if agent_step_recorder is not None and not callable(
+            getattr(agent_step_recorder, "record", None)
+        ):
+            raise AIOrchestratorInputError(
+                "agent_step_recorder 必须提供可调用的 record()"
+                f"（当前: {type(agent_step_recorder).__name__}）"
+            )
+        self._agent_step_recorder = agent_step_recorder
+        # Phase 5 P-5：Agent Checkpoint 持久化边界（可选；同风格校验）。
+        # 只写**终态** checkpoint（TERMINAL / COMPLETED|FAILED）；ACTIVE checkpoint
+        # 由 AgentRuntime 在 Tool Result 之后直接写（同一 recorder 实例）。
+        if agent_checkpoint_recorder is not None and not (
+            callable(getattr(agent_checkpoint_recorder, "record_terminal", None))
+            or callable(
+                getattr(agent_checkpoint_recorder, "arecord_terminal", None)
+            )
+        ):
+            raise AIOrchestratorInputError(
+                "agent_checkpoint_recorder 必须提供可调用的 record_terminal()"
+                " 或 arecord_terminal()"
+                f"（当前: {type(agent_checkpoint_recorder).__name__}）"
+            )
+        self._agent_checkpoint_recorder = agent_checkpoint_recorder
+        # Phase 5 P-7：HITL 审批存储（可选；None ⇒ resolve_agent_approval 不可用）。
+        # Orchestrator 只做**控制状态裁决**（不执行 Agent Loop / 不解析 Tool Call /
+        # 不直接执行 Tool；§四十五 / §二十三）。
+        if agent_approval_store is not None and not (
+            callable(getattr(agent_approval_store, "aresolve", None))
+            or callable(getattr(agent_approval_store, "resolve", None))
+        ):
+            raise AIOrchestratorInputError(
+                "agent_approval_store 必须提供可调用的 aresolve() 或 resolve()"
+                f"（当前: {type(agent_approval_store).__name__}）"
+            )
+        self._agent_approval_store = agent_approval_store
         self._argument_extractor: ToolArgumentExtractor = (
             tool_argument_extractor
             if tool_argument_extractor is not None
@@ -548,6 +664,24 @@ class AIOrchestratorService:
         """本 Orchestrator 注入的观测出口（None = 不产生 Record）。"""
         return self._tool_execution_observer
 
+    @property
+    def agent_run_recorder(self) -> AgentRunRecorder | None:
+        """本 Orchestrator 注入的 Agent Run 持久化边界（None = 不落盘）。
+
+        Phase 5 P-2：供 composition root / 项目工厂继承同一实例
+        （与 ``tool_execution_observer`` 的继承方式一致）。
+        """
+        return self._agent_run_recorder
+
+    @property
+    def agent_step_recorder(self) -> AgentStepRecorder | None:
+        """本 Orchestrator 注入的 Agent Step 持久化边界（None = 不落盘）。
+
+        Phase 5 AgentStep Persistence：与 ``agent_run_recorder`` 同样供
+        composition root / 项目工厂继承同一实例。
+        """
+        return self._agent_step_recorder
+
     # ---------- 主入口 ----------
 
     async def execute(
@@ -571,14 +705,14 @@ class AIOrchestratorService:
         # 随三条成功路径的 ``metadata["request_id"]`` 透出（RAG / Tool /
         # Text-to-SQL），使调用方可用它关联 Tool Execution Observability；
         # 由本方法生成（API 层不生成第二个 ID）。
-        request_id = new_request_id()
+        request_id = self._issue_request_id()
 
         # ---- 1) 路由决策 ----
         # Phase 3.12 Step 36：整个执行（含 Router 的 LLM fallback、RAG /
         # Tool / Text-to-SQL 内部的 LLM 调用）都在同一个 Assistant Trace
         # Scope 内 —— LLM Usage 持久化因此可以把 usage 事实关联到本
         # request_id（不改 LLM Client / RAG / Text-to-SQL 参数签名）。
-        with assistant_trace_scope(request_id):
+        with self._request_trace_scope(request_id):
             try:
                 decision: RouteDecision = await self._router.route(
                     question=normalized, context=context
@@ -614,6 +748,16 @@ class AIOrchestratorService:
                     )
                 elif decision.route == RouteType.TEXT_TO_SQL:
                     result = await self._run_text_to_sql(
+                        decision,
+                        normalized,
+                        request_id=request_id,
+                        context=context,
+                    )
+                elif decision.route == RouteType.AGENT:
+                    # Phase 5 Agent Runtime Integration（§29.11）：Agent 与
+                    # RAG / TOOL / TEXT_TO_SQL 同级 —— 唯一执行入口仍是本方法
+                    # （Agent **不**回调 Orchestrator / Router / Conversation）。
+                    result = await self._run_agent(
                         decision,
                         normalized,
                         request_id=request_id,
@@ -1072,6 +1216,543 @@ class AIOrchestratorService:
             },
         )
 
+    # ---------- Phase 5 AgentStep Persistence（best-effort） ----------
+
+    async def _record_agent_steps(self, agent_result: AgentRuntimeResult) -> None:
+        """Best-effort 持久化本次 Run 的 Step 投影（**永不**影响业务结果）。
+
+        * ``agent_step_recorder is None``（默认 / 未接线）⇒ 直接返回（0 行）；
+        * 只读 ``AgentRuntimeResult.step_records``（不改写 / 不重排 / 不补造）；
+        * 无 retry / fallback / 跨表事务；Step 与 Run 相互独立。
+        """
+        recorder = self._agent_step_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.arecord(agent_result)
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Step 持久化失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
+    # ---------- Phase 5 P-5：Agent Checkpoint 持久化（best-effort） ----------
+
+    async def _record_agent_terminal_checkpoint(
+        self, agent_result: AgentRuntimeResult
+    ) -> None:
+        """Best-effort 写**终态** Checkpoint（**永不**影响业务结果）。
+
+        * ``agent_checkpoint_recorder is None``（默认 / 未接线）⇒ 直接返回（0 行）；
+        * 状态映射（§三十五 / §三十六）：``COMPLETED`` ⇒ TERMINAL / COMPLETED；
+          ``FAILED`` / ``LIMIT_REACHED`` ⇒ TERMINAL / FAILED；预留状态
+          （WAITING_APPROVAL / CANCELLED）无 P-5 映射 ⇒ 记录器不写（§三十七）；
+        * ``run_id`` 由记录器从 Agent Run Scope 取（**不**在这里传 run_id）；
+        * 不修改 AgentRun 语义、不做 claim 接管 / 不 retry、无跨表事务。
+        """
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            return
+        kwargs: dict[str, Any] = {
+            "run_id": agent_result.run_id,  # **只读**（不重新生成 / 不推导）
+            "agent_status": agent_result.status,
+            "agent_error": _stable_agent_error_code(agent_result.error),
+        }
+        try:
+            arecord = getattr(recorder, "arecord_terminal", None)
+            if callable(arecord):
+                await arecord(**kwargs)
+                return
+            record = getattr(recorder, "record_terminal", None)
+            if callable(record):
+                record(**kwargs)
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Checkpoint 终态写入失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
+    # ---------- Phase 5 P-2：Agent Run 持久化（best-effort） ----------
+
+    async def _record_agent_run(
+        self,
+        agent_result: AgentRuntimeResult,
+        *,
+        request_id: str,
+        started_at: datetime,
+        finished_at: datetime,
+        duration_ms: float,
+    ) -> None:
+        """Best-effort 持久化一次 Agent Run（**永不**影响业务结果）。
+
+        * ``recorder is None``（默认 / 未接线）⇒ 直接返回（零开销，0 行）；
+        * recorder 自身已 best-effort；本方法再兜一层 try/except，
+          保证任何实现都不会把持久化失败变成 Agent / Assistant 业务失败；
+        * 无 retry / sleep / backoff / queue；不生成 run_id / request_id
+          （run_id 来自 AgentRuntimeResult，request_id 来自 ``execute()``）。
+        """
+        recorder = self._agent_run_recorder
+        if recorder is None:
+            return
+        try:
+            await recorder.arecord(
+                agent_result,
+                request_id=request_id,
+                project_id=self._capability_project_id(),
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        except Exception:  # noqa: BLE001 —— 持久化绝不穿透为业务失败
+            logger.warning(
+                "Agent Run 持久化失败（不影响 Agent 业务结果）",
+                exc_info=True,
+            )
+
+    # ---------- Phase 5 P-7：HITL 审批裁决 / 协作式取消（内部 Service API） ----------
+
+    async def resolve_agent_approval(
+        self, approval_id: str, *, decision: str
+    ) -> AgentApprovalResolution:
+        """裁决一次 HITL 审批（**只改控制状态**；执行由 :meth:`resume_agent_run` 承担）。
+
+        契约（§十三 / §十七 / §十八 / §十九 / §二十三 / §三十二）：
+
+            * ``decision`` ∈ {``APPROVED``, ``REJECTED``} —— **不**接受
+              retry / modify / edit_tool / change_arguments / change_tool；
+            * **幂等**：同一裁决重复提交 ⇒ 返回既有终态，**不**再次执行 Tool；
+            * **冲突**：不同裁决（或 Run 已终态，含 CANCELLED）⇒
+              ``AGENT_APPROVAL_CONFLICT`` + fail-closed（**不**覆盖、**不**重试）；
+            * **不**调用 LLM / ToolExecutionService / Resume（§二十三）；
+            * ``Approval ≠ Authorization``：批准后执行前仍必须**重新**授权（§四十一）。
+
+        Returns:
+            :class:`AgentApprovalResolution`（``error_code`` 非空 ⇒ 未发生转换）。
+        """
+        if not isinstance(approval_id, str) or not approval_id.strip():
+            raise AIOrchestratorInputError("approval_id 必须是非空 str")
+        if not is_valid_approval_decision(decision):
+            raise AIOrchestratorInputError(
+                "decision 只接受 APPROVED / REJECTED"
+                f"（当前: {decision!r}）"
+            )
+        store = self._agent_approval_store
+        if store is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 HITL 审批（agent_approval_store 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        record = await self._call_approval(
+            store, ("aget", "get"), approval_id=approval_id
+        )
+        if record is None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=None,
+                status=None,
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_NOT_FOUND,
+            )
+        run_id = getattr(record, "run_id", None)
+        # 已终态 Run（含 CANCELLED）：审批**不得**复活执行（§三十二：fail-closed）
+        if await self._approval_run_is_terminal(run_id):
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=run_id if isinstance(run_id, str) else None,
+                status=getattr(record, "status", None),
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_CONFLICT,
+            )
+
+        resolved = await self._call_approval(
+            store,
+            ("aresolve", "resolve"),
+            approval_id=approval_id,
+            decision=decision,
+        )
+        if resolved is not None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=getattr(resolved, "run_id", None),
+                status=getattr(resolved, "status", None),
+                decision=getattr(resolved, "decision", None),
+                error_code=None,
+            )
+        # 无转换（条件 UPDATE 未命中）：读回判定"幂等"或"冲突"（绝不 force）
+        current = await self._call_approval(
+            store, ("aget", "get"), approval_id=approval_id
+        )
+        if current is None:
+            return AgentApprovalResolution(
+                approval_id=approval_id,
+                run_id=run_id if isinstance(run_id, str) else None,
+                status=None,
+                decision=None,
+                error_code=AGENT_ERROR_APPROVAL_NOT_FOUND,
+            )
+        existing = getattr(current, "status", None)
+        conflict = approval_conflict_code(existing, decision)
+        return AgentApprovalResolution(
+            approval_id=approval_id,
+            run_id=getattr(current, "run_id", None),
+            status=existing,
+            decision=decision if conflict is None else None,
+            error_code=conflict,
+        )
+
+    async def cancel_agent_run(self, run_id: str) -> AgentCancellationResult:
+        """请求取消一个 Agent Run（**协作式**；内部 Service API；§四十三）。
+
+        契约（§二十四–§三十八）：
+
+            * 只设置**持久化控制状态**（Checkpoint.cancel_requested = true，CAS）；
+              运行中的 Agent 在安全边界（LLM 前 / Tool 前 / Tool 返回后）停止；
+            * **不强杀**运行中的 Tool：等它返回 ⇒ Tool Result 保留 ⇒ CANCELLED；
+            * 暂停中的 Run（PAUSED / WAITING_APPROVAL）没有活着的循环 ⇒ 直接终态化
+              （Checkpoint = TERMINAL / CANCELLED；Tool = 0）；
+            * 终态 Run ⇒ **no-op**（``AGENT_RUN_NOT_CANCELLABLE``）；
+            * 重复取消 ⇒ **幂等**（返回当前状态；不再调 LLM / Tool）；
+            * **不**调用 LLM / ToolExecutionService / Resume。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AIOrchestratorInputError("run_id 必须是非空 str")
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent Checkpoint（无法取消：无控制状态）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+        coordinator = AgentCancellationCoordinator(checkpoints=recorder)
+        try:
+            return await asyncio.to_thread(coordinator.cancel, run_id)
+        except AgentCancellationError as exc:
+            raise AIOrchestratorExecutionError(
+                f"取消 Agent Run 失败（fail-closed）: {type(exc).__name__}"
+            ) from exc
+
+    async def _call_approval(
+        self, store: Any, names: tuple[str, str], *args: Any, **kwargs: Any
+    ) -> Any | None:
+        """调用审批存储的异步入口（``aget``/``aresolve``，否则同步入口放进线程）。"""
+        async_name, sync_name = names
+        call = getattr(store, async_name, None)
+        if callable(call):
+            return await call(*args, **kwargs)
+        sync_call = getattr(store, sync_name, None)
+        if callable(sync_call):
+            return await asyncio.to_thread(sync_call, *args, **kwargs)
+        return None
+
+    async def _approval_run_is_terminal(self, run_id: Any) -> bool:
+        """该 Run 的 Checkpoint 是否已终态（**读失败 ⇒ True = fail-closed**）。"""
+        recorder = self._agent_checkpoint_recorder
+        if recorder is None:
+            return False
+        if not isinstance(run_id, str) or not run_id.strip():
+            return True
+        try:
+            checkpoint = await asyncio.to_thread(recorder.get, run_id)
+        except Exception:  # noqa: BLE001 —— 不可判定 ⇒ fail-closed（不裁决）
+            logger.warning("审批裁决前无法读取 Checkpoint（fail-closed）")
+            return True
+        if checkpoint is None:
+            return False
+        return getattr(checkpoint, "status", None) == CHECKPOINT_STATUS_TERMINAL
+
+    # ---------- AGENT 路径（Phase 5 Agent Runtime Integration §29） ----------
+
+    async def _run_agent(
+        self,
+        decision: RouteDecision,
+        question: str,
+        *,
+        request_id: str,
+        context: str | None = None,
+    ) -> AIOrchestrationResult:
+        """Agent 路径（Phase 5 Integration §29.2 / §29.8 / §29.11）。
+
+        契约：
+            * **能力硬校验**：``agent_runtime is None``（未接线）⇒ 执行前拒绝
+              （``AIOrchestratorCapabilityError`` = 既有"能力未启用"语义，
+              不降级为 RAG / TOOL / TEXT_TO_SQL）；
+            * ``request_id`` 由 ``execute()`` 生成并透传（本方法**不**生成 ID；
+              Agent 也不生成 —— 同一 request_id 经由 ``assistant_trace_scope``
+              关联 LLM usage / Tool execution）；
+            * ``context`` = Conversation 层选择后的会话上下文（**untrusted
+              reference**，本 Run 只读输入；Agent 不查询 Conversation）；
+            * 结果映射（OD-P5-15）：``route=AGENT`` · ``content`` 原样 ·
+              ``data=AgentRuntimeResult``（frozen 内存 DTO，不转 dict）·
+              ``metadata`` 仅冻结白名单键（见下）；
+            * 失败（FAILED）⇒ ``AIOrchestratorExecutionError``
+              （Conversation 层：USER turn 保留 / 无 ASSISTANT turn）；
+            * LIMIT_REACHED ⇒ **返回 Result**（不抛异常），``outcome=FAILED``
+              + ``agent_status=LIMIT_REACHED`` 显式携带（不伪装成普通失败）。
+
+        metadata 白名单（§29.2；**只含非敏感稳定字段**）：
+            decision_source · route_reason · request_id · outcome ·
+            agent_status · agent_error · agent_steps · agent_tool_calls ·
+            agent_llm_calls · agent_tokens_used · agent_token_budget_unverifiable
+        （**禁止**：step_records / Tool name 列表 / arguments / data /
+          prompt / conversation_context / 异常正文 / 密钥 —— API 层
+          ``metadata=dict(result.metadata)`` 全量透传，故本字典本身即安全 DTO）
+        """
+        # Phase 3.8.2 一致性：Router 只是分类器，执行前硬校验在此层。
+        agent_runtime = self._agent_runtime
+        if agent_runtime is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent 能力（AgentCapability 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        # Phase 5 P-2：run-level 计时（§九：Runtime 不额外暴露持久化字段 ⇒
+        # 由本调用点测量；duration 只在这里定义一次，不制造第二套 duration）。
+        started_at = datetime.now(timezone.utc)
+        monotonic_start = time.monotonic()
+        try:
+            agent_result: AgentRuntimeResult = await agent_runtime.run(
+                question=question,
+                conversation_context=context,
+                # Phase 5 S-1：请求 correlation（Orchestrator 生成；Agent 不生成）
+                # ⇒ Agent 的 Tool 执行复用既有 ToolExecutionRecord 观测链路。
+                request_id=request_id,
+            )
+        except AIOrchestratorCapabilityError:
+            # 能力拒绝：保持既有 403 语义，不被下方 ExecutionError 包装
+            raise
+        except Exception as exc:  # noqa: BLE001 —— Agent 边界外异常归一化
+            raise AIOrchestratorExecutionError(
+                f"Agent 执行失败: {type(exc).__name__}"
+            ) from exc
+        duration_ms = (time.monotonic() - monotonic_start) * 1000.0
+        finished_at = datetime.now(timezone.utc)
+
+        # Phase 5 AgentStep Persistence：**先 Steps、后 Run**（§十七）；
+        # 两者均 best-effort，写入失败绝不改变 Agent / Assistant 业务结果。
+        await self._record_agent_steps(agent_result)
+
+        # Phase 5 P-2：run-level 持久化（best-effort；失败绝不改变 Agent 结果）。
+        # 终态（COMPLETED / FAILED / LIMIT_REACHED…）**一律**记录：
+        # FAILED 之后本方法仍会抛 ExecutionError，但 run 事实已经发生。
+        # Phase 5 P-7：WAITING_APPROVAL ⇒ Run **尚未终态** ⇒ **不写** AgentRun
+        #（§十六：既不能写 WAITING_APPROVAL，也不能把它映射成 FAILED；
+        #  终态记录留给审批后的 resume 路径）。
+        if (
+            getattr(agent_result, "status", None)
+            != AGENT_STATUS_WAITING_APPROVAL
+        ):
+            await self._record_agent_run(
+                agent_result,
+                request_id=request_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+
+        if not isinstance(agent_result, AgentRuntimeResult):
+            raise AIOrchestratorExecutionError(
+                "AgentCapability.run() 必须返回 AgentRuntimeResult"
+                f"（当前: {type(agent_result).__name__}）"
+            )
+
+        status = agent_result.status
+        error_code = _stable_agent_error_code(agent_result.error)
+
+        # Phase 5 P-5：终态 Checkpoint（best-effort；写点必须在 FAILED 抛出之前，
+        # 使 COMPLETED / FAILED / LIMIT_REACHED / CANCELLED 都能落 TERMINAL；
+        # §三十五 / §三十六 / P-7 §三十四–§三十五）。
+        # P-7：WAITING_APPROVAL 不是终态 ⇒ 不写（Checkpoint 由 Runtime 写 PAUSED）。
+        if status != AGENT_STATUS_WAITING_APPROVAL:
+            await self._record_agent_terminal_checkpoint(agent_result)
+
+        # FAILED：进入既有 Orchestrator 错误边界（USER turn 保留 /
+        # 无 ASSISTANT turn / outcome=FAILED 由 execute() 统一记录）。
+        if status == AGENT_STATUS_FAILED:
+            raise AIOrchestratorExecutionError(
+                f"Agent 执行失败: {error_code or AGENT_ERROR_FAILED}"
+            )
+
+        # Phase 5 Integration §29.8（OD-P5-20）映射表：
+        # COMPLETED            → SUCCESS（content 非空）/ EMPTY（理论不可达）
+        # LIMIT_REACHED        → FAILED + metadata.agent_status 显式保留
+        # WAITING_APPROVAL / CANCELLED（预留不可达）→ FAILED（同 LIMIT_REACHED）
+        outcome = _agent_assistant_outcome(status, agent_result.content)
+
+        return AIOrchestrationResult(
+            route=RouteType.AGENT,
+            content=agent_result.content,
+            data=agent_result,
+            metadata={
+                "decision_source": decision.source,
+                "route_reason": decision.reason,
+                "request_id": request_id,
+                "outcome": outcome,
+                # Agent 状态（稳定字符串；区分 LIMIT / CANCEL / APPROVAL）
+                "agent_status": status,
+                # 稳定错误码（白名单校验后；无自由文本 / 无异常消息）
+                "agent_error": error_code,
+                "agent_steps": agent_result.steps,
+                "agent_tool_calls": agent_result.tool_calls,
+                "agent_llm_calls": agent_result.llm_calls,
+                "agent_tokens_used": agent_result.tokens_used,
+                "agent_token_budget_unverifiable": (
+                    agent_result.token_budget_unverifiable
+                ),
+                # Phase 5 P-7（HITL）：暂停待审批时的审批身份（否则 None；
+                # 稳定 / 非敏感；不含 arguments / claim_token）
+                "agent_approval_id": getattr(agent_result, "approval_id", None),
+            },
+        )
+
+
+    # ---------- 请求 identity（**唯一**生成点；C40/C41/C20/C21 单源审计） ----------
+
+    def _issue_request_id(self) -> str:
+        """请求 correlation 的**唯一**生成点（``execute`` / ``resume_agent_run`` 共用）。
+
+        单源不变式（Phase 3.12 / C40 / C41 / C20 / C21 审计）：本模块只有这一处
+        生成请求 id；每个入口点各生成**一次**、绝不在循环 / retry 内、绝不透传或
+        复用其它请求的 id（run_id 与 request_id 语义独立：前者=Agent 执行身份，
+        后者=请求 correlation）。
+        """
+        return new_request_id()
+
+    @contextmanager
+    def _request_trace_scope(self, request_id: str) -> Iterator[None]:
+        """请求级 Assistant Trace Scope 的**唯一**建立点（C41.4 单源不变式）。
+
+        整个执行（Router / RAG / Tool / Text-to-SQL / Agent，含 LLM 调用）都必须在
+        同一个 scope 内，使 LLM Usage / Tool Execution 观测关联到本 request_id；
+        ``execute`` 与 ``resume_agent_run`` 共用本 helper ⇒ 模块内只有一处绑定。
+        """
+        with assistant_trace_scope(request_id):
+            yield
+
+    # ---------- AGENT Resume 路径（Phase 5 P-6） ----------
+
+    async def resume_agent_run(
+        self,
+        run_id: str,
+        *,
+        question: str,
+        context: str | None = None,
+    ) -> AIOrchestrationResult:
+        """Resume 一个**已存在**的 Agent Run（P-6；独立于 :meth:`execute`）。
+
+        契约：
+
+            * ``run_id`` **不变**（同一 Agent Run）；``request_id`` = **新**请求
+              correlation（§二十八）；Agent 层**不**查询 Conversation / 不重建历史
+              prompt（``question`` 由调用方作为本次输入提供；§三十一 / §三十二）；
+            * 终态 / Replay 路径 **不**调 LLM、**不**执行 Tool（§四十一）；
+            * fail-closed 结果（Decision / Tool Result 缺失、不可用、身份不一致、
+              并发冲突）⇒ ``AIOrchestratorExecutionError``（稳定码在 metadata）；
+            * 不新增 AgentRun / AgentStep / AgentToolResult（§三十八–§四十：
+              分别 best-effort 幂等投影 + 只读 Replay）；
+            * 终态 Checkpoint 仍由本层写（TERMINAL / COMPLETED|FAILED；§三十四）。
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise AIOrchestratorInputError("run_id 必须是非空 str")
+        if not isinstance(question, str) or not question.strip():
+            raise AIOrchestratorInputError("question 必须是非空 str")
+
+        capability = self._agent_runtime
+        if capability is None:
+            raise AIOrchestratorCapabilityError(
+                "该项目未启用 Agent 能力（AgentCapability 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+        resume = getattr(capability, "resume", None)
+        if not callable(resume):
+            raise AIOrchestratorCapabilityError(
+                "Agent 能力未提供 resume()（P-6 未接线）",
+                capability="agent",
+                project_id=self._capability_project_id(),
+            )
+
+        # Resume 是一次**新的** Runtime 请求（run_id 不变 / request_id 新建；
+        # 生成点与 execute 共用唯一 helper ⇒ 单源不变式不破）
+        request_id = self._issue_request_id()
+        started_at = datetime.now(timezone.utc)
+        monotonic_start = time.monotonic()
+        with self._request_trace_scope(request_id):
+            resume_result = await resume(
+                run_id=run_id,
+                question=question,
+                conversation_context=context,
+                request_id=request_id,
+            )
+        duration_ms = (time.monotonic() - monotonic_start) * 1000.0
+        finished_at = datetime.now(timezone.utc)
+
+        agent_result: AgentRuntimeResult = resume_result.agent_result
+
+        # Phase 5 P-7：CANCELLED 的 Run **拒绝** Resume（§三十三 / §六十五）：
+        # 不写 Step / 不写 AgentRun（该 Run 没有本次请求的执行记录）；
+        # 只把控制状态终态化（TERMINAL / CANCELLED）后抛拒绝错误。
+        if resume_result.error_code == AGENT_ERROR_RUN_NOT_RESUMABLE:
+            await self._record_agent_terminal_checkpoint(agent_result)
+            raise AIOrchestratorExecutionError(
+                f"Agent Resume 拒绝: {AGENT_ERROR_RUN_NOT_RESUMABLE}"
+            )
+
+        # Phase 5 P-7：WAITING_APPROVAL ⇒ Run 仍未终态：不写 Step / Run / 终态
+        # Checkpoint（§十六）；把审批身份透出给调用方（§四十二）。
+        paused = resume_result.status == AGENT_STATUS_WAITING_APPROVAL
+        if not paused:
+            # 既有终态投影（best-effort；幂等：run_id 已存在则不产生第二行）
+            await self._record_agent_steps(agent_result)
+            await self._record_agent_run(
+                agent_result,
+                request_id=request_id,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+            # 终态 Checkpoint（TERMINAL；COMPLETED / FAILED / CANCELLED；
+            # 经 state_version + claim_token 更新；§三十四）
+            await self._record_agent_terminal_checkpoint(agent_result)
+
+        if resume_result.status == AGENT_STATUS_FAILED:
+            raise AIOrchestratorExecutionError(
+                f"Agent Resume 失败: {resume_result.error_code or AGENT_ERROR_FAILED}"
+            )
+
+        outcome = _agent_assistant_outcome(
+            resume_result.status, resume_result.content
+        )
+        return AIOrchestrationResult(
+            route=RouteType.AGENT,
+            content=resume_result.content,
+            data=agent_result,
+            metadata={
+                "request_id": request_id,
+                "outcome": outcome,
+                "agent_status": resume_result.status,
+                "agent_error": resume_result.error_code,
+                "agent_steps": agent_result.steps,
+                "agent_tool_calls": agent_result.tool_calls,
+                "agent_llm_calls": agent_result.llm_calls,
+                "agent_tokens_used": agent_result.tokens_used,
+                "agent_token_budget_unverifiable": (
+                    agent_result.token_budget_unverifiable
+                ),
+                # Resume 专属（稳定 / 非敏感；不含 claim_token / payload）
+                "resume_run_id": resume_result.run_id,
+                "resume_replayed_step_index": resume_result.replayed_step_index,
+                "resume_llm_calls": resume_result.llm_calls,
+                "resume_tool_calls": resume_result.tool_calls,
+                "resume_error": resume_result.error_code,
+                # Phase 5 P-7（HITL）：暂停待审批 / 已裁决时的审批身份（否则 None）
+                "agent_approval_id": getattr(resume_result, "approval_id", None)
+                or getattr(agent_result, "approval_id", None),
+            },
+        )
+
 
 # ============================================================
 # 内部工具函数（纯函数，便于测试）
@@ -1102,6 +1783,47 @@ def _tool_result_to_content(result: ToolResult) -> str:
     if isinstance(data, Mapping):
         return ", ".join(f"{k}={v}" for k, v in data.items())
     return str(data) if data is not None else ""
+
+
+def _stable_agent_error_code(error: object) -> str | None:
+    """Agent 错误归一化（Phase 5 Integration §29.2 / §29.8 白名单校验）。
+
+    * ``None`` / 空 → ``None``（无错误）；
+    * 命中 ``AGENT_ERROR_CODES`` → 原样返回（稳定码）；
+    * 其它（自由文本 / 异常消息 / 未知实现）→ ``AGENT_ERROR_FAILED``
+      （**绝不**把自由文本透出到 metadata / 错误消息）。
+    """
+    if error is None:
+        return None
+    if isinstance(error, str) and error in AGENT_ERROR_CODES:
+        return error
+    return AGENT_ERROR_FAILED
+
+
+def _agent_assistant_outcome(status: str, content: str | None) -> AssistantOutcome:
+    """Agent 状态 → AssistantOutcome（Phase 5 Integration §29.8 冻结映射）。
+
+         COMPLETED（content 非空）      → SUCCESS
+         COMPLETED（content 空；理论不可达）→ EMPTY
+         LIMIT_REACHED / 其它状态       → FAILED
+
+    说明：
+        * ``AssistantOutcome`` 是**冻结的 4 态契约**（不新增枚举成员）——
+          LIMIT_REACHED 的精确语义由 ``metadata["agent_status"]`` 携带，
+          上层 / 观测仍可区分"出错"与"到达预算边界"（OD-P5-20）；
+        * 只读取 status / content（不读 step_records / 不读 arguments）。
+    """
+    if status == AGENT_STATUS_COMPLETED:
+        return (
+            AssistantOutcome.SUCCESS
+            if isinstance(content, str) and content.strip()
+            else AssistantOutcome.EMPTY
+        )
+    if status == AGENT_STATUS_LIMIT_REACHED:
+        return AssistantOutcome.FAILED
+    # WAITING_APPROVAL / CANCELLED（本阶段不可达）等：一律 FAILED
+    # （不伪装成 SUCCESS；精确状态由 metadata["agent_status"] 保留）。
+    return AssistantOutcome.FAILED
 
 
 def _sql_result_to_content(

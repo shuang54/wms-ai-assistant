@@ -39,6 +39,25 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from backend.app.agent import (
+    AGENT_DEFAULT_MAX_COST_TOKENS,
+    AGENT_DEFAULT_MAX_EXECUTION_TIME_MS,
+    AgentRuntime,
+    AgentRuntimePolicy,
+    ProviderAgentLLM,
+)
+from backend.app.agent.recorder import (
+    build_agent_approval_store,
+    build_agent_checkpoint_recorder,
+    build_agent_decision_store,
+    build_agent_tool_result_reader,
+    build_agent_tool_result_write_point,
+)
+from backend.app.agent.recorder import (
+    build_agent_run_recorder,
+    build_agent_step_recorder,
+)
+from backend.app.llm.client import get_default_llm_client
 from backend.app.projects.capabilities import ProjectCapabilities
 from backend.app.projects.configuration import (
     DefaultProjectConfigurationProvider,
@@ -78,6 +97,7 @@ from backend.app.services.ai_router_service import (
 )
 from backend.app.services.schema_explorer_service import SchemaExplorerService
 from backend.app.services.sql_executor_service import SQLExecutorService
+from backend.app.services.tool_execution_service import ToolExecutionService
 from backend.app.tools.get_inventory import (
     GetInventoryHandler,
     build_default_tool_registry,
@@ -105,6 +125,9 @@ def build_orchestrator_for_project(
     semantic_provider: ProjectSemanticProvider | None = None,
     knowledge_provider: ProjectKnowledgeProvider | None = None,
     configuration_provider: ProjectConfigurationProvider | None = None,
+    agent_enabled: bool = False,
+    agent_llm_provider: Any | None = None,
+    agent_policy: AgentRuntimePolicy | None = None,
 ) -> AIOrchestratorService:
     """构造绑定到指定项目数据源的 Orchestrator（Phase 3.8.1）。
 
@@ -132,6 +155,24 @@ def build_orchestrator_for_project(
                             semantic_provider / knowledge_provider 组合
                             构造 ``DefaultProjectConfigurationProvider``
                             （Factory 不再分别调用各 Provider）。
+        agent_enabled:      Phase 5 Agent Runtime Integration（§29.1 / §29.11）——
+                            AGENT 能力开关；**默认 False**。
+                            False ⇒ 本函数**不**创建 ProviderAgentLLM /
+                            AgentRuntime，Router 的 AGENT route 也被拒绝
+                            （fail-closed；行为与 Phase 4.2 完全一致）。
+                            True ⇒ 在本装配点构造 AgentRuntime（唯一允许的
+                            composition root；Runtime **不**自行读 .env /
+                            不创建 DeepSeek client）并共享**同一**
+                            ToolExecutionService 执行边界。
+        agent_llm_provider: 可选 LLM Provider（Agent 的 AgentLLM 来源）；
+                            None ⇒ ``get_default_llm_client()``
+                            （生产默认单例 —— 与 RAG / T2SQL 同源）。
+                            仅在 ``agent_enabled=True`` 时被使用。
+        agent_policy:       可选 AgentRuntimePolicy；None ⇒ 使用
+                            ``AGENT_DEFAULT_MAX_EXECUTION_TIME_MS`` /
+                            ``AGENT_DEFAULT_MAX_COST_TOKENS``
+                            （steps / tool_calls / llm_calls 保持 8/8/8 默认）。
+                            仅在 ``agent_enabled=True`` 时被使用。
 
     Observability（Phase 3.11 Step 19，**签名不变**）：
 
@@ -248,6 +289,111 @@ def build_orchestrator_for_project(
     # 保持 Factory 签名不变（HTTP 不能注入任何配置 / 观测依赖）。
     resolved_observer = getattr(base, "tool_execution_observer", None)
 
+    # ---- 4.6) Phase 5 Agent Runtime Integration（§29.1 / §29.11 / OD-P5-23） ----
+    # 默认（agent_enabled=False）⇒ **不**创建 Provider / Runtime / Router LLM；
+    # 本函数行为与 Phase 4.2 逐字节等价（AGENT route 在 Router 层即被拒绝）。
+    agent_runtime: AgentRuntime | None = None
+    router_llm_client: Any | None = None
+    shared_tool_execution: ToolExecutionService | None = None
+    # Phase 5 P-2：Agent Run 持久化边界 —— 与 observer 同方式继承 base
+    # （同一 Application lifetime 内共享一个 recorder；无 DB ⇒ None）。
+    resolved_agent_run_recorder: Any | None = getattr(
+        base, "agent_run_recorder", None
+    )
+    # Phase 5 AgentStep Persistence：Step 持久化边界（同方式继承 base）。
+    resolved_agent_step_recorder: Any | None = getattr(
+        base, "agent_step_recorder", None
+    )
+    # Phase 5 P-5：Checkpoint 持久化边界（同方式继承 base）。
+    resolved_agent_checkpoint_recorder: Any | None = getattr(
+        base, "agent_checkpoint_recorder", None
+    )
+    # Phase 5 P-6：Decision Store（同方式继承 base）。
+    resolved_agent_decision_store: Any | None = getattr(
+        base, "agent_decision_store", None
+    )
+    # Phase 5 P-7：HITL 审批存储（同方式继承 base；无 DB ⇒ None）。
+    resolved_agent_approval_store: Any | None = getattr(
+        base, "agent_approval_store", None
+    )
+    if agent_enabled:
+        resolved_agent_provider = (
+            agent_llm_provider
+            if agent_llm_provider is not None
+            else get_default_llm_client()
+        )
+        # 与 Orchestrator 自建默认实例**同源同参**（registry / capabilities /
+        # project_id / observer）⇒ 复用**同一**执行边界（capability 第二道
+        # 校验 + 观测出口不丢失），不新建第二套授权中心。
+        shared_tool_execution = ToolExecutionService(
+            registry=tool_registry,
+            capabilities=capabilities,
+            project_id=project_id,
+            observer=resolved_observer,
+        )
+        # Phase 5 P-6：Decision Store（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析（Runtime 直接持有 Decision 写入端口）。
+        if resolved_agent_decision_store is None:
+            resolved_agent_decision_store = build_agent_decision_store()
+        # Phase 5 P-7：HITL 审批存储（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析：Runtime 直接持有审批端口
+        # （请求写入 + Resume 读取）；Orchestrator 用同一实例裁决。
+        if resolved_agent_approval_store is None:
+            resolved_agent_approval_store = build_agent_approval_store()
+        # Phase 5 P-5：Checkpoint 持久化边界（base 继承 → 否则在本装配点创建）。
+        # 必须在 Runtime 构造前解析：Runtime 直接持有 Checkpoint 写入端口。
+        # 同一实例随后也注入 Orchestrator（终态 TERMINAL 写点）。
+        if resolved_agent_checkpoint_recorder is None:
+            resolved_agent_checkpoint_recorder = build_agent_checkpoint_recorder()
+        agent_runtime = AgentRuntime(
+            llm=ProviderAgentLLM(resolved_agent_provider),
+            tool_execution=shared_tool_execution,
+            policy=(
+                agent_policy
+                if agent_policy is not None
+                else AgentRuntimePolicy(
+                    max_execution_time_ms=(
+                        AGENT_DEFAULT_MAX_EXECUTION_TIME_MS
+                    ),
+                    max_cost_tokens=AGENT_DEFAULT_MAX_COST_TOKENS,
+                )
+            ),
+            # Agent 只能请求项目允许的 Tool（⊆ ProjectCapabilities；
+            # Runtime 装配期二次校验，ToolExecutionService 执行期第三次校验）。
+            allowed_tools=capabilities.tool_names,
+            # Phase 5 P-4 Integration：Tool Result 写入端口（Tool handler 返回后
+            # **立即**写 agent_tool_result；run_id 取自 Agent Run Scope）。
+            # 无 DATABASE_URL ⇒ None（Runtime 零开销跳过；行为与 P-4 之前一致）。
+            tool_result_sink=build_agent_tool_result_write_point(),
+            # Phase 5 P-5：Checkpoint 写入端口（Tool Result durable 之后写
+            # ACTIVE / LLM_DECISION 控制状态；与 Orchestrator 共享**同一**实例）。
+            checkpoint_sink=resolved_agent_checkpoint_recorder,
+            # Phase 5 P-6：Resume 所需端口
+            #   checkpoint_store = 同一 recorder（读取 current checkpoint）
+            #   decision_store   = Decision Store（**fail-closed** 写入）
+            #   tool_result_store= P-4 仓储（Resume 专用只读 get）
+            checkpoint_store=resolved_agent_checkpoint_recorder,
+            decision_store=resolved_agent_decision_store,
+            tool_result_store=(
+                build_agent_tool_result_reader() if agent_enabled else None
+            ),
+            # Phase 5 P-7：HITL 审批端口（Tool **执行前**暂停；人工裁决后 Resume）。
+            # 生产默认 **没有** Tool 需要审批（现有只读 Tool 不需 HITL；§四十）：
+            # ``approval_required_tools=()`` ⇒ 审批门永不触发（行为与 P-6 一致）；
+            # 未来在 ProjectCapabilities / 策略层声明后，仅需在此传入工具名。
+            approval_port=resolved_agent_approval_store,
+            approval_required_tools=(),
+        )
+        # AGENT 只能由 LLM fallback 选择（§29.1 / OQ-P5-11）⇒ 启用 Agent 的
+        # 项目必须让 Router 能真正发起 fallback，否则 AGENT 恒不可达。
+        router_llm_client = resolved_agent_provider
+        # Agent Run 持久化（P-2）：base 未提供时在本装配点创建（唯一允许位置）。
+        if resolved_agent_run_recorder is None:
+            resolved_agent_run_recorder = build_agent_run_recorder()
+        # Agent Step 持久化：同上（独立边界，独立 best-effort）。
+        if resolved_agent_step_recorder is None:
+            resolved_agent_step_recorder = build_agent_step_recorder()
+
     logger.info(
         "project orchestrator built",
         extra={
@@ -257,6 +403,7 @@ def build_orchestrator_for_project(
             "tools": list(capabilities.tool_names),
             "knowledge_enabled": capabilities.knowledge_enabled,
             "text_to_sql_enabled": capabilities.text_to_sql_enabled,
+            "agent_enabled": bool(agent_enabled),
             "knowledge_namespace": (
                 knowledge_scope.namespace
                 if knowledge_scope is not None
@@ -270,10 +417,14 @@ def build_orchestrator_for_project(
         # （只有该项目允许的 Tool）；路由规则本身不变。
         # Phase 3.8.2：knowledge / text_to_sql 开关同步注入，
         # 被禁用的能力不会被规则选中（任务书 §十）。
+        # Phase 5 §29.1：agent_enabled / llm_client 仅在显式启用 Agent 时注入
+        # （AGENT 只能经 LLM fallback 进入；默认两者都不改变）。
         router=AIRouterService(
+            llm_client=router_llm_client,
             tool_capabilities=ToolRegistryCapabilityAdapter(tool_registry),
             knowledge_enabled=capabilities.knowledge_enabled,
             text_to_sql_enabled=capabilities.text_to_sql_enabled,
+            agent_enabled=agent_enabled,
         ),
         # RAG：RagService 实例复用 base（无状态，可共享），
         # 但检索范围由 Phase 3.8.4 的 per-project knowledge_scope
@@ -297,6 +448,19 @@ def build_orchestrator_for_project(
         # Phase 3.11 Step 19：Observability 出口（Application lifetime 共享；
         # Collector 由 Composition Root / 调用方创建 —— Factory 不创建）
         tool_execution_observer=resolved_observer,
+        # Phase 5 §29.11：Agent 接线（默认两者均 None ⇒ 旧行为 / fail-closed）。
+        # 显式注入 ToolExecutionService 时 observer 由该边界持有（同一实例）。
+        tool_execution_service=shared_tool_execution,
+        agent_runtime=agent_runtime,
+        # Phase 5 P-2：Agent Run 持久化（None ⇒ 0 行；仅在 AGENT 执行时写入）。
+        agent_run_recorder=resolved_agent_run_recorder,
+        # Phase 5 P-5：终态 Checkpoint 写点（best-effort；无 DB ⇒ None）。
+        agent_checkpoint_recorder=resolved_agent_checkpoint_recorder,
+        # Phase 5 P-7：HITL 审批裁决（resolve_agent_approval）与取消
+        # （cancel_agent_run）经由同一 Checkpoint recorder / Approval store。
+        agent_approval_store=resolved_agent_approval_store,
+        # Phase 5 AgentStep Persistence：Step 投影持久化（独立 best-effort）。
+        agent_step_recorder=resolved_agent_step_recorder,
     )
 
 

@@ -219,6 +219,59 @@ def _counting_db(monkeypatch: pytest.MonkeyPatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _tool_execution_residue_guard(engine):
+    """Phase 6 Step 8B-2B：定向清理**本用例**新增的 tool_execution_record 行。
+
+    背景：本文件 ``TestApiCapabilityE2E`` 经真实 app（``TestClient(app)`` +
+    ``POST /api/ai/chat``）的 TOOL 路由执行，写入 ``ai_ops.tool_execution_record``
+    （生产 fan-out 接线——``api/orchestrator_chat.py`` 的 Observer 在 DATABASE_URL
+    已配置时即写库，与 ``RUN_DB_TESTS`` 无关）；既有 6 个测试级清理者均未覆盖
+    本文件 ⇒ 会话收尾零残留检查报"本会话新增未清理"（片 7 ERROR 的根因）。
+
+    语义（**只清本用例新增**，仿 ``test_assistant_trace_multi_path_e2e.py``
+    的既有水位模式）：
+        * 用例开始前读取 ``MAX(id)`` 水位；
+        * teardown（``yield`` 之后——**pytest 在测试断言失败等正常异常路径
+          仍会执行 fixture teardown**）仅删除 ``id > 水位`` 的行；
+        * **不**触碰测试开始前的既有数据；**无**全表 DELETE；
+        * 表不存在 / DB 不可达 ⇒ 静默跳过（守卫不影响任何断言结果）；
+        * 清理失败 ⇒ best-effort 忽略（会话收尾残留检查仍会兜底报告）。
+
+    并发安全分析（任务书 §二要求）：项目**未**启用并行执行——
+    ``pytest.ini`` 无 xdist/randomly 配置、``requirements.txt`` 未安装
+    ``pytest-xdist``/``pytest-randomly`` ⇒ 单进程串行、文件顺序稳定
+    ⇒ 单纯 ID 水位**无**跨测试误删风险（无需更复杂的隔离标识）。
+    """
+    try:
+        with engine.begin() as conn:
+            watermark = int(
+                conn.execute(
+                    text(
+                        "SELECT COALESCE(MAX(id), 0) "
+                        "FROM ai_ops.tool_execution_record"
+                    )
+                ).scalar_one()
+            )
+    except Exception:  # noqa: BLE001 —— 表缺失 / DB 不可达：静默跳过
+        yield
+        return
+
+    yield
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "DELETE FROM ai_ops.tool_execution_record "
+                    "WHERE id > :watermark"
+                ),
+                {"watermark": watermark},
+            )
+    except Exception:  # noqa: BLE001 —— best-effort（不改变测试结果；
+        pass          # 若清理失败，会话收尾残留检查会兜底报告）
+
+
 # ---- Fake RAG / T2S（确定性，不调 LLM） ----
 
 class _FakeRag:

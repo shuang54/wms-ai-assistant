@@ -934,3 +934,38 @@ python -m backend.app.cli.ingest_knowledge docs/knowledge/wms-basic-operations.m
 - **向后兼容**：新增响应字段（如 `sources`）不破坏既有客户端；不擅自变更既有字段语义。
 - **不暴露内部细节**：错误信息对用户友好，敏感信息（API Key、SQL、堆栈、Authorization header、embedding 向量）禁止出现在响应中。
 - **单一 LLM 调用**：一次对话请求只允许一次 Embedding + 一次 LLM 调用；Chat 与 RAG 共享同一条链路。
+
+---
+
+## 8. Agent / Workflow Read API（Phase 5 P-8 / Phase 6 Step 7-8A）
+
+四个 Workflow 端点 + 两个 Agent 端点均为**只读**（Query only；不触发
+Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`** 请求头：
+
+| 端点 | 认证 | 授权作用域来源 |
+| --- | --- | --- |
+| `GET /api/workflow-runs/{run_id}` | `X-API-Key`（必需） | 服务端 `WORKFLOW_READ_API_PROJECT_ID` |
+| `GET /api/workflow-runs/{run_id}/nodes` | 同上 | 同上 |
+| `GET /api/workflow-runs/{run_id}/timeline` | 同上 | 同上 |
+| `GET /api/workflow-approvals/{approval_id}` | 同上 | 同上（经父 Run 归属校验） |
+| `GET /api/agent/runs/{run_id}` | `X-API-Key`（必需） | 服务端 `AGENT_READ_API_PROJECT_ID` |
+| `GET /api/agent/runs/{run_id}/timeline` | 同上 | 同上 |
+
+认证与授权契约（两域一致）：
+
+```text
+401  缺少 / 错误 X-API-Key（固定文案；不泄露目标资源是否存在）
+503  服务端未配置凭据或授权项目（fail closed；绝不匿名放行、不回退默认项目）
+404  资源不存在 **或** 不属于授权项目（**故意同码**——不泄露存在性）
+400 / 422 / 502 与各端点既有契约一致（参数校验 / 长度越界 / 持久化不可用）
+```
+
+- **授权作用域仅来自服务端配置**：客户端 `project_id` 查询参数被忽略
+  （Agent / Workflow Read API 均**不接受**该参数）；`X-Project-ID` 等普通
+  身份头不被信任；不使用任何代理身份头。
+- API Key **不写入**日志 / 响应体；比较使用恒定时间实现。
+- 配置方式见 `.env.example`（`WORKFLOW_READ_API_KEY` /
+  `WORKFLOW_READ_API_PROJECT_ID` / `AGENT_READ_API_KEY` /
+  `AGENT_READ_API_PROJECT_ID`；均无默认值）与 `docs/security.md` §7。
+- **部署边界（如实）**：HTTPS = NOT VERIFIED；网络边界 = NOT VERIFIED ⇒
+  `PRODUCTION_DEPLOYMENT = BLOCKED`（应用层认证通过不代表可部署）。
