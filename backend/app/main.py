@@ -21,6 +21,7 @@ from backend.app.api import (
     health,
     orchestrator_chat,
     rag,
+    runtime_read,
     tool_chat,
     tool_observability,
     usage,
@@ -83,6 +84,11 @@ def create_app() -> FastAPI:
     app.include_router(
         workflow_command.router, prefix="/api", tags=["workflow"]
     )
+    # Phase 7 Step 2：统一 Runtime 读取 API（**只读** Query 边界：
+    # GET /api/runtime-runs/{runtime_type}/{run_id}——runtime_type ∈
+    # {agent, workflow}；按域复用两套只读面（认证 / 项目作用域 / 详情
+    # 语义逐项沿用）；不新增执行能力、不重写 ReadService / Repository）。
+    app.include_router(runtime_read.router, prefix="/api", tags=["runtime"])
     return app
 
 

@@ -969,3 +969,73 @@ Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`**
   `AGENT_READ_API_PROJECT_ID`；均无默认值）与 `docs/security.md` §7。
 - **部署边界（如实）**：HTTPS = NOT VERIFIED；网络边界 = NOT VERIFIED ⇒
   `PRODUCTION_DEPLOYMENT = BLOCKED`（应用层认证通过不代表可部署）。
+
+---
+
+## 9. 统一 Runtime Read API（Phase 7 Step 2）
+
+在既有 Agent / Workflow 只读面之上提供**统一查询入口**：调用方经一个路径
+查询两类运行记录，不必分别理解两套内部数据结构。本入口为**纯只读**——
+不新增任何执行能力（不触发 Resume / Approve / Cancel / start / advance），
+不复写两域 ReadService / Repository；详情数据 = 域端点同一映射产物**原样
+内嵌**（零重映射、零字段丢失）。
+
+### 9.1 端点
+
+| 端点 | 认证 | 授权作用域来源 |
+| --- | --- | --- |
+| `GET /api/runtime-runs/agent/{run_id}` | `X-API-Key`（Agent 域凭据） | 服务端 `AGENT_READ_API_PROJECT_ID` |
+| `GET /api/runtime-runs/workflow/{run_id}` | `X-API-Key`（Workflow 域凭据） | 服务端 `WORKFLOW_READ_API_PROJECT_ID` |
+
+- `runtime_type` ∈ {`agent`, `workflow`}（小写枚举）；非法值 ⇒ 400；
+  纯空白 ⇒ 400（白名单拦截）；路径长度越界 ⇒ 422。
+- **按域认证**：`agent` 请求只要求 Agent 域凭据配置、只读 `ai_ops.agent_*`
+  视图；`workflow` 请求只要求 Workflow 域凭据配置、只读 `ai_ops.workflow_*`
+  视图。未涉及的域**不要求**配置（两域凭据独立、可分别轮换——§8 契约不变）。
+- 无分页参数（两域详情端点均无分页；统一入口保持一致）。
+
+### 9.2 统一响应 DTO（公共字段 + 类型专属详情）
+
+```text
+runtime_type   "agent" | "workflow"（域标识；**不是**状态、不参与状态映射）
+run_id         运行身份（域内 run_id；由详情数据原样投影）
+project_id     授权项目作用域（服务端解析结果——绝不来自客户端参数）
+status         域状态**原值**（两域词汇不同——不强行映射、不归一化）
+started_at     开始时刻（两域共有字段；无 ⇒ null）
+detail         类型专属完整详情（Agent：AgentRunResponse 原样；
+               Workflow：WorkflowRunDetailResponse 原样）
+```
+
+- **不伪造缺失字段**：Agent 域无 `created_at` / `updated_at` ⇒ 统一 DTO
+  **不引入**这两个键（需要时读域端点；不猜、不补）。
+- `status` 不跨域归一化：同一字符串在两域含义可能不同（如 `RUNNING`），
+  统一入口拒绝任何语义映射。
+- 响应只由 `backend.app.dto.runtime_read_api` 的 Pydantic DTO 组成
+  （`response_model` + `runtime_type` discriminator 同时充当字段过滤与
+  类型路由边界）；不暴露 ORM / Session / Connection / 凭据 / 连接串。
+
+### 9.3 错误契约（沿用域端点语义）
+
+```text
+400  runtime_type 非法（固定文案）或 run_id 非法（服务层校验）
+401  缺少 / 错误 X-API-Key（**按域文案**；不泄露目标资源是否存在）
+404  运行不存在 **或** 不属于授权项目（沿用域文案："Agent Run 不存在" /
+     "Workflow Run 不存在"——与域端点同码同文案）
+422  路径参数长度越界（FastAPI Path 校验）
+502  持久化读边界不可用（按域文案；不回传 DB 异常文本）
+503  对应域认证 / 作用域未配置（fail closed）
+```
+
+- **跨项目与不存在同码同文案**（不泄露存在性）——与 §8 两域端点一致。
+- 运行类型不混淆：Agent `run_id` 在 `workflow` 类型下 ⇒ 404（反之亦然）；
+  两域数据互不串读。
+
+### 9.4 已知限制（如实记录）
+
+- **无统一列表端点**：两域 ReadService / Repository 当前均无"按项目范围
+  列表"能力（Workflow Read Layer 在 Phase 6 S6 明确声明不实现全局 Run
+  列表；Agent Run Repository 同样无列表方法）。本阶段按"不为统一而大规模
+  扩展"原则只提供统一**详情**入口；列表需求属后续阶段（需先经治理评估
+  扩展仓储能力）。
+- 测试证据：`tests/test_runtime_read_api.py`（离线契约，43 例）+
+  `tests/test_runtime_read_api_db.py`（DB 真链，9 例；`RUN_DB_TESTS=1`）。
