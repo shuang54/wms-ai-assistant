@@ -47,7 +47,7 @@ import asyncio
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Security, status
+from fastapi import APIRouter, HTTPException, Path, Query, Security, status
 from pydantic import Field
 
 from backend.app.api.agent_read import get_agent_read_service, to_api_run
@@ -71,9 +71,15 @@ from backend.app.db.agent_tool_result_repository import (
 )
 from backend.app.dto.runtime_read_api import (
     RuntimeAgentRunDetailResponse,
+    RuntimeRunListResponse,
+    RuntimeRunSummaryResponse,
     RuntimeWorkflowRunDetailResponse,
 )
 from backend.app.services.agent_read_service import AgentRunNotFoundError
+from backend.app.services.runtime_run_list_service import (
+    RuntimeRunListError,
+    RuntimeRunListService,
+)
 from backend.app.workflow_runtime.read_service import (
     WorkflowReadError,
     WorkflowReadNotFoundError,
@@ -101,6 +107,25 @@ _AUTH_RESPONSES: dict[int | str, dict[str, object]] = {
     },
     503: {"description": "服务端认证 / 作用域未配置（fail closed）"},
 }
+
+#: 列表端点共享的 responses 片段（分页 / 过滤错误声明）。
+_LIST_RESPONSES: dict[int | str, dict[str, object]] = {
+    200: {"description": "项目范围 Run 概要列表（分页 + 可靠 total）"},
+    400: {"description": "limit / offset 非法（默认 50；1..100；offset >= 0）"},
+    502: {"description": "持久化读边界不可用（DB 未配置 / 查询失败）"},
+    **_AUTH_RESPONSES,
+}
+
+
+def get_runtime_run_list_service() -> RuntimeRunListService:
+    """Composition Root：装配列表服务（测试以 monkeypatch 替换本函数）。"""
+    from backend.app.db.agent_run_repository import AgentRunRepository
+    from backend.app.db.workflow_run_repository import WorkflowRunRepository
+
+    return RuntimeRunListService(
+        agent_run_repository=AgentRunRepository(),
+        workflow_run_repository=WorkflowRunRepository(),
+    )
 
 
 @router.get(
@@ -168,6 +193,138 @@ async def get_runtime_run(
     if scope.runtime_type == "agent":
         return _read_agent_run(run_id=run_id, project_id=scope.project_id)
     return await _read_workflow_run(run_id=run_id, project_id=scope.project_id)
+
+
+@router.get(
+    "/runtime-runs/agent",
+    response_model=RuntimeRunListResponse,
+    responses=_LIST_RESPONSES,
+)
+async def list_agent_runtime_runs(
+    api_key: Annotated[str | None, Security(api_key_header)] = None,
+    limit: Annotated[
+        int | None,
+        Query(description="每页条数（默认 50；**1..100**；非法 ⇒ 400）"),
+    ] = None,
+    offset: Annotated[
+        int,
+        Query(description="跳过条数（>= 0；负数 ⇒ 400）"),
+    ] = 0,
+) -> RuntimeRunListResponse:
+    """授权项目范围内的 **Agent Run 列表**（只读；分页；Phase 7 Step 3）。
+
+    语义：DB 层按授权项目过滤（``WHERE project_id = …``——不是 Python
+    后过滤）；稳定排序 ``started_at DESC, run_id DESC``；``total`` 为
+    同一过滤条件的真实 COUNT。授权范围仅来自服务端认证配置
+    （``AGENT_READ_API_PROJECT_ID``）——客户端 Query / 请求头不能扩宽。
+    列表只含**概要**字段（无 step / decision / approval / tool 明细——
+    详情走 ``GET /api/runtime-runs/agent/{run_id}``）。
+    """
+    scope = await resolve_runtime_read_scope(
+        runtime_type="agent", api_key=api_key
+    )
+    return await _list_runtime_runs(
+        runtime_type="agent",
+        project_id=scope.project_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/runtime-runs/workflow",
+    response_model=RuntimeRunListResponse,
+    responses=_LIST_RESPONSES,
+)
+async def list_workflow_runtime_runs(
+    api_key: Annotated[str | None, Security(api_key_header)] = None,
+    limit: Annotated[
+        int | None,
+        Query(description="每页条数（默认 50；**1..100**；非法 ⇒ 400）"),
+    ] = None,
+    offset: Annotated[
+        int,
+        Query(description="跳过条数（>= 0；负数 ⇒ 400）"),
+    ] = 0,
+) -> RuntimeRunListResponse:
+    """授权项目范围内的 **Workflow Run 列表**（只读；分页；Phase 7 Step 3）。
+
+    语义：DB 层按授权项目过滤；稳定排序
+    ``started_at DESC NULLS LAST, workflow_run_id DESC``（PENDING 行无
+    started_at ⇒ 排后）；``total`` 为真实 COUNT。授权范围仅来自服务端
+    认证配置（``WORKFLOW_READ_API_PROJECT_ID``）。列表只含**概要**字段
+    （无 node / approval / input——详情走
+    ``GET /api/runtime-runs/workflow/{run_id}``）。
+    """
+    scope = await resolve_runtime_read_scope(
+        runtime_type="workflow", api_key=api_key
+    )
+    return await _list_runtime_runs(
+        runtime_type="workflow",
+        project_id=scope.project_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _list_runtime_runs(
+    *,
+    runtime_type: str,
+    project_id: str,
+    limit: int | None,
+    offset: int,
+) -> RuntimeRunListResponse:
+    """按域分发列表查询（to_thread；异常 ⇒ 安全映射——不吞、不伪空列表）。"""
+    service = get_runtime_run_list_service()
+    not_found_detail = (
+        _AGENT_UNAVAILABLE_DETAIL
+        if runtime_type == "agent"
+        else _WORKFLOW_UNAVAILABLE_DETAIL
+    )
+    try:
+        query = (
+            service.list_agent_runs
+            if runtime_type == "agent"
+            else service.list_workflow_runs
+        )
+        page = await asyncio.to_thread(
+            query, project_id=project_id, limit=limit, offset=offset
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"非法输入: {exc}",
+        ) from None
+    except RuntimeRunListError as exc:
+        logger.error(
+            "runtime run list data source unavailable",
+            extra={"error_type": type(exc).__name__},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=not_found_detail,
+        ) from None
+    except Exception:  # noqa: BLE001 —— 不暴露 traceback / 内部路径
+        logger.error("runtime run list unavailable", extra={"error_type": "unknown"})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=not_found_detail,
+        ) from None
+    return RuntimeRunListResponse(
+        items=[
+            RuntimeRunSummaryResponse(
+                runtime_type=item.runtime_type,
+                run_id=item.run_id,
+                project_id=item.project_id,
+                status=item.status,
+                started_at=item.started_at,
+            )
+            for item in page.items
+        ],
+        limit=page.limit,
+        offset=page.offset,
+        total=page.total,
+    )
 
 
 def _read_agent_run(*, run_id: str, project_id: str) -> RuntimeAgentRunDetailResponse:
@@ -266,5 +423,6 @@ __all__ = [
     "router",
     "get_agent_read_service",
     "get_workflow_read_service",
+    "get_runtime_run_list_service",
     "RUNTIME_RUN_ID_MAX_LENGTH",
 ]

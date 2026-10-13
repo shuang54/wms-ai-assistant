@@ -420,6 +420,85 @@ class WorkflowRunRepository:
             ) from exc
         return row
 
+    # ---------- 读取（Phase 7 Step 3 项目范围列表；只读） ----------
+
+    def list_by_project(
+        self, *, project_id: str, limit: int, offset: int
+    ) -> list[WorkflowRunModel]:
+        """按**授权项目**分页读取 Run 概要（Phase 7 Step 3；**只读**）。
+
+        纪律：
+
+        * **DB 层过滤**：``WHERE project_id = :project`` 由 SQL 执行——
+          **绝不**先查全部再在 Python 过滤（项目隔离是数据边界）；
+        * **稳定排序**：``started_at DESC NULLS LAST, workflow_run_id DESC``
+          （PENDING 行 ``started_at`` 为 NULL ⇒ NULLS LAST；``workflow_run_id``
+          UNIQUE 作 tiebreaker ⇒ 分页窗口稳定）；
+        * 返回 ORM 行的**只读投影**由调用方（服务层）显式构造——本方法
+          不附加任何聚合 / 关联查询。
+
+        Raises:
+            ValueError:                   project_id / limit / offset 非法。
+            WorkflowRunRepositoryError:   DB 未配置或读取失败。
+        """
+        project = _required_text(
+            project_id,
+            field="project_id",
+            max_length=WORKFLOW_RUN_PROJECT_ID_MAX_LENGTH,
+        )
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit 必须是非负 int")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset 必须是非负 int")
+        statement = (
+            select(WorkflowRunModel)
+            .where(WorkflowRunModel.project_id == project)
+            .order_by(
+                WorkflowRunModel.started_at.desc().nulls_last(),
+                WorkflowRunModel.workflow_run_id.desc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = session.execute(statement).scalars().all()
+        except SQLAlchemyError as exc:
+            raise WorkflowRunRepositoryError(
+                f"Workflow Run 列表读取失败: {type(exc).__name__}"
+            ) from exc
+        return list(rows)
+
+    def count_by_project(self, *, project_id: str) -> int:
+        """按**授权项目**统计 Run 总数（Phase 7 Step 3；**只读**）。
+
+        与 :meth:`list_by_project` 同一过滤条件 ⇒ ``total`` 与分页结果
+        一致（可靠计数，不伪造）。
+
+        Raises:
+            ValueError:                 project_id 非法。
+            WorkflowRunRepositoryError: DB 未配置或读取失败。
+        """
+        project = _required_text(
+            project_id,
+            field="project_id",
+            max_length=WORKFLOW_RUN_PROJECT_ID_MAX_LENGTH,
+        )
+        statement = (
+            select(func.count())
+            .select_from(WorkflowRunModel)
+            .where(WorkflowRunModel.project_id == project)
+        )
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                return int(session.execute(statement).scalar_one())
+        except SQLAlchemyError as exc:
+            raise WorkflowRunRepositoryError(
+                f"Workflow Run 计数失败: {type(exc).__name__}"
+            ) from exc
+
     # ---------- 控制状态推进（state_version CAS） ----------
 
     def update_cas(

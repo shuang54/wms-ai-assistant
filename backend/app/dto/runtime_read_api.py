@@ -34,9 +34,11 @@ from backend.app.dto.workflow_read_api import WorkflowRunDetailResponse
 __all__ = [
     "RUNTIME_TYPES",
     "RUNTIME_RUN_SUMMARY_FIELDS",
+    "RUNTIME_RUN_LIST_FIELDS",
     "RUNTIME_AGENT_RUN_DETAIL_FIELDS",
     "RUNTIME_WORKFLOW_RUN_DETAIL_FIELDS",
     "RuntimeRunSummaryResponse",
+    "RuntimeRunListResponse",
     "RuntimeAgentRunDetailResponse",
     "RuntimeWorkflowRunDetailResponse",
 ]
@@ -65,6 +67,14 @@ RUNTIME_WORKFLOW_RUN_DETAIL_FIELDS: Final[tuple[str, ...]] = (
     "detail",
 )
 
+#: 列表响应顶层字段（顺序 ≡ 声明）。
+RUNTIME_RUN_LIST_FIELDS: Final[tuple[str, ...]] = (
+    "items",
+    "limit",
+    "offset",
+    "total",
+)
+
 
 class RuntimeRunSummaryResponse(BaseModel):
     """Agent / Workflow 运行记录的**公共字段**（只含两域真实共有项）。
@@ -89,6 +99,25 @@ class RuntimeRunSummaryResponse(BaseModel):
     started_at: datetime | None = Field(
         default=None, description="开始时刻（两域共有字段；无 ⇒ null）"
     )
+
+
+class RuntimeRunListResponse(BaseModel):
+    """项目范围 Run 列表响应（Phase 7 Step 3；分页 + 可靠总数）。
+
+    * ``items``：概要列表项（公共字段；**不含** step / node / approval /
+      input / 明细——详情走统一详情 API）；
+    * ``limit`` / ``offset``：**服务端校验后**的实际分页参数（回显生效值，
+      不一定是请求原值——默认 50 时回显 50）；
+    * ``total``：与列表**同一过滤条件**的真实 COUNT（授权项目范围内）——
+      可靠计数；不可靠时该端点不提供列表（不伪造）。
+    """
+
+    items: list[RuntimeRunSummaryResponse] = Field(
+        default_factory=list, description="运行概要列表（可能为空）"
+    )
+    limit: int = Field(description="生效的每页条数（服务端校验后）")
+    offset: int = Field(description="生效的跳过条数（服务端校验后）")
+    total: int = Field(description="授权项目范围内的真实总数（COUNT）")
 
 
 class RuntimeAgentRunDetailResponse(RuntimeRunSummaryResponse):

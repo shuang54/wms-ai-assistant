@@ -65,6 +65,7 @@ pytestmark = pytest.mark.skipif(
 __all__ = [
     "TestRuntimeReadApiDb",
     "TestRuntimeReadApiResidueDb",
+    "TestRuntimeRunListDb",
 ]
 
 _AGENT_PREFIX = "rt-p7s2-agent-"
@@ -150,10 +151,14 @@ def _cleanup(engine: Any):
     _delete_prefixes(engine)
 
 
-def _seed_agent_run(*, project_id: str = _PROJECT) -> str:
+def _seed_agent_run(
+    *,
+    project_id: str = _PROJECT,
+    started_at: datetime | None = None,
+) -> str:
     """真实 Repository 写一条 Agent Run（返回 run_id）。"""
     run_id = _agent_run_id()
-    now = datetime.now(timezone.utc)
+    now = started_at or datetime.now(timezone.utc)
     AgentRunRepository().create(
         run_id=run_id,
         request_id=f"{_AGENT_PREFIX}req-{uuid.uuid4().hex[:8]}",
@@ -330,5 +335,152 @@ class TestRuntimeReadApiResidueDb:
 
     def test_prefix_cleanup_leaves_no_rows(self, engine: Any) -> None:
         """定向前缀清理后无残留（测试自清纪律）。"""
+        _delete_prefixes(engine)
+        assert _counts(engine) == {"agent_run": 0, "workflow_run": 0}
+
+
+# ============================================================
+# Phase 7 Step 3：项目范围 Run 列表（真链 + 真实项目隔离）
+# ============================================================
+
+
+class TestRuntimeRunListDb:
+    """真链列表（**不** monkeypatch 读取服务——走生产 Repository → PG）。
+
+    覆盖（Phase 7 Step 3 任务书 §七 DB 项）：授权范围隔离（DB 层过滤）·
+    跨域不混淆 · 分页与稳定排序 · total 一致 · 认证 fail-closed · 无残留。
+
+    每测试前清零定向前缀（自零基线——排序 / 计数断言不依赖其它测试
+    的残留 seed）。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_prefix(self, engine: Any) -> Any:
+        _delete_prefixes(engine)
+        yield
+        _delete_prefixes(engine)
+
+    def test_agent_list_only_contains_authorized_project(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """真实项目隔离：他项目 seed 的记录**不可见**（DB 层过滤，非后过滤）。"""
+        mine_old = _seed_agent_run(
+            started_at=datetime(2026, 10, 13, 10, 0, tzinfo=timezone.utc)
+        )
+        mine_new = _seed_agent_run(
+            started_at=datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+        )
+        _seed_agent_run(
+            project_id=_OTHER_PROJECT,
+            started_at=datetime(2026, 10, 13, 13, 0, tzinfo=timezone.utc),
+        )
+        response = _client(monkeypatch).get(
+            "/api/runtime-runs/agent", headers=_AGENT_HEADERS
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        ids = [item["run_id"] for item in payload["items"]]
+        assert mine_new in ids and mine_old in ids
+        assert len(ids) == 2  # 他项目记录不可见
+        assert all(item["project_id"] == _PROJECT for item in payload["items"])
+        assert payload["total"] == 2
+        # 稳定排序：started_at DESC ⇒ 新 → 旧
+        assert ids == [mine_new, mine_old]
+
+    def test_workflow_list_only_contains_authorized_project(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mine = _seed_workflow_run()
+        _seed_workflow_run(project_id=_OTHER_PROJECT)
+        response = _client(monkeypatch).get(
+            "/api/runtime-runs/workflow", headers=_WF_HEADERS
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        ids = [item["run_id"] for item in payload["items"]]
+        assert mine in ids
+        assert len(ids) == 1
+        assert payload["total"] == 1
+
+    def test_agent_list_excludes_workflow_records(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """跨域不混淆：Agent 列表不含 Workflow run_id（真链）。"""
+        agent_id = _seed_agent_run()
+        wf_id = _seed_workflow_run()
+        agent_ids = [
+            item["run_id"]
+            for item in _client(monkeypatch)
+            .get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+            .json()["items"]
+        ]
+        assert agent_id in agent_ids
+        assert wf_id not in agent_ids
+
+    def test_pagination_is_stable_across_pages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """分页窗口稳定：limit=1 两页拼接 == limit=100 首页前 2 条（同序）。"""
+        first = _seed_agent_run(
+            started_at=datetime(2026, 10, 13, 10, 0, tzinfo=timezone.utc)
+        )
+        second = _seed_agent_run(
+            started_at=datetime(2026, 10, 13, 11, 0, tzinfo=timezone.utc)
+        )
+        third = _seed_agent_run(
+            started_at=datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
+        )
+        client = _client(monkeypatch)
+        page1 = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": 1, "offset": 0},
+            headers=_AGENT_HEADERS,
+        ).json()
+        page2 = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": 1, "offset": 1},
+            headers=_AGENT_HEADERS,
+        ).json()
+        full = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": 100},
+            headers=_AGENT_HEADERS,
+        ).json()
+        assert page1["items"][0]["run_id"] == third
+        assert page2["items"][0]["run_id"] == second
+        assert (
+            [page1["items"][0]["run_id"], page2["items"][0]["run_id"]]
+            == [item["run_id"] for item in full["items"][:2]]
+        )
+        assert full["total"] == 3
+        assert first in [item["run_id"] for item in full["items"]]
+
+    def test_agent_list_without_credential_is_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_agent_run()
+        assert (
+            _client(monkeypatch).get("/api/runtime-runs/agent").status_code == 401
+        )
+
+    def test_agent_list_unconfigured_is_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """§四 按域 fail-closed：agent 域未配置 ⇒ 503（不匿名放行）。"""
+        _seed_agent_run()
+        client = _client(monkeypatch)
+        # 先建 client（有效配置），再改为未配置——覆盖 auth Composition Root
+        monkeypatch.setattr(
+            agent_auth_module,
+            "get_agent_read_settings",
+            lambda: AgentReadSettings(),
+        )
+        assert (
+            client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS).status_code
+            == 503
+        )
+
+    def test_list_reads_leave_no_residue(self, engine: Any) -> None:
+        """列表查询为纯读；清理后定向前缀无残留。"""
         _delete_prefixes(engine)
         assert _counts(engine) == {"agent_run": 0, "workflow_run": 0}

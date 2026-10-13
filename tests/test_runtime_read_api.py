@@ -1,29 +1,40 @@
-"""Phase 7 Step 2 — 统一 Runtime 读取 API **HTTP 契约**测试（离线；零 DB）。
+"""Phase 7 Step 2 / Step 3 — 统一 Runtime 读取 API **HTTP 契约**测试（离线；零 DB）。
 
-覆盖（Phase 7 Step 2 任务书 §七 全部可离线验证项）：
+覆盖（Phase 7 Step 2 §七 + Phase 7 Step 3 §七 离线项）：
 
 ```text
+【Step 2 详情】
 1  Agent 与 Workflow 运行都能通过统一入口读取（200；公共字段 + 类型专属 detail）
 2  runtime_type 路由正确（agent→Agent 域；workflow→Workflow 域；非法⇒400）
 3  详情不混淆运行类型（跨类型 run_id ⇒ 404 + 对应域文案）
 4  不存在 / 跨项目 ⇒ 404（沿用域文案；与不存在同码同文案）
 5  未认证 ⇒ 401；未配置 ⇒ 503（**按需**：本域未配置拒本域，另一域不受影响）
 6  客户端 project_id 参数被忽略；授权作用域来自服务端配置（Recording 证）
-7  DTO 安全：递归键扫描 + 敏感值扫描 + 不伪造缺失字段（agent 无
-   created_at/updated_at ⇒ 统一 DTO 无该键）
+7  DTO 安全：递归键扫描 + 敏感值扫描 + 不伪造缺失字段
 8  错误映射：仓储/存储故障 ⇒ 502；未预期 ⇒ 500（不回传内部文本）
 9  与域端点一致性：统一入口 detail == 域端点响应（零重映射）
 10 只读面形：OpenAPI 仅 GET；未知写方法 ⇒ 405
+【Step 3 列表】
+11 Agent / Workflow 列表正常响应（items 概要字段集 + limit/offset/total 回显）
+12 空列表
+13 分页参数边界（默认 50；1..100；offset >= 0；非法 ⇒ 400）
+14 稳定排序（API 不重排——仓储顺序原样透出）
+15 两域列表互不混淆（调用独立 + item.runtime_type 纯）
+16 未认证 ⇒ 401；未配置 ⇒ 503（按域 fail-closed）
+17 客户端 project_id 不能改变授权范围（Recording 证）
+18 列表响应不含敏感字段 / 明细字段
+19 仓储故障 ⇒ 502；未预期 ⇒ 500
 ```
 
-注入方式沿用既有范式：monkeypatch 两个 Composition Root（本模块的
-``get_agent_read_service`` / ``get_workflow_read_service`` + 两域 auth 的
-``get_*_read_settings``）+ ``TestClient(app)``；Fake 基元复用既有测试模块
-（``tests.test_agent_read_service`` / ``tests.test_workflow_runtime_read_service``）。
+注入方式沿用既有范式：monkeypatch 本模块 Composition Root（详情服务 /
+列表服务）+ 两域 auth 的 ``get_*_read_settings`` + ``TestClient(app)``；
+Fake 基元复用既有测试模块（``tests.test_agent_read_service`` /
+``tests.test_workflow_runtime_read_service``）。
 """
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -39,8 +50,15 @@ from backend.app.db.agent_approval_repository import AgentApprovalRepositoryErro
 from backend.app.dto.agent_read_api import AGENT_RUN_RESPONSE_FIELDS
 from backend.app.dto.runtime_read_api import (
     RUNTIME_AGENT_RUN_DETAIL_FIELDS,
+    RUNTIME_RUN_LIST_FIELDS,
     RUNTIME_RUN_SUMMARY_FIELDS,
     RUNTIME_WORKFLOW_RUN_DETAIL_FIELDS,
+)
+from backend.app.services.runtime_run_list_service import (
+    RuntimeRunListError,
+    RuntimeRunListItem,
+    RuntimeRunListPage,
+    _validate_pagination,
 )
 from backend.app.dto.workflow_read_api import WORKFLOW_RUN_DETAIL_RESPONSE_FIELDS
 from backend.app.main import app
@@ -76,6 +94,7 @@ __all__ = [
     "TestDtoSafety",
     "TestErrorMapping",
     "TestSurface",
+    "TestRuntimeRunList",
 ]
 
 _AGENT_RUN_ID = "rt-p7s2-agent-run"
@@ -765,3 +784,483 @@ class TestSurface:
             f"/api/workflow-runs/{_WF_RUN_ID}", headers=_WF_HEADERS
         )
         assert wf_response.status_code == 200
+
+
+# ============================================================
+# Phase 7 Step 3：统一 Runtime Run 列表（离线）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class _FakeListCall:
+    domain: str
+    project_id: str
+    limit: int | None
+    offset: int
+
+
+class _FakeListService:
+    """列表服务 Fake：记录调用（项目隔离断言）+ 可控返回 / 异常。
+
+    分页校验**复用真实 service 的 ``_validate_pagination``**（模拟 service
+    契约：API 层不重复校验，400 语义来自服务层单一校验点）。
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_page: RuntimeRunListPage | None = None,
+        workflow_page: RuntimeRunListPage | None = None,
+        agent_error: BaseException | None = None,
+        workflow_error: BaseException | None = None,
+    ) -> None:
+        self._agent_page = agent_page
+        self._workflow_page = workflow_page
+        self._agent_error = agent_error
+        self._workflow_error = workflow_error
+        self.calls: list[_FakeListCall] = []
+
+    def list_agent_runs(
+        self, *, project_id: str, limit: int | None = None, offset: int = 0
+    ) -> RuntimeRunListPage:
+        validated_limit, validated_offset = _validate_pagination(limit, offset)
+        self.calls.append(
+            _FakeListCall("agent", project_id, validated_limit, validated_offset)
+        )
+        if self._agent_error is not None:
+            raise self._agent_error
+        if self._agent_page is not None:
+            return self._agent_page
+        return RuntimeRunListPage(
+            items=(), limit=validated_limit, offset=validated_offset, total=0
+        )
+
+    def list_workflow_runs(
+        self, *, project_id: str, limit: int | None = None, offset: int = 0
+    ) -> RuntimeRunListPage:
+        validated_limit, validated_offset = _validate_pagination(limit, offset)
+        self.calls.append(
+            _FakeListCall("workflow", project_id, validated_limit, validated_offset)
+        )
+        if self._workflow_error is not None:
+            raise self._workflow_error
+        if self._workflow_page is not None:
+            return self._workflow_page
+        return RuntimeRunListPage(
+            items=(), limit=validated_limit, offset=validated_offset, total=0
+        )
+
+
+def _agent_page(
+    *, count: int = 2, total: int | None = None
+) -> RuntimeRunListPage:
+    items = tuple(
+        RuntimeRunListItem(
+            runtime_type="agent",
+            run_id=f"rt-list-agent-{index}",
+            project_id=_PROJECT,
+            status="COMPLETED",
+            started_at=datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc),
+        )
+        for index in range(count)
+    )
+    return RuntimeRunListPage(
+        items=items,
+        limit=50,
+        offset=0,
+        total=total if total is not None else count,
+    )
+
+
+def _workflow_page(
+    *, count: int = 2, total: int | None = None
+) -> RuntimeRunListPage:
+    items = tuple(
+        RuntimeRunListItem(
+            runtime_type="workflow",
+            run_id=f"rt-list-wf-{index}",
+            project_id=_PROJECT,
+            status="PENDING",
+            started_at=None,
+        )
+        for index in range(count)
+    )
+    return RuntimeRunListPage(
+        items=items,
+        limit=50,
+        offset=0,
+        total=total if total is not None else count,
+    )
+
+
+def _list_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    domain: str,
+    service: _FakeListService,
+    auth_settings: AgentReadSettings | WorkflowReadSettings | None = None,
+) -> TestClient:
+    """列表客户端：替换列表 Composition Root + 对应域 auth 配置。"""
+    monkeypatch.setattr(
+        runtime_read_module, "get_runtime_run_list_service", lambda: service
+    )
+    if domain == "agent":
+        monkeypatch.setattr(
+            agent_auth_module,
+            "get_agent_read_settings",
+            lambda: auth_settings
+            or AgentReadSettings(api_key=_AGENT_KEY, api_project_id=_PROJECT),
+        )
+    else:
+        monkeypatch.setattr(
+            workflow_auth_module,
+            "get_workflow_read_settings",
+            lambda: auth_settings
+            or WorkflowReadSettings(api_key=_WF_KEY, api_project_id=_PROJECT),
+        )
+    return TestClient(app)
+
+
+class TestRuntimeRunList:
+    # ---------- 正常响应 ----------
+
+    def test_agent_list_returns_summary_items(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page(count=2, total=5))
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert response.status_code == 200
+        payload = response.json()
+        assert tuple(payload.keys()) == RUNTIME_RUN_LIST_FIELDS
+        assert payload["limit"] == 50
+        assert payload["offset"] == 0
+        assert payload["total"] == 5
+        assert len(payload["items"]) == 2
+        for item in payload["items"]:
+            assert tuple(item.keys()) == RUNTIME_RUN_SUMMARY_FIELDS
+            assert item["runtime_type"] == "agent"
+            assert item["project_id"] == _PROJECT
+            assert "detail" not in item  # 列表不含类型专属详情
+
+    def test_workflow_list_returns_summary_items(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(workflow_page=_workflow_page(count=1, total=3))
+        client = _list_client(monkeypatch, domain="workflow", service=service)
+        response = client.get("/api/runtime-runs/workflow", headers=_WF_HEADERS)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 3
+        assert len(payload["items"]) == 1
+        assert payload["items"][0]["runtime_type"] == "workflow"
+        assert payload["items"][0]["status"] == "PENDING"
+
+    def test_empty_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service = _FakeListService()
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["items"] == []
+        assert payload["total"] == 0
+        assert payload["limit"] == 50
+        assert payload["offset"] == 0
+
+    # ---------- 分页 ----------
+
+    def test_default_pagination_is_50(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """默认 limit=50 由**服务层**生效（API 透传 None；server-side 默认）。"""
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert service.calls == [_FakeListCall("agent", _PROJECT, 50, 0)]
+
+    @pytest.mark.parametrize("limit", [1, 50, 100])
+    def test_valid_limits_pass_through(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": limit},
+            headers=_AGENT_HEADERS,
+        )
+        assert response.status_code == 200
+        assert service.calls[-1].limit == limit
+
+    @pytest.mark.parametrize("limit", [0, -1, 101, 1000000])
+    def test_invalid_limits_are_bad_request(
+        self, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": limit},
+            headers=_AGENT_HEADERS,
+        )
+        assert response.status_code == 400
+        assert "非法输入" in response.json()["detail"]
+
+    def test_negative_offset_is_bad_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get(
+            "/api/runtime-runs/agent",
+            params={"offset": -1},
+            headers=_AGENT_HEADERS,
+        )
+        assert response.status_code == 400
+
+    def test_offset_passes_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get(
+            "/api/runtime-runs/agent",
+            params={"limit": 10, "offset": 20},
+            headers=_AGENT_HEADERS,
+        )
+        assert response.status_code == 200
+        assert service.calls[-1] == _FakeListCall("agent", _PROJECT, 10, 20)
+
+    def test_api_does_not_reorder_items(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """稳定排序由仓储保证；API 层**不重排**（顺序原样透出）。"""
+        page = RuntimeRunListPage(
+            items=(
+                RuntimeRunListItem(
+                    runtime_type="agent",
+                    run_id="rt-order-b",
+                    project_id=_PROJECT,
+                    status="COMPLETED",
+                    started_at=datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc),
+                ),
+                RuntimeRunListItem(
+                    runtime_type="agent",
+                    run_id="rt-order-a",
+                    project_id=_PROJECT,
+                    status="COMPLETED",
+                    started_at=datetime(2026, 10, 13, 11, 0, tzinfo=timezone.utc),
+                ),
+            ),
+            limit=50,
+            offset=0,
+            total=2,
+        )
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService(agent_page=page)
+        )
+        payload = client.get(
+            "/api/runtime-runs/agent", headers=_AGENT_HEADERS
+        ).json()
+        assert [item["run_id"] for item in payload["items"]] == [
+            "rt-order-b",
+            "rt-order-a",
+        ]
+
+    # ---------- 两域不混淆 ----------
+
+    def test_agent_list_does_not_touch_workflow_domain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert [c.domain for c in service.calls] == ["agent"]
+
+    def test_workflow_list_does_not_touch_agent_domain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(workflow_page=_workflow_page())
+        client = _list_client(monkeypatch, domain="workflow", service=service)
+        client.get("/api/runtime-runs/workflow", headers=_WF_HEADERS)
+        assert [c.domain for c in service.calls] == ["workflow"]
+
+    def test_agent_list_items_are_all_agent_typed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService(agent_page=_agent_page())
+        )
+        payload = client.get(
+            "/api/runtime-runs/agent", headers=_AGENT_HEADERS
+        ).json()
+        assert {item["runtime_type"] for item in payload["items"]} == {"agent"}
+
+    # ---------- 认证与项目隔离 ----------
+
+    def test_agent_list_without_credential_is_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService()
+        )
+        assert client.get("/api/runtime-runs/agent").status_code == 401
+
+    def test_workflow_list_without_credential_is_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch, domain="workflow", service=_FakeListService()
+        )
+        assert client.get("/api/runtime-runs/workflow").status_code == 401
+
+    def test_agent_list_unconfigured_is_503_while_workflow_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """§四 按域 fail-closed：agent 域未配置 ⇒ agent 列表 503；
+        workflow 域不受影响（未涉及的域不要求配置）。"""
+        _list_client(
+            monkeypatch,
+            domain="agent",
+            service=_FakeListService(),
+            auth_settings=AgentReadSettings(),
+        )
+        _list_client(
+            monkeypatch,
+            domain="workflow",
+            service=_FakeListService(workflow_page=_workflow_page()),
+        )
+        assert (
+            TestClient(app)
+            .get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+            .status_code
+            == 503
+        )
+        assert (
+            TestClient(app)
+            .get("/api/runtime-runs/workflow", headers=_WF_HEADERS)
+            .status_code
+            == 200
+        )
+
+    def test_client_project_id_cannot_widen_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """客户端 project_id 查询参数**不**参与授权（服务层只收到授权 scope）。"""
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        response = client.get(
+            "/api/runtime-runs/agent",
+            params={"project_id": _OTHER_PROJECT},
+            headers=_AGENT_HEADERS,
+        )
+        assert response.status_code == 200
+        assert service.calls[-1].project_id == _PROJECT
+
+    def test_scope_comes_from_server_config_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service = _FakeListService(agent_page=_agent_page())
+        client = _list_client(monkeypatch, domain="agent", service=service)
+        client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert service.calls == [_FakeListCall("agent", _PROJECT, 50, 0)]
+
+    # ---------- DTO 安全 ----------
+
+    def test_list_response_has_no_forbidden_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService(agent_page=_agent_page())
+        )
+        payload = client.get(
+            "/api/runtime-runs/agent", headers=_AGENT_HEADERS
+        ).json()
+        leaked = _AGENT_FORBIDDEN_KEYS & set(_iter_keys(payload))
+        assert not leaked
+
+    def test_list_items_have_no_detail_or_steps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """列表项只含概要（无 detail / steps / nodes / approvals / input）。"""
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService(agent_page=_agent_page())
+        )
+        payload = client.get(
+            "/api/runtime-runs/agent", headers=_AGENT_HEADERS
+        ).json()
+        for item in payload["items"]:
+            assert set(item.keys()) == set(RUNTIME_RUN_SUMMARY_FIELDS)
+
+    def test_sensitive_values_never_appear_in_list_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch,
+            domain="workflow",
+            service=_FakeListService(workflow_page=_workflow_page()),
+        )
+        text = client.get(
+            "/api/runtime-runs/workflow", headers=_WF_HEADERS
+        ).text
+        assert _SECRET_INPUT not in text
+        assert _SECRET_URL not in text
+
+    # ---------- 错误映射 ----------
+
+    def test_agent_list_repository_failure_is_502(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch,
+            domain="agent",
+            service=_FakeListService(agent_error=RuntimeRunListError("db down")),
+        )
+        response = client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert response.status_code == 502
+        assert "db down" not in response.text
+
+    def test_workflow_list_repository_failure_is_502(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch,
+            domain="workflow",
+            service=_FakeListService(workflow_error=RuntimeRunListError("store down")),
+        )
+        response = client.get("/api/runtime-runs/workflow", headers=_WF_HEADERS)
+        assert response.status_code == 502
+        assert "store down" not in response.text
+
+    def test_unexpected_failure_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _list_client(
+            monkeypatch,
+            domain="agent",
+            service=_FakeListService(agent_error=RuntimeError("boom")),
+        )
+        response = client.get("/api/runtime-runs/agent", headers=_AGENT_HEADERS)
+        assert response.status_code == 500
+        assert "boom" not in response.text
+
+    # ---------- 只读面形 ----------
+
+    def test_list_paths_are_get_only(self) -> None:
+        schema = app.openapi()
+        list_paths = {
+            path: methods
+            for path, methods in schema["paths"].items()
+            if path in ("/api/runtime-runs/agent", "/api/runtime-runs/workflow")
+        }
+        assert set(list_paths) == {
+            "/api/runtime-runs/agent",
+            "/api/runtime-runs/workflow",
+        }
+        for methods in list_paths.values():
+            assert set(methods) == {"get"}
+
+    def test_write_method_on_list_path_is_405(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _list_client(
+            monkeypatch, domain="agent", service=_FakeListService()
+        )
+        assert (
+            client.post("/api/runtime-runs/agent", headers=_AGENT_HEADERS).status_code
+            == 405
+        )

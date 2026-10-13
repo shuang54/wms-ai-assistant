@@ -993,7 +993,6 @@ Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`**
   视图；`workflow` 请求只要求 Workflow 域凭据配置、只读 `ai_ops.workflow_*`
   视图。未涉及的域**不要求**配置（两域凭据独立、可分别轮换——§8 契约不变）。
 - 无分页参数（两域详情端点均无分页；统一入口保持一致）。
-
 ### 9.2 统一响应 DTO（公共字段 + 类型专属详情）
 
 ```text
@@ -1029,6 +1028,33 @@ detail         类型专属完整详情（Agent：AgentRunResponse 原样；
 - **跨项目与不存在同码同文案**（不泄露存在性）——与 §8 两域端点一致。
 - 运行类型不混淆：Agent `run_id` 在 `workflow` 类型下 ⇒ 404（反之亦然）；
   两域数据互不串读。
+
+### 9.3 列表端点（Phase 7 Step 3）
+
+| 端点 | 认证 | 授权作用域来源 |
+| --- | --- | --- |
+| `GET /api/runtime-runs/agent?limit=20&offset=0` | `X-API-Key`（Agent 域凭据） | 服务端 `AGENT_READ_API_PROJECT_ID` |
+| `GET /api/runtime-runs/workflow?limit=20&offset=0` | `X-API-Key`（Workflow 域凭据） | 服务端 `WORKFLOW_READ_API_PROJECT_ID` |
+
+- **项目隔离在 DB 层**：`WHERE project_id = …` 由 SQL 执行（仓储方法
+  `list_by_project` / `count_by_project`）——绝不先查全部再在 Python
+  过滤；授权 `project_id` 只来自服务端认证配置，客户端 `project_id`
+  查询参数被忽略（不可扩宽范围）。
+- **分页**（沿用 Agent Read 既有规范）：`limit` 默认 50、上限 100
+  （服务层 server-side 校验；`limit=0` / `101` / 负数 ⇒ 400）；
+  `offset >= 0`（负数 ⇒ 400）；响应回显**生效值**。
+- **稳定排序**：`started_at DESC, <run_id> DESC`（唯一 ID 作
+  tiebreaker ⇒ 分页窗口稳定；Workflow 的 `started_at` 可空 ⇒
+  `NULLS LAST`）。
+- **响应结构**（`RuntimeRunListResponse`）：`items` / `limit` /
+  `offset` / `total`；`total` = 同一过滤条件的真实 COUNT（可靠计数，
+  不伪造）。`items` 为 `RuntimeRunSummaryResponse` 概要列表
+  （`runtime_type` / `run_id` / `project_id` / `status` / `started_at`）——
+  **不含** step / node / approval / input / 明细（详情走 §9.1）。
+- 两种 Runtime **分别查询**（一次请求不跨域合并两类记录）。
+- 错误契约与 §9.2 详情一致（400 分页非法 / 401 / 502 / 503 按域）。
+- 测试证据：`tests/test_runtime_read_api.py`（离线，Step 3 列表 30 例）+
+  `tests/test_runtime_read_api_db.py`（DB 真链 + 真实项目隔离，7 例）。
 
 ### 9.4 已知限制（如实记录）
 

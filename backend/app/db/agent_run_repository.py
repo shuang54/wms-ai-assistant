@@ -40,7 +40,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -184,6 +184,85 @@ class AgentRunRepository:
         except SQLAlchemyError as exc:
             raise AgentRunRepositoryError(
                 f"Agent Run 读取失败: {type(exc).__name__}"
+            ) from exc
+
+    # ---------- 读取（Phase 7 Step 3 项目范围列表；只读） ----------
+
+    def _validate_project_id(self, project_id: object) -> str:
+        """校验授权项目标识（触达 DB 之前拦截；不生成 / 不截断）。"""
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project_id 必须是非空 str")
+        if len(project_id) > AGENT_RUN_PROJECT_ID_MAX_LENGTH:
+            raise ValueError("project_id 超出长度上限")
+        return project_id
+
+    def list_by_project(
+        self, *, project_id: str, limit: int, offset: int
+    ) -> list[AgentRunRecord]:
+        """按**授权项目**分页读取 Run 概要（Phase 7 Step 3；**只读**）。
+
+        纪律：
+
+        * **DB 层过滤**：``WHERE project_id = :project`` 由 SQL 执行——
+          **绝不**先查全部再在 Python 过滤（项目隔离是数据边界，不是
+          展示层过滤）；
+        * **稳定排序**：``started_at DESC, run_id DESC``（``run_id`` UNIQUE
+          作 tiebreaker ⇒ 分页窗口稳定，不依赖 DB 自然序）；
+        * 分页（``limit`` / ``offset``）由调用方（服务层）校验后传入——
+          本方法不再重复校验业务边界，但拒绝负数等明显非法值。
+
+        Returns:
+            该项目的 Run 记录（写入字段投影；可能为空列表）。
+
+        Raises:
+            ValueError:              project_id / limit / offset 非法。
+            AgentRunRepositoryError: DB 未配置或读取失败。
+        """
+        project = self._validate_project_id(project_id)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit 必须是非负 int")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset 必须是非负 int")
+        statement = (
+            select(AgentRun)
+            .where(AgentRun.project_id == project)
+            .order_by(AgentRun.started_at.desc(), AgentRun.run_id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                rows = session.execute(statement).scalars().all()
+        except SQLAlchemyError as exc:
+            raise AgentRunRepositoryError(
+                f"Agent Run 列表读取失败: {type(exc).__name__}"
+            ) from exc
+        return [_to_record(row) for row in rows]
+
+    def count_by_project(self, *, project_id: str) -> int:
+        """按**授权项目**统计 Run 总数（Phase 7 Step 3；**只读**）。
+
+        与 :meth:`list_by_project` 同一过滤条件 ⇒ ``total`` 与分页结果
+        一致（可靠计数，不伪造）。
+
+        Raises:
+            ValueError:              project_id 非法。
+            AgentRunRepositoryError: DB 未配置或读取失败。
+        """
+        project = self._validate_project_id(project_id)
+        statement = (
+            select(func.count())
+            .select_from(AgentRun)
+            .where(AgentRun.project_id == project)
+        )
+        factory = self._get_session_factory()
+        try:
+            with factory() as session, session.begin():
+                return int(session.execute(statement).scalar_one())
+        except SQLAlchemyError as exc:
+            raise AgentRunRepositoryError(
+                f"Agent Run 计数失败: {type(exc).__name__}"
             ) from exc
 
     # ---------- 写入 ----------
