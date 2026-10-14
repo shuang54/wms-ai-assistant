@@ -504,6 +504,101 @@ class AgentCommandSettings:
 
 
 # ============================================================
+# 用户认证配置（Phase 7 Recovery M1 — Human User Authentication）
+# ============================================================
+
+#: 会话 TTL 允许区间（小时；绝对过期，不做滑动续期）。
+AUTH_SESSION_TTL_HOURS_MIN = 1
+AUTH_SESSION_TTL_HOURS_MAX = 720
+
+#: 登录尝试限制允许区间。
+AUTH_MAX_FAILED_LOGINS_MIN = 1
+AUTH_MAX_FAILED_LOGINS_MAX = 20
+AUTH_LOCKOUT_MINUTES_MIN = 1
+AUTH_LOCKOUT_MINUTES_MAX = 1440
+
+#: SameSite 允许值（``none`` 必须配合 Secure；代码层强制）。
+AUTH_COOKIE_SAMESITE_VALUES = ("lax", "strict", "none")
+
+
+@dataclass(frozen=True)
+class AuthSettings:
+    """用户认证（浏览器会话）配置——与 X-API-Key 服务认证**并存不替代**。
+
+    凭据类型区分（M1 兼容性设计）：
+
+        * 本配置 = **Human User Authentication**（登录名 + 密码 → 服务端会话
+          → HttpOnly Cookie）；
+        * ``AgentCommandSettings`` / ``AgentReadSettings`` /
+          ``WorkflowCommandSettings`` / ``WorkflowReadSettings``
+          = **Service-to-Service API Key**（服务端共享凭据 + 服务端项目作用域）。
+
+    字段（全部环境变量；**无**任何默认凭据——认证本身不配置默认值，
+    未配置时端点 fail-closed）：
+
+        session_cookie_name:  会话 Cookie 名（``AUTH_SESSION_COOKIE_NAME``；
+                              默认 ``wms_ai_session``；HttpOnly）。
+        csrf_cookie_name:      CSRF 双提交 Cookie 名（``AUTH_CSRF_COOKIE_NAME``；
+                              默认 ``wms_ai_csrf``；**非** HttpOnly）。
+        csrf_header_name:      CSRF 头名（``AUTH_CSRF_HEADER_NAME``；
+                              默认 ``X-CSRF-Token``）。
+        session_ttl_hours:    会话绝对 TTL（小时；``AUTH_SESSION_TTL_HOURS``；
+                              默认 12；钳制 [1, 720]）。
+        cookie_secure:         Secure 标志（``AUTH_COOKIE_SECURE``；
+                              **默认 True**——仅 HTTPS 传输会话 Cookie；
+                              内网纯 HTTP 部署须显式置 0 并知悉风险）。
+        cookie_samesite:       SameSite（``AUTH_COOKIE_SAMESITE``；默认 ``lax``；
+                              ``none`` 时强制 Secure）。
+        max_failed_logins:     连续失败锁定阈值（``AUTH_MAX_FAILED_LOGINS``；
+                              默认 5；钳制 [1, 20]）。
+        lockout_minutes:       锁定时长（分钟；``AUTH_LOCKOUT_MINUTES``；
+                              默认 15；钳制 [1, 1440]）。
+    """
+
+    session_cookie_name: str = field(
+        default_factory=lambda: _get_str(
+            "AUTH_SESSION_COOKIE_NAME", "wms_ai_session"
+        )
+    )
+    csrf_cookie_name: str = field(
+        default_factory=lambda: _get_str("AUTH_CSRF_COOKIE_NAME", "wms_ai_csrf")
+    )
+    csrf_header_name: str = field(
+        default_factory=lambda: _get_str("AUTH_CSRF_HEADER_NAME", "X-CSRF-Token")
+    )
+    session_ttl_hours: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "AUTH_SESSION_TTL_HOURS",
+            12,
+            AUTH_SESSION_TTL_HOURS_MIN,
+            AUTH_SESSION_TTL_HOURS_MAX,
+        )
+    )
+    cookie_secure: bool = field(
+        default_factory=lambda: _get_bool("AUTH_COOKIE_SECURE", True)
+    )
+    cookie_samesite: str = field(
+        default_factory=lambda: _get_str("AUTH_COOKIE_SAMESITE", "lax").lower()
+    )
+    max_failed_logins: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "AUTH_MAX_FAILED_LOGINS",
+            5,
+            AUTH_MAX_FAILED_LOGINS_MIN,
+            AUTH_MAX_FAILED_LOGINS_MAX,
+        )
+    )
+    lockout_minutes: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "AUTH_LOCKOUT_MINUTES",
+            15,
+            AUTH_LOCKOUT_MINUTES_MIN,
+            AUTH_LOCKOUT_MINUTES_MAX,
+        )
+    )
+
+
+# ============================================================
 # Tool Calling 配置（Phase 3.6.3）
 # ============================================================
 
@@ -790,6 +885,7 @@ class Settings:
     agent_command: AgentCommandSettings = field(
         default_factory=AgentCommandSettings
     )
+    auth: AuthSettings = field(default_factory=AuthSettings)
     workflow_command: WorkflowCommandSettings = field(
         default_factory=WorkflowCommandSettings
     )
@@ -815,6 +911,7 @@ __all__ = [
     "WorkflowReadSettings",
     "AgentReadSettings",
     "WorkflowCommandSettings",
+    "AuthSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",
     "AIRouterSettings",

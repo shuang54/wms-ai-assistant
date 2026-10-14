@@ -17,6 +17,7 @@ from backend.app.api import (
     agent_read,
     assistant_timeline,
     assistant_trace,
+    auth,
     chat,
     conversations,
     health,
@@ -44,6 +45,9 @@ def create_app() -> FastAPI:
         ),
     )
     app.include_router(health.router, prefix="/api", tags=["health"])
+    # Phase 7 Recovery M1：用户认证（登录 / 登出 / 当前用户）。
+    # 与 5 个域 X-API-Key 服务认证**并存不替代**（人类用户会话 vs 服务凭据）。
+    app.include_router(auth.router, prefix="/api", tags=["auth"])
     app.include_router(chat.router, prefix="/api", tags=["chat"])
     app.include_router(rag.router, prefix="/api", tags=["rag"])
     app.include_router(tool_chat.router, prefix="/api", tags=["chat"])

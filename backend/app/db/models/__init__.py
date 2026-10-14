@@ -23,6 +23,7 @@ from backend.app.db.models.agent_run import AgentRun
 from backend.app.db.models.agent_step import AgentStep
 from backend.app.db.models.agent_approval import AgentApproval
 from backend.app.db.models.agent_tool_result import AgentToolResult
+from backend.app.db.models.app_user import AppUser
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_evidence import ConversationEvidenceRecord
@@ -33,7 +34,9 @@ from backend.app.db.models.knowledge_chunk import KnowledgeChunk
 from backend.app.db.models.knowledge_document import KnowledgeDocument
 from backend.app.db.models.llm_usage_record import LLMUsageRecord
 from backend.app.db.models.rag_execution_record import RagExecutionRecordModel
+from backend.app.db.models.resource_owner import ResourceOwner
 from backend.app.db.models.tool_execution_record import ToolExecutionRecordModel
+from backend.app.db.models.user_session import UserSession
 from backend.app.db.models.workflow_approval import WorkflowApproval
 from backend.app.db.models.workflow_node_run import WorkflowNodeRun
 from backend.app.db.models.workflow_run import WorkflowRun
@@ -82,6 +85,12 @@ _MODELS: tuple[type, ...] = (
     WorkflowRun,
     WorkflowNodeRun,
     WorkflowApproval,
+    # Phase 7 Recovery M1：用户身份地基（3 张**全新**表；不改任何既有冻结表）。
+    # AppUser 先于 UserSession（后者 correlation 引用前者 user_id，无 FK）。
+    AppUser,
+    UserSession,
+    # 资源归属映射（独立表；conversation / agent_run 等冻结表**不加列**）。
+    ResourceOwner,
 )
 
 
@@ -92,6 +101,7 @@ __all__ = [
     "AgentStep",
     "AgentToolResult",
     "AgentApproval",
+    "AppUser",
     "AssistantOutcomeRecord",
     "Conversation",
     "ConversationEvidenceRecord",
@@ -102,7 +112,9 @@ __all__ = [
     "KnowledgeChunk",
     "LLMUsageRecord",
     "RagExecutionRecordModel",
+    "ResourceOwner",
     "ToolExecutionRecordModel",
+    "UserSession",
     "WorkflowRun",
     "WorkflowNodeRun",
     "WorkflowApproval",

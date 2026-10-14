@@ -407,10 +407,15 @@ def _counts(engine: Any) -> dict[str, int]:
 
 #: AgentRuntime 真实执行写入的**控制行**表（UUID run_id，无法用前缀匹配；
 #: conftest 会话守卫只覆盖 agent_run / agent_step ⇒ 本文件自行兜底）。
+#: Phase 7 Recovery M1 补充 ``agent_approval``：Step 6 曾补
+#: checkpoint / decision / tool_result 三表，但 HITL 审批行（Phase 5 P-7）
+#: 同样由闭环测试写入且**不在**任何守卫范围——本轮实测发现 7 行
+#: ``ec-p7s5-`` 孤儿审批行（令 test_agent_read_db 的 residue 门失败）。
 _AGENT_CONTROL_TABLES: tuple[str, ...] = (
     "agent_checkpoint",
     "agent_decision",
     "agent_tool_result",
+    "agent_approval",
 )
 
 

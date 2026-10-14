@@ -201,12 +201,18 @@ class AgentReadService:
 
     # ---------- 公开 Query（§二十四） ----------
 
-    def get_run(self, run_id: str, project_id: str) -> AgentRunView:
+    def get_run(
+        self, run_id: str, project_id: str, *, user_id: str | None = None
+    ) -> AgentRunView:
         """读取一次 Agent Run 的组合只读视图。
 
         Args:
             run_id:      Agent Run 身份（``agent_run.run_id``）。
             project_id:  当前 project（**必须**由调用方提供；不猜）。
+            user_id:     **可选**的已认证用户（Phase 7 Recovery M1）。提供时
+                         先做资源归属校验（fail-closed：无归属登记 / 归属他人
+                         ⇒ ``AgentRunNotFoundError``——与"不存在"同构）；
+                         不提供（API-Key 服务路径）⇒ 行为不变。
 
         Returns:
             :class:`AgentRunView`（``run`` 为 ``None`` ⇒ 尚无终态执行记录，
@@ -214,8 +220,10 @@ class AgentReadService:
 
         Raises:
             ValueError:            参数非法（400）。
-            AgentRunNotFoundError: 不存在 / 不属于该 project（404）。
+            AgentRunNotFoundError: 不存在 / 不属于该 project / 不属于该用户（404）。
         """
+        if user_id is not None:
+            self._require_run_ownership(run_id=run_id, user_id=user_id)
         loaded = self._load(run_id, project_id)
         return AgentRunView(
             run=self._run_summary(loaded.run) if loaded.run is not None else None,
@@ -237,6 +245,32 @@ class AgentReadService:
                 self._tool_result_view(item) for item in loaded.tool_results
             ),
         )
+
+    @staticmethod
+    def _require_run_ownership(*, run_id: str, user_id: str) -> None:
+        """Agent Run 归属校验（Phase 7 Recovery M1；fail-closed）。
+
+        归属服务不可用（DB 未配置 / 查询失败）同样按"不可见"处理——
+        **绝不**因归属系统故障而放行用户上下文读取。
+        """
+        from backend.app.services.resource_ownership_service import (
+            RESOURCE_TYPE_AGENT_RUN,
+            ResourceOwnershipDeniedError,
+            ResourceOwnershipError,
+            ResourceOwnershipService,
+        )
+
+        try:
+            ResourceOwnershipService().assert_can_read(
+                resource_type=RESOURCE_TYPE_AGENT_RUN,
+                resource_id=run_id,
+                user_id=user_id,
+            )
+        except ResourceOwnershipDeniedError as exc:
+            raise AgentRunNotFoundError() from exc
+        except ResourceOwnershipError as exc:
+            # 归属系统故障 ⇒ 拒绝（不降级为放行）
+            raise AgentRunNotFoundError() from exc
 
     def get_checkpoint(self, run_id: str, project_id: str) -> AgentCheckpointView | None:
         """读取 Control State 视图（无 ⇒ ``None``；**不含** ``claim_token``）。"""

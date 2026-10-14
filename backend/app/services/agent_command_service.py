@@ -198,12 +198,21 @@ class AgentCommandService:
     # ---------- start ----------
 
     async def start_agent(
-        self, *, project_id: str, question: str
+        self,
+        *,
+        project_id: str,
+        question: str,
+        user_id: str | None = None,
     ) -> AgentCommandOutcome:
         """启动一次新的 Agent Run（有界循环到终态 / 等待点）。
 
         持久化时序与 Orchestrator Agent 路径一致（先 Steps、后 Run；
         WAITING_APPROVAL 不写终态 Run；best-effort）。
+
+        Phase 7 Recovery M1：``user_id`` 为**可选**的已认证用户（来自服务端
+        会话；由调用方解析后传入——本方法**不**接受任何客户端身份字段）。
+        提供时在 Run 落库后登记资源归属（best-effort：失败仅记录错误，
+        不阻断 Run 本身；未登记的 Run 在用户上下文读取时 fail-closed 拒绝）。
         """
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question 必须是非空 str")
@@ -234,7 +243,42 @@ class AgentCommandService:
                 0.0, (finished_at - started_at).total_seconds() * 1000.0
             ),
         )
+        if user_id:
+            self._bind_run_ownership(
+                run_id=getattr(result, "run_id", None),
+                project_id=project_id,
+                user_id=user_id,
+            )
         return self._from_runtime_result(result)
+
+    def _bind_run_ownership(
+        self, *, run_id: str | None, project_id: str, user_id: str
+    ) -> None:
+        """登记 Agent Run 归属（Phase 7 Recovery M1；best-effort）。
+
+        失败（DB 不可用 / 归属冲突）只记录错误——Run 本身已成功执行，
+        且失败后果是 fail-closed（该 Run 在用户上下文不可读），不阻断命令。
+        """
+        if not run_id:
+            return
+        from backend.app.services.resource_ownership_service import (
+            RESOURCE_TYPE_AGENT_RUN,
+            ResourceOwnershipError,
+            ResourceOwnershipService,
+        )
+
+        try:
+            ResourceOwnershipService().bind_owner(
+                resource_type=RESOURCE_TYPE_AGENT_RUN,
+                resource_id=run_id,
+                user_id=user_id,
+                project_id=project_id,
+            )
+        except ResourceOwnershipError:
+            logger.error(
+                "agent run ownership bind failed",
+                extra={"error_type": "ResourceOwnershipError"},
+            )
 
     # ---------- resume ----------
 

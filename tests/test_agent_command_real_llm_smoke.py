@@ -27,10 +27,13 @@ python -m pytest -m real_llm tests/test_agent_command_real_llm_smoke.py -q -s
     3. 开关打开但 ``LLM_BASE_URL`` / ``LLM_MODEL`` 为空 → SKIP。
 
 业务数据边界（**如实**；不为通过 Smoke 创造条件）：
-    * 本仓库开发库当前**没有** ``public.inventory``（Phase 5 已记录）；
-    * 表存在 ⇒ 断言完整业务闭环（Tool success + 业务结果 + 终态 Resume 幂等）；
-    * 表不存在 ⇒ 链路级断言照常（LLM 决策 / Tool 授权 / 真实派发 / 持久化 /
-      Read/List 可见），业务断言与 Resume 幂等断言 **SKIP** 并给出原因
+    * 库存口径 = **报表等价查询**（Phase 7：真实 WMS 条码库存现存量），数据来自
+      **独立 WMS/ERP 业务库**（``WMS_DATABASE_*`` ⇒ ``db/business_session``；
+      **不**复用应用库 Engine、**不**回退假数据）；
+    * 业务数据源已配置且报表固定表齐备 ⇒ 断言完整业务闭环（Tool success +
+      真实库存结果 + 持久化内容与**原报表 SQL** 合计一致 + 终态 Resume 幂等）；
+    * 未配置 / 表缺失 ⇒ 链路级断言照常（LLM 决策 / Tool 授权 / 真实派发 /
+      持久化 / Read/List 可见），业务断言与 Resume 幂等断言 **SKIP** 并给出原因
       （不伪造业务结果、不建表、不造数）。
 
 清理（**定向**，沿既有残留纪律）：
@@ -47,6 +50,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -60,11 +64,16 @@ __all__ = [
     "test_real_agent_command_run_visible_in_read_and_list_api",
     "test_real_agent_command_terminal_resume_does_not_reexecute_tool",
     "test_real_agent_command_business_result_when_inventory_table_present",
+    "test_real_agent_command_persisted_tool_content_matches_report",
     "test_smoke_script_default_is_no_op",
 ]
 
-#: Smoke 问题（简单、单 Tool、可直接由 get_inventory schema 回答）。
-_QUESTION: str = "查询物料 MAT001 的当前库存数量。"
+#: Smoke 物料：已与**原始库存现存量报表**逐行核对过的真实物料
+#: （Phase 7：7 组 / 39,315.381650；见 tests/test_get_inventory_report_sql.py）。
+_MATERIAL: str = "EEBMCMBK01"
+
+#: Smoke 问题（简单、单 Tool、可直接由 get_inventory 契约回答）。
+_QUESTION: str = f"查询物料 {_MATERIAL} 的库存现存量。"
 
 #: 测试专用凭据（**非**生产凭据；仅存在于测试进程内 monkeypatch 配置）。
 _TEST_COMMAND_KEY = "p7s6-agent-command-key-NOT-A-PRODUCTION-CREDENTIAL"
@@ -108,10 +117,13 @@ class _RealRun:
     payload: dict[str, Any]
     detail: dict[str, Any]
     list_ids: list[str]
-    table_present: bool
+    #: 业务数据源是否已配置（WMS_DATABASE_*；独立于应用库）。
+    business_configured: bool
+    #: 报表口径固定表是否齐备（缺则列出；缺 ⇒ 业务断言 SKIP，不建表）。
+    report_tables_present: bool
+    inventory_schema: str
+    missing_tables: list[str]
     project_id: str
-    schema_name: str
-    table_name: str
 
 
 def _view(detail: dict[str, Any]) -> dict[str, Any]:
@@ -137,11 +149,26 @@ def real_run() -> Any:
     if engine is None:
         pytest.skip("DATABASE_URL 未配置；Run/Step 持久化与 Read/List 需要 DB")
 
+    from backend.app.db.business_session import (
+        get_business_engine,
+        is_business_datasource_configured,
+    )
+    from backend.app.tools.get_inventory import INVENTORY_REPORT_TABLES
+
     project_id = settings.project.project_id
     configuration = get_default_project_configuration_provider().get(project_id)
-    table_present = _table_exists(
-        engine, configuration.schema_name, settings.inventory_tool.table_name
-    )
+    inventory_schema = settings.inventory_tool.schema_name
+    business_configured = is_business_datasource_configured()
+    business_engine = get_business_engine()
+    if business_engine is None:
+        missing_tables = list(INVENTORY_REPORT_TABLES)
+    else:
+        missing_tables = [
+            table
+            for table in INVENTORY_REPORT_TABLES
+            if not _table_exists(business_engine, inventory_schema, table)
+        ]
+    report_tables_present = not missing_tables
     watermarks = _watermarks(engine)
 
     mp = pytest.MonkeyPatch()
@@ -186,10 +213,11 @@ def real_run() -> Any:
             payload=payload,
             detail=detail,
             list_ids=list_ids,
-            table_present=table_present,
+            business_configured=business_configured,
+            report_tables_present=report_tables_present,
+            inventory_schema=inventory_schema,
+            missing_tables=missing_tables,
             project_id=project_id,
-            schema_name=configuration.schema_name,
-            table_name=settings.inventory_tool.table_name,
         )
     finally:
         mp.undo()
@@ -272,9 +300,9 @@ def test_real_agent_command_terminal_resume_does_not_reexecute_tool(
     view = _view(real_run.detail)
     if view.get("status") != "COMPLETED":
         pytest.skip(
-            "BUSINESS_DATA_BLOCKED：run 未达 COMPLETED（"
-            f"{real_run.schema_name}.{real_run.table_name} 缺失）⇒ "
-            "终态 Replay 幂等不适用（不为通过 Smoke 建表/造数）"
+            "BUSINESS_DATA_BLOCKED：run 未达 COMPLETED（业务数据源 configured="
+            f"{real_run.business_configured}；缺失固定表={real_run.missing_tables or 'none'}）"
+            " ⇒ 终态 Replay 幂等不适用（不为通过 Smoke 建表/造数）"
         )
 
     from backend.app.api import agent_command_auth
@@ -328,8 +356,23 @@ def test_real_agent_command_terminal_resume_does_not_reexecute_tool(
 
 
 # ============================================================
-# Test 4：业务闭环（仅当真实库存表存在）
+# Test 4 / 5：业务闭环 + 持久化内容与报表口径对照
+# （仅当业务数据源已配置且报表固定表齐备）
 # ============================================================
+
+
+def _require_business_tables(real_run: _RealRun) -> None:
+    if not real_run.business_configured:
+        pytest.skip(
+            "BUSINESS_DATA_BLOCKED：WMS_DATABASE_* 未配置 ⇒ 无法验证真实业务结果"
+            "（不回退应用库；填写本机 .env 后本用例即可验证）"
+        )
+    if not real_run.report_tables_present:
+        pytest.skip(
+            "BUSINESS_DATA_BLOCKED：报表固定表缺失 "
+            f"{real_run.missing_tables}（schema={real_run.inventory_schema}）"
+            " ⇒ 不建表 / 不造数"
+        )
 
 
 @pytest.mark.real_llm
@@ -337,13 +380,8 @@ def test_real_agent_command_terminal_resume_does_not_reexecute_tool(
 def test_real_agent_command_business_result_when_inventory_table_present(
     real_run: _RealRun,
 ) -> None:
-    """真实 WMS 只读业务结果（表存在 ⇒ Tool success + 业务数据进入 Run 结果）。"""
-    if not real_run.table_present:
-        pytest.skip(
-            "BUSINESS_DATA_BLOCKED："
-            f"{real_run.schema_name}.{real_run.table_name} 不存在 ⇒ 无法验证真实业务结果"
-            "（不建表 / 不造数；真实部署提供该表后本用例即可验证）"
-        )
+    """真实 WMS 只读业务结果（数据源齐备 ⇒ Tool success + 业务数据进入 Run 结果）。"""
+    _require_business_tables(real_run)
 
     view = _view(real_run.detail)
     assert view.get("status") == "COMPLETED"
@@ -351,6 +389,84 @@ def test_real_agent_command_business_result_when_inventory_table_present(
     assert len(tool_results) == 1
     assert tool_results[0].get("success") is True, tool_results[0]
     assert real_run.payload.get("content"), "最终 content 为空（业务结果未进入 Agent 结果）"
+
+
+@pytest.mark.real_llm
+@_needs_real_llm
+def test_real_agent_command_persisted_tool_content_matches_report(
+    real_run: _RealRun,
+) -> None:
+    """Phase 7 Step 8：持久化内容（arguments / result_payload）与报表口径一致。
+
+    读取 API 视图**有意**不含 arguments / payload ⇒ 本用例直读 ``ai_ops``
+    两张表（只读 SELECT），证明"Agent 真正用对了物料 + Tool 真的查了业务库"。
+    """
+    _require_business_tables(real_run)
+
+    from sqlalchemy import text
+
+    from backend.app.config import settings
+    from backend.app.db.business_session import get_business_engine
+    from backend.app.db.session import get_engine
+    from tests.test_get_inventory_report_sql import REPORT_ON_HAND_SQL
+
+    engine = get_engine()
+    assert engine is not None
+
+    # ① 决策中的 Tool Call 参数（物料编码必须与请求一致）
+    with engine.connect() as conn:
+        calls = conn.execute(
+            text(
+                "SELECT tool_name, arguments FROM ai_ops.agent_decision "
+                "WHERE run_id = :run_id AND tool_name IS NOT NULL "
+                "ORDER BY step_index"
+            ),
+            {"run_id": real_run.run_id},
+        ).all()
+    assert calls, "无持久化决策（Tool Call 未落库）"
+    assert calls[0][0] == "get_inventory"
+    assert (calls[0][1] or {}).get("material_code") == _MATERIAL
+
+    # ② Tool Result 载荷（成功 + 契约字段）
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT success, result_unavailable, result_payload "
+                "FROM ai_ops.agent_tool_result WHERE run_id = :run_id "
+                "ORDER BY step_index"
+            ),
+            {"run_id": real_run.run_id},
+        ).all()
+    assert rows, "无 agent_tool_result 持久化行"
+    success, unavailable, payload = rows[0]
+    assert bool(success) is True
+    assert bool(unavailable) is False, "payload 不可用（不可 Replay）"
+    data = (payload or {}).get("data") or {}
+    assert data.get("material_code") == _MATERIAL
+    assert isinstance(data.get("groups"), list)
+    assert isinstance(data.get("group_count"), int)
+    assert isinstance(data.get("truncated"), bool)
+    assert float(data["qty"]) >= 0.0
+
+    # ③ 与**原报表 SQL**（业务库只读）的合计对照
+    business_engine = get_business_engine()
+    assert business_engine is not None
+    with business_engine.connect() as conn:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        report_rows = conn.execute(
+            text(REPORT_ON_HAND_SQL), {"material_code": _MATERIAL}
+        ).mappings().all()
+        conn.rollback()
+    baseline_total = sum((row["qty"] for row in report_rows), Decimal("0"))
+
+    assert float(data["qty"]) == pytest.approx(float(baseline_total))
+    assert data["group_count"] == len(report_rows)
+    # 报表口径：物料编码已在业务库核对过 ⇒ 期望非零（防"静默空结果"）
+    assert float(baseline_total) != 0.0, (
+        f"物料 {_MATERIAL} 在业务库报表口径下为 0 ⇒ 基线物料选择失效"
+        "（如实暴露，不伪造）"
+    )
+    assert settings.inventory_tool.schema_name == real_run.inventory_schema
 
 
 # ============================================================

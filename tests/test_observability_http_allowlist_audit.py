@@ -432,6 +432,12 @@ class TestSecurityAudit:
             "/api/agent-runs/{run_id}/resume",
             "/api/agent-runs/{run_id}/cancel",
             "/api/agent-approvals/{approval_id}/decision",
+            # ---- User Authentication（Phase 7 Recovery M1；精确路由，无 wildcard）----
+            # 登录（login）· 登出（logout）。**人类用户会话**（HttpOnly Cookie +
+            # 服务端会话），与 X-API-Key 服务凭据并存不替代：无公开注册端点，
+            # 登录失败统一 401（不泄露用户名存在性），登出要求 CSRF 双提交。
+            "/api/auth/login",
+            "/api/auth/logout",
         }, write_routes
         for route in discover_routes():
             if route.method.lower() in _WRITE_METHODS:
