@@ -748,14 +748,17 @@ RagError                                services/rag_service.py（RAG 自身错�
 
 | 方法 | 路径                          | 阶段    | 说明                       |
 | ---- | ----------------------------- | ------- | -------------------------- |
-| GET  | `/api/conversations`          | Phase 2.5 | 会话列表                 |
-| GET  | `/api/conversations/{id}`     | Phase 2.5 | 会话详情                 |
+| GET  | `/api/conversations`          | Phase 2.5 | 会话列表（**未实现**）   |
 | POST | `/api/knowledge/documents`    | Phase 3.6+ | 知识库文档入库（API 化） |
 | POST | `/api/knowledge/search`       | Phase 3.6+ | 知识库检索（内部接口）   |
 | GET  | `/api/tools`                  | Phase 4 | Tool 注册清单              |
 | POST | `/api/tools/{tool_name}`      | Phase 4 | Tool 调用                  |
 | POST | `/api/auth/login`             | Phase 6 | 用户登录                   |
 | GET  | `/api/audit/logs`             | Phase 6 | 审计日志                   |
+
+> Conversation 端点（创建 / 详情 / 消息读 / 消息写 / 归档）**已实现**
+> （Phase 4.1 Step 8、Phase 4.2 Step 12；认证与所有权 = Phase 7 Recovery M2.2）
+> ——完整契约见 **§12**。**会话列表 / 分页仍未实现**。
 
 ---
 
@@ -1214,3 +1217,117 @@ answer_review    v1   AI（问题模板）→ APPROVAL → 终态
   + `tests/test_workflow_definition_catalog_db.py`（DB 真链 e2e 4 例；
   `RUN_DB_TESTS=1`——生产定义目录 start ⇒ 节点执行 ⇒ 审批门 ⇒ 批准 ⇒
   COMPLETED ⇒ Read/List 可读；外部 LLM / Tool 以离线替身注入）。
+
+---
+
+## 12. Conversation API（Phase 4.1 Step 8 / Phase 4.2 Step 12；认证与所有权 = Phase 7 Recovery M2.2）
+
+> 本节记录**当前实际**契约（含 M2.2 认证 / 会话所有权 / D1 项目作用域加固）。
+> 会话与消息持久化在 `ai_ops.conversation` / `ai_ops.conversation_turn`；
+> AI 执行**只能**经 `ChatApplicationService`（本 API 不直接调用 Orchestrator /
+> Router / RAG / Tool / Text-to-SQL，也不直接访问 SQLAlchemy / DB）。
+
+### 12.1 端点
+
+| 方法 | 路径 | 说明 | 登录态 | CSRF |
+| --- | --- | --- | --- | --- |
+| POST | `/api/conversations` | 创建会话（`conversation_id` 由服务端生成） | 必需 | 必需 |
+| GET | `/api/conversations/{conversation_id}` | 会话 metadata（不含消息） | 必需 | — |
+| GET | `/api/conversations/{conversation_id}/messages` | 消息列表（持久化顺序：`created_at ASC, turn_id ASC`） | 必需 | — |
+| POST | `/api/conversations/{conversation_id}/messages` | 追加消息（AI 执行 + 持久化 USER / ASSISTANT） | 必需 | 必需 |
+| POST | `/api/conversations/{conversation_id}/archive` | 归档会话（幂等） | 必需 | 必需 |
+
+**不提供**：会话列表 / 分页 / `DELETE` / `PATCH` / `PUT` / switch-project /
+物理删除；`conversation_id` 不可由客户端指定（额外 JSON 字段被忽略）。
+
+### 12.2 登录态要求（M1 用户会话）
+
+- 身份**只**来自服务端会话（`wms_ai_session` HttpOnly Cookie →
+  `ai_ops.user_session`）；登录入口 `POST /api/auth/login`。
+- 五个端点未携带有效会话（缺失 / 无效 / 过期 / 已撤销 / 登出后重放）⇒
+  **401**（固定文案；不区分具体原因，不泄露账号是否存在）。
+- **不**接受 `X-API-Key`、Query 或 Body 中的用户身份；本 API 无身份覆盖入口
+  （服务 API-Key 身份与用户会话身份并存、互不替代，未混淆）。
+- 认证发生在**任何业务调用与数据库写之前**（失败路径零 AI 调用、零写）。
+
+### 12.3 CSRF 要求（写操作）
+
+- 不安全方法（创建 / 追加 / 归档）要求 M1 双提交头：
+  `X-CSRF-Token` = `wms_ai_csrf` Cookie 值，且必须等于服务端对该会话（创建为
+  无会话上下文）重算的 HMAC 值。
+- 缺头 / 缺 Cookie / 两者不一致 / 伪造值 / 其他会话的值 ⇒ **403**，副作用为零。
+
+### 12.4 项目作用域校验（D1 加固）
+
+- 创建时 `project_id` 必须**精确等于服务端配置项目**
+  （`PROJECT_ID` → `ProjectContext.project_id`；见 `.env.example`）——
+  服务端配置是允许项目的**唯一授权来源**。
+- 其他项目**即使已在 Project Registry 注册**也不被授权（已注册 ≠ 已授权）；
+  未注册 / 未授权 / 变形（如尾随空格）一律 **422**（同一固定文案，不回显输入，
+  不泄露项目存在性）。
+- 配置无法解析（缺失 / 空白 / 取值异常）或配置项目在注册表不可解析 ⇒
+  **503**（fail-closed；**绝不**回退默认项目）。
+- 落库的 `conversation.project_id` 与 `resource_owner.project_id` 均为
+  服务端**已验证**值。
+- 读取 / 追加 / 归档**不接受** `project_id` 参数：作用域来自会话自身的
+  服务端绑定，不可被请求扩宽。
+
+### 12.5 会话所有权校验（M2.2）
+
+- 创建：归属行（`ai_ops.resource_owner`，`resource_type = CONVERSATION`）与
+  Conversation **同一事务**写入（任一步失败整体回滚 ⇒ 不产生无主会话）。
+- 读取 / 追加 / 归档：**先**做所有权校验，**再**调用业务层。
+- 非所有者 / 不存在 / 无归属的历史会话 / ID 篡改 ⇒ **同构 404**
+  （同 status + 同 body：`{"detail": "会话不存在"}`）——不泄露资源是否存在，
+  **不**自动认领历史会话。
+- 归属校验通过后 Service 层仍未命中（如并发删除）⇒ 同样 404
+  （`{"detail": "会话不存在: <conversation_id>"}`；此分支仅在归属已通过时可达，
+  因此不泄露他人资源）。
+- 归属服务 / DB 故障 ⇒ **503**（fail-closed，绝不放行、绝不降级为成功）。
+
+### 12.6 请求 / 响应要点
+
+- 创建请求体只有 `project_id`；响应
+  `{conversation_id, project_id, status, created_at, updated_at}`。
+- 消息列表响应 `{conversation_id, messages: [{turn_id, role, content,
+  assistant_request_id, created_at}]}`。
+- 追加消息请求体只有 `content`（≤ 10000 字符）；幂等键**只**经
+  `Idempotency-Key` 请求头传递（Body 同名字段被忽略）。响应 envelope 与
+  `/api/ai/chat` 一致（`route` / `content` / `data` / `metadata`），
+  **不**返回 `conversation_id` / `turn_id` / `assistant_request_id`。
+- 幂等：同键同载荷重放 ⇒ 200 + `metadata.idempotent_replay = true`（不重复
+  执行 AI、不新增 Turn）；同键不同载荷 ⇒ 409（`IDEMPOTENCY_KEY_REUSED_WITH_
+  DIFFERENT_PAYLOAD`）；同键在途 ⇒ 409（`IDEMPOTENCY_KEY_IN_FLIGHT`）；
+  键长 > 128 ⇒ 422（无写入）。
+- 响应只由 `backend.app.dto.conversation_api` 的 Pydantic DTO 组成
+  （`response_model` 即字段过滤边界）；`data` 只透传值均为 JSON 基本类型的
+  Mapping（富对象不透传）。日志只记录固定事件与 `error_type`，
+  **不**记录凭据 / Cookie / 消息正文 / SQL。
+
+### 12.7 错误契约
+
+```text
+200  成功
+401  未认证 / 会话无效（固定文案）
+403  CSRF 校验失败（固定文案）
+404  不存在或无权访问（归属阶段：同构固定文案，不区分二者；
+     归属已通过后的 Service 未命中：`会话不存在: <id>`）
+409  归档会话仍追加消息 / 幂等冲突（契约保留 + 幂等语义）
+422  请求体或路径校验失败 / 项目未授权或未注册（同一固定文案）
+500  会话服务不可用 / 内部错误（固定文案；不暴露 traceback / SQL / 凭据）
+503  项目配置 / 项目注册表 / 所有权校验不可用（fail-closed）
+```
+
+### 12.8 测试证据
+
+- 认证 / 所有权 / 项目作用域：`tests/test_conversation_ownership.py`
+  （离线 31 例 + DB 真链 6 例，`RUN_DB_TESTS=1`）
+- HTTP 契约（Step 7/8 冻结）：`tests/test_conversation_api.py`、
+  `tests/test_conversation_api_contract.py`、
+  `tests/test_conversation_message_api_contract.py`
+- 幂等：`tests/test_conversation_message_idempotency.py`（+ DB 版）
+- 架构审计：`tests/test_conversation_api_architecture_audit.py`、
+  `tests/test_conversation_message_api_architecture_audit.py`
+- DB E2E：`tests/test_conversation_api_db_e2e.py`、
+  `tests/test_conversation_multiturn_db_e2e.py`、
+  `tests/test_conversation_context_e2e_db.py`（均 `RUN_DB_TESTS=1`）

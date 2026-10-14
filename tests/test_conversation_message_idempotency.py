@@ -60,6 +60,7 @@ from backend.app.services.conversation_service import (
     IdempotencyKeyReusedWithDifferentPayloadError,
     message_fingerprint,
 )
+from tests.conversation_auth_support import patch_message_api_auth
 
 _DEFAULT_PROJECT_ID = "proj-alpha"
 _DEFAULT_REQUEST_ID = "req-0001"
@@ -656,8 +657,17 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> FakeChatApplicationService:
 
 
 @pytest.fixture()
-def api_client(fake_service: FakeChatApplicationService) -> TestClient:
-    return TestClient(app)
+def api_client(
+    monkeypatch: pytest.MonkeyPatch, fake_service: FakeChatApplicationService
+) -> TestClient:
+    """已登录客户端（M2.2）：``conv-1`` 预绑定到测试用户 alice。
+
+    只装配认证 / 归属 / 项目注册表；Application 层仍是本文件的
+    ``FakeChatApplicationService``（零 AI / 零 DB 不变）。
+    """
+    return patch_message_api_auth(
+        monkeypatch, conversation_ids=("conv-1",)
+    )
 
 
 def _post(

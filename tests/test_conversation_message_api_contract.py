@@ -36,6 +36,7 @@ from backend.app.services.conversation_service import (
     ConversationArchivedError,
     ConversationNotFoundError,
 )
+from tests.conversation_auth_support import patch_message_api_auth
 
 _MESSAGES_PATH = "/api/conversations/{conversation_id}/messages"
 _CONVERSATION_ID = "conv-1"
@@ -114,8 +115,17 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeChatApplicationService:
 
 
 @pytest.fixture()
-def client(fake: FakeChatApplicationService) -> TestClient:
-    return TestClient(app)
+def client(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeChatApplicationService
+) -> TestClient:
+    """已登录客户端（M2.2）：``conv-1`` 预绑定到测试用户 alice。
+
+    只装配认证 / 归属 / 项目注册表（``patch_message_api_auth``）；Application
+    层仍是本文件的 ``FakeChatApplicationService``（零 AI / 零 DB 不变）。
+    """
+    return patch_message_api_auth(
+        monkeypatch, conversation_ids=(_CONVERSATION_ID,)
+    )
 
 
 def _post(client: TestClient, body: dict[str, Any], conversation_id: str = _CONVERSATION_ID):

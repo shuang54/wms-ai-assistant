@@ -41,6 +41,16 @@ _SELF = "tests/test_conversation_message_api_architecture_audit.py"
 _TARGET = "backend/app/api/conversations.py"
 
 #: 允许的 import 前缀（白名单：API 只能依赖 HTTP / DTO / Application / 异常）。
+#: Phase 7 Recovery M2.2 追加四项（用户会话认证 / 资源归属 / 服务端项目配置
+#: 与注册表）：对 Step 12"API 不实现认证与授权"冻结的正式修订
+#: （先例：Phase 6 Step 8A 对 Agent Read API 的同类修订）。新增依赖均为
+#: **服务端**组件：
+#:   * auth_dependency —— M1 用户会话（HttpOnly Cookie）+ CSRF；
+#:   * resource_ownership_service —— M1 resource_owner 归属校验（fail-closed）；
+#:   * projects.context —— D1 加固：部署配置项目（唯一允许的 project_id；
+#:     **不**读取请求参数，不可解析 ⇒ 503 fail-closed）；
+#:   * projects.registry —— 服务端项目注册表（可解析性双保险；**不**作为
+#:     授权依据：已注册 ≠ 已授权）。
 _ALLOWED_IMPORT_PREFIXES: tuple[str, ...] = (
     "__future__",
     "logging",
@@ -51,6 +61,10 @@ _ALLOWED_IMPORT_PREFIXES: tuple[str, ...] = (
     "backend.app.dto.conversation_api",
     "backend.app.services.chat_application_service",
     "backend.app.services.conversation_service",
+    "backend.app.api.auth_dependency",
+    "backend.app.services.resource_ownership_service",
+    "backend.app.projects.context",
+    "backend.app.projects.registry",
 )
 
 #: 禁止的 import 前缀（DB / AI Core / 基础设施）。
@@ -237,7 +251,15 @@ class TestApplicationServiceEntrypoint:
         params = list(inspect.signature(endpoint).parameters)
         # Phase 4.2 Step 6：新增可选 Header 参数 `idempotency_key`
         # （幂等键只经 HTTP Header 传递，**不在** JSON Body）。
-        assert params == ["conversation_id", "request", "idempotency_key"]
+        # Phase 7 Recovery M2.2：追加 `principal`（M1 用户会话依赖）与
+        # `_csrf`（M1 CSRF 双提交依赖）——置于末位，原三参顺序不变。
+        assert params == [
+            "conversation_id",
+            "request",
+            "idempotency_key",
+            "principal",
+            "_csrf",
+        ]
 
 
 # ============================================================

@@ -55,6 +55,16 @@ from backend.app.services.conversation_context_builder import (
     ConversationContextBuilder,
 )
 from backend.app.services.conversation_service import ConversationService
+from backend.app.services.resource_ownership_service import (
+    RESOURCE_TYPE_CONVERSATION,
+)
+from tests.conversation_auth_support import (
+    AutoCsrfTestClient,
+    create_and_login,
+    delete_users,
+    register_test_projects,
+    unregister_test_projects,
+)
 
 _ENV_FLAG = os.getenv("RUN_DB_TESTS", "").strip().lower() in {
     "1",
@@ -70,11 +80,12 @@ pytestmark = pytest.mark.skipif(
 
 #: 测试专用 project_id（明显标识，便于人工识别）。
 TEST_PROJECT_ID = "phase-4-1-step-15-test"
+#: D1 加固用例：**真实注册**但不等于部署配置项目（验证"已注册 ≠ 已授权"）。
 PROJECT_A = "project-a"
-PROJECT_B = "project-b"
 
 _CONVERSATION_TABLE = "ai_ops.conversation"
 _TURN_TABLE = "ai_ops.conversation_turn"
+_OWNER_TABLE = "ai_ops.resource_owner"
 
 _OBSERVABILITY_TABLES: tuple[str, ...] = (
     "ai_ops.llm_usage_record",
@@ -166,17 +177,35 @@ def _ensure_tables() -> None:
 
 @pytest.fixture(scope="module", autouse=True)
 def _residue_guard() -> Iterator[None]:
-    """残留守卫：会话级计数前后一致（含 observability 隔离）。"""
+    """残留守卫：会话级计数前后一致（含归属表 / observability 隔离）。"""
     before_conversations = _count(_CONVERSATION_TABLE)
     before_turns = _count(_TURN_TABLE)
+    before_owners = _count(_OWNER_TABLE)
     before_observability = {t: _count(t) for t in _OBSERVABILITY_TABLES}
 
     yield
 
     assert _count(_CONVERSATION_TABLE) == before_conversations, "conversation 残留"
     assert _count(_TURN_TABLE) == before_turns, "conversation_turn 残留"
+    assert _count(_OWNER_TABLE) == before_owners, "resource_owner 残留"
     after_observability = {t: _count(t) for t in _OBSERVABILITY_TABLES}
     assert after_observability == before_observability, "observability 不得被清理"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _register_projects() -> Iterator[None]:
+    """M2.2 D1：测试项目必须在服务端注册表登记（module 结束卸载）。"""
+    registered = register_test_projects((TEST_PROJECT_ID, PROJECT_A))
+    yield
+    unregister_test_projects(registered)
+
+
+@pytest.fixture(scope="module")
+def created_users() -> Iterator[set[str]]:
+    """本 module 创建的用户 / 会话（module 结束定向删除）。"""
+    user_ids: set[str] = set()
+    yield user_ids
+    delete_users(user_ids)
 
 
 @pytest.fixture(scope="module")
@@ -187,7 +216,7 @@ def observability_before(_residue_guard: None) -> dict[str, int]:
 
 @pytest.fixture()
 def created() -> Iterator[list[str]]:
-    """收集本用例创建的 conversation_id；结束时精确删除（级联删 turns）。"""
+    """收集本用例创建的 conversation_id；结束时精确删除（含归属行）。"""
     ids: list[str] = []
     yield ids
     _delete_conversations(ids)
@@ -202,8 +231,19 @@ class Env:
 
 
 @pytest.fixture()
-def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
-    """真实 Application Service + 真实 Context Builder + Fake AI。"""
+def env(
+    monkeypatch: pytest.MonkeyPatch, created_users: set[str]
+) -> Iterator[Env]:
+    """真实 Application Service + 真实 Context Builder + Fake AI；真实登录。
+
+    D1 加固：将"部署允许项目"替换为 ``TEST_PROJECT_ID``（等价于以
+    ``PROJECT_ID=TEST_PROJECT_ID`` 部署；注册表仍必须命中 ⇒ ``_register_projects``）。
+    """
+    monkeypatch.setattr(
+        conversations_module,
+        "get_conversation_allowed_project_id",
+        lambda: TEST_PROJECT_ID,
+    )
     orchestrator = FakeOrchestrator()
     factory = FakeOrchestratorFactory(orchestrator)
     service = ChatApplicationService(
@@ -216,7 +256,8 @@ def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
         "_chat_application_service",
         service,  # type: ignore[arg-type]
     )
-    with TestClient(app) as test_client:
+    with AutoCsrfTestClient(app, base_url="https://testserver") as test_client:
+        created_users.add(create_and_login(test_client, "alice"))
         yield Env(
             client=test_client,
             service=service,
@@ -258,6 +299,18 @@ def _count_turns(conversation_id: str) -> int:
         )
 
 
+def _count_for_project(table: str, project_id: str) -> int:
+    """按 project_id 精确计数（D1 拒绝路径的零副作用断言）。"""
+    factory = _session_factory()
+    with factory() as session:
+        return int(
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {table} WHERE project_id = :p"),
+                {"p": project_id},
+            ).scalar_one()
+        )
+
+
 def _db_turns(conversation_id: str) -> list[dict[str, Any]]:
     factory = _session_factory()
     with factory() as session:
@@ -272,11 +325,19 @@ def _db_turns(conversation_id: str) -> list[dict[str, Any]]:
 
 
 def _delete_conversations(conversation_ids: list[str]) -> None:
+    """精确删除本测试创建的会话（含 M2.2 归属行；绝不 TRUNCATE）。"""
     if not conversation_ids:
         return
     factory = _session_factory()
     with factory() as session, session.begin():
         for conversation_id in conversation_ids:
+            session.execute(
+                text(
+                    f"DELETE FROM {_OWNER_TABLE} "
+                    "WHERE resource_type = :rt AND resource_id = :cid"
+                ),
+                {"rt": RESOURCE_TYPE_CONVERSATION, "cid": conversation_id},
+            )
             session.execute(
                 text(
                     f"DELETE FROM {_CONVERSATION_TABLE} "
@@ -532,12 +593,9 @@ class TestIsolationE2E:
     def test_project_binding_per_conversation(
         self, env: Env, created: list[str]
     ) -> None:
-        conversation_a = _create(env, created, project_id=PROJECT_A)[
-            "conversation_id"
-        ]
-        conversation_b = _create(env, created, project_id=PROJECT_B)[
-            "conversation_id"
-        ]
+        """会话的 project_id = 服务端已验证项目；消息文本 / 输入无法改变它。"""
+        conversation_a = _create(env, created)["conversation_id"]
+        conversation_b = _create(env, created)["conversation_id"]
 
         env.orchestrator.scripted["A 的问题（提到 project-b）"] = _result(
             content="A 答", request_id="req-a1"
@@ -549,13 +607,32 @@ class TestIsolationE2E:
         _send(env, conversation_a, "A 的问题（提到 project-b）")
         _send(env, conversation_b, "B 的问题")
 
-        assert env.factory.project_ids == [PROJECT_A, PROJECT_B]
+        # Orchestrator 工厂收到的 project_id 来自服务端会话绑定（非消息文本）
+        assert env.factory.project_ids == [TEST_PROJECT_ID, TEST_PROJECT_ID]
 
-        # conversation-A 的 project_id 不被消息文本/任何输入改变
-        a_row = env.client.get(
-            f"/api/conversations/{conversation_a}"
-        ).json()
-        assert a_row["project_id"] == PROJECT_A
+        a_row = env.client.get(f"/api/conversations/{conversation_a}").json()
+        assert a_row["project_id"] == TEST_PROJECT_ID
+
+    def test_other_registered_project_rejected_with_zero_side_effects(
+        self, env: Env, created: list[str]
+    ) -> None:
+        """D1 加固：其他项目**已注册**也不得创建（零会话 / 零归属行）。"""
+        before_conversations = _count_for_project(
+            _CONVERSATION_TABLE, PROJECT_A
+        )
+        before_owners = _count_for_project(_OWNER_TABLE, PROJECT_A)
+
+        response = env.client.post(
+            "/api/conversations", json={"project_id": PROJECT_A}
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "项目未注册或不可用"
+        assert (
+            _count_for_project(_CONVERSATION_TABLE, PROJECT_A)
+            == before_conversations
+        )
+        assert _count_for_project(_OWNER_TABLE, PROJECT_A) == before_owners
 
 
 # ============================================================

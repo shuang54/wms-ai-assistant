@@ -221,8 +221,14 @@ class ConversationService:
 
     # ---------- 对外 Contract ----------
 
-    def create_conversation(self, *, project_id: str) -> ConversationView:
+    def create_conversation(
+        self, *, project_id: str, owner_user_id: str | None = None
+    ) -> ConversationView:
         """创建会话（服务端生成 conversation_id；status = ACTIVE）。
+
+        Phase 7 Recovery M2.2：``owner_user_id``（**已认证**用户；由 API 层
+        从服务端会话解析后传入）非 None 时，归属行与 Conversation 由
+        Repository 在**同一事务**落库——失败即整体回滚，不产生无主会话。
 
         Raises:
             ValueError:                   project_id 非法（空 / 非 str / 超长）。
@@ -234,6 +240,7 @@ class ConversationService:
             conversation_id=conversation_id,
             project_id=validated_project_id,
             status=CONVERSATION_STATUS_ACTIVE,
+            owner_user_id=owner_user_id,
         )
         return _to_conversation_view(row)
 

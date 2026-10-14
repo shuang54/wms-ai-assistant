@@ -46,6 +46,16 @@ from backend.app.services.conversation_context_builder import (
     ConversationContextBuilder,
 )
 from backend.app.services.conversation_service import ConversationService
+from backend.app.services.resource_ownership_service import (
+    RESOURCE_TYPE_CONVERSATION,
+)
+from tests.conversation_auth_support import (
+    AutoCsrfTestClient,
+    create_and_login,
+    delete_users,
+    register_test_projects,
+    unregister_test_projects,
+)
 from tests.test_conversation_multiturn_db_e2e import (
     FakeOrchestrator,
     FakeOrchestratorFactory,
@@ -65,6 +75,7 @@ TEST_PROJECT_ID = "phase-4-2-step-7g-test"
 
 _CONVERSATION_TABLE = "ai_ops.conversation"
 _TURN_TABLE = "ai_ops.conversation_turn"
+_OWNER_TABLE = "ai_ops.resource_owner"
 
 _OBSERVABILITY_TABLES: tuple[str, ...] = (
     "ai_ops.llm_usage_record",
@@ -96,13 +107,31 @@ def _ensure_tables() -> None:
 def _residue_guard() -> Iterator[None]:
     before_conversations = _count(_CONVERSATION_TABLE)
     before_turns = _count(_TURN_TABLE)
+    before_owners = _count(_OWNER_TABLE)
     before_observability = {t: _count(t) for t in _OBSERVABILITY_TABLES}
 
     yield
 
     assert _count(_CONVERSATION_TABLE) == before_conversations, "conversation 残留"
     assert _count(_TURN_TABLE) == before_turns, "conversation_turn 残留"
+    assert _count(_OWNER_TABLE) == before_owners, "resource_owner 残留"
     assert {t: _count(t) for t in _OBSERVABILITY_TABLES} == before_observability
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _register_projects() -> Iterator[None]:
+    """M2.2 D1：创建会话前项目必须在服务端注册表登记（module 结束卸载）。"""
+    registered = register_test_projects((TEST_PROJECT_ID,))
+    yield
+    unregister_test_projects(registered)
+
+
+@pytest.fixture(scope="module")
+def created_users() -> Iterator[set[str]]:
+    """本 module 创建的用户 / 会话（module 结束定向删除）。"""
+    user_ids: set[str] = set()
+    yield user_ids
+    delete_users(user_ids)
 
 
 @pytest.fixture()
@@ -120,7 +149,15 @@ class Env:
 
 
 @pytest.fixture()
-def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
+def env(
+    monkeypatch: pytest.MonkeyPatch, created_users: set[str]
+) -> Iterator[Env]:
+    """D1 加固：部署允许项目 = 本文件测试项目（注册表仍必须命中）。"""
+    monkeypatch.setattr(
+        conversations_module,
+        "get_conversation_allowed_project_id",
+        lambda: TEST_PROJECT_ID,
+    )
     orchestrator = FakeOrchestrator()
     factory = FakeOrchestratorFactory(orchestrator)
     service = ChatApplicationService(
@@ -133,7 +170,8 @@ def env(monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
         "_chat_application_service",
         service,  # type: ignore[arg-type]
     )
-    with TestClient(app) as test_client:
+    with AutoCsrfTestClient(app, base_url="https://testserver") as test_client:
+        created_users.add(create_and_login(test_client, "alice"))
         yield Env(client=test_client, service=service, orchestrator=orchestrator)
 
 
@@ -171,11 +209,19 @@ def _count_turns(conversation_id: str) -> int:
 
 
 def _delete_conversations(conversation_ids: list[str]) -> None:
+    """精确删除本测试创建的会话（含 M2.2 归属行；绝不 TRUNCATE）。"""
     if not conversation_ids:
         return
     factory = _session_factory()
     with factory() as session, session.begin():
         for conversation_id in conversation_ids:
+            session.execute(
+                text(
+                    f"DELETE FROM {_OWNER_TABLE} "
+                    "WHERE resource_type = :rt AND resource_id = :cid"
+                ),
+                {"rt": RESOURCE_TYPE_CONVERSATION, "cid": conversation_id},
+            )
             session.execute(
                 text(
                     f"DELETE FROM {_CONVERSATION_TABLE} "

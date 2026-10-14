@@ -38,6 +38,7 @@ from backend.app.services.conversation_service import (
     ConversationTurnView,
     ConversationView,
 )
+from tests.conversation_auth_support import patch_conversation_api
 
 #: 冻结的 Conversation 路径（4 条路径；Step 12 起 messages 同时含 GET 与 POST）。
 EXPECTED_CONVERSATION_ROUTES: dict[str, set[str]] = {
@@ -124,20 +125,29 @@ class FakeConversationService:
 
 
 @pytest.fixture()
-def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def fake(monkeypatch: pytest.MonkeyPatch) -> FakeConversationService:
     """每个用例都注入 Fake Service（保证 DB = 0）。"""
-    fake = FakeConversationService()
+    service = FakeConversationService()
     monkeypatch.setattr(
-        conversations_module, "_conversation_service", fake  # type: ignore[arg-type]
+        conversations_module, "_conversation_service", service  # type: ignore[arg-type]
     )
-    return TestClient(app)
+    return service
 
 
 @pytest.fixture()
-def fake(client: TestClient) -> FakeConversationService:
-    service = conversations_module.get_conversation_service()
-    assert isinstance(service, FakeConversationService)
-    return service
+def client(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeConversationService
+) -> TestClient:
+    """已登录客户端（Phase 7 Recovery M2.2）。
+
+    契约测试模式（``mirror_conversations=True``）：归属语义不在本文件测试范围
+    （专用覆盖见 ``tests/test_conversation_ownership.py``），归属替身以 Fake
+    Service 中会话的存在性为准；认证 / CSRF 复用生产语义（**不**削弱）。
+    """
+    client, _own = patch_conversation_api(
+        monkeypatch, fake, mirror_conversations=True
+    )
+    return client
 
 
 def _conversation_view(conversation_id: str, status: str = "ACTIVE") -> ConversationView:
@@ -405,8 +415,12 @@ class TestArchiveConversation:
     def test_archived_error_maps_to_409(
         self, client: TestClient, fake: FakeConversationService
     ) -> None:
-        """契约保留：ConversationArchivedError → 409（当前端点真实路径不触发）。"""
+        """契约保留：ConversationArchivedError → 409（当前端点真实路径不触发）。
+
+        M2.2：会话须先存在（归属校验先于 Service 调用）。
+        """
         conversation_id = str(uuid.uuid4())
+        fake._conversations[conversation_id] = _conversation_view(conversation_id)  # noqa: SLF001
         fake.raise_on(
             "archive_conversation",
             ConversationArchivedError(f"conversation 已归档: {conversation_id}"),

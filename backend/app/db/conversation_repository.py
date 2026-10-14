@@ -59,6 +59,11 @@ from backend.app.db.models.conversation_turn import (
     TURN_ROLE_USER,
     ConversationTurn,
 )
+from backend.app.db.models.resource_owner import (
+    RESOURCE_TYPE_CONVERSATION,
+    ResourceOwner,
+)
+from backend.app.db.resource_owner_repository import validate_owner_user_id
 from backend.app.db.session import get_session_factory
 
 __all__ = [
@@ -498,8 +503,15 @@ class ConversationRepository:
         conversation_id: str,
         project_id: str,
         status: str = CONVERSATION_STATUS_ACTIVE,
+        owner_user_id: str | None = None,
     ) -> ConversationRow:
         """插入会话（conversation_id 由 **Service** 生成，本层不生成 ID）。
+
+        Phase 7 Recovery M2.2：``owner_user_id`` 非 None 时，归属行
+        （``ai_ops.resource_owner``）与 Conversation **在同一事务**内插入——
+        任一步失败整体 ROLLBACK ⇒ **绝不留下无主 Conversation**（D2）。
+        绑定冲突（同资源异用户）在本路径不可能发生：conversation_id 由
+        服务端即时生成（uuid4）。
 
         Raises:
             ValueError: 参数非法（触达 DB 之前拦截）。
@@ -508,6 +520,11 @@ class ConversationRepository:
         validated_id = validate_conversation_id(conversation_id)
         validated_project = validate_project_id(project_id)
         validated_status = validate_status(status)
+        validated_owner = (
+            validate_owner_user_id(owner_user_id)
+            if owner_user_id is not None
+            else None
+        )
         factory = self._get_session_factory()
         statement = self.build_conversation_insert(
             conversation_id=validated_id,
@@ -517,6 +534,16 @@ class ConversationRepository:
         try:
             with factory() as session, session.begin():
                 raw = session.execute(statement).one()
+                if validated_owner is not None:
+                    # 同一事务内绑定所有权（失败 ⇒ 整体回滚）
+                    session.add(
+                        ResourceOwner(
+                            resource_type=RESOURCE_TYPE_CONVERSATION,
+                            resource_id=validated_id,
+                            user_id=validated_owner,
+                            project_id=validated_project,
+                        )
+                    )
         except SQLAlchemyError as exc:
             raise ConversationRepositoryError(
                 f"Conversation 写入失败: {type(exc).__name__}"

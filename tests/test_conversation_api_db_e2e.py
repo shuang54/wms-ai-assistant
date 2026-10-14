@@ -46,6 +46,16 @@ from backend.app.services.conversation_service import (
     ConversationArchivedError,
     ConversationService,
 )
+from backend.app.services.resource_ownership_service import (
+    RESOURCE_TYPE_CONVERSATION,
+)
+from tests.conversation_auth_support import (
+    AutoCsrfTestClient,
+    create_and_login,
+    delete_users,
+    register_test_projects,
+    unregister_test_projects,
+)
 
 _ENV_FLAG = os.getenv("RUN_DB_TESTS", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -56,9 +66,13 @@ pytestmark = pytest.mark.skipif(
 
 #: 测试专用 project_id（明显标识，便于人工识别）。
 TEST_PROJECT_ID = "phase-4-1-step-9-test"
+#: D1 加固用例使用的第二个项目：**真实注册**但不等于部署配置项目
+#: （用于验证"已注册 ≠ 已授权"）；需显式注册才能证明拒绝理由不是"未注册"。
+BINDING_PROJECT_ID = "project-a"
 
 _CONVERSATION_TABLE = "ai_ops.conversation"
 _TURN_TABLE = "ai_ops.conversation_turn"
+_OWNER_TABLE = "ai_ops.resource_owner"
 
 #: 不得被 Conversation 测试影响的观测表。
 _OBSERVABILITY_TABLES: tuple[str, ...] = (
@@ -89,30 +103,61 @@ def _ensure_tables() -> None:
 
 @pytest.fixture(scope="module", autouse=True)
 def _residue_guard() -> Iterator[None]:
-    """残留守卫：会话级计数前后一致（含观测隔离）。"""
+    """残留守卫：会话级计数前后一致（含归属表 / 观测隔离）。"""
     before_conversations = _count(_CONVERSATION_TABLE)
     before_turns = _count(_TURN_TABLE)
+    before_owners = _count(_OWNER_TABLE)
     before_observability = {t: _count(t) for t in _OBSERVABILITY_TABLES}
 
     yield
 
     assert _count(_CONVERSATION_TABLE) == before_conversations, "conversation 残留"
     assert _count(_TURN_TABLE) == before_turns, "conversation_turn 残留"
+    assert _count(_OWNER_TABLE) == before_owners, "resource_owner 残留"
     after_observability = {t: _count(t) for t in _OBSERVABILITY_TABLES}
     assert after_observability == before_observability, "observability 不得被清理"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _register_projects() -> Iterator[None]:
+    """M2.2 D1：创建会话前项目必须在服务端注册表登记（module 结束卸载）。"""
+    registered = register_test_projects((TEST_PROJECT_ID, BINDING_PROJECT_ID))
+    yield
+    unregister_test_projects(registered)
+
+
+@pytest.fixture(scope="module")
+def created_users() -> Iterator[set[str]]:
+    """本 module 创建的用户 / 会话（module 结束定向删除）。"""
+    user_ids: set[str] = set()
+    yield user_ids
+    delete_users(user_ids)
+
+
 @pytest.fixture()
 def created() -> Iterator[list[str]]:
-    """收集本用例创建的 conversation_id；结束时精确删除。"""
+    """收集本用例创建的 conversation_id；结束时精确删除（含归属行）。"""
     ids: list[str] = []
     yield ids
     _delete_conversations(ids)
 
 
 @pytest.fixture()
-def client() -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
+def client(
+    monkeypatch: pytest.MonkeyPatch, created_users: set[str]
+) -> Iterator[TestClient]:
+    """已登录客户端（M2.2：真实 DB 用户 + HTTP 登录 + 自动 CSRF 头）。
+
+    D1 加固：将"部署允许项目"替换为本文件的测试项目——等价于以
+    ``PROJECT_ID=<测试项目>`` 部署（注册表仍必须命中 ⇒ 见 ``_register_projects``）。
+    """
+    monkeypatch.setattr(
+        conversations_module,
+        "get_conversation_allowed_project_id",
+        lambda: TEST_PROJECT_ID,
+    )
+    with AutoCsrfTestClient(app, base_url="https://testserver") as test_client:
+        created_users.add(create_and_login(test_client, "alice"))
         yield test_client
 
 
@@ -135,11 +180,19 @@ def _count(table: str) -> int:
 
 
 def _delete_conversations(conversation_ids: list[str]) -> None:
+    """精确删除本测试创建的会话（含 M2.2 归属行；绝不 TRUNCATE）。"""
     if not conversation_ids:
         return
     factory = _session_factory()
     with factory() as session, session.begin():
         for conversation_id in conversation_ids:
+            session.execute(
+                text(
+                    f"DELETE FROM {_OWNER_TABLE} "
+                    "WHERE resource_type = :rt AND resource_id = :cid"
+                ),
+                {"rt": RESOURCE_TYPE_CONVERSATION, "cid": conversation_id},
+            )
             session.execute(
                 text(f"DELETE FROM {_CONVERSATION_TABLE} WHERE conversation_id = :cid"),
                 {"cid": conversation_id},
@@ -153,6 +206,18 @@ def _count_turns(conversation_id: str) -> int:
             session.execute(
                 text(f"SELECT COUNT(*) FROM {_TURN_TABLE} WHERE conversation_id = :cid"),
                 {"cid": conversation_id},
+            ).scalar_one()
+        )
+
+
+def _count_for_project(table: str, project_id: str) -> int:
+    """按 project_id 精确计数（D1 拒绝路径的零副作用断言）。"""
+    factory = _session_factory()
+    with factory() as session:
+        return int(
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {table} WHERE project_id = :p"),
+                {"p": project_id},
             ).scalar_one()
         )
 
@@ -575,7 +640,9 @@ class TestStatusCodes:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         class _FailingService:
-            def create_conversation(self, *, project_id: str) -> Any:
+            def create_conversation(
+                self, *, project_id: str, owner_user_id: str | None = None
+            ) -> Any:
                 raise ConversationRepositoryError(
                     "connection failed: postgresql://user:pw@host/db"
                 )
@@ -604,14 +671,36 @@ class TestBindingSecurityIsolation:
     def test_project_binding_is_immutable(
         self, client: TestClient, created: list[str]
     ) -> None:
-        payload = _create_via_api(client, created, project_id="project-a")
+        """会话的 project_id 固定为服务端已验证项目；无 project 切换端点。"""
+        payload = _create_via_api(client, created)
 
         body = client.get(f"/api/conversations/{payload['conversation_id']}").json()
 
-        assert body["project_id"] == "project-a"
+        assert body["project_id"] == TEST_PROJECT_ID
         # 不存在 project 切换端点
         paths = app.openapi()["paths"]
         assert not [p for p in paths if "switch-project" in p]
+
+    def test_other_registered_project_rejected_with_zero_side_effects(
+        self, client: TestClient, created: list[str]
+    ) -> None:
+        """D1 加固：其他项目**已注册**也不得创建；不产生会话 / 归属行。"""
+        before_conversations = _count_for_project(
+            _CONVERSATION_TABLE, BINDING_PROJECT_ID
+        )
+        before_owners = _count_for_project(_OWNER_TABLE, BINDING_PROJECT_ID)
+
+        response = client.post(
+            "/api/conversations", json={"project_id": BINDING_PROJECT_ID}
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "项目未注册或不可用"
+        assert (
+            _count_for_project(_CONVERSATION_TABLE, BINDING_PROJECT_ID)
+            == before_conversations
+        )
+        assert _count_for_project(_OWNER_TABLE, BINDING_PROJECT_ID) == before_owners
 
     def test_response_shapes_are_exact_and_secure(
         self, client: TestClient, created: list[str], service: ConversationService
