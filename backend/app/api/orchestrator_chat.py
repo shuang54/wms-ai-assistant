@@ -37,6 +37,15 @@
 * 现有 ``/api/chat``（ChatService / RAG-only，Phase 3.5.6）行为**不变**：
   本端点是新增的 Orchestrator 总入口，不替换旧端点
 
+认证（Phase 7 Recovery M2.3 A1 —— **不再允许匿名执行**）：
+
+    * 身份只来自 M1 服务端会话（``wms_ai_session`` HttpOnly Cookie →
+      ``ai_ops.user_session``）；本模块**不**接受 API Key / Query / Body 身份；
+    * 认证与 CSRF 校验**先于**任何 Orchestrator / LLM / RAG / Tool /
+      Text-to-SQL 执行：未认证 / 无效 / 过期 / 已撤销会话 ⇒ **401**、
+      缺或不匹配 CSRF ⇒ **403**（固定文案；业务调用 = 0）；
+    * 会话服务不可用 ⇒ **503**（fail-closed；**绝不**降级为匿名放行）。
+
 Phase 3.11 Step 19（Observability Composition Root / Lifecycle Contract）：
 
     本模块同时是 Orchestrator 链路的 **Composition Root**（与既有
@@ -95,9 +104,9 @@ if TYPE_CHECKING:  # 仅类型检查期（避免 import 期拉起组装依赖）
         AssistantTraceQueryService,
     )
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
 from backend.app.config import settings
@@ -106,6 +115,7 @@ from backend.app.projects.context import (
 )
 from backend.app.projects.registry import ProjectNotFoundError
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http  # noqa: E501
+from backend.app.api.auth_dependency import CurrentPrincipal, require_csrf
 from backend.app.services.ai_orchestrator_service import (
     AIOrchestrationResult,
     AIOrchestratorCapabilityError,
@@ -671,16 +681,29 @@ def _to_chat_response(result: AIOrchestrationResult) -> ChatResponse:
     response_model=ChatResponse,
     responses={
         400: {"description": "请求参数非法（question 等）"},
-        403: {"description": "项目能力未启用（Phase 3.8.2 capability denied）"},
+        401: {"description": "未认证 / 会话无效（M2.3 A1；固定文案；零业务执行）"},
+        403: {
+            "description": (
+                "CSRF 校验失败（M2.3 A1；固定文案；零业务执行）"
+                " 或 项目能力未启用（Phase 3.8.2 capability denied）"
+            )
+        },
         404: {"description": "project_id 未注册（Phase 3.8.1）"},
         422: {"description": "请求体校验失败（Pydantic）"},
         500: {"description": "AI 服务内部错误"},
         502: {"description": "路由决策失败（Router / Tool 路由未命中）"},
-        503: {"description": "项目上下文不可用"},
+        503: {"description": "认证服务不可用（fail-closed）或项目上下文不可用"},
     },
 )
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest,
+    principal: CurrentPrincipal,
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> ChatResponse:
     """Orchestrator-backed 统一对话入口。
+
+    认证（Phase 7 Recovery M2.3 A1）：要求 M1 用户会话 + CSRF；
+    **Breaking change：本端点不再允许匿名执行**。
 
     Pipeline：
 

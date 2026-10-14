@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import assistant_trace as trace_module
 from backend.app.api import orchestrator_chat as root
@@ -34,6 +33,11 @@ from backend.app.db.tool_execution_repository import ToolExecutionRecordRow
 from backend.app.services.tool_execution_persistent_query_service import (
     ToolExecutionPersistentQueryService,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _API_MODULE = "backend/app/api/assistant_trace.py"

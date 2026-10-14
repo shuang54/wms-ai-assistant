@@ -25,7 +25,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import tool_chat as tool_chat_module
 from backend.app.llm.client import (
@@ -47,6 +46,11 @@ from backend.app.services.tool_chat_service import (
 )
 from backend.app.tools.mock_tools import register_mock_tools
 from backend.app.tools.registry import ToolRegistry
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/chat/with-tools 不再允许匿名执行。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 def _mock_registry() -> ToolRegistry:

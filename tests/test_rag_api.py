@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import pytest
 from contextlib import contextmanager
-from fastapi.testclient import TestClient
 
 from backend.app.api import rag as rag_module
 from backend.app.embedding.exceptions import (
@@ -44,6 +43,11 @@ from backend.app.services.vector_search_service import (
     VectorSearchInputError,
     VectorSearchParameterError,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/rag/answer 与 /api/chat 不再允许匿名执行。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 # ============================================================

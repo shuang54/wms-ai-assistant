@@ -23,7 +23,6 @@ import os
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import bindparam, text
 
 from backend.app.api import orchestrator_chat as root
@@ -56,6 +55,11 @@ from backend.app.services.tool_execution_persistent_query_service import (
 from backend.app.services.tool_execution_service import ToolExecutionService
 from backend.app.tools.get_inventory import GET_INVENTORY_DEFINITION
 from backend.app.tools.registry import ToolRegistry
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _LLM_TABLE = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
 _TOOL_TABLE = "ai_ops.tool_execution_record"

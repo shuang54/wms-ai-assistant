@@ -30,7 +30,6 @@ import dataclasses
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import chat as chat_module
 from backend.app.api import orchestrator_chat as orch_module
@@ -50,6 +49,11 @@ from backend.app.services.rag_observability_runtime import (
     get_rag_observability_query_service,
 )
 from backend.app.services.vector_search_service import VectorSearchResult
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：四个 AI 执行入口不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _RAG_QUESTION = "采购入库的操作步骤是什么"

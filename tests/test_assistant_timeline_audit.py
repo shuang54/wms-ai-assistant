@@ -329,13 +329,19 @@ class TestCorrelationAudit:
         assert "request_id" in LLM_USAGE_TRACE_READ_COLUMNS
         assert "assistant_request_id" in LLM_USAGE_TRACE_READ_COLUMNS
 
-    def test_3_tool_request_id_is_the_assistant_request_id(self, e2e) -> None:
+    def test_3_tool_request_id_is_the_assistant_request_id(
+        self, e2e, monkeypatch
+    ) -> None:
         """离线 E2E：Tool 持久化记录的 request_id == metadata.request_id。"""
         _repository, _handler, persistent_tools, _collector = e2e()
 
-        from fastapi.testclient import TestClient
+        # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 安装 Fake 会话 + 认证客户端
+        from tests.api_session_auth import SessionTestClient as TestClient
+        from tests.api_session_auth import install_fake_session_service
 
         from backend.app.main import app
+
+        install_fake_session_service(monkeypatch)
 
         with TestClient(app) as client:
             response = client.post(

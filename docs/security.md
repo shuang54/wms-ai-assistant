@@ -188,3 +188,49 @@ AUTH_COOKIE_SECURE=true       # 生产必须为 true（TLS 内网例外需显式
 `tests/test_conversation_message_api_architecture_audit.py`、
 `tests/test_conversation_api_db_e2e.py`、`tests/test_conversation_multiturn_db_e2e.py`、
 `tests/test_conversation_context_e2e_db.py`（`RUN_DB_TESTS=1`）。
+
+---
+
+## 9. AI 执行入口认证（Phase 7 Recovery M2.3 A1；已实现）
+
+四个 **AI 执行入口**（`POST /api/ai/chat`、`POST /api/chat`、
+`POST /api/chat/with-tools`、`POST /api/rag/answer`）从**可匿名执行**改为
+**必须认证**（对 Step 12 / 早期冻结契约的正式修订，先例：S7.1→S7.2 的
+"审计缺口 → 语义翻转"）：
+
+| 项 | 行为 |
+| --- | --- |
+| 匿名 | **不再允许**（未认证 ⇒ 401；LLM / Tool / RAG / Text-to-SQL 调用 = 0） |
+| 身份来源 | M1 服务端会话（`wms_ai_session` HttpOnly Cookie → `ai_ops.user_session`）；**不**接受 API Key / Query / Body 身份字段 |
+| 无效 / 过期 / 已撤销会话 | **401**（固定文案；不区分原因、不泄露账号存在性） |
+| CSRF | 四个端点均为 POST 且**有服务端副作用**（LLM 成本 / 真实 Tool 执行 / SQL 只读查询 / 观测写入）⇒ 要求会话绑定双提交头 `X-CSRF-Token`（Cookie 值 == 头 == 服务端重算 HMAC）；缺失 / 不匹配 / 伪造 / 换会话 ⇒ **403**，副作用为零 |
+| 认证服务故障 | **503 fail closed**（**绝不**降级为匿名继续调用 AI，见 §9 下方反模式） |
+| 机器调用 | 当前**无**适用 API-Key 契约；本阶段**不**新增 API-Key 路径。若未来需要服务间调用，必须先建立并评审独立契约（**不得**以"兼容"为由保留匿名） |
+| 响应 / 参数契约 | 除认证外不变（DTO / 校验语义 / Router 策略 / Prompt / Tool 契约 / 幂等行为均未修改） |
+
+明确边界（**不**宣称已达成）：
+
+- **A1 ≠ 全部 API 已完成认证**：仍为只读匿名的端点 = `/api/usage*`（1）+
+  `/api/observability/*`（6，allowlist 冻结，**未**纳入本阶段，见 A2 计划）；
+  `/api/health` 保持公开；
+- **A2 尚未开始**（7 个只读端点）；
+- 当前项目作用域仍是**单部署项目作用域**（§8），**不是**用户级 RBAC——
+  不得表述为"已实现用户级授权"；
+- HTTPS / 网络边界仍为 **NOT VERIFIED** ⇒ A1 完成**不代表**生产部署就绪
+  （`PRODUCTION_DEPLOYMENT` 仍为 **BLOCKED**）。
+
+禁止的反模式（本阶段明确不采用）：
+
+```text
+认证异常 / 未认证
+    ↓
+自动降级为匿名访问
+    ↓
+继续调用 LLM / Tool / RAG
+```
+
+测试证据：`tests/test_ai_execution_api_auth.py`（四端点认证 / CSRF 矩阵 +
+失败路径零业务执行断言 + "不使用 dependency_overrides" 元断言）；
+26 个调用方测试文件改用认证客户端（`tests/api_session_auth.py`，仅替换会话
+存储 Fake，生产依赖仍真实执行）；四个入口 Python 源码侧认证说明见
+`docs/api.md` §13。

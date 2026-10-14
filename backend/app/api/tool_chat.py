@@ -46,6 +46,14 @@ characterization 测试使用（测试自行构造 Mock Registry 注入），
 
 真实 ``get_work_order`` 接入 = DEFERRED（Step 12+）。
 
+认证（Phase 7 Recovery M2.3 A1）：
+    * 身份只来自 M1 服务端会话（``wms_ai_session`` HttpOnly Cookie）；
+      本模块**不**接受 API Key / Query / Body 身份字段；
+    * 认证与 CSRF 校验先于任何 LLM / Tool 执行：未认证 / 无效会话 ⇒ **401**、
+      缺或不匹配 CSRF ⇒ **403**（固定文案；LLM 调用 = 0、Tool 执行 = 0）；
+    * 会话服务不可用 ⇒ **503**（fail-closed；**绝不**降级为匿名放行）；
+    * **Breaking change：本端点不再允许匿名执行**。
+
 安全（Step 11 未削弱任何既有机制）：
 
     * Tool 参数只有 material_code（必填）/ warehouse_code（可选，当前库存表
@@ -84,11 +92,13 @@ DATABASE_URL / SQL / traceback / Tool handler / embedding。
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http
+from backend.app.api.auth_dependency import CurrentPrincipal, require_csrf
 from backend.app.projects.registry import (
     ProjectNotFoundError,
     ProjectRegistry,
@@ -208,16 +218,29 @@ def _build_project_execution_service(project_id: str) -> ToolExecutionService:
     response_model=ToolChatApiResponse,
     responses={
         400: {"description": "请求参数非法（message 等）"},
-        403: {"description": "项目能力未启用（Phase 3.11 Step 10 capability denied）"},
+        401: {"description": "未认证 / 会话无效（M2.3 A1；固定文案；零业务执行）"},
+        403: {
+            "description": (
+                "CSRF 校验失败（M2.3 A1；固定文案；零业务执行）"
+                " 或 项目能力未启用（Phase 3.11 Step 10 capability denied）"
+            )
+        },
         404: {"description": "project_id 未注册（Phase 3.11 Step 10）"},
         422: {"description": "请求体校验失败（Pydantic）"},
         500: {"description": "Tool Chat 服务内部错误"},
         502: {"description": "LLM 多 Tool Call / 预算耗尽 / LLM 响应解析失败"},
-        503: {"description": "LLM 配置错误"},
+        503: {"description": "认证服务不可用（fail-closed）或 LLM 配置错误"},
     },
 )
-async def chat_with_tools(request: ToolChatRequest) -> ToolChatApiResponse:
+async def chat_with_tools(
+    request: ToolChatRequest,
+    principal: CurrentPrincipal,
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> ToolChatApiResponse:
     """对话接口（Phase 3.6.3 Multi-Step + Phase 3.11 Step 11 真实 Tool）。
+
+    认证（Phase 7 Recovery M2.3 A1）：要求 M1 用户会话 + CSRF；
+    **Breaking change：本端点不再允许匿名执行**。
 
     Pipeline：
 

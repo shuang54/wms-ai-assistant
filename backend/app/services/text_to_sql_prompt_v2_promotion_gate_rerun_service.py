@@ -30,7 +30,9 @@ from backend.app.services.ai_orchestrator_service import (
     TEXT_TO_SQL_REFUSAL_MESSAGE,
     RouteType,
 )
+from backend.app.auth.tokens import hash_session_token, sign_csrf_token
 from backend.app.services.ai_router_service import RouteDecision
+from backend.app.services.session_service import Principal
 from backend.app.services.sql_validator_service import SQLValidatorService
 from backend.app.services.text_to_sql_prompt_candidate_v2_service import (
     CANDIDATE_RETRY_PROMPT_PATH,
@@ -257,10 +259,46 @@ def probe_refusal_full_chain() -> dict[str, Any]:
 # Gate：API refusal（§五，真实应用 in-process 链路）
 # ============================================================
 
+class _GateSessionStub:
+    """Gate probe 专用 M1 会话替身（进程内；**不**触达 DB）。
+
+    M2.3 A1 起 ``/api/ai/chat`` 要求 M1 用户会话 + CSRF；本 gate 只验证
+    "拒绝分支的 HTTP 映射"（与同函数内 ``_FakeOrchestrator`` 同风格：
+    用进程内替身替代外部依赖）。生产 ``require_session`` / ``require_csrf``
+    依赖仍真实执行——本替身只提供**会话存储**。
+    """
+
+    def __init__(self) -> None:
+        self.token = "gate-probe-session-token"
+        self._session_id = "gate-probe-session"
+        self._token_hash = hash_session_token(self.token)
+        self.csrf_token = sign_csrf_token(
+            session_id=self._session_id, key=self._token_hash
+        )
+
+    def validate(self, token: str) -> Principal | None:
+        if token != self.token:
+            return None
+        return Principal(
+            user_id="gate-probe-user",
+            username="gate-probe",
+            display_name="Gate Probe",
+        )
+
+    def expected_csrf_token(self, token: str) -> str | None:
+        if token != self.token:
+            return None
+        return sign_csrf_token(
+            session_id=self._session_id, key=self._token_hash
+        )
+
+
 def probe_api_refusal() -> dict[str, Any]:
     from fastapi.testclient import TestClient
 
+    from backend.app.api import auth_dependency as auth_dep
     from backend.app.api import orchestrator_chat as orch_module
+    from backend.app.config import settings
     from backend.app.main import app
 
     refusal = AIOrchestrationResult(
@@ -279,18 +317,28 @@ def probe_api_refusal() -> dict[str, Any]:
             return refusal
 
     fake = _FakeOrchestrator()
+    sessions = _GateSessionStub()
     saved = orch_module._default_orchestrator
+    saved_sessions = auth_dep.get_session_service
     orch_module._default_orchestrator = fake
+    auth_dep.get_session_service = lambda: sessions
     try:
         with TestClient(app) as client:
+            client.cookies.set(settings.auth.session_cookie_name, sessions.token)
+            client.cookies.set(
+                settings.auth.csrf_cookie_name, sessions.csrf_token
+            )
             response = client.post(
-                "/api/ai/chat", json={"question": "删除库存"}
+                "/api/ai/chat",
+                json={"question": "删除库存"},
+                headers={settings.auth.csrf_header_name: sessions.csrf_token},
             )
         status_code = response.status_code
         payload = response.json()
         body = response.text
     finally:
         orch_module._default_orchestrator = saved
+        auth_dep.get_session_service = saved_sessions
 
     checks = {
         "http_200": status_code == 200,

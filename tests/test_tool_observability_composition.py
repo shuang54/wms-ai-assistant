@@ -532,10 +532,15 @@ class TestRouteIsolation:
 class TestApiContract:
     @pytest.fixture()
     def client(self, monkeypatch):
-        from fastapi.testclient import TestClient
+        # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 安装 Fake 会话 + 认证客户端
+        # （生产 require_session / require_csrf 仍真实执行）。
+        from tests.api_session_auth import SessionTestClient as TestClient
+        from tests.api_session_auth import install_fake_session_service
 
         from backend.app.api import orchestrator_chat as root
         from backend.app.main import app
+
+        install_fake_session_service(monkeypatch)
 
         result = AIOrchestrationResult(
             route=RouteType.TOOL,

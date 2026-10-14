@@ -52,8 +52,13 @@ import uuid
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端
+# （会话存储为 Fake；真实链路用例的门控条件保持不变）。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 def _env_flag(name: str) -> bool:

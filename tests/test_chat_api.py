@@ -27,7 +27,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import orchestrator_chat as orch_module
 from backend.app.main import app
@@ -42,6 +41,11 @@ from backend.app.services.ai_orchestrator_service import (
 from backend.app.services.ai_router_service import RouteType
 from backend.app.services.rag_service import RagResponse, RagSource
 from backend.app.tools.registry import ToolRegistry, ToolResult
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 测试使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 # ============================================================

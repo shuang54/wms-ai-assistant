@@ -27,7 +27,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.projects.capabilities import ProjectCapabilities
@@ -49,6 +48,11 @@ from backend.app.services.project_orchestrator_factory import (
 )
 
 import backend.app.services.project_orchestrator_factory as factory_module
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 def _env_flag(name: str) -> bool:

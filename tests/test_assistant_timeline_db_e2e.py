@@ -28,7 +28,6 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.api import orchestrator_chat as root
@@ -39,6 +38,11 @@ from backend.app.services.llm_usage_persistence_service import (
     DatabaseLLMAccountingSink,
 )
 from backend.app.services.text_to_sql_service import REFUSAL_MARKER
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 from tests.test_assistant_trace_correlation_e2e import (  # noqa: PLC2701
     _RAG_QUESTION,

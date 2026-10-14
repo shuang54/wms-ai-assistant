@@ -51,6 +51,9 @@
 
 ### 2.2 POST /api/chat
 
+> **认证（Phase 7 Recovery M2.3 A1）**：要求 M1 用户会话（HttpOnly Cookie）+
+> CSRF；**不再允许匿名执行**——完整契约见 **§13**。
+
 对话接口。Phase 3.5.6 起基于 RAG 知识库回答：
 
 ```text
@@ -104,6 +107,10 @@ ChatService → RagService → Vector Search → Context Builder → LLMClient
 
 ### 2.3 POST /api/rag/answer
 
+> **认证（Phase 7 Recovery M2.3 A1）**：要求 M1 用户会话 + CSRF；
+> **不再允许匿名执行**（该端点会返回知识片段正文 `sources[].content`）——
+> 完整契约见 **§13**。
+
 独立 RAG 问答接口（Phase 3.5.5），与 `/api/chat` 共用 RagService，
 可显式指定召回片段数。
 
@@ -152,6 +159,9 @@ ChatService → RagService → Vector Search → Context Builder → LLMClient
 ---
 
 ### 2.4 POST /api/chat/with-tools
+
+> **认证（Phase 7 Recovery M2.3 A1）**：要求 M1 用户会话 + CSRF；
+> **不再允许匿名执行**（该端点会触发**真实 Tool 执行**）——完整契约见 **§13**。
 
 对话接口（Phase 3.6.2 引入；Phase 3.6.3 升级为 **Multi-Step Tool Calling**；
 Phase 3.11 Step 9 起 Tool 执行统一走 ToolExecutionService；
@@ -539,10 +549,11 @@ RAG / Tool / Text-to-SQL 之一（Phase 3.12 Step 34 审计结论：这是当前
 Method:       POST
 Request:      { "question": str（必填，非空 / 非纯空白）, "project_id": str | None }
 Response:     { "route": "rag" | "tool" | "text_to_sql",
-                "content": str | None,
-                "data": object | None,
-                "metadata": object }
-Auth:         当前项目现有 API 机制（未新增认证）
+               "content": str | None,
+               "data": object | None,
+               "metadata": object }
+Auth:         M1 用户会话（HttpOnly Cookie）+ CSRF —— Phase 7 Recovery M2.3 A1
+              （**不再允许匿名执行**；完整契约见 §13）
 Side Effect:  按 route：RAG 检索 + LLM / Tool 只读执行 / Text-to-SQL 只读查询
 ```
 
@@ -1331,3 +1342,70 @@ answer_review    v1   AI（问题模板）→ APPROVAL → 终态
 - DB E2E：`tests/test_conversation_api_db_e2e.py`、
   `tests/test_conversation_multiturn_db_e2e.py`、
   `tests/test_conversation_context_e2e_db.py`（均 `RUN_DB_TESTS=1`）
+
+---
+
+## 13. AI 执行入口认证（Phase 7 Recovery M2.3 A1）
+
+以下**四个 AI 执行入口**自 M2.3 A1 起要求 **M1 用户会话 + CSRF**：
+
+| 方法 | 路径 | 说明 | 失败拒绝时的业务执行 |
+| --- | --- | --- | --- |
+| POST | `/api/ai/chat` | Orchestrator 统一入口（RAG / Tool / Text-to-SQL） | LLM = 0 · Tool = 0 · SQL = 0 |
+| POST | `/api/chat` | RAG 问答（ChatService → RagService） | LLM = 0 · RAG = 0 |
+| POST | `/api/chat/with-tools` | Multi-Step Tool Calling（真实 Tool 执行） | LLM = 0 · Tool = 0 |
+| POST | `/api/rag/answer` | 独立 RAG 问答（可指定 `top_k`） | LLM = 0 · RAG = 0 |
+
+```text
+Breaking change（M2.3 A1）:
+The four AI execution endpoints no longer permit anonymous execution.
+```
+
+### 13.1 认证（浏览器调用）
+
+- 身份**只**来自 M1 服务端会话（`wms_ai_session` HttpOnly Cookie →
+  `ai_ops.user_session`，见 §12.2 的同一机制）；登录入口 `POST /api/auth/login`。
+- 缺 / 无效 / 过期 / 已撤销会话 ⇒ **401**（固定文案「认证失败：缺少或无效的会话」）；
+  认证服务不可用 ⇒ **503**（固定文案「认证服务不可用」）——**绝不**降级为匿名。
+- 本 API **不**接受 `X-API-Key`、Query 或 Body 中的用户身份；四个端点亦**不**
+  新增 API-Key 认证路径（如需机器调用，必须先建立独立契约并单独评审）。
+- 认证与 CSRF 校验**先于**任何 LLM / RAG / Tool / Text-to-SQL 执行。
+
+### 13.2 CSRF（写操作保护）
+
+- 四个端点均为 POST 且**有服务端副作用**（LLM 成本、真实 Tool 执行、
+  Text-to-SQL 只读查询、观测记录写入）⇒ 与 M1/M2.2 同机制要求会话绑定的
+  双提交头：`X-CSRF-Token` = `wms_ai_csrf` Cookie 值，且必须等于服务端用
+  当前会话重算的 HMAC。
+- 缺头 / 缺 Cookie / 两者不一致 / 伪造值 / 其他会话的值 ⇒ **403**
+  （固定文案「CSRF 校验失败」），副作用为零。
+- **不**依赖 `SameSite` 或自定义前端头作为 CSRF 防护（见 OWASP CSRF
+  Prevention Cheat Sheet）。
+
+### 13.3 兼容性（除认证外契约不变）
+
+- 请求 DTO / 成功响应 DTO / 正常业务结果结构**均未变化**（见 §2.2 / §2.3 /
+  §2.4 / §2.9 的既有定义）；参数校验语义（422 / 400）不变。
+- Tool 参数契约、RAG 检索语义、Text-to-SQL 语义、Router 策略、Prompt、
+  幂等行为（四个端点本就无幂等机制）均未修改。
+- 受影响调用方：仓库内 26 个测试文件（已改为携带会话 + CSRF 的客户端）、
+  `README.md` 中的匿名用法示例（待后续文档提交同步）；**无**仓库内脚本 /
+  服务间调用方依赖匿名访问。
+
+### 13.4 边界（如实声明）
+
+- **A1 ≠ 全部 API 已完成认证**：`/api/usage*`（1）与
+  `/api/observability/*`（6，allowlist 冻结）仍为只读匿名端点，
+  未纳入本阶段（见 A2 计划）；`/api/health` 保持公开。
+- 当前项目作用域仍是**单部署项目作用域**（§12.4），**不是**用户级 RBAC。
+- HTTPS / 网络边界**未验证** ⇒ 本阶段完成**不代表**生产部署就绪。
+
+### 13.5 测试证据
+
+- 认证 / CSRF 矩阵：`tests/test_ai_execution_api_auth.py`
+  （四端点 × 未登录 / 无效 / 过期 / 已撤销 / 缺 CSRF / 伪造 CSRF / 换会话 /
+  合法 / 认证服务故障 / 参数校验；失败路径断言四类业务调用为 0）
+- 调用方改造后的回归：`tests/test_chat.py`、`tests/test_chat_api.py`、
+  `tests/test_rag_api.py`、`tests/test_tool_chat_api.py` 等 26 个文件
+  （认证客户端由 `tests/api_session_auth.py` 提供；生产
+  `require_session` / `require_csrf` 仍真实执行，**无** `dependency_overrides`）

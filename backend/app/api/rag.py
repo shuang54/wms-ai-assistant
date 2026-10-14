@@ -4,6 +4,10 @@
 
     HTTP Request
         ↓
+    M1 用户会话认证（Phase 7 Recovery M2.3 A1：**不再允许匿名执行**）
+        ↓
+    CSRF 校验（Cookie 会话的状态变更请求）
+        ↓
     /api/rag/answer
         ↓
     RagService（Phase 3.5.4）
@@ -21,17 +25,24 @@
 
 不做：Embedding / pgvector / Prompt 拼接 / LLM 调用 / 数据库查询。
 
+认证（Phase 7 Recovery M2.3 A1）：
+    * 身份只来自 M1 服务端会话（HttpOnly Cookie）；不接受 API Key / 身份字段；
+    * 未认证 / 无效会话 ⇒ 401；缺或不匹配 CSRF ⇒ 403；认证服务故障 ⇒ 503
+      （fail-closed；**绝不**匿名放行）——全部先于任何 RAG / LLM 执行。
+
 与 /api/chat 的关系：Phase 3.5.6 起 /api/chat 也经由 RagService；
 本接口保留独立的 RAG 问答入口（可显式指定 top_k）。
 """
 from __future__ import annotations
 
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
 
 from backend.app.api._rag_error_mapping import rag_pipeline_error_to_http
+from backend.app.api.auth_dependency import CurrentPrincipal, require_csrf
 from backend.app.services.rag_service import RagResponse, RagService
 from backend.app.services.vector_search_service import VectorSearchService
 
@@ -126,9 +137,24 @@ def _to_answer_response(result: RagResponse) -> RagAnswerResponse:
 # Endpoint
 # ============================================================
 
-@router.post("/rag/answer", response_model=RagAnswerResponse)
-async def rag_answer(request: RagAnswerRequest) -> RagAnswerResponse:
+@router.post(
+    "/rag/answer",
+    response_model=RagAnswerResponse,
+    responses={
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "CSRF 校验失败（固定文案；零业务执行）"},
+        503: {"description": "认证服务不可用（fail-closed）"},
+    },
+)
+async def rag_answer(
+    request: RagAnswerRequest,
+    principal: CurrentPrincipal,
+    _csrf: Annotated[None, Depends(require_csrf)],
+) -> RagAnswerResponse:
     """基于知识库的 RAG 问答接口。
+
+    认证（Phase 7 Recovery M2.3 A1）：要求 M1 用户会话 + CSRF；
+    **Breaking change：本端点不再允许匿名执行**。
 
     Pipeline（全部由 RagService 承担）：
 

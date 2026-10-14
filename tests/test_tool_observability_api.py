@@ -26,7 +26,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import orchestrator_chat as root
 from backend.app.api import tool_observability as api_module
@@ -49,6 +48,11 @@ from backend.app.services.tool_observability_snapshot import (
     ToolExecutionSnapshot,
 )
 from backend.app.tools.registry import ToolRegistry
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 # 复用既有测试资产（Fakes / decisions），不重复创建
 from tests.test_ai_orchestrator import (  # noqa: E402

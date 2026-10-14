@@ -29,7 +29,6 @@ import logging
 import os
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.api import chat as chat_module
@@ -53,6 +52,11 @@ from backend.app.services.rag_observability_runtime import (
 )
 from backend.app.services.rag_service import RagService
 from backend.app.services.vector_search_service import VectorSearchResult
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：四个 AI 执行入口不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _TABLE = f"{RAG_EXECUTION_SCHEMA}.{RAG_EXECUTION_TABLE}"
 _RAG_QUESTION = "采购入库的操作步骤是什么"

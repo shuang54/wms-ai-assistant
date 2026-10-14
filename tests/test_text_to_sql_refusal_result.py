@@ -18,7 +18,6 @@ import asyncio
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import orchestrator_chat as orch_module
 from backend.app.main import app
@@ -46,6 +45,11 @@ from backend.app.services.text_to_sql_service import (
     TextToSQLService,
     is_refusal_output,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _CTX = "Tables:\n- public.knowledge_document(id, title)\n"
 _TABLES = ("public.knowledge_document",)

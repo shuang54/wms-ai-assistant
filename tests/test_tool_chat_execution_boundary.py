@@ -36,7 +36,6 @@ import os
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.llm.client import LLMResponse, LLMToolCallFormatError, ToolCall
 from backend.app.services.tool_chat_service import (
@@ -57,6 +56,11 @@ from tests.test_tool_chat_service import (  # noqa: E402
 from tests.test_tool_chat_service_characterization import (  # noqa: E402
     _CountingRegistry,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/chat/with-tools 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SERVICE_MODULE = "backend/app/services/tool_chat_service.py"

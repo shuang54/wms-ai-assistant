@@ -36,10 +36,20 @@ def _env_flag(name: str) -> bool:
 _RUN_REAL = _env_flag("RUN_REAL_LLM_TEST")
 
 
-pytestmark = pytest.mark.skipif(
-    not _RUN_REAL,
-    reason="set RUN_REAL_LLM_TEST=1 (or true/yes/on) to enable real LLM smoke test",
-)
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/chat 不再允许匿名执行 ⇒ 真实链路冒烟同样需要会话
+# （会话存储在本文件由安装的 Fake 提供；其余链路保持真实）。
+pytestmark = [
+    pytest.mark.usefixtures("api_auth_session"),
+    pytest.mark.skipif(
+        not _RUN_REAL,
+        reason=(
+            "set RUN_REAL_LLM_TEST=1 (or true/yes/on) "
+            "to enable real LLM smoke test"
+        ),
+    ),
+]
 
 
 @pytest.mark.asyncio
@@ -82,8 +92,12 @@ async def test_real_llm_smoke_chat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_rag_chat_smoke() -> None:
+async def test_real_rag_chat_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     """对 POST /api/chat 执行一次真实 RAG 全链路冒烟（Phase 3.5.6）。
+
+    A1（M2.3）补充：本端点已不再允许匿名执行——会话存储用 Fake（避免测试
+    写 ``app_user`` / ``user_session`` 残留），其余链路（DB / Embedding / LLM）
+    保持**真实**。
 
     目标：验证
         - Chat API → ChatService → RagService 真实链路打通
@@ -107,9 +121,12 @@ async def test_real_rag_chat_smoke() -> None:
     if not settings.embedding.api_key:
         pytest.skip("EMBEDDING_API_KEY 未配置；无法执行真实 RAG 链路")
 
-    from fastapi.testclient import TestClient
+    from tests.api_session_auth import SessionTestClient as TestClient
+    from tests.api_session_auth import install_fake_session_service
 
     from backend.app.main import app
+
+    install_fake_session_service(monkeypatch)
 
     with TestClient(app) as c:
         response = c.post("/api/chat", json={"message": "采购入库怎么操作？"})

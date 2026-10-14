@@ -41,6 +41,12 @@ from backend.app.services.llm_usage_persistence_service import (
     DatabaseLLMAccountingSink,
 )
 from backend.app.services.text_to_sql_service import REFUSAL_MARKER
+from backend.app.config import settings
+from tests.api_session_auth import FakeSessionService
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 并发请求同样携带 M1 会话 + CSRF。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 from tests.test_assistant_trace_correlation_e2e import (  # noqa: PLC2701
     _RAG_QUESTION,
@@ -180,11 +186,38 @@ def _residue() -> dict[str, int]:
 # 并发 HTTP（ASGI + asyncio.gather）
 # ============================================================
 
+def _auth_material() -> tuple[dict[str, str], dict[str, str]]:
+    """A1：构造并发请求所需的 (CSRF 头, 会话 Cookie)（依赖 api_auth_session）。"""
+    from backend.app.api import auth_dependency as auth_dep
+    from tests.conversation_auth_support import USER_PASSWORDS
+
+    service = auth_dep.get_session_service()
+    assert isinstance(service, FakeSessionService), (
+        "需要 api_auth_session fixture（安装 Fake 会话服务）"
+    )
+    result = service.login(
+        username="alice", password=USER_PASSWORDS["alice"]
+    )
+    cookies = {
+        settings.auth.session_cookie_name: result.token,
+        settings.auth.csrf_cookie_name: result.csrf_token,
+    }
+    return {settings.auth.csrf_header_name: result.csrf_token}, cookies
+
+
 async def _post_chats(questions: list[str]) -> list[tuple[int, Any]]:
-    """**并发** POST /api/ai/chat（真实 ASGI app；Fake LLM 传输层）。"""
+    """**并发** POST /api/ai/chat（真实 ASGI app；Fake LLM 传输层）。
+
+    A1（M2.3）：请求须携带 M1 会话 Cookie + CSRF 头（生产 ``require_session`` /
+    ``require_csrf`` 仍然真实执行；会话存储由 ``api_auth_session`` 提供 Fake）。
+    """
+    headers, cookies = _auth_material()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://step70.test"
+        transport=transport,
+        base_url="http://step70.test",
+        headers=headers,
+        cookies=cookies,
     ) as client:
         responses = await asyncio.gather(
             *[

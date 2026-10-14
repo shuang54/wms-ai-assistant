@@ -26,7 +26,6 @@ import dataclasses
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 import backend.app.services.rag_service as rag_service_module
 from backend.app.config import settings
@@ -37,6 +36,11 @@ from backend.app.reranker.exceptions import (
 )
 from backend.app.services.rag_service import RagError, RagService, RagResponse
 from backend.app.services.vector_search_service import VectorSearchResult
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 与 /api/rag/answer 不再允许匿名执行。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 # ============================================================

@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import orchestrator_chat as root
 from backend.app.main import app
@@ -40,6 +39,11 @@ from backend.app.services.assistant_trace import (
 )
 from backend.app.services.rag_service import RagResponse, RagSource
 from backend.app.tools.registry import ToolRegistry
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：AI 执行入口不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _RAG_QUESTION = "采购入库的操作步骤是什么"

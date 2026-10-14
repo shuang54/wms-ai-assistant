@@ -30,7 +30,6 @@ from typing import Any
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.api import orchestrator_chat as orch_module
@@ -51,6 +50,11 @@ from backend.app.services.rag_observability_runtime import (
 )
 from backend.app.services.rag_service import RagService
 from backend.app.services.vector_search_service import VectorSearchResult
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 _ENDPOINT = "/api/observability/assistant-trace"
 _RAG_QUESTION = "采购入库的操作步骤是什么"

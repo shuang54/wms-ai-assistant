@@ -44,7 +44,6 @@ import json
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import tool_chat as tool_chat_module
 from backend.app.llm.client import (
@@ -86,6 +85,11 @@ from tests.test_tool_chat_service import (  # noqa: E402
     ScriptedLLMClient,
     _tool_call_llm_response,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/chat/with-tools 不再允许匿名执行 ⇒ 使用已认证客户端。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 #: 敏感信息样本（任何 error / message / HTTP body 都不得包含）
 _SECRETS = (

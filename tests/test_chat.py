@@ -18,7 +18,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import chat as chat_module
 from backend.app.embedding.exceptions import (
@@ -46,6 +45,12 @@ from backend.app.services.vector_search_service import (
     VectorSearchInputError,
     VectorSearchParameterError,
 )
+from tests.api_session_auth import SessionTestClient as TestClient
+from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+
+# A1（M2.3）：/api/chat 不再允许匿名执行 ⇒ 测试使用已认证客户端
+# （生产 require_session / require_csrf 仍真实执行）。
+pytestmark = pytest.mark.usefixtures("api_auth_session")
 
 
 # ============================================================
