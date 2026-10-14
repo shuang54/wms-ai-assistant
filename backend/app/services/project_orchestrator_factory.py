@@ -510,11 +510,13 @@ def _build_project_tool_registry(
     复用现有 ToolRegistry（不创建第二套注册中心）：全局 Tool 构建器
     映射 → 按 capabilities.tool_names 白名单注册。
 
-    Phase 3.11 Step 5：支持两个真实只读 Tool（均绑定同一项目 Engine /
-    schema / project_id，共用 ToolExecutionService 执行边界）：
+    Phase 3.11 Step 5：支持两个真实只读 Tool（共用 ToolExecutionService
+    执行边界）：
 
-        * ``get_inventory``   （Phase 3.7.12）
-        * ``get_work_order``  （Phase 3.11 Step 5）
+        * ``get_inventory``   （Phase 3.7.12）—— 绑定**独立 WMS/ERP 业务库**
+          （``WMS_DATABASE_*``；只读；未配置 ⇒ 显式失败，不回退应用库）；
+        * ``get_work_order``  （Phase 3.11 Step 5）—— 绑定项目 Engine / schema
+          （沿用既有项目数据源机制）。
 
     - 白名单为空 → 空 Registry（该项目无任何 Tool）；
     - 白名单含未知 Tool 名（全局不存在）→ 记 warning 并跳过
@@ -527,14 +529,19 @@ def _build_project_tool_registry(
     registry = ToolRegistry()
 
     if capabilities.allows_tool("get_inventory"):
-        inv_settings = _dc.replace(
-            settings.inventory_tool, schema_name=schema_name
-        )
+        # 库存 Tool 绑定**独立 WMS/ERP 业务数据源**（只读；与项目数据源解耦）：
+        #   * Engine = db.business_session.require_business_engine
+        #     （独立连接池 + default_transaction_read_only=on；**不复用**应用库）；
+        #   * 坐标 = settings.inventory_tool（WMS_INVENTORY_SCHEMA / _TABLE），
+        #     不再用项目 schema 覆盖 —— 业务库有自身 schema 结构；
+        #   * 业务库未配置 ⇒ 工具**显式失败**（不回退应用库 / 不伪造数据）。
+        from backend.app.db.business_session import require_business_engine
+
         register_get_inventory_tool(
             registry,
             handler=GetInventoryHandler(
-                engine=engine,
-                inv_settings=inv_settings,
+                engine_provider=require_business_engine,
+                inv_settings=settings.inventory_tool,
                 project_id=project_id,
             ),
         )
@@ -576,4 +583,50 @@ def _build_default_base() -> AIOrchestratorService:
             ),
         ),
         tool_registry=build_default_tool_registry(),
+    )
+
+
+class AgentCommandUnavailableError(Exception):
+    """Agent 命令服务不可用（项目未启用 Agent / 装配失败；API 层映射 503）。"""
+
+
+def build_agent_command_service(project_id: str) -> Any:
+    """Agent **命令** API composition root（Phase 7 Step 4）。
+
+    复用 ``build_orchestrator_for_project(project_id, agent_enabled=True)``
+    的**同一** per-project 装配（与 Workflow Runtime 的 agent_enabled=True
+    决策一致）——经 Orchestrator 只读面（``agent_runtime`` 等）取得
+    Runtime / 持久化边界，**不新建**第二套 Provider / ToolExecutionService /
+    授权中心。
+
+    Args:
+        project_id: 授权项目（**服务端**认证配置解析结果——HTTP 不可注入）。
+
+    Returns:
+        :class:`backend.app.services.agent_command_service.AgentCommandService`。
+
+    Raises:
+        AgentCommandUnavailableError: 项目未启用 Agent 能力
+            （runtime 未接线 ⇒ fail-closed 503，**绝不**降级）。
+        ProjectNotFoundError / AIOrchestratorUnavailableError: 项目未注册 /
+            数据源不可用（API 层分别映射 503）。
+    """
+    from backend.app.db.agent_run_repository import AgentRunRepository
+    from backend.app.services.agent_command_service import AgentCommandService
+
+    orchestrator = build_orchestrator_for_project(
+        project_id, agent_enabled=True
+    )
+    runtime = getattr(orchestrator, "agent_runtime", None)
+    if runtime is None:
+        raise AgentCommandUnavailableError(
+            f"项目 {project_id!r} 未启用 Agent 能力（fail-closed）"
+        )
+    return AgentCommandService(
+        runtime=runtime,
+        run_repository=AgentRunRepository(),
+        checkpoints=getattr(orchestrator, "agent_checkpoint_recorder", None),
+        approval_store=getattr(orchestrator, "agent_approval_store", None),
+        run_recorder=getattr(orchestrator, "agent_run_recorder", None),
+        step_recorder=getattr(orchestrator, "agent_step_recorder", None),
     )

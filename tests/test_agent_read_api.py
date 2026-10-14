@@ -434,11 +434,21 @@ class TestAgentReadApiSurface:
             assert set(methods) == {"get"}, (path, sorted(methods))
 
     def test_no_login_or_command_endpoints_under_agent(self) -> None:
-        """§五：Read API **不**提供 Resume / Approve / Cancel 端点。"""
+        """§五：Read API（``/api/agent/`` 前缀）**不**提供 Resume / Approve /
+        Cancel 端点。
+
+        Phase 7 Step 4 注意：Agent **命令** API 是**独立命名空间**
+        （``/api/agent-runs`` / ``/api/agent-approvals``——经
+        ``agent_command`` + 独立凭据 ``AGENT_COMMAND_API_KEY``），不是
+        本只读面的扩展；本断言精确限定于读面前缀 ``/api/agent/``
+        （读面契约零命令端点，逐字保持）。
+        """
         paths = set(app.openapi()["paths"])
         for forbidden in ("resume", "approve", "cancel", "execute", "command"):
             assert not any(
-                forbidden in path for path in paths if "agent" in path
+                forbidden in path
+                for path in paths
+                if path.startswith("/api/agent/")
             ), forbidden
 
     def test_response_contains_no_forbidden_keys(

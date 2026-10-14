@@ -118,6 +118,21 @@ class _FakeInventoryHandler:
         return {"material_code": arguments.get("material_code"), "qty": 120}
 
 
+class _NoopOutcomeRecorder:
+    """Assistant Outcome 写边界的 no-op 替身（Phase 7 Step 4.1）。
+
+    与 RAG / Tool 写边界同模式：Orchestrator 的终态**判定**照常执行
+    （本文件不测判定），只有持久化 fan-out 变为计数 no-op ⇒ 非 DB-gated
+    文件**不触达** ``ai_ops.assistant_outcome_record``。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def arecord(self, result: Any, **kwargs: Any) -> None:  # noqa: ANN001
+        self.calls.append(result)
+
+
 @pytest.fixture()
 def collector():
     """应用级 RAG Collector（清理前后各一次；不新建实例）。"""
@@ -131,10 +146,17 @@ def collector():
 def no_db_writes(monkeypatch):
     """本文件（非 DB-gated）**不得写数据库**：
 
-    只替换 RAG 持久化 Adapter 的 **DB 写边界**（计数 no-op）——
-    Composite fan-out / Collector / RagService / 装配仍全部真实。
-    真正的持久化链路由 ``tests/test_rag_runtime_observability_e2e_db.py``
-    （RUN_DB_TESTS=1）验证。
+    替换三类持久化 **DB 写边界**（计数 no-op）——RAG Adapter · Tool
+    Persistence Adapter · Assistant Outcome Recorder；
+    Composite fan-out / Collector / RagService / Orchestrator 判定 /
+    装配仍全部真实。真正的持久化链路由
+    ``tests/test_rag_runtime_observability_e2e_db.py``（RUN_DB_TESTS=1）验证。
+
+    Phase 7 Step 4.1：补 Outcome 边界——此前只替换 RAG / Tool 两类，
+    模块级 Orchestrator 单例的 ``BestEffortAssistantOutcomeRecorder``
+    在 DATABASE_URL 已配置时直达 DB（本文件 15 个 E2E 各写一行
+    ``assistant_outcome_record``，仅靠会话守卫兜底；进程被外部中断时
+    残留 ⇒ 全量离线 residue teardown error 的根因）。
     """
     persisted: list[str] = []
     adapter = get_rag_execution_persistence_adapter()
@@ -142,6 +164,12 @@ def no_db_writes(monkeypatch):
         adapter,
         "record",
         lambda observation: persisted.append(observation.request_id),
+    )
+    # Phase 7 Step 4.1：Assistant Outcome 写边界（no-op 计数）。
+    monkeypatch.setattr(
+        orch_module._default_orchestrator,  # noqa: SLF001 —— 只换持久化边界
+        "_outcome_recorder",
+        _NoopOutcomeRecorder(),
     )
     return persisted
 

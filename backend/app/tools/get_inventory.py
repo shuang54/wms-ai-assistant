@@ -53,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import Engine
@@ -277,12 +277,16 @@ async def _run_inventory_query(
     table: str,
     material_code: str,
     timeout_seconds: int,
+    material_code_column: str = "material_code",
+    qty_column: str = "qty",
 ) -> float:
-    """执行只读查询并返回物料库存合计。
+    """执行只读查询并返回物料库存合计（**限量返回**：聚合标量，无明细）。
 
     安全策略（纵深防御）：
         1. ``material_code`` 通过绑定参数传递（**不**拼字符串）
-        2. schema / table 已通过 ``_assert_safe_identifier`` 校验
+        2. schema / table / 列名（material_code_column / qty_column）均已通过
+           ``_assert_safe_identifier`` 校验 —— 来自**服务器端配置**
+           （``WMS_INVENTORY_*``），**绝不**由用户输入拼接
         3. 事务级 ``BEGIN READ ONLY`` + ``SET LOCAL statement_timeout`` 防止
            数据库端写操作 / 长时间占用
         4. 自动 ``ROLLBACK`` 归还连接
@@ -294,19 +298,21 @@ async def _run_inventory_query(
         table:  已校验的 table 名。
         material_code: 已校验的物料编码。
         timeout_seconds: PostgreSQL ``statement_timeout``（秒）。
+        material_code_column: 已校验的物料编码列名（默认 ``material_code``）。
+        qty_column: 已校验的库存数量列名（默认 ``qty``）。
 
     Returns:
-        float: SUM(qty)；不存在记录 → 0.0。
+        float: ``SUM(<qty_column>)``；不存在记录 → 0.0（真实空结果）。
 
     Raises:
         ToolExecutionError: DB 异常（错误消息仅含类名，不含 SQL / connection string）。
     """
-    # schema / table 已通过 _assert_safe_identifier 校验 → 安全拼接
+    # schema / table / 列名已通过 _assert_safe_identifier 校验 → 安全拼接
     qualified_table = f'"{schema}"."{table}"'
     sql = (
-        f"SELECT COALESCE(SUM(qty), 0) "
+        f'SELECT COALESCE(SUM("{qty_column}"), 0) '
         f"FROM {qualified_table} "
-        f"WHERE material_code = :material_code"
+        f'WHERE "{material_code_column}" = :material_code'
     )
 
     def _sync_query() -> float:
@@ -373,8 +379,10 @@ class GetInventoryHandler:
         inv_settings: InventoryToolSettings | None = None,
         project_context_provider: GetInventoryProjectContextProvider | None = None,
         project_id: str | None = None,
+        engine_provider: Callable[[], Engine] | None = None,
     ) -> None:
         self._engine = engine
+        self._engine_provider = engine_provider
         self._settings = inv_settings or settings.inventory_tool
         self._project_provider = (
             project_context_provider
@@ -449,20 +457,50 @@ class GetInventoryHandler:
                 ),
             )
 
-        # 2. Engine 解析
-        engine = self._engine or get_engine()
+        # 2. Engine 解析（**唯一**顺序：engine_provider → 显式 engine → 全局缓存）
+        #
+        #   生产装配（project_orchestrator_factory / build_default_tool_registry）
+        #   注入 ``engine_provider = db.business_session.require_business_engine``：
+        #   库存数据来自**独立** WMS/ERP 业务库（只读）；业务库未配置 ⇒ 显式
+        #   失败 —— **绝不**回退应用库（DATABASE_URL）、**绝不**返回假数据。
+        if self._engine_provider is not None:
+            try:
+                engine = self._engine_provider()
+            except Exception as exc:  # noqa: BLE001 —— 显式失败；不泄露内部细节
+                logger.warning(
+                    "get_inventory: business datasource unavailable",
+                    extra={"error_type": type(exc).__name__},
+                )
+                raise ToolExecutionError(
+                    tool_name="get_inventory",
+                    reason=(
+                        "WMS/ERP 业务数据源不可用（未配置或连接失败）："
+                        "请检查 WMS_DATABASE_* 配置；不回退应用数据库，"
+                        "不返回假数据"
+                    ),
+                ) from exc
+        else:
+            engine = self._engine or get_engine()
         if engine is None:
             raise ToolExecutionError(
                 tool_name="get_inventory",
                 reason="Database engine 未配置（DATABASE_URL 为空）",
             )
 
-        # 3. schema / table 标识符校验
+        # 3. schema / table / 列名标识符校验
+        #    （全部来自服务器端配置 WMS_INVENTORY_*；白名单校验后安全拼接）
         schema = _assert_safe_identifier(
             self._settings.schema_name, field_name="schema_name"
         )
         table = _assert_safe_identifier(
             self._settings.table_name, field_name="table_name"
+        )
+        material_code_column = _assert_safe_identifier(
+            self._settings.material_code_column,
+            field_name="material_code_column",
+        )
+        qty_column = _assert_safe_identifier(
+            self._settings.qty_column, field_name="qty_column"
         )
 
         # 4. ProjectContext 解析（仅用于 metadata；不进入 SQL 拼接）
@@ -487,6 +525,8 @@ class GetInventoryHandler:
                 table=table,
                 material_code=material_code,
                 timeout_seconds=self._settings.query_timeout_seconds,
+                material_code_column=material_code_column,
+                qty_column=qty_column,
             )
         except ToolError:
             raise
@@ -538,7 +578,10 @@ def build_default_tool_registry(
     以使 TOOL 路由可达。
 
     Args:
-        handler: 可选自定义 get_inventory Handler；None 时使用默认 Handler。
+        handler: 可选自定义 get_inventory Handler；None 时使用**生产默认**
+                 Handler —— 绑定**独立 WMS/ERP 业务数据源**
+                 （``db.business_session.require_business_engine``；只读；
+                 业务库未配置 ⇒ 工具显式失败，**不**回退应用库）。
         work_order_handler: 可选自定义 get_work_order Handler；
                             None 时使用默认 Handler（懒加载 engine）。
 
@@ -553,6 +596,11 @@ def build_default_tool_registry(
     )
 
     registry = ToolRegistry()
+    if handler is None:
+        # 生产默认：独立业务库（只读）——惰性解析，未配置即显式失败。
+        from backend.app.db.business_session import require_business_engine
+
+        handler = GetInventoryHandler(engine_provider=require_business_engine)
     register_get_inventory_tool(registry, handler=handler)
     register_get_work_order_tool(registry, handler=work_order_handler)
     return registry

@@ -22,10 +22,16 @@ __all__ = [
     "WORKFLOW_NODE_RUN_RESPONSE_FIELDS",
     "WORKFLOW_APPROVAL_RESPONSE_FIELDS",
     "WORKFLOW_TIMELINE_EVENT_RESPONSE_FIELDS",
+    "WORKFLOW_DEFINITION_NODE_RESPONSE_FIELDS",
+    "WORKFLOW_DEFINITION_RESPONSE_FIELDS",
+    "WORKFLOW_DEFINITION_CATALOG_RESPONSE_FIELDS",
     "WorkflowRunDetailResponse",
     "WorkflowNodeRunResponse",
     "WorkflowApprovalResponse",
     "WorkflowTimelineEventResponse",
+    "WorkflowDefinitionNodeResponse",
+    "WorkflowDefinitionResponse",
+    "WorkflowDefinitionCatalogResponse",
 ]
 
 #: ``GET /api/workflow-runs/{run_id}`` 顶层字段（顺序 ≡ 声明）。
@@ -154,3 +160,59 @@ class WorkflowTimelineEventResponse(BaseModel):
     node_id: str | None = Field(default=None)
     attempt: int | None = Field(default=None)
     approval_id: str | None = Field(default=None)
+
+
+# ============================================================
+# Workflow 定义目录（Phase 7 Step 7）—— 只读发现面
+# ============================================================
+
+#: 定义目录中节点概要字段（顺序 ≡ 声明）。
+WORKFLOW_DEFINITION_NODE_RESPONSE_FIELDS: Final[tuple[str, ...]] = (
+    "node_id",
+    "node_type",
+)
+
+#: ``GET /api/workflow-definitions`` 元素字段（顺序 ≡ 声明）。
+WORKFLOW_DEFINITION_RESPONSE_FIELDS: Final[tuple[str, ...]] = (
+    "name",
+    "version",
+    "start_node_id",
+    "input_fields",
+    "nodes",
+)
+
+#: 定义目录响应顶层字段（顺序 ≡ 声明）。
+WORKFLOW_DEFINITION_CATALOG_RESPONSE_FIELDS: Final[tuple[str, ...]] = ("items",)
+
+
+class WorkflowDefinitionNodeResponse(BaseModel):
+    """定义中的节点**概要**（**无** 模板 / 参数映射 / 审批文案）。
+
+    只暴露"图里有哪些节点、什么类型"这两项启动前必需信息；
+    AI 模板、TOOL 参数映射、审批展示文案属服务器端定义内部，
+    **不**通过本 API 暴露。
+    """
+
+    node_id: str
+    node_type: str = Field(description="AI / TOOL / CONDITION / APPROVAL")
+
+
+class WorkflowDefinitionResponse(BaseModel):
+    """一个已注册 Workflow 定义的可发现信息（**只读**；服务器端静态定义）。"""
+
+    name: str = Field(description="definition 名称（start 的 workflow_id）")
+    version: str = Field(description="当前注册版本（Resume 按持久化 version 解析）")
+    start_node_id: str
+    input_fields: list[str] = Field(
+        description=(
+            "start input JSON 需要提供的顶层字段"
+            "（由定义中的受限引用 input.<path> 推导；无 ⇒ 空列表）"
+        )
+    )
+    nodes: list[WorkflowDefinitionNodeResponse]
+
+
+class WorkflowDefinitionCatalogResponse(BaseModel):
+    """``GET /api/workflow-definitions``：已注册定义列表（可能为空）。"""
+
+    items: list[WorkflowDefinitionResponse] = Field(default_factory=list)

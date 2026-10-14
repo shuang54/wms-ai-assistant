@@ -11,7 +11,8 @@ ToolExecutionService（capability + project scope）
     ↓
 ToolRegistry（真实 GET_INVENTORY_DEFINITION + GetInventoryHandler）
     ↓
-PostgreSQL（SELECT SUM(qty) …；BEGIN READ ONLY + 绑定参数 + timeout）
+PostgreSQL（SELECT SUM("<qty_column>") …；BEGIN READ ONLY + 绑定参数 +
+            配置化字段映射 WMS_INVENTORY_*_COLUMN + timeout）
     ↓
 ToolResult → role=tool → LLM → Final Answer
 ```
@@ -113,14 +114,26 @@ def real_engine() -> Any:
         reset_engine_cache()
 
 
+def _fixture_inv_settings() -> InventoryToolSettings:
+    """隔离 fixture 表（``material_code`` / ``qty`` 列）的 Tool 配置。
+
+    显式指定**列映射**：本机 .env 可能把 ``WMS_INVENTORY_*_COLUMN`` 指向真实
+    ERP 表结构（如 ``available_qty`` / ``mat_code``）；本文件的 fixture 表
+    固定为 ``material_code`` + ``qty``，因此不继承 env 的列映射。
+    """
+    return InventoryToolSettings(
+        schema_name=_INVENTORY_TEST_SCHEMA,
+        table_name=_INVENTORY_TEST_TABLE,
+        material_code_column="material_code",
+        qty_column="qty",
+    )
+
+
 def _real_handler(engine: Any) -> GetInventoryHandler:
     """真实 Handler，指向隔离 fixture schema（不是 Fake）。"""
     return GetInventoryHandler(
         engine=engine,
-        inv_settings=InventoryToolSettings(
-            schema_name=_INVENTORY_TEST_SCHEMA,
-            table_name=_INVENTORY_TEST_TABLE,
-        ),
+        inv_settings=_fixture_inv_settings(),
         project_id=_PROJECT_ID,
     )
 
@@ -343,9 +356,10 @@ class TestRealGetInventoryThroughToolChat:
         # 真实 SQL：唯一一条 SELECT（只读；绑定参数，无字符串拼接）
         assert len(recorder.selects) == 1
         select_sql = recorder.selects[0]
-        assert "SUM(QTY)" in select_sql.upper()
+        # 列名为**带引号**的标识符（配置化字段映射：WMS_INVENTORY_*_COLUMN）
+        assert 'SUM("QTY")' in select_sql.upper()
         assert _INVENTORY_TEST_TABLE in select_sql
-        assert "MATERIAL_CODE = %(MATERIAL_CODE)S" in select_sql.upper()
+        assert '"MATERIAL_CODE" = %(MATERIAL_CODE)S' in select_sql.upper()
         recorder.assert_read_only()
 
     async def test_material_code_forwarded_verbatim(

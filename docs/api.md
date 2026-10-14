@@ -1058,10 +1058,159 @@ detail         类型专属完整详情（Agent：AgentRunResponse 原样；
 
 ### 9.4 已知限制（如实记录）
 
-- **无统一列表端点**：两域 ReadService / Repository 当前均无"按项目范围
-  列表"能力（Workflow Read Layer 在 Phase 6 S6 明确声明不实现全局 Run
-  列表；Agent Run Repository 同样无列表方法）。本阶段按"不为统一而大规模
-  扩展"原则只提供统一**详情**入口；列表需求属后续阶段（需先经治理评估
-  扩展仓储能力）。
-- 测试证据：`tests/test_runtime_read_api.py`（离线契约，43 例）+
-  `tests/test_runtime_read_api_db.py`（DB 真链，9 例；`RUN_DB_TESTS=1`）。
+- ~~**无统一列表端点**~~（Phase 7 Step 3 已提供）：`GET /api/runtime-runs/agent`
+  与 `GET /api/runtime-runs/workflow`（DB 层项目过滤 + 分页 + 可靠 total；
+  见 §9.3）。
+- 测试证据：`tests/test_runtime_read_api.py`（离线契约，73 例）+
+  `tests/test_runtime_read_api_db.py`（DB 真链 + 真实项目隔离，16 例；
+  `RUN_DB_TESTS=1`）。
+
+---
+
+## 10. Agent 命令 API（Phase 7 Step 4）
+
+在既有 Agent Runtime（run / resume / cancel / approval）之上提供
+**认证 + 项目作用域** HTTP 写边界——与 §8 Workflow 命令 API 同形对称。
+**只适配、不重造**：不修改 Agent Runtime / Domain / Persistence 语义；
+复用既有 `AgentRuntime` / `AgentCancellationCoordinator` /
+`AgentApprovalStore`（经 `build_agent_command_service` composition root
+以 `agent_enabled=True` 装配——与 Workflow Runtime 决策一致）。
+
+### 10.1 端点
+
+| 端点 | 认证 | 授权作用域来源 |
+| --- | --- | --- |
+| `POST /api/agent-runs` | `X-API-Key`（Agent 命令凭据） | 服务端 `AGENT_COMMAND_API_PROJECT_ID` |
+| `POST /api/agent-runs/{run_id}/resume` | 同上 | 同上 |
+| `POST /api/agent-runs/{run_id}/cancel` | 同上 | 同上 |
+| `POST /api/agent-approvals/{approval_id}/decision` | 同上 | 同上（经父 Run 归属校验） |
+
+- **凭据独立**：`AGENT_COMMAND_API_KEY` 与 Agent/Workflow 读取凭据、
+  Workflow 命令凭据**各自独立**（读写最小权限分离、可分别轮换；
+  部署层可配置为相同值）。未配置 ⇒ 503（fail closed）；缺失 / 错误
+  ⇒ 401（固定文案）。
+- **项目作用域仅来自服务端配置**：客户端 `project_id` 查询参数被忽略；
+  `start` 的作用域经 per-project 装配的 Runtime 兑现（allowed_tools /
+  ToolExecutionService 绑定授权项目），run 落库 `project_id` 即授权
+  作用域。
+- **归属前置校验**：`resume` / `cancel` / `decision` 执行前经
+  `AgentRunRepository` 按授权项目过滤；不存在**或**跨项目 ⇒ 同一 404
+  （不泄露存在性）。
+
+### 10.2 命令语义（沿用 Runtime 契约，不新增能力）
+
+```text
+start    有界循环到终态 / 等待点（COMPLETED / FAILED / LIMIT_REACHED /
+         WAITING_APPROVAL 均为 200 业务结果；持久化 best-effort——
+         先 Steps 后 Run；WAITING_APPROVAL 不写终态 Run）
+resume   TERMINAL ⇒ 历史终态；ACTIVE + pending ⇒ Decision / Tool Result
+         Replay（不重跑 handler）；不确定 ⇒ fail-closed
+cancel   协作式三态：CANCEL_REQUESTED（信号置位，运行中 Agent 在安全边界
+         停止）/ CANCELLED（PAUSED 直接终态化）/ NOT_CANCELLABLE（终态或
+         无控制状态 ⇒ 409）；不强杀 Tool、不重试
+decision APPROVED / REJECTED——**只改控制状态**（不调用 LLM / Tool /
+         Resume；执行由 resume 承担）；幂等（同裁决 200）；相反裁决
+         或 Run 已终态 ⇒ 409
+```
+
+### 10.3 错误契约（与 §9.1 Workflow 命令 API 同形）
+
+```text
+200  命令完成（含业务性结果：COMPLETED / FAILED / LIMIT_REACHED /
+     WAITING_APPROVAL / CANCELLED / CANCEL_REQUESTED / 幂等审批）
+400  输入违反契约（空白 question / run_id / approval_id）
+401  缺少 / 错误 X-API-Key（固定文案；不泄露目标资源是否存在）
+404  Run / Approval 不存在 **或** 不属于授权项目（**故意同码**）
+409  状态冲突（APPROVAL_CONFLICT / CANCELLATION_CONFLICT /
+     NOT_CANCELLABLE——固定文案）
+422  请求体校验失败（FastAPI / Pydantic）
+502  持久化边界不可用（不回传内部细节）
+503  服务端认证 / 作用域未配置，或项目未启用 Agent 能力（fail closed）
+500  其它未预期错误（固定文案；不暴露 traceback / SQL / 凭据）
+```
+
+### 10.4 响应 DTO 与安全边界
+
+- 响应只由 `backend.app.dto.agent_command_api` 的 Pydantic DTO 组成：
+  `run_id` / `outcome` / `status` / `error_code` / `approval_id` /
+  `approval_status` / `decision` / `content` / `run`（轻量只读视图）。
+- **无** prompt / arguments / claim_token / ORM / Session / Connection /
+  异常正文；`status` / `error_code` 为域词汇 / 稳定码**原值**（不映射）。
+- 测试证据：`tests/test_agent_command_api.py`（离线契约，39 例）+
+  `tests/test_agent_command_api_db.py`（DB 真链——控制状态路径，9 例）+
+  `tests/test_runtime_e2e_closure_db.py`（Phase 7 Step 5：Agent/Workflow
+  端到端闭环——start ⇒ 落库 ⇒ Read/List 可查、审批一致性、终态 resume
+  零重复 LLM 调用、协作式取消、跨项目不可见；Agent LLM 以 FakeLLM 注入，
+  Runtime / Repository / 认证全部真实）。
+- 部署边界（如实）：应用层认证与项目作用域已实现；HTTPS = NOT VERIFIED ·
+  网络边界 = NOT VERIFIED ⇒ `PRODUCTION_DEPLOYMENT = BLOCKED`。
+
+---
+
+## 11. Workflow 定义目录 API（Phase 7 Step 7）
+
+补齐 Workflow 命令 API 的**前置能力**：此前生产注册表为空（任何
+`POST /api/workflow-runs` 都是 404）。现在服务器端静态**定义目录**
+（`backend.app.workflow.catalog`）经 Composition Root 惰性注册，并提供
+只读发现端点——调用方在 start 之前即可获知有哪些 workflow、其版本、
+起始节点与 start input 需要的字段。
+
+### 11.1 端点
+
+| 端点 | 认证 | 数据来源 |
+| --- | --- | --- |
+| `GET /api/workflow-definitions` | `X-API-Key`（**Workflow 读取域**凭据；与 `/api/workflow-runs` 读面同一 fail-closed 语义） | 服务器端注册表（与命令 API **同一实例**） |
+
+- 无参数（无分页 / 无过滤 / **无** `project_id`——定义是服务器端静态目录，
+  响应内容与客户端输入无关；未知 query 参数被忽略）。
+- 只读面形：仅 `GET`；未知写方法 ⇒ 405；不接触 DB / Runtime / Tool / LLM。
+
+### 11.2 响应 DTO
+
+```text
+items[]                      已注册定义（注册顺序；可能为空——空 ≠ 错误）
+  name                       definition 名称（= start 的 workflow_id）
+  version                    当前注册版本（Resume 按**持久化** version 解析）
+  start_node_id              起始节点
+  input_fields[]             start input JSON 需要的顶层字段
+                             （由定义中的受限引用 input.<path> 推导）
+  nodes[]                    节点概要：node_id / node_type（AI/TOOL/APPROVAL/CONDITION）
+```
+
+**不暴露**定义内部：AI 模板 / TOOL 参数映射（含 Tool 名）/ 审批展示文案 /
+retry 策略 / 边（`next_node_id`）。
+
+### 11.3 生产目录（当前 2 条；全部只读语义，无写操作节点）
+
+```text
+inventory_check  v1   TOOL get_inventory → APPROVAL → 终态
+    输入契约：{"material_code": "<物料编码>"}
+    语义：只读库存查询 + 人工确认（数据源由部署提供；缺失 ⇒ 节点
+    fail-closed 失败，不伪造查询成功）
+
+answer_review    v1   AI（问题模板）→ APPROVAL → 终态
+    输入契约：{"question": "<问题>"}
+    语义：项目作用域内 AI 回答 + 人工确认后关闭流程
+```
+
+- 定义版本发布后**冻结**（语义变更 ⇒ 新 version；Resume 按持久化 version
+  fail-closed 解析）。
+- 未注册名称仍 ⇒ 404（目录不改变 fail-closed 语义）。
+- 额外定义由服务器端代码经 `register_workflow_definition(...)` 显式注册
+  （重复 name ⇒ 域异常，不隐式替换）。
+
+### 11.4 错误契约
+
+```text
+200  定义目录（可能为空列表）
+401  缺少或无效的 X-API-Key（固定文案）
+405  未知写方法
+500  定义目录读取未预期失败（固定文案；不暴露内部细节）
+503  服务端认证 / 作用域未配置（fail closed）
+```
+
+- 测试证据：`tests/test_workflow_definition_catalog.py`（目录 / 注册表 / 装配连线，
+  离线 14 例）+ `tests/test_workflow_definitions_api.py`（HTTP 契约，离线 15 例）
+  + `tests/test_workflow_definition_catalog_db.py`（DB 真链 e2e 4 例；
+  `RUN_DB_TESTS=1`——生产定义目录 start ⇒ 节点执行 ⇒ 审批门 ⇒ 批准 ⇒
+  COMPLETED ⇒ Read/List 可读；外部 LLM / Tool 以离线替身注入）。

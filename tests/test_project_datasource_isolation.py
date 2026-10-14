@@ -283,31 +283,88 @@ class TestDataSourceIsolation:
 
 
 # ============================================================
-# Tool 数据源切换（任务书 §十二）
+# Tool 数据源（任务书 §十二；Phase 7 Step 8 契约变更）
 # ============================================================
+
+def _business_ds_configured() -> bool:
+    """业务库（WMS_DATABASE_*）是否已在本机配置。"""
+    from backend.app.db.business_session import (
+        is_business_datasource_configured,
+    )
+
+    return is_business_datasource_configured()
+
+
+def _direct_business_qty(material_code: str) -> float | None:
+    """直连业务库读取 qty（只读事务）；未配置 / 表缺失 / 失败 ⇒ None。"""
+    from sqlalchemy import text as _text
+
+    from backend.app.db.business_session import get_business_engine
+
+    engine = get_business_engine()
+    if engine is None:
+        return None
+    cfg = settings.inventory_tool
+    try:
+        with engine.connect() as conn:
+            conn.execute(_text("SET TRANSACTION READ ONLY"))
+            value = conn.execute(
+                _text(
+                    f'SELECT COALESCE(SUM("{cfg.qty_column}"), 0) FROM '
+                    f'"{cfg.schema_name}"."{cfg.table_name}" '
+                    f'WHERE "{cfg.material_code_column}" = :material_code'
+                ),
+                {"material_code": material_code},
+            ).scalar()
+            conn.rollback()
+        return float(value) if value is not None else None
+    except Exception:  # noqa: BLE001 —— 表缺失 / 权限不足 ⇒ 视为不可得
+        return None
+
+
+def _assert_tool_reads_business_datasource(result, material_code: str) -> None:
+    """Phase 7 Step 8 契约：库存 Tool 读**独立业务库**，不读应用库项目 schema。
+
+    - 业务库已配置 ⇒ 成功且 qty == 直连业务库查询值（同一数据源）；
+    - 业务库未配置 / 表缺失 ⇒ **显式失败**（消息含"业务数据源"），
+      **绝不**回退应用库 fixture（project_a=100 / project_b=999）。
+    """
+    assert result.route.value == "tool"
+    data = result.data
+    assert data is not None
+
+    if _business_ds_configured():
+        expected = _direct_business_qty(material_code)
+        if expected is None:
+            # 业务库中目标表缺失 / 不可读 ⇒ 显式失败（不是 fixture 值）
+            assert data.success is False, data
+        else:
+            assert data.success is True, data.error
+            assert float(data.data["qty"]) == pytest.approx(expected)
+            assert data.data["material_code"] == material_code
+        return
+
+    assert data.success is False, data
+    assert "业务数据源" in (data.error or "")
+
 
 @requires_db
 class TestToolDataSourceSwitch:
-    def test_project_a_tool_returns_100(self) -> None:
-        """project-a → get_inventory → qty 100（真实 DB 查询，无 LLM）。"""
+    def test_project_a_tool_reads_business_datasource(self) -> None:
+        """project-a 的库存 Tool 绑定独立业务库（**不**读 project_a schema）。"""
         orch = _build_project_orchestrator("project-a")
         result = asyncio.run(orch.execute(QUESTION_TOOL))
+        _assert_tool_reads_business_datasource(result, "10001")
+        if result.data.success:
+            assert result.data.data["project_id"] == "project-a"
 
-        assert result.route.value == "tool"
-        assert result.data is not None and result.data.success
-        assert result.data.data["qty"] == 100.0
-        assert result.data.data["project_id"] == "project-a"
-        assert result.data.data["material_code"] == "10001"
-
-    def test_project_b_tool_returns_999(self) -> None:
-        """project-b → get_inventory → qty 999（证明真正切换）。"""
+    def test_project_b_tool_reads_business_datasource(self) -> None:
+        """project-b 同上（fixture qty=999 不得出现在结果中）。"""
         orch = _build_project_orchestrator("project-b")
         result = asyncio.run(orch.execute(QUESTION_TOOL))
-
-        assert result.route.value == "tool"
-        assert result.data is not None and result.data.success
-        assert result.data.data["qty"] == 999.0
-        assert result.data.data["project_id"] == "project-b"
+        _assert_tool_reads_business_datasource(result, "10001")
+        if result.data.success:
+            assert result.data.data["project_id"] == "project-b"
 
 
 # ============================================================
@@ -417,22 +474,25 @@ class TestCrossProjectSecurity:
             asyncio.run(orch.execute(QUESTION_T2S))
 
     def test_project_a_tool_cannot_read_project_b(self) -> None:
-        """project-a 的 get_inventory（绑定 project_a schema）查 project_b
-        数据 → 返回 0（隔离：工具只能读本项目 schema）。"""
+        """Phase 7 Step 8：库存 Tool **不读**应用库项目 schema ⇒ 不存在
+        "project-a 工具读 project_b 数据"的路径（隔离由独立业务库承担）。
+
+        本用例仍验证**无泄漏**：仅存在于应用库 project_b schema 的物料
+        （qty=777777）不得出现在 project-a 的 Tool 结果中。
+        """
         orch = _build_project_orchestrator("project-a")
-        # 999 只在 project_b 中；用 project-a 工具查询一个仅存在于
-        # project_b 的物料 → qty=0（读不到对方数据）
         with _schemas_engine() as eng:
             with eng.begin() as conn:
                 conn.execute(text(
                     f'INSERT INTO "{SCHEMA_B}"."inventory" '
-                    f"(material_code, qty) VALUES ('20002', 777)"
+                    f"(material_code, qty) VALUES ('20002', 777777)"
                 ))
         try:
             result = asyncio.run(orch.execute("查询物料 20002 当前库存"))
-            assert result.route.value == "tool"
-            assert result.data is not None and result.data.success
-            assert result.data.data["qty"] == 0.0
+            _assert_tool_reads_business_datasource(result, "20002")
+            if result.data.success:
+                # 结果来自业务库：其值不得等于应用库 fixture（777777）
+                assert float(result.data.data["qty"]) != 777777.0
         finally:
             with _schemas_engine() as eng:
                 with eng.begin() as conn:
@@ -466,11 +526,16 @@ class TestApiProjectE2E:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def test_api_project_a_and_b_return_different_data(
+    def test_api_project_a_and_b_keep_project_scope(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """POST /api/ai/chat：project-a → 100 / project-b → 999
-        （route=tool，真实 DB 查询，无 LLM 调用）。"""
+        """POST /api/ai/chat：project-a / project-b 均走 TOOL 路由且作用域正确。
+
+        Phase 7 Step 8 起库存 Tool 绑定**独立业务库**（不再按项目 schema
+        切换数据）：业务库已配置 ⇒ 两项目返回同一业务源结果；未配置 ⇒
+        两项目均**显式失败**（消息含"业务数据源"），绝不返回应用库
+        fixture（project_a=100 / project_b=999）。
+        """
         import backend.app.services.project_orchestrator_factory as factory
 
         with _test_registry() as registry:
@@ -485,12 +550,17 @@ class TestApiProjectE2E:
 
         assert pa["route"] == "tool"
         assert pb["route"] == "tool"
-        qty_a = pa["data"]["data"]["qty"]
-        qty_b = pb["data"]["data"]["qty"]
-        assert qty_a == 100.0, pa
-        assert qty_b == 999.0, pb
-        assert pa["data"]["data"]["project_id"] == "project-a"
-        assert pb["data"]["data"]["project_id"] == "project-b"
+        data_a = (pa.get("data") or {}).get("data")
+        data_b = (pb.get("data") or {}).get("data")
+        if data_a is not None:
+            assert data_a.get("project_id") == "project-a"
+        if data_b is not None:
+            assert data_b.get("project_id") == "project-b"
+        if not _business_ds_configured():
+            # 未配置业务库 ⇒ 显式失败（应用库 fixture 100 / 999 不得出现）
+            assert (pa.get("data") or {}).get("success") is False, pa
+            assert (pb.get("data") or {}).get("success") is False, pb
+            assert "业务数据源" in ((pa.get("data") or {}).get("error") or "")
 
     def test_api_unknown_project_404(
         self, monkeypatch: pytest.MonkeyPatch
@@ -525,16 +595,17 @@ class TestApiProjectE2E:
             from backend.app.main import app
 
             with TestClient(app) as client:
-                # 默认 vietnam-wms 的 public schema 无 inventory 表
-                # → Tool 返回失败结果（ToolResult success=False）但 HTTP 仍 200
+                # 默认项目（vietnam-wms）的库存 Tool 绑定**独立业务库**：
+                # 业务库未配置 ⇒ ToolResult success=False；已配置 ⇒ 真实业务结果。
+                # 两种情况下 HTTP 均为 200（工具失败不是 API 失败）。
                 payload = self._post(client, None)
 
         assert payload["route"] in {"tool", "rag"}
-        # 未提供 project_id 不应命中 project-a/b 的数据
+        # 未提供 project_id 不应命中 project-a/b 的数据（作用域 = 默认项目）
         data = payload.get("data") or {}
         tool_data = data.get("data") if isinstance(data, dict) else None
         if tool_data:
-            assert tool_data.get("qty") in (None, 0.0)
+            assert tool_data.get("project_id") == settings.project.project_id
 
     def test_api_default_project_id_equivalent_to_default(self) -> None:
         """project_id = 配置默认值（vietnam-wms）→ 默认注册表命中，

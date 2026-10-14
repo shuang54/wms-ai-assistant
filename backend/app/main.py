@@ -13,6 +13,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.app.api import (
+    agent_command,
     agent_read,
     assistant_timeline,
     assistant_trace,
@@ -26,6 +27,7 @@ from backend.app.api import (
     tool_observability,
     usage,
     workflow_command,
+    workflow_definitions,
     workflow_read,
 )
 from backend.app.config import settings
@@ -89,6 +91,21 @@ def create_app() -> FastAPI:
     # {agent, workflow}；按域复用两套只读面（认证 / 项目作用域 / 详情
     # 语义逐项沿用）；不新增执行能力、不重写 ReadService / Repository）。
     app.include_router(runtime_read.router, prefix="/api", tags=["runtime"])
+    # Phase 7 Step 4：Agent 命令 API（**认证 + 项目作用域** 写边界：
+    # POST /api/agent-runs（start）+ /{run_id}/resume|cancel +
+    # POST /api/agent-approvals/{approval_id}/decision；经既有
+    # AgentRuntime（run/resume）+ AgentCancellationCoordinator +
+    # AgentApprovalStore——不修改 Runtime 状态机；凭据独立
+    # （AGENT_COMMAND_API_KEY）可分别轮换）。
+    app.include_router(agent_command.router, prefix="/api", tags=["agent"])
+    # Phase 7 Step 7：Workflow 定义目录 API（**只读** Query 边界：
+    # GET /api/workflow-definitions——已注册定义（name / version /
+    # start_node_id / input_fields / 节点类型概要）；与命令 API 使用**同一**
+    # 注册表实例（生产目录 workflow.catalog 经 Composition Root 惰性注册）；
+    # 复用 Workflow 读取域认证；不暴露模板 / 参数映射 / 审批文案。
+    app.include_router(
+        workflow_definitions.router, prefix="/api", tags=["workflow"]
+    )
     return app
 
 

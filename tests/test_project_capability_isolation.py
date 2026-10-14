@@ -357,14 +357,22 @@ class TestFactoryCapabilityFiltering:
 @requires_db
 class TestToolExecutionIsolation:
     def test_project_a_tool_succeeds(self) -> None:
-        """A + get_inventory → 成功（真实 DB 查询 project_a → qty 100）。"""
+        """A + get_inventory → 路由命中且 Tool 被授权执行。
+
+        Phase 7 Step 8：库存 Tool 绑定**独立 WMS/ERP 业务库**（不再读应用库
+        project_a schema）—— 业务库已配置 ⇒ 结果与直连业务库一致；未配置 ⇒
+        **显式失败**（消息含"业务数据源"），绝不返回应用库 fixture（qty=100）。
+        """
+        from tests.test_project_datasource_isolation import (
+            _assert_tool_reads_business_datasource,
+        )
+
         orch = _build("project-a")
         result = asyncio.run(orch.execute(QUESTION_TOOL))
-
-        assert result.route.value == "tool"
-        assert result.data.success
-        assert result.data.data["qty"] == 100.0
-        assert result.data.data["project_id"] == "project-a"
+        _assert_tool_reads_business_datasource(result, "10001")
+        if result.data.success:
+            # 作用域仍来自服务端 project_id（Tool 数据标注）
+            assert result.data.data["project_id"] == "project-a"
 
     def test_project_b_denied_zero_db_queries(self, _counting_db) -> None:
         """B + 库存问题 → capability denied；**0 次业务数据库查询**。
@@ -487,13 +495,25 @@ class TestApiCapabilityE2E:
     # ---- Project A：全能力（§十六 回归：原路由行为继续成立） ----
 
     def test_api_project_a_tool_route(self, monkeypatch, _counting_db) -> None:
-        """A + 库存问题 → route=tool，qty=100（真实 DB）。"""
+        """A + 库存问题 → route=tool（Phase 7 Step 8：数据源 = 独立业务库）。"""
+        from tests.test_project_datasource_isolation import (
+            _business_ds_configured,
+        )
+
         with self._api(monkeypatch) as client:
             resp = self._post(client, "project-a", QUESTION_TOOL)
         assert resp.status_code == 200, resp.text
         payload = resp.json()
         assert payload["route"] == "tool"
-        assert payload["data"]["data"]["qty"] == 100.0
+        tool_result = payload["data"]
+        if _business_ds_configured():
+            # 已配置业务库 ⇒ 成功则为真实业务结果（作用域仍为 project-a）
+            if tool_result.get("success"):
+                assert tool_result["data"]["project_id"] == "project-a"
+        else:
+            # 未配置 ⇒ 显式失败（不回退应用库 / 不返回 fixture qty=100）
+            assert tool_result.get("success") is False
+            assert "业务数据源" in (tool_result.get("error") or "")
 
     def test_api_project_a_rag_route(self, monkeypatch, _counting_db) -> None:
         """A + 知识问题 → route=rag（FakeRag 正常调用，§十六 回归）。"""

@@ -423,6 +423,15 @@ class TestSecurityAudit:
             "/api/workflow-runs/{run_id}/advance",
             "/api/workflow-runs/{run_id}/cancel",
             "/api/workflow-approvals/{approval_id}/decision",
+            # ---- Agent Command API（Phase 7 Step 4；精确路由，无 wildcard）----
+            # 启动（start）· 恢复（resume）· 取消（cancel）· 审批裁决（decision）；
+            # 全部挂载 require_agent_command_scope（X-API-Key + 服务端作用域；
+            # 凭据独立于读写两面）。**注意**：与 /api/agent/ 只读面是不同
+            # 命名空间（读面零命令端点契约由 test_agent_read_api 锁定）。
+            "/api/agent-runs",
+            "/api/agent-runs/{run_id}/resume",
+            "/api/agent-runs/{run_id}/cancel",
+            "/api/agent-approvals/{approval_id}/decision",
         }, write_routes
         for route in discover_routes():
             if route.method.lower() in _WRITE_METHODS:

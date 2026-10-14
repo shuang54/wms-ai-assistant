@@ -35,6 +35,7 @@ HTTP Response（API 层显式映射；不在本模块返回 HTTP 细节）
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -88,15 +89,46 @@ class CommandResult:
 
 _REGISTRY = WorkflowRegistry()
 
+#: 生产目录注册状态（惰性 + 幂等 + 线程安全；见 :func:`_ensure_default_definitions`）。
+_DEFAULTS_LOCK = threading.Lock()
+_DEFAULTS_REGISTERED = False
+
+
+def _ensure_default_definitions() -> None:
+    """把**生产定义目录**注册进进程内注册表（惰性；幂等；线程安全）。
+
+    Phase 7 Step 7：``backend.app.workflow.catalog`` 是服务器端静态定义的
+    唯一事实来源；此前生产注册表为空 ⇒ 任何 start 都是 404。本函数只在
+    首次访问 Composition Root 时注册（不重复注册 / 不隐式替换：已存在
+    同名定义 ⇒ 跳过，注册语义仍由 :meth:`WorkflowRegistry.register` 保持
+    fail-closed）。
+    """
+    global _DEFAULTS_REGISTERED
+    if _DEFAULTS_REGISTERED:
+        return
+    with _DEFAULTS_LOCK:
+        if _DEFAULTS_REGISTERED:
+            return
+        from backend.app.workflow.catalog import (
+            build_default_workflow_definitions,
+        )
+
+        for definition in build_default_workflow_definitions():
+            if definition.name not in _REGISTRY:
+                _REGISTRY.register(definition)
+        _DEFAULTS_REGISTERED = True
+
 
 def get_workflow_registry() -> WorkflowRegistry:
     """项目 Workflow 定义注册表（Composition Root）。
 
-    生产装配：本进程内注册表（**不**硬编码任何 workflow 名；未注册名称
-    ⇒ Runtime 侧 ``WorkflowDefinitionNotFoundError`` ⇒ API 404）。
-    定义注册属部署 / 后续步骤——经 :func:`register_workflow_definition`
-    显式注册（重复 name 显式失败，不做隐式替换）。
+    生产装配：本进程内注册表 + **生产定义目录**（Phase 7 Step 7：惰性 +
+    幂等注册，见 :func:`_ensure_default_definitions`）；未注册名称
+    ⇒ Runtime 侧 ``WorkflowDefinitionNotFoundError`` ⇒ API 404。
+    额外定义可经 :func:`register_workflow_definition` 显式注册
+    （重复 name 显式失败，不做隐式替换）。
     """
+    _ensure_default_definitions()
     return _REGISTRY
 
 

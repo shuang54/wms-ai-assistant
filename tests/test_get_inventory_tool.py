@@ -438,15 +438,27 @@ def real_engine() -> Generator[Any, None, None]:
         reset_engine_cache()
 
 
+def _fixture_inv_settings() -> InventoryToolSettings:
+    """隔离 fixture 表（``material_code`` / ``qty`` 列）的 Tool 配置。
+
+    显式指定**列映射**：本机 .env 可能把 ``WMS_INVENTORY_*_COLUMN`` 指向真实
+    ERP 表结构（如 ``available_qty`` / ``mat_code``）；本文件的 fixture 表
+    固定为 ``material_code`` + ``qty``，因此不继承 env 的列映射。
+    """
+    return InventoryToolSettings(
+        schema_name=_INVENTORY_TEST_SCHEMA,
+        table_name=_INVENTORY_TEST_TABLE,
+        material_code_column="material_code",
+        qty_column="qty",
+    )
+
+
 @pytest.fixture()
 def real_handler(real_engine: Any) -> Generator[GetInventoryHandler, None, None]:
     """真实 GetInventoryHandler（指向 _INVENTORY_TEST_FULL）。"""
     yield GetInventoryHandler(
         engine=real_engine,
-        inv_settings=InventoryToolSettings(
-            schema_name=_INVENTORY_TEST_SCHEMA,
-            table_name=_INVENTORY_TEST_TABLE,
-        ),
+        inv_settings=_fixture_inv_settings(),
         project_id="inventory-tool-test",
     )
 
@@ -621,10 +633,7 @@ class TestProjectContext:
         """
         handler = GetInventoryHandler(
             engine=real_engine,
-            inv_settings=InventoryToolSettings(
-                schema_name=_INVENTORY_TEST_SCHEMA,
-                table_name=_INVENTORY_TEST_TABLE,
-            ),
+            inv_settings=_fixture_inv_settings(),
             project_id="another-warehouse",
         )
         result = await handler({"material_code": "10001"})
@@ -700,10 +709,7 @@ class TestOrchestratorIntegration:
         """Orchestrator 调用真实 get_inventory Handler → 真实 DB 数据。"""
         handler = GetInventoryHandler(
             engine=real_engine,
-            inv_settings=InventoryToolSettings(
-                schema_name=_INVENTORY_TEST_SCHEMA,
-                table_name=_INVENTORY_TEST_TABLE,
-            ),
+            inv_settings=_fixture_inv_settings(),
             project_id="orch-test",
         )
         registry = ToolRegistry()
@@ -729,10 +735,7 @@ class TestOrchestratorIntegration:
         """
         handler = GetInventoryHandler(
             engine=real_engine,
-            inv_settings=InventoryToolSettings(
-                schema_name=_INVENTORY_TEST_SCHEMA,
-                table_name=_INVENTORY_TEST_TABLE,
-            ),
+            inv_settings=_fixture_inv_settings(),
         )
         registry = ToolRegistry()
         register_get_inventory_tool(registry, handler=handler)
@@ -767,10 +770,7 @@ class TestApiIntegration:
 
         handler = GetInventoryHandler(
             engine=real_engine,
-            inv_settings=InventoryToolSettings(
-                schema_name=_INVENTORY_TEST_SCHEMA,
-                table_name=_INVENTORY_TEST_TABLE,
-            ),
+            inv_settings=_fixture_inv_settings(),
             project_id="api-test",
         )
         registry = build_default_tool_registry(handler=handler)
@@ -879,10 +879,7 @@ class TestDbWriteProtection:
 
         handler = GetInventoryHandler(
             engine=real_engine,
-            inv_settings=InventoryToolSettings(
-                schema_name=_INVENTORY_TEST_SCHEMA,
-                table_name=_INVENTORY_TEST_TABLE,
-            ),
+            inv_settings=_fixture_inv_settings(),
         )
         for code in ("10001", "10002", "99999", "MAT-001"):
             try:

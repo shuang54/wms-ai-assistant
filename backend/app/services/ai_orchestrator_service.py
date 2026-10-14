@@ -664,6 +664,35 @@ class AIOrchestratorService:
         """本 Orchestrator 注入的观测出口（None = 不产生 Record）。"""
         return self._tool_execution_observer
 
+    # ---------- Phase 7 Step 4：Agent 命令 API 装配只读面 ----------
+    # （Agent Command API 的 composition root 经这些访问器复用**同一**
+    #  per-project 装配——不新建第二套 Runtime / 凭据 / 执行边界。）
+
+    @property
+    def agent_runtime(self) -> Any | None:
+        """本项目装配的 AgentRuntime（None = Agent 能力未启用）。"""
+        return self._agent_runtime
+
+    @property
+    def agent_run_recorder(self) -> Any | None:
+        """Agent Run 持久化边界（None = 不持久化）。"""
+        return self._agent_run_recorder
+
+    @property
+    def agent_step_recorder(self) -> Any | None:
+        """Agent Step 持久化边界（None = 不持久化）。"""
+        return self._agent_step_recorder
+
+    @property
+    def agent_checkpoint_recorder(self) -> Any | None:
+        """Agent Checkpoint 持久化边界（None = 无控制状态）。"""
+        return self._agent_checkpoint_recorder
+
+    @property
+    def agent_approval_store(self) -> Any | None:
+        """HITL 审批存储（None = 审批未接线）。"""
+        return self._agent_approval_store
+
     @property
     def agent_run_recorder(self) -> AgentRunRecorder | None:
         """本 Orchestrator 注入的 Agent Run 持久化边界（None = 不落盘）。

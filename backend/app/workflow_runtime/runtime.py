@@ -484,6 +484,13 @@ class WorkflowRuntime:
                         workflow_run_id, WF_ERROR_RUN_NOT_FOUND
                     )
                 if fresh.status in WORKFLOW_TERMINAL_STATUSES:
+                    # Phase 7 Step 4.1：区分"因取消而终态"与"其它终态"——
+                    # 并发取消的**输家**（他人已在竞态中完成 CANCELLED 收尾）
+                    # 读到的是**已取消的事实**，必须报 CANCELLED；把它报成
+                    # NOT_CANCELLABLE（"不可取消"）是对事实的错误分类
+                    # （三态不二值化：D-C——每个结果都是可证明的事实）。
+                    if fresh.status == WORKFLOW_STATUS_CANCELLED:
+                        return _outcome(fresh, OUTCOME_CANCELLED)
                     return _outcome(fresh, OUTCOME_NOT_CANCELLABLE)
                 if not fresh.cancel_requested:
                     # 无法归因（reason=unknown 类）⇒ 明确冲突，不猜测

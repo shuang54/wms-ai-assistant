@@ -137,6 +137,84 @@ class DatabaseSettings:
 
 
 # ============================================================
+# Business Database 配置（WMS/ERP 独立只读业务数据源）
+# ============================================================
+
+@dataclass(frozen=True)
+class BusinessDatabaseSettings:
+    """WMS/ERP 业务库配置（**独立**于应用库；只读账号）。
+
+    为什么独立（与应用库 ``DatabaseSettings`` / ``DATABASE_URL`` 的关系）：
+
+        * 应用库 = 本项目自身的数据（ai_ops 观测表 / 知识库 / 会话）；
+        * 业务库 = 客户 WMS/ERP 的真实业务数据（库存等），**只读**；
+        * 二者**不复用连接**（独立 Engine / 独立连接池 / 独立 fail-closed）：
+          业务库缺失 / 不可达 ⇒ 明确报错，**绝不**回退应用库、**绝不**伪造数据。
+
+    字段（环境变量；**不修改** DATABASE_URL）：
+
+        host:     ``WMS_DATABASE_HOST``     业务库主机
+        port:     ``WMS_DATABASE_PORT``     端口（默认 5432）
+        name:     ``WMS_DATABASE_NAME``     数据库名
+        user:     ``WMS_DATABASE_USER``     只读账号
+        password: ``WMS_DATABASE_PASSWORD`` 密码 —— ``repr=False``（**绝不**出现在
+                  repr / 日志 / 异常文本中）；真实值只允许放在本机**忽略跟踪**的
+                  ``.env``（.gitignore: ``.env`` / ``.env.*``）
+        pool_size / max_overflow: 独立小池（只读单查询工具）
+        connect_timeout: 建连超时（秒；钳制 [1, 60]）
+    """
+
+    host: str = field(default_factory=lambda: _get_str("WMS_DATABASE_HOST"))
+    port: int = field(
+        default_factory=lambda: _get_int_clamped("WMS_DATABASE_PORT", 5432, 1, 65535)
+    )
+    name: str = field(default_factory=lambda: _get_str("WMS_DATABASE_NAME"))
+    user: str = field(default_factory=lambda: _get_str("WMS_DATABASE_USER"))
+    password: str = field(
+        default_factory=lambda: _get_str("WMS_DATABASE_PASSWORD"), repr=False
+    )
+    pool_size: int = field(
+        default_factory=lambda: _get_int_clamped("WMS_DATABASE_POOL_SIZE", 2, 1, 20)
+    )
+    max_overflow: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_DATABASE_MAX_OVERFLOW", 1, 0, 20
+        )
+    )
+    connect_timeout: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_DATABASE_CONNECT_TIMEOUT", 5, 1, 60
+        )
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        """连接参数是否齐备（含密码）—— **唯一**的"已配置"判定。
+
+        任一缺失（含密码为空字符串 / 纯空白）⇒ False ⇒ 业务数据源视为未配置
+        （fail-closed：调用方必须显式报错，不得回退应用库）。
+        """
+        return bool(
+            self.host.strip()
+            and self.name.strip()
+            and self.user.strip()
+            and self.password.strip()
+        )
+
+    def summary(self) -> dict[str, object]:
+        """非敏感摘要（host / port / database / configured；**无** user / password）。
+
+        供日志与人工排查使用；**绝不**包含凭据。
+        """
+        return {
+            "configured": self.is_configured,
+            "host": self.host,
+            "port": self.port,
+            "database": self.name,
+        }
+
+
+# ============================================================
 # Embedding 配置（Phase 3.2）
 # ============================================================
 
@@ -394,6 +472,37 @@ class WorkflowCommandSettings:
     )
 
 
+@dataclass(frozen=True)
+class AgentCommandSettings:
+    """Agent **命令** API（start / resume / cancel / approve-reject）认证配置。
+
+    Phase 7 Step 4 —— 与 ``WorkflowCommandSettings`` / ``AgentReadSettings``
+    **同形同机制**（X-API-Key + 服务端唯一授权作用域；不引入新的认证机制），
+    但**独立凭据**（读写最小权限分离：Agent 读取凭据泄露不影响命令面；
+    可分别轮换——部署层可配置为相同值，代码不耦合）。
+
+    **不提供任何默认凭据**：两项默认均为空字符串 ⇒ 视为"未配置" ⇒
+    命令端点一律拒绝访问（503，**绝不**退化为匿名可访问、
+    **绝不**回退默认项目）。
+
+    字段：
+        api_key:        服务端共享 API Key（环境变量
+                        ``AGENT_COMMAND_API_KEY``；默认空 = 未配置）。
+                        不得写入源码 / 测试默认值 / 文档 / 日志 / 响应体。
+        api_project_id: 该凭据**唯一**授权的项目作用域（环境变量
+                        ``AGENT_COMMAND_API_PROJECT_ID``；默认空 = 未配置）——
+                        授权作用域的**唯一来源**；客户端 Query / Header /
+                        Body 参数不能覆盖或扩宽。
+    """
+
+    api_key: str = field(
+        default_factory=lambda: _get_str("AGENT_COMMAND_API_KEY", "")
+    )
+    api_project_id: str = field(
+        default_factory=lambda: _get_str("AGENT_COMMAND_API_PROJECT_ID", "")
+    )
+
+
 # ============================================================
 # Tool Calling 配置（Phase 3.6.3）
 # ============================================================
@@ -450,6 +559,16 @@ class InventoryToolSettings:
                           PostgreSQL ``statement_timeout``（秒）。
                           环境变量 ``WMS_INVENTORY_QUERY_TIMEOUT_SECONDS``，
                           默认 10，钳制到 [1, 60]。
+
+    字段映射（业务库**表结构可能与通用假设不同** ⇒ 显式配置；仍由
+    ``_assert_safe_identifier`` 白名单校验，**绝不**接受用户输入拼接）：
+
+        material_code_column: 物料编码列名。环境变量
+                          ``WMS_INVENTORY_MATERIAL_CODE_COLUMN``，默认
+                          ``material_code``（如 ERP 使用 ``mat_code`` ⇒ 配置它）。
+        qty_column:       库存数量列名。环境变量 ``WMS_INVENTORY_QTY_COLUMN``，
+                          默认 ``qty``（如快照表用 ``available_qty``（可用）或
+                          ``onhand_qty``（现有量）⇒ 配置它）。
     """
 
     schema_name: str = field(
@@ -457,6 +576,14 @@ class InventoryToolSettings:
     )
     table_name: str = field(
         default_factory=lambda: _get_str("WMS_INVENTORY_TABLE", "inventory")
+    )
+    material_code_column: str = field(
+        default_factory=lambda: _get_str(
+            "WMS_INVENTORY_MATERIAL_CODE_COLUMN", "material_code"
+        )
+    )
+    qty_column: str = field(
+        default_factory=lambda: _get_str("WMS_INVENTORY_QTY_COLUMN", "qty")
     )
     material_code_max_len: int = field(
         default_factory=lambda: _get_int_clamped(
@@ -652,6 +779,9 @@ class Settings:
     app_port: int = field(default_factory=lambda: _get_int("APP_PORT", 8000))
     llm: LLMSettings = field(default_factory=LLMSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
+    business_database: BusinessDatabaseSettings = field(
+        default_factory=BusinessDatabaseSettings
+    )
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
     rag: RagSettings = field(default_factory=RagSettings)
     reranker: RerankerSettings = field(default_factory=RerankerSettings)
@@ -667,6 +797,9 @@ class Settings:
         default_factory=WorkflowReadSettings
     )
     agent_read: AgentReadSettings = field(default_factory=AgentReadSettings)
+    agent_command: AgentCommandSettings = field(
+        default_factory=AgentCommandSettings
+    )
     workflow_command: WorkflowCommandSettings = field(
         default_factory=WorkflowCommandSettings
     )
@@ -681,6 +814,7 @@ __all__ = [
     "Settings",
     "LLMSettings",
     "DatabaseSettings",
+    "BusinessDatabaseSettings",
     "EmbeddingSettings",
     "RagSettings",
     "RerankerSettings",
