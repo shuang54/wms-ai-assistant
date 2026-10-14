@@ -69,8 +69,10 @@ from backend.app.tools.get_inventory import (
     _MATERIAL_CODE_PATTERN,
     _SAFE_IDENTIFIER_PATTERN,
     _assert_safe_identifier,
+    _escape_like,
     _validate_material_code,
-    _validate_warehouse_code,
+    _validate_optional_code,
+    _validate_stat_date,
     build_default_tool_registry,
     register_get_inventory_tool,
 )
@@ -100,15 +102,11 @@ requires_db = pytest.mark.skipif(
 # ============================================================
 
 _INVENTORY_TEST_SCHEMA = "inventory_tool_test"
-_INVENTORY_TEST_TABLE = "inventory"
+#: 报表口径条码表（Phase 7：库存现存量 = 条码库存；夹具表名与业务库一致）。
+_INVENTORY_TEST_TABLE = "dyn_wh_barcode"
 _INVENTORY_TEST_FULL = f"{_INVENTORY_TEST_SCHEMA}.{_INVENTORY_TEST_TABLE}"
-# DDL 用：schema 与 table 必须**分别**加引号，
-# 否则 '"a.b"' 会被 PostgreSQL 当成单个含点的标识符（建到 public 下）。
-_INVENTORY_TEST_DDL_QUALIFIED = (
-    f'"{_INVENTORY_TEST_SCHEMA}"."{_INVENTORY_TEST_TABLE}"'
-)
 
-# 关键测试 fixture 数据
+# 关键测试 fixture 数据（material_code → qty；每个物料 1 条在库条码）
 _INVENTORY_SEED_DATA: tuple[tuple[str, float], ...] = (
     ("10001", 120.0),
     ("10002", 80.0),
@@ -116,42 +114,168 @@ _INVENTORY_SEED_DATA: tuple[tuple[str, float], ...] = (
     ("SKU.001", 5.0),
 )
 
+#: fixture 内的固定维度 id（隔离 schema；与业务库结构对齐的最小列集）
+_FX_DIC_IN = "st-in"
+_FX_DIC_OUT = "st-out"
+_FX_UNIT = "u1"
+_FX_ORG = "o1"
+_FX_WAREHOUSE = "w1"
+_FX_LOCATION = "l1"
+_FX_SHELF = "sh1"
+_FX_UPDATE_TIME = "2026-01-01 08:00:00"
+
+#: 报表口径夹具表清单（DDL 由本文件管理；teardown 整 schema 删除）。
+_INVENTORY_TEST_TABLES: tuple[str, ...] = (
+    "secf_sys_f_dic",
+    "dyn_unit",
+    "secf_sys_org_company",
+    "dyn_wh_warehouse",
+    "dyn_wh_location",
+    "dyn_wh_shelf",
+    "dyn_wh_bc",
+    "dyn_erp_basic_material",
+    "dyn_erp_basic_material_i18n",
+    "dyn_wh_bc_location_record",
+    "dyn_wh_barcode",
+)
+
+#: 报表口径夹具 DDL（最小列集；**仅**建在隔离 schema，绝不触碰 public）。
+_INVENTORY_TEST_DDL: tuple[str, ...] = (
+    "CREATE TABLE {s}.secf_sys_f_dic ("
+    "  id VARCHAR(64) PRIMARY KEY, code VARCHAR(64))",
+    "CREATE TABLE {s}.dyn_unit ("
+    "  id VARCHAR(64) PRIMARY KEY, unit_desc VARCHAR(64))",
+    "CREATE TABLE {s}.secf_sys_org_company ("
+    "  id VARCHAR(64) PRIMARY KEY, cnname VARCHAR(128), kd_stock_code VARCHAR(64))",
+    "CREATE TABLE {s}.dyn_wh_warehouse ("
+    "  id VARCHAR(64) PRIMARY KEY, code VARCHAR(64), name VARCHAR(128))",
+    "CREATE TABLE {s}.dyn_wh_location ("
+    "  id VARCHAR(64) PRIMARY KEY, location_code VARCHAR(64), name VARCHAR(128))",
+    "CREATE TABLE {s}.dyn_wh_shelf ("
+    "  id VARCHAR(64) PRIMARY KEY, shelf_code VARCHAR(64))",
+    "CREATE TABLE {s}.dyn_wh_bc ("
+    "  id VARCHAR(64) PRIMARY KEY, code VARCHAR(64), archived VARCHAR(4),"
+    "  material_code VARCHAR(64))",
+    "CREATE TABLE {s}.dyn_erp_basic_material ("
+    "  id VARCHAR(64) PRIMARY KEY, material_code VARCHAR(64), unit_id VARCHAR(64))",
+    "CREATE TABLE {s}.dyn_erp_basic_material_i18n ("
+    "  id VARCHAR(64), locale VARCHAR(16), material_desc VARCHAR(128))",
+    "CREATE TABLE {s}.dyn_wh_bc_location_record ("
+    "  id VARCHAR(64) PRIMARY KEY, archived VARCHAR(4), location_id VARCHAR(64),"
+    "  material_id VARCHAR(64), update_time TIMESTAMP)",
+    "CREATE TABLE {s}.dyn_wh_barcode ("
+    "  id VARCHAR(64) PRIMARY KEY, archived VARCHAR(4), qty NUMERIC(18,4),"
+    "  status_dic_id VARCHAR(64), location_id VARCHAR(64),"
+    "  warehouse_id VARCHAR(64), wh_bc_id VARCHAR(64), material_id VARCHAR(64),"
+    "  org_id VARCHAR(64), shelf_id VARCHAR(64))",
+)
+
 
 def _setup_inventory_fixture(engine: Any) -> None:
-    """创建 inventory_tool_test 隔离 schema + 表 + seed data。
+    """创建 inventory_tool_test 隔离 schema + **报表口径**夹具表 + seed。
 
-    使用 DDL 直接创建（**不**走 ORM Model 注册），避免污染 Base.metadata
-    与现有 knowledge_document / knowledge_chunk 表。
+    为什么是"报表口径"：``get_inventory``（Phase 7）执行的是真实 WMS
+    现存量报表等价查询（``dyn_wh_barcode`` 等固定表映射）⇒ 夹具必须提供
+    同结构的最小表；schema 由 ``WMS_INVENTORY_SCHEMA``（测试注入）指向本
+    隔离 schema，因此**不触碰** public / 业务库。
+
+    负向数据（验证报表关键过滤）：
+        * ``MAT-001`` 另有一条 ``archived='1'`` 条码（qty=1000）⇒ 不得计入；
+        * ``MAT-001`` 另有一条状态 ``BARCODE_STATUS_OUT`` 条码（qty=500）
+          ⇒ 不得计入；
+        * 期望结果仍为 seed 值（250）。
     """
     with engine.begin() as conn:
         conn.execute(sa_text(
-            f'CREATE SCHEMA IF NOT EXISTS "{_INVENTORY_TEST_SCHEMA}"'
+            f'DROP SCHEMA IF EXISTS "{_INVENTORY_TEST_SCHEMA}" CASCADE'
         ))
         conn.execute(sa_text(
-            f"DROP TABLE IF EXISTS {_INVENTORY_TEST_DDL_QUALIFIED}"
+            f'CREATE SCHEMA "{_INVENTORY_TEST_SCHEMA}"'
         ))
+        qualified = f'"{_INVENTORY_TEST_SCHEMA}"'
+        for ddl in _INVENTORY_TEST_DDL:
+            conn.execute(sa_text(ddl.format(s=qualified)))
+
+        # 字典 / 单位 / 组织 / 仓库 / 库位 / 货架
         conn.execute(sa_text(
-            f"CREATE TABLE {_INVENTORY_TEST_DDL_QUALIFIED} ("
-            f'  id SERIAL PRIMARY KEY,'
-            f'  material_code VARCHAR(64) NOT NULL,'
-            f'  qty NUMERIC(18, 4) NOT NULL DEFAULT 0'
-            f')'
-        ))
+            f"INSERT INTO {qualified}.secf_sys_f_dic (id, code) VALUES "
+            "(:i, 'BARCODE_STATUS_IN'), (:o, 'BARCODE_STATUS_OUT')"
+        ), {"i": _FX_DIC_IN, "o": _FX_DIC_OUT})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_unit (id, unit_desc) VALUES (:id, 'PCS')"
+        ), {"id": _FX_UNIT})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.secf_sys_org_company "
+            "(id, cnname, kd_stock_code) VALUES (:id, 'Test Org', 'ORG1')"
+        ), {"id": _FX_ORG})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_wh_warehouse (id, code, name) "
+            "VALUES (:id, 'A01', 'Warehouse A01')"
+        ), {"id": _FX_WAREHOUSE})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_wh_location (id, location_code, name) "
+            "VALUES (:id, 'L01', 'Location L01')"
+        ), {"id": _FX_LOCATION})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_wh_shelf (id, shelf_code) "
+            "VALUES (:id, 'S01')"
+        ), {"id": _FX_SHELF})
+
         for code, qty in _INVENTORY_SEED_DATA:
-            conn.execute(
-                sa_text(
-                    f"INSERT INTO {_INVENTORY_TEST_DDL_QUALIFIED} "
-                    f'(material_code, qty) VALUES (:code, :qty)'
-                ),
-                {"code": code, "qty": qty},
-            )
+            material_id = f"m-{code}"
+            bc_id = f"bc-{code}"
+            conn.execute(sa_text(
+                f"INSERT INTO {qualified}.dyn_erp_basic_material "
+                "(id, material_code, unit_id) VALUES (:mid, :code, :unit)"
+            ), {"mid": material_id, "code": code, "unit": _FX_UNIT})
+            conn.execute(sa_text(
+                f"INSERT INTO {qualified}.dyn_erp_basic_material_i18n "
+                "(id, locale, material_desc) VALUES (:mid, 'zh-CN', :desc)"
+            ), {"mid": material_id, "desc": f"Material {code}"})
+            conn.execute(sa_text(
+                f"INSERT INTO {qualified}.dyn_wh_bc "
+                "(id, code, archived, material_code) "
+                "VALUES (:bid, :bcode, '0', :code)"
+            ), {"bid": bc_id, "bcode": f"B{code}", "code": code})
+            conn.execute(sa_text(
+                f"INSERT INTO {qualified}.dyn_wh_bc_location_record "
+                "(id, archived, location_id, material_id, update_time) "
+                "VALUES (:rid, '0', :loc, :mid, CAST(:ts AS timestamp))"
+            ), {"rid": f"r-{code}", "loc": _FX_LOCATION,
+                 "mid": material_id, "ts": _FX_UPDATE_TIME})
+            conn.execute(sa_text(
+                f"INSERT INTO {qualified}.dyn_wh_barcode "
+                "(id, archived, qty, status_dic_id, location_id, warehouse_id, "
+                " wh_bc_id, material_id, org_id, shelf_id) VALUES "
+                "(:bid, '0', :qty, :dic, :loc, :wh, :bc, :mid, :org, :shelf)"
+            ), {"bid": f"b-{code}", "qty": qty, "dic": _FX_DIC_IN,
+                 "loc": _FX_LOCATION, "wh": _FX_WAREHOUSE, "bc": bc_id,
+                 "mid": material_id, "org": _FX_ORG, "shelf": _FX_SHELF})
+
+        # 负向数据（仅 MAT-001）：归档条码 + 非在库状态条码
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_wh_barcode "
+            "(id, archived, qty, status_dic_id, location_id, warehouse_id, "
+            " wh_bc_id, material_id, org_id, shelf_id) VALUES "
+            "('b-MAT-001-archived', '1', 1000, :dic, :loc, :wh, 'bc-MAT-001', "
+            " 'm-MAT-001', :org, :shelf)"
+        ), {"dic": _FX_DIC_IN, "loc": _FX_LOCATION, "wh": _FX_WAREHOUSE,
+            "org": _FX_ORG, "shelf": _FX_SHELF})
+        conn.execute(sa_text(
+            f"INSERT INTO {qualified}.dyn_wh_barcode "
+            "(id, archived, qty, status_dic_id, location_id, warehouse_id, "
+            " wh_bc_id, material_id, org_id, shelf_id) VALUES "
+            "('b-MAT-001-out', '0', 500, :dic, :loc, :wh, 'bc-MAT-001', "
+            " 'm-MAT-001', :org, :shelf)"
+        ), {"dic": _FX_DIC_OUT, "loc": _FX_LOCATION, "wh": _FX_WAREHOUSE,
+            "org": _FX_ORG, "shelf": _FX_SHELF})
 
 
 def _teardown_inventory_fixture(engine: Any) -> None:
-    """清理 inventory_tool_test schema（保留 schema 本身以便下次复用）。"""
+    """清理 inventory_tool_test schema（整 schema 删除，零残留）。"""
     with engine.begin() as conn:
         conn.execute(sa_text(
-            f"DROP TABLE IF EXISTS {_INVENTORY_TEST_DDL_QUALIFIED}"
+            f'DROP SCHEMA IF EXISTS "{_INVENTORY_TEST_SCHEMA}" CASCADE'
         ))
 
 
@@ -227,39 +351,56 @@ class TestDefinitionAndValidation:
     # ---------- Phase 3.11 Step 4：warehouse_code（可选第二参数） ----------
 
     def test_definition_declares_optional_warehouse_code(self) -> None:
-        """warehouse_code 为可选字段；required 仍只有 material_code。"""
+        """warehouse_code 为可选字段（Phase 7 起**真实生效**）；required 仍只有
+        material_code。"""
         params = GET_INVENTORY_DEFINITION.parameters
         props = params["properties"]
         assert props["warehouse_code"]["type"] == "string"
         assert params["required"] == ["material_code"]
 
-    def test_validate_warehouse_code_none_is_optional(self) -> None:
-        """缺省（None）→ None（可选语义，与 material 的必填语义不同）。"""
-        assert _validate_warehouse_code(None, max_len=64) is None
+    def test_definition_declares_report_filters(self) -> None:
+        """Phase 7：报表筛选参数（组织/仓库/库位/货架/批次/统计日期）齐备。"""
+        props = GET_INVENTORY_DEFINITION.parameters["properties"]
+        for field_name in (
+            "org_code",
+            "warehouse_code",
+            "location_code",
+            "shelf_code",
+            "batch_code",
+            "stat_date",
+        ):
+            assert field_name in props, field_name
+            assert props[field_name]["type"] == "string"
 
-    def test_validate_warehouse_code_strips(self) -> None:
-        assert _validate_warehouse_code("  A01  ", max_len=64) == "A01"
+    def test_validate_optional_code_none_is_optional(self) -> None:
+        """缺省（None）→ None（可选语义，与 material 的必填语义不同）。"""
+        assert (
+            _validate_optional_code(
+                None, field_name="warehouse_code", max_len=64
+            )
+            is None
+        )
+
+    def test_validate_optional_code_strips(self) -> None:
+        assert (
+            _validate_optional_code(
+                "  A01  ", field_name="warehouse_code", max_len=64
+            )
+            == "A01"
+        )
 
     @pytest.mark.parametrize("value", [
         "", "   ", 123, 1.5,
         "' OR '1'='1", "A01; DELETE FROM x", "a" * 65, "-A01",
     ])
-    def test_validate_warehouse_code_rejects_invalid(self, value) -> None:
+    def test_validate_optional_code_rejects_invalid(self, value) -> None:
         with pytest.raises(ValueError):
-            _validate_warehouse_code(value, max_len=64)
-
-    async def test_handler_rejects_warehouse_code_guard(self) -> None:
-        """携带 warehouse_code → 显式拒绝（ToolExecutionError）；
-        guard 位于 DB 访问之前（本测试 0 DB）。"""
-        handler = GetInventoryHandler()  # 无 engine；guard 先于 engine 解析
-        with pytest.raises(ToolExecutionError) as ei:
-            await handler(
-                {"material_code": "MAT-001", "warehouse_code": "A01"}
+            _validate_optional_code(
+                value, field_name="warehouse_code", max_len=64
             )
-        assert "warehouse" in str(ei.value)
 
     async def test_handler_rejects_invalid_warehouse_code(self) -> None:
-        """warehouse_code 格式非法 → ToolValidationError（guard 之前拦截）。"""
+        """warehouse_code 格式非法 → ToolValidationError（DB 访问之前拦截）。"""
         handler = GetInventoryHandler()
         with pytest.raises(ToolValidationError) as ei:
             await handler(
@@ -267,6 +408,43 @@ class TestDefinitionAndValidation:
                  "warehouse_code": "A01' OR '1'='1"}
             )
         assert ei.value.field_path == "warehouse_code"
+
+    async def test_handler_rejects_unsupported_filter_fields(self) -> None:
+        """未确认的筛选字段（如任意列名 / SQL 片段）由 Schema 拒绝（0 DB）。"""
+        from backend.app.tools.base import validate_arguments
+
+        with pytest.raises(ValueError):
+            validate_arguments(
+                GET_INVENTORY_DEFINITION.parameters,
+                {"material_code": "MAT-001", "where_clause": "1=1"},
+            )
+
+    @pytest.mark.parametrize("value", ["2026-01-01", "2026-12-31"])
+    def test_validate_stat_date_accepts_iso(self, value) -> None:
+        from datetime import date
+
+        assert _validate_stat_date(value) == date.fromisoformat(value)
+
+    def test_validate_stat_date_none_is_optional(self) -> None:
+        assert _validate_stat_date(None) is None
+
+    @pytest.mark.parametrize("value", [
+        "", "   ", "2026/01/01", "2026-13-01", "01-01-2026", 20260101,
+        "2026-01-01'; DROP TABLE x; --",
+    ])
+    def test_validate_stat_date_rejects_invalid(self, value) -> None:
+        with pytest.raises(ValueError):
+            _validate_stat_date(value)
+
+    @pytest.mark.parametrize("value,expected", [
+        ("A01", "A01"),
+        ("100%", "100\\%"),
+        ("A_1", "A\\_1"),
+        ("a\\b", "a\\\\b"),
+    ])
+    def test_escape_like_is_literal(self, value, expected) -> None:
+        """批次模糊匹配按字面量（% / _ / \\ 全部转义）。"""
+        assert _escape_like(value) == expected
 
 
 # ============================================================
@@ -439,18 +617,12 @@ def real_engine() -> Generator[Any, None, None]:
 
 
 def _fixture_inv_settings() -> InventoryToolSettings:
-    """隔离 fixture 表（``material_code`` / ``qty`` 列）的 Tool 配置。
+    """隔离 fixture schema 的 Tool 配置（Phase 7：报表口径固定表映射）。
 
-    显式指定**列映射**：本机 .env 可能把 ``WMS_INVENTORY_*_COLUMN`` 指向真实
-    ERP 表结构（如 ``available_qty`` / ``mat_code``）；本文件的 fixture 表
-    固定为 ``material_code`` + ``qty``，因此不继承 env 的列映射。
+    只覆盖 ``schema_name`` ⇒ 查询指向隔离 schema 中的报表结构夹具表
+    （``dyn_wh_barcode`` 等）；表 / 列映射为服务器端固定常量。
     """
-    return InventoryToolSettings(
-        schema_name=_INVENTORY_TEST_SCHEMA,
-        table_name=_INVENTORY_TEST_TABLE,
-        material_code_column="material_code",
-        qty_column="qty",
-    )
+    return InventoryToolSettings(schema_name=_INVENTORY_TEST_SCHEMA)
 
 
 @pytest.fixture()
@@ -518,9 +690,15 @@ class TestRealDatabaseInventory:
             ).scalar()
             # 行数不变，且未发生全表求和泄露
             assert int(after_count) == int(before_count)
+            # 报表口径合计（仅 未归档 + BARCODE_STATUS_IN + bc 未归档 的条码）
             total_qty = conn.execute(
                 sa_text(
-                    f"SELECT COALESCE(SUM(qty), 0) FROM {_INVENTORY_TEST_FULL}"
+                    f"SELECT COALESCE(SUM(b.qty), 0) FROM {_INVENTORY_TEST_FULL} b "
+                    f"JOIN {_INVENTORY_TEST_SCHEMA}.secf_sys_f_dic st "
+                    "  ON st.id = b.status_dic_id AND st.code = 'BARCODE_STATUS_IN' "
+                    f"LEFT JOIN {_INVENTORY_TEST_SCHEMA}.dyn_wh_bc bc "
+                    "  ON bc.id = b.wh_bc_id "
+                    "WHERE b.archived = '0' AND bc.archived = '0'"
                 )
             ).scalar()
         assert float(total_qty) == 120.0 + 80.0 + 250.0 + 5.0
@@ -608,7 +786,6 @@ class TestRealDatabaseInventory:
         handler = GetInventoryHandler(
             inv_settings=InventoryToolSettings(
                 schema_name="public; DROP TABLE x",
-                table_name="inventory",
             ),
         )
         with pytest.raises(ToolExecutionError):

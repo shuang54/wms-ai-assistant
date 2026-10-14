@@ -543,14 +543,18 @@ INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MAX = 60
 
 @dataclass(frozen=True)
 class InventoryToolSettings:
-    """真实 ``get_inventory`` Tool 配置（Phase 3.7.12 引入）。
+    """真实 ``get_inventory`` Tool 配置（Phase 3.7.12；Phase 7 报表接入）。
+
+    库存口径（Phase 7 真实 WMS 条码库存）：
+        ``get_inventory`` 查询 **WMS 条码库存现存量**（业务报表
+        ``库存现存量报表`` 的等价实现）——表 / 列映射为**服务器端固定常量**
+        （``backend/app/tools/get_inventory.py`` 中已核对测试库白名单），
+        用户输入**只**作为绑定参数（绝不拼接标识符）。
 
     字段：
-        schema_name:      库存表所在 schema。环境变量 ``WMS_INVENTORY_SCHEMA``，
-                          默认 ``public``。必须是 SQL 安全标识符
-                          （字母/数字/下划线/点；不接受引号）。
-        table_name:       库存表名。环境变量 ``WMS_INVENTORY_TABLE``，
-                          默认 ``inventory``。同 schema_name 约束。
+        schema_name:      业务库 schema（报表全部表均位于该 schema）。
+                          环境变量 ``WMS_INVENTORY_SCHEMA``，默认 ``public``。
+                          必须是 SQL 安全标识符（字母/数字/下划线；不接受引号）。
         material_code_max_len:
                           ``material_code`` 长度上限。环境变量
                           ``WMS_INVENTORY_MATERIAL_CODE_MAX_LEN``，
@@ -559,31 +563,12 @@ class InventoryToolSettings:
                           PostgreSQL ``statement_timeout``（秒）。
                           环境变量 ``WMS_INVENTORY_QUERY_TIMEOUT_SECONDS``，
                           默认 10，钳制到 [1, 60]。
-
-    字段映射（业务库**表结构可能与通用假设不同** ⇒ 显式配置；仍由
-    ``_assert_safe_identifier`` 白名单校验，**绝不**接受用户输入拼接）：
-
-        material_code_column: 物料编码列名。环境变量
-                          ``WMS_INVENTORY_MATERIAL_CODE_COLUMN``，默认
-                          ``material_code``（如 ERP 使用 ``mat_code`` ⇒ 配置它）。
-        qty_column:       库存数量列名。环境变量 ``WMS_INVENTORY_QTY_COLUMN``，
-                          默认 ``qty``（如快照表用 ``available_qty``（可用）或
-                          ``onhand_qty``（现有量）⇒ 配置它）。
+        max_rows:         分组明细返回行数上限（``LIMIT``；缺省 100，
+                          钳制到 [1, 500]）。环境变量 ``WMS_INVENTORY_MAX_ROWS``。
     """
 
     schema_name: str = field(
         default_factory=lambda: _get_str("WMS_INVENTORY_SCHEMA", "public")
-    )
-    table_name: str = field(
-        default_factory=lambda: _get_str("WMS_INVENTORY_TABLE", "inventory")
-    )
-    material_code_column: str = field(
-        default_factory=lambda: _get_str(
-            "WMS_INVENTORY_MATERIAL_CODE_COLUMN", "material_code"
-        )
-    )
-    qty_column: str = field(
-        default_factory=lambda: _get_str("WMS_INVENTORY_QTY_COLUMN", "qty")
     )
     material_code_max_len: int = field(
         default_factory=lambda: _get_int_clamped(
@@ -597,6 +582,11 @@ class InventoryToolSettings:
             "WMS_INVENTORY_QUERY_TIMEOUT_SECONDS", 10,
             INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MIN,
             INVENTORY_TOOL_QUERY_TIMEOUT_SECONDS_MAX,
+        )
+    )
+    max_rows: int = field(
+        default_factory=lambda: _get_int_clamped(
+            "WMS_INVENTORY_MAX_ROWS", 100, 1, 500
         )
     )
 

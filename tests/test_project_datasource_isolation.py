@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import contextmanager
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -296,28 +297,27 @@ def _business_ds_configured() -> bool:
 
 
 def _direct_business_qty(material_code: str) -> float | None:
-    """直连业务库读取 qty（只读事务）；未配置 / 表缺失 / 失败 ⇒ None。"""
+    """直连业务库读取现存量总量（**原报表 SQL** 口径；只读事务）。
+
+    未配置 / 失败 ⇒ None（测试据此走"显式失败"分支）。
+    """
     from sqlalchemy import text as _text
 
     from backend.app.db.business_session import get_business_engine
+    from tests.test_get_inventory_report_sql import REPORT_ON_HAND_SQL
 
     engine = get_business_engine()
     if engine is None:
         return None
-    cfg = settings.inventory_tool
     try:
         with engine.connect() as conn:
             conn.execute(_text("SET TRANSACTION READ ONLY"))
-            value = conn.execute(
-                _text(
-                    f'SELECT COALESCE(SUM("{cfg.qty_column}"), 0) FROM '
-                    f'"{cfg.schema_name}"."{cfg.table_name}" '
-                    f'WHERE "{cfg.material_code_column}" = :material_code'
-                ),
-                {"material_code": material_code},
-            ).scalar()
+            rows = conn.execute(
+                _text(REPORT_ON_HAND_SQL), {"material_code": material_code}
+            ).mappings().all()
             conn.rollback()
-        return float(value) if value is not None else None
+        total = sum((row["qty"] for row in rows), Decimal("0"))
+        return float(total)
     except Exception:  # noqa: BLE001 —— 表缺失 / 权限不足 ⇒ 视为不可得
         return None
 

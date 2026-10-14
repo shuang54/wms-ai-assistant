@@ -360,58 +360,36 @@ class _FakeEngine:
 
 
 @pytest.mark.asyncio
-async def test_custom_column_mapping_is_parameterized() -> None:
-    """字段映射生效：SUM(<qty_column>) / WHERE "<code_column>" = :bind（无字面量）。"""
-    from backend.app.tools.get_inventory import _run_inventory_query
+async def test_query_is_report_shaped_and_parameterized() -> None:
+    """Phase 7：查询 = 报表口径（固定表映射 + 关键过滤 + 绑定参数）。
 
-    engine = _FakeEngine(60.0)
-    qty = await _run_inventory_query(
-        engine=engine,  # type: ignore[arg-type]
-        schema="public",
-        table="dyn_wh_erp_inventory_snapshot",
-        material_code="V923719",
-        timeout_seconds=5,
-        material_code_column="mat_code",
-        qty_column="available_qty",
+    表 / 列 = 服务器端固定常量（未确认前不得改为用户输入）；过滤值全部
+    走绑定参数（不出现在 SQL 文本中）。
+    """
+    from backend.app.tools.get_inventory import _build_inventory_query
+
+    sql, params = _build_inventory_query(
+        schema="inventory_tool_test", material_code="MAT-001", max_rows=10
     )
-    assert qty == 60.0
-
-    selects = [item for item in engine.log if "SUM(" in item[0]]
-    assert len(selects) == 1, engine.log
-    sql, params = selects[0]
-    assert 'SUM("available_qty")' in sql
-    assert '"public"."dyn_wh_erp_inventory_snapshot"' in sql
-    assert '"mat_code" = :material_code' in sql
-    # 绑定参数传递；值**不**出现在 SQL 文本中（无拼接注入面）
-    assert params == {"material_code": "V923719"}
-    assert "V923719" not in sql
-    # 只读事务 + 超时（每条查询都带）
-    assert any("SET TRANSACTION READ ONLY" in item[0] for item in engine.log)
-    assert any("statement_timeout" in item[0] for item in engine.log)
+    upper = sql.upper()
+    assert "BARCODE.ARCHIVED = '0'" in upper
+    assert "BC.ARCHIVED = '0'" in upper
+    assert "STATUS.CODE = :STATUS_CODE_IN" in upper
+    assert "HAVING SUM(BARCODE.QTY) <> 0" in upper
+    assert '"INVENTORY_TOOL_TEST".DYN_WH_BARCODE' in upper  # 固定表映射
+    assert params["material_code"] == "MAT-001"
+    assert "MAT-001" not in sql  # 值不入 SQL 文本（无注入面）
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field_name",
-    ["schema_name", "table_name", "material_code_column", "qty_column"],
-)
-async def test_invalid_identifier_config_is_rejected_without_db_access(
-    field_name: str,
-) -> None:
-    """非法标识符（含注入字符）⇒ ToolExecutionError（且**零** DB 访问）。"""
+async def test_invalid_schema_config_is_rejected_without_db_access() -> None:
+    """非法 schema（含注入字符）⇒ ToolExecutionError（且**零** DB 访问）。"""
     from backend.app.config import InventoryToolSettings
     from backend.app.tools.get_inventory import GetInventoryHandler
 
-    kwargs: dict[str, Any] = {
-        "schema_name": "public",
-        "table_name": "inventory",
-        "material_code_column": "material_code",
-        "qty_column": "qty",
-    }
-    kwargs[field_name] = 'x" OR 1=1 --'
     handler = GetInventoryHandler(
         engine=_ExplodingEngine(),  # type: ignore[arg-type]
-        inv_settings=InventoryToolSettings(**kwargs),
+        inv_settings=InventoryToolSettings(schema_name='x" OR 1=1 --'),
     )
     with pytest.raises(ToolExecutionError):
         await handler({"material_code": "10001"})
@@ -463,9 +441,11 @@ class TestRealBusinessDatasource:
         if role is not None:
             assert role == (False, False, False), role
 
-    def test_metadata_inventory_tables_and_columns(self) -> None:
-        """限定元数据：列出 schema + 库存相关表/视图 + 目标表类型。"""
+    def test_metadata_report_tables_and_columns(self) -> None:
+        """限定元数据：schema 清单 + **报表固定表**存在性 + 条码表关键列。"""
         from sqlalchemy import text
+
+        from backend.app.tools.get_inventory import INVENTORY_REPORT_TABLES
 
         cfg = settings.inventory_tool
         with self._engine().connect() as conn:
@@ -474,47 +454,45 @@ class TestRealBusinessDatasource:
                 for row in conn.execute(
                     text(
                         "SELECT nspname FROM pg_namespace "
-                        "WHERE nspname NOT LIKE 'pg\\_%' "
+                        "WHERE nspname NOT LIKE 'pg_\\%' "
                         "AND nspname <> 'information_schema' ORDER BY nspname"
                     )
                 ).all()
             ]
             assert schemas, "业务库应至少有一个业务 schema"
-            candidates = conn.execute(
-                text(
-                    "SELECT table_schema, table_name, table_type "
-                    "FROM information_schema.tables "
-                    "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
-                    "AND (table_name ILIKE '%inventory%' OR table_name ILIKE '%stock%' "
-                    "     OR table_name ILIKE '%material%') "
-                    "ORDER BY table_schema, table_name"
-                )
-            ).all()
-            target_type = conn.execute(
-                text(
-                    "SELECT table_type FROM information_schema.tables "
-                    "WHERE table_schema = :s AND table_name = :t"
-                ),
-                {"s": cfg.schema_name, "t": cfg.table_name},
-            ).scalar_one_or_none()
-            columns = conn.execute(
-                text(
-                    "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_schema = :s AND table_name = :t "
-                    "ORDER BY ordinal_position"
-                ),
-                {"s": cfg.schema_name, "t": cfg.table_name},
-            ).all()
+            missing: list[str] = []
+            for table in INVENTORY_REPORT_TABLES:
+                kind = conn.execute(
+                    text(
+                        "SELECT table_type FROM information_schema.tables "
+                        "WHERE table_schema = :s AND table_name = :t"
+                    ),
+                    {"s": cfg.schema_name, "t": table},
+                ).scalar_one_or_none()
+                if kind is None:
+                    missing.append(table)
+            barcode_columns = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = :s AND table_name = 'dyn_wh_barcode'"
+                    ),
+                    {"s": cfg.schema_name},
+                ).all()
+            }
 
         print("\n业务库 schema:", schemas)
-        print("库存相关表候选:", [tuple(r) for r in candidates])
-        print(
-            "目标表: %s.%s type=%s" % (cfg.schema_name, cfg.table_name, target_type)
-        )
-        print("目标表列:", [tuple(r) for r in columns])
+        print("报表固定表缺失:", missing or "无")
+        print("dyn_wh_barcode 列:", sorted(barcode_columns))
+        assert not missing, f"报表固定表缺失: {missing}"
+        assert {
+            "id", "archived", "qty", "status_dic_id", "location_id",
+            "warehouse_id", "wh_bc_id", "material_id", "org_id", "shelf_id",
+        } <= barcode_columns
 
-    def test_inventory_probe_matches_handler_result(self) -> None:
-        """真实只读查询：Handler 结果 == 直接查询结果（空表 ⇒ 真 0）。"""
+    def test_inventory_probe_matches_plain_aggregate(self) -> None:
+        """真实只读：Handler 结果 == 报表关键过滤下的朴素聚合（空表 ⇒ 真 0）。"""
         import asyncio
 
         from sqlalchemy import text
@@ -522,53 +500,44 @@ class TestRealBusinessDatasource:
         cfg = settings.inventory_tool
         engine = self._engine()
         with engine.connect() as conn:
-            exists = conn.execute(
-                text(
-                    "SELECT 1 FROM information_schema.tables "
-                    "WHERE table_schema = :s AND table_name = :t"
-                ),
-                {"s": cfg.schema_name, "t": cfg.table_name},
-            ).scalar_one_or_none()
-            if exists is None:
-                pytest.skip(
-                    f"业务库中不存在 {cfg.schema_name}.{cfg.table_name} ⇒ "
-                    "请按 metadata 结果调整 WMS_INVENTORY_SCHEMA / WMS_INVENTORY_TABLE"
-                )
+            conn.execute(text("SET TRANSACTION READ ONLY"))
             material_code = conn.execute(
                 text(
-                    f'SELECT material_code FROM "{cfg.schema_name}"."{cfg.table_name}" '
-                    "LIMIT 1"
+                    "SELECT m.material_code FROM public.dyn_wh_barcode b "
+                    "JOIN public.secf_sys_f_dic st ON st.id = b.status_dic_id "
+                    "  AND st.code = 'BARCODE_STATUS_IN' "
+                    "LEFT JOIN public.dyn_wh_bc bc ON bc.id = b.wh_bc_id "
+                    "LEFT JOIN public.dyn_erp_basic_material m "
+                    "  ON m.id = b.material_id "
+                    "WHERE b.archived='0' AND bc.archived='0' "
+                    "  AND m.material_code IS NOT NULL LIMIT 1"
                 )
             ).scalar_one_or_none()
-            if material_code is None:
-                expected_zero = True
-                material_code = "P7S8-EMPTY-PROBE"
-            else:
-                expected_zero = False
+            direct = conn.execute(
+                text(
+                    "SELECT COALESCE(SUM(b.qty), 0) FROM public.dyn_wh_barcode b "
+                    "JOIN public.secf_sys_f_dic st ON st.id = b.status_dic_id "
+                    "  AND st.code = 'BARCODE_STATUS_IN' "
+                    "LEFT JOIN public.dyn_wh_bc bc ON bc.id = b.wh_bc_id "
+                    "LEFT JOIN public.dyn_erp_basic_material m "
+                    "  ON m.id = b.material_id "
+                    "WHERE b.archived='0' AND bc.archived='0' "
+                    "  AND m.material_code = :code"
+                ),
+                {"code": material_code or "P7S8-EMPTY-PROBE"},
+            ).scalar()
+            conn.rollback()
+        assert cfg.schema_name == "public"
 
         registry = build_default_tool_registry()
         result = asyncio.run(
             registry.execute(
-                "get_inventory", arguments={"material_code": material_code}
+                "get_inventory",
+                arguments={"material_code": material_code or "P7S8-EMPTY-PROBE"},
             )
         )
         assert result.success is True, result.error
-        qty = float(result.data["qty"])
-        if expected_zero:
-            assert qty == 0.0  # 表存在但无数据 ⇒ 真实空结果
-        else:
-            with engine.connect() as conn:
-                conn.execute(text("SET TRANSACTION READ ONLY"))
-                direct = conn.execute(
-                    text(
-                        f'SELECT COALESCE(SUM("{cfg.qty_column}"), 0) FROM '
-                        f'"{cfg.schema_name}"."{cfg.table_name}" '
-                        f'WHERE "{cfg.material_code_column}" = :code'
-                    ),
-                    {"code": material_code},
-                ).scalar()
-                conn.rollback()
-            assert qty == float(direct)
+        assert float(result.data["qty"]) == float(direct or 0)
 
 
 # ============================================================

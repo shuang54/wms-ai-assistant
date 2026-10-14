@@ -97,14 +97,12 @@ def main(argv: list[str] | None = None) -> int:
         description="WMS/ERP 业务数据源只读检查（不写任何数据）"
     )
     parser.add_argument(
-        "--table",
-        default=None,
-        help="目标库存表/视图（schema.table 或 table；默认取 WMS_INVENTORY_* 配置）",
-    )
-    parser.add_argument(
         "--probe",
         default=None,
-        help="可选：对给定 material_code 执行一次真实只读库存查询",
+        help=(
+            "可选：对给定 material_code 执行一次真实只读现存量查询"
+            "（报表等价 SQL；LIMIT 5 预览）"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -131,15 +129,8 @@ def main(argv: list[str] | None = None) -> int:
             2,
         )
 
-    if args.table:
-        raw = args.table.strip()
-        if "." in raw:
-            schema_name, _, table_name = raw.partition(".")
-        else:
-            schema_name, table_name = settings.inventory_tool.schema_name, raw
-    else:
-        schema_name = settings.inventory_tool.schema_name
-        table_name = settings.inventory_tool.table_name
+    # 库存口径 = 报表口径（固定表映射；仅 schema 可配置）
+    schema_name = settings.inventory_tool.schema_name
 
     try:
         engine = require_business_engine()
@@ -221,40 +212,63 @@ def main(argv: list[str] | None = None) -> int:
             if not cols:
                 print("  （无匹配列）")
 
-            print("\n目标库存表坐标（WMS_INVENTORY_*）：%s.%s" % (schema_name, table_name))
-            target = conn.execute(
-                sa_text(
-                    "SELECT table_type FROM information_schema.tables "
-                    "WHERE table_schema = :s AND table_name = :t"
-                ),
-                {"s": schema_name, "t": table_name},
-            ).scalar_one_or_none()
-            if target is None:
-                print("  [WARN] 该表/视图不存在 —— 请在 metadata 核对后调整 "
-                      "WMS_INVENTORY_SCHEMA / WMS_INVENTORY_TABLE")
-            else:
-                print("  存在：type =", target)
+            # 报表口径固定表（Phase 7：真实条码库存现存量）
+            from backend.app.tools.get_inventory import (
+                INVENTORY_REPORT_TABLES,
+            )
+
+            inv = settings.inventory_tool
+            print("\n报表口径固定表（schema = %s）：" % inv.schema_name)
+            missing_tables: list[str] = []
+            for table in INVENTORY_REPORT_TABLES:
+                kind = conn.execute(
+                    sa_text(
+                        "SELECT table_type FROM information_schema.tables "
+                        "WHERE table_schema = :s AND table_name = :t"
+                    ),
+                    {"s": inv.schema_name, "t": table},
+                ).scalar_one_or_none()
+                if kind is None:
+                    missing_tables.append(table)
+                    print("  [WARN] %-32s 不存在" % table)
+                else:
+                    print("  %-32s %s" % (table, kind))
+            if missing_tables:
+                print("  提示：请核对 WMS_INVENTORY_SCHEMA（缺失 = %s）"
+                      % ", ".join(missing_tables))
 
             if args.probe is not None:
                 code = str(args.probe).strip()
-                # 列映射与应用一致（WMS_INVENTORY_MATERIAL_CODE_COLUMN / _QTY_COLUMN；
-                # 均为服务器端配置的安全标识符）
-                inv = settings.inventory_tool
-                print("\n真实只读查询（probe=%s；列映射 %s / %s）：" % (
-                    code, inv.material_code_column, inv.qty_column
-                ))
+                print("\n真实只读查询（probe=%s；报表等价 SQL，LIMIT 5）：" % code)
+                from backend.app.tools.get_inventory import (
+                    _build_inventory_query,
+                )
+
+                sql, params = _build_inventory_query(
+                    schema=inv.schema_name,
+                    material_code=code,
+                    max_rows=5,
+                )
                 with engine.connect() as probe_conn:
                     probe_conn.execute(sa_text("SET TRANSACTION READ ONLY"))
-                    qty = probe_conn.execute(
-                        sa_text(
-                            f'SELECT COALESCE(SUM("{inv.qty_column}"), 0) FROM '
-                            f'"{schema_name}"."{table_name}" '
-                            f'WHERE "{inv.material_code_column}" = :material_code'
-                        ),
-                        {"material_code": code},
-                    ).scalar()
+                    rows = (
+                        probe_conn.execute(sa_text(sql), params).mappings().all()
+                    )
                     probe_conn.rollback()
-                print("  qty =", qty)
+                if not rows:
+                    print("  （无在库条码 / 物料不存在 ⇒ 现存量 0）")
+                for row in rows:
+                    print(
+                        "  %s | %s | %s | %s | qty=%s | 条码=%s"
+                        % (
+                            row.get("warehouse_code"),
+                            row.get("location_code"),
+                            row.get("batch_code"),
+                            row.get("unit"),
+                            row.get("qty"),
+                            row.get("barcode_count"),
+                        )
+                    )
     except Exception as exc:  # noqa: BLE001 —— 明确报错（不输出连接参数）
         return _fail(
             f"连接 / 元数据检查失败（{type(exc).__name__}）："

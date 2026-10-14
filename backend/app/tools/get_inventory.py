@@ -1,6 +1,8 @@
-"""真实 ``get_inventory`` Tool（Phase 3.7.12）。
+"""真实 ``get_inventory`` Tool（Phase 3.7.12；Phase 7 报表接入：真实条码库存）。
 
-将 Phase 3.6.1 的 Mock ``get_inventory`` 升级为**真实**只读 Tool。
+将 Phase 3.6.1 的 Mock ``get_inventory`` 升级为**真实**只读 Tool；
+Phase 7 起查询**真实 WMS 条码库存现存量**——业务依据为仓库侧报表
+``库存现存量报表``（第一份 SQL；货架维度取自 ``库存盘点单备注查询``）。
 
 链路：
 
@@ -12,8 +14,7 @@
         ↓
     _run_tool                        （tool_name 来自 Router decision；Step 3）
         ↓
-    ToolArgumentExtractor.extract    （确定性提取；Phase 3.11 Step 6：
-                                       material_code + warehouse_code）
+    ToolArgumentExtractor.extract    （确定性提取；Phase 3.11 Step 6）
         ↓
     ToolRegistry.execute("get_inventory", arguments={...})
         ↓
@@ -21,38 +22,57 @@
         ↓
     ProjectContextProvider.resolve   （解析 Project Context）
         ↓
-    SQLAlchemy Engine.connect (READ ONLY)
+    SQLAlchemy Engine.connect (READ ONLY；独立 WMS 业务库 Engine)
         ↓
-    PostgreSQL：SELECT SUM(qty) FROM schema.table WHERE material_code = :material_code
+    PostgreSQL：条码库存现存量报表等价查询
+                （barcode × 状态字典/仓库/库位/货架/批次/物料/单位/组织
+                  + latest_record 最新库位记录；GROUP BY 维度
+                  HAVING SUM(barcode.qty) <> 0；LIMIT 上限）
         ↓
-    ToolResult(success=True, data={"material_code": "...", "qty": <n>})
+    ToolResult(success=True, data={
+        "material_code", "qty"（总量）, "groups"（分组明细 ≤ max_rows）,
+        "group_count", "truncated", "project_id"})
+
+报表关键过滤条件（**原样保留**）：
+
+* ``barcode.archived = '0'``
+* ``bc.archived = '0'``
+* ``status.code = 'BARCODE_STATUS_IN'``
+* ``HAVING SUM(barcode.qty) <> 0``
+
+``latest_record`` 语义（**已核对，不得擅自修改**）：按
+``MAX(id)``（不是 ``MAX(update_time)``）取每个
+``(location_id, material_id)`` 的最新一条库位记录，展示**该行**的
+``update_time``；实测 7705 组中 9 组的 MAX(ID) 行 update_time 不等于
+MAX(update_time) —— 两者语义不同，报表口径为 MAX(ID)。
 
 设计纪律（纵深防御）：
 
 * **不**修改 Orchestrator 核心路由逻辑："从 question 抽取参数"由独立组件
   ``ToolArgumentExtractor`` 负责（Phase 3.11 Step 6 起；Orchestrator 只编排）
 * **不**修改 SQLValidator / SQLExecutor / TextToSQLService / AIRouterService
-* **不**修改已有 RAG 核心逻辑
-* **不**新增数据库表：Tool 引用**外部**库存表（settings.inventory_tool
-  可配置 schema/table 名），生产可指向任何已有库存表
+* **不**新增数据库表：Tool 只读**外部** WMS 业务库（表/列映射为服务器端
+  固定常量；仅 schema 可配置且经白名单校验）
 * **不**写死 ``project_id == "vietnam-wms"``：project_id 仅通过 ProjectContextProvider
   解析；Tool 不关心具体 project_id 值
-* **不**允许 Tool 输入任意 SQL / table / where_clause：Tool 只接受
-  ``material_code``（必填）与 ``warehouse_code``（可选，Phase 3.11
-  Step 4 契约保留；当前库存表无 warehouse 维度 → Handler 显式拒绝，
-  不静默忽略、不改 SQL）；其它字段被 Tool 参数 Schema 拒绝
+* **不**允许 Tool 输入任意 SQL / table / where_clause：只接受
+  ``material_code``（必填）+ 已确认的筛选参数（``org_code`` /
+  ``warehouse_code`` / ``location_code`` / ``shelf_code`` / ``batch_code`` /
+  ``stat_date``）；报表平台的 ``${if(...)}`` 全部转为**绑定参数**；
+  未知参数被 Tool 参数 Schema 拒绝，非法值显式拒绝（不回显原始输入）
 * **只读**：Handler 内使用 ``BEGIN READ ONLY`` 事务 + ``SET LOCAL statement_timeout``
-  + 绑定参数；Tool 不提供 UPDATE/INSERT/DELETE 入口
-* **不**在 Tool 中创建 Engine / LLMClient / Embedding：复用 ``get_engine()``
-  全局缓存
+  + 绑定参数 + 行数上限；Tool 不提供 UPDATE/INSERT/DELETE 入口
+* **不**在 Tool 中创建 Engine / LLMClient / Embedding：Engine 由装配层注入
+  （生产 = 独立 WMS 业务库 Engine，见 ``db/business_session``）
 * **不**在 ToolResult.error 中暴露：DATABASE_URL / password / traceback /
-  SQL 原文（包含 schema/table 拼接后的最终 SQL）
+  SQL 原文（包含 schema 拼接后的最终 SQL）
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
+from datetime import date
 from typing import Any, Callable
 
 from sqlalchemy import text as sa_text
@@ -94,12 +114,16 @@ __all__ = [
 GET_INVENTORY_DEFINITION: ToolDefinition = ToolDefinition(
     name="get_inventory",
     description=(
-        "查询指定物料的当前库存数量（只读）。"
-        "返回 material_code 与 qty（库存数量）。"
-        "支持 material_code（必填）与 warehouse_code（可选）两个参数；"
-        "当前库存表未提供 warehouse 维度，携带 warehouse_code 的查询会被"
-        "显式拒绝（不静默按全仓汇总）。"
-        "不接受 SQL / table / where_clause 等。"
+        "查询指定物料的**真实条码库存现存量**（只读）。"
+        "返回 material_code 与 qty（库存总量），并附按"
+        "库存组织/仓库/库位/货架/批次/单位 的分组明细（groups）。"
+        "必填 material_code（精确匹配）；可选筛选：org_code（库存组织编码）、"
+        "warehouse_code（仓库编码）、location_code（库位编码）、"
+        "shelf_code（货架编码）、batch_code（批次编码，模糊匹配）、"
+        "stat_date（统计日期 YYYY-MM-DD）。"
+        "仅统计条码状态为 BARCODE_STATUS_IN 且未归档的记录；"
+        "查询不到（含不存在的物料）返回数量 0。"
+        "不接受 SQL / table / where_clause / 任意列名等。"
     ),
     # Router 规则命中所用的业务别名。**必须**是具备区分度的短语：
     # 不要放裸词 "库存"，否则 "库存最多的 10 个物料是什么？" 这类
@@ -117,19 +141,51 @@ GET_INVENTORY_DEFINITION: ToolDefinition = ToolDefinition(
             "material_code": {
                 "type": "string",
                 "description": (
-                    "物料编码（1-64 字符）；自动 strip；不接受空字符串 / "
-                    "纯空白 / SQL 关键字。"
+                    "物料编码（1-64 字符，精确匹配）；自动 strip；"
+                    "不接受空字符串 / 纯空白 / SQL 关键字。"
                 ),
             },
-            # Phase 3.11 Step 4：多参数 Argument Contract（可选字段）。
-            # 注意：当前库存表未提供 warehouse 维度 → Handler 收到该值
-            # 时**显式拒绝**（不静默忽略，绝不假装过滤）。
+            # Phase 7 报表接入：已确认的筛选参数（与报表 ${if(...)} 一一对应；
+            # 全部作为**绑定参数**，绝不拼接进 SQL 文本）。
+            "org_code": {
+                "type": "string",
+                "description": (
+                    "库存组织编码（可选；1-64 字符；精确匹配 "
+                    "secf_sys_org_company.kd_stock_code）。"
+                ),
+            },
             "warehouse_code": {
                 "type": "string",
                 "description": (
-                    "仓库编码（可选，1-64 字符，与 material_code 同字符集）；"
-                    "自动 strip。当前库存表未提供 warehouse 维度，"
-                    "携带该值的查询会被显式拒绝（不静默忽略）。"
+                    "仓库编码（可选；1-64 字符；精确匹配 dyn_wh_warehouse.code）。"
+                ),
+            },
+            "location_code": {
+                "type": "string",
+                "description": (
+                    "库位编码（可选；1-64 字符；精确匹配 "
+                    "dyn_wh_location.location_code）。"
+                ),
+            },
+            "shelf_code": {
+                "type": "string",
+                "description": (
+                    "货架编码（可选；1-64 字符；精确匹配 dyn_wh_shelf.shelf_code；"
+                    "货架维度来自货架报表）。"
+                ),
+            },
+            "batch_code": {
+                "type": "string",
+                "description": (
+                    "批次编码（可选；1-64 字符；模糊匹配 dyn_wh_bc.code，"
+                    "字面量匹配 —— % / _ 不作为通配符）。"
+                ),
+            },
+            "stat_date": {
+                "type": "string",
+                "description": (
+                    "统计日期（可选；格式 YYYY-MM-DD；按最新库位记录 "
+                    "update_time 的日期过滤，语义与报表一致）。"
                 ),
             },
         },
@@ -186,6 +242,53 @@ _MATERIAL_CODE_PATTERN: re.Pattern[str] = re.compile(
 )
 
 
+# ============================================================
+# 固定业务表 / 列映射（Phase 7 报表接入；**服务器端常量**）
+# ============================================================
+#
+# 依据（已核对测试库 information_schema，Phase 7 Step 8 报表核对）：
+#   * 第一份报表 ``库存现存量报表``（现存量查询基础）
+#   * 第二份报表 ``库存盘点单备注查询``（货架维度）
+#
+# 纪律：表名 / 列名是**固定映射常量**（不使用用户输入；不拼接标识符）；
+#       仅 ``schema`` 来自配置且经 ``_assert_safe_identifier`` 白名单校验。
+_TABLE_BARCODE: str = "dyn_wh_barcode"
+_TABLE_STATUS_DIC: str = "secf_sys_f_dic"
+_TABLE_LOCATION: str = "dyn_wh_location"
+_TABLE_WAREHOUSE: str = "dyn_wh_warehouse"
+_TABLE_SHELF: str = "dyn_wh_shelf"
+_TABLE_BC: str = "dyn_wh_bc"
+_TABLE_MATERIAL: str = "dyn_erp_basic_material"
+_TABLE_MATERIAL_I18N: str = "dyn_erp_basic_material_i18n"
+_TABLE_UNIT: str = "dyn_unit"
+_TABLE_LOCATION_RECORD: str = "dyn_wh_bc_location_record"
+_TABLE_ORG: str = "secf_sys_org_company"
+
+#: 报表口径涉及的**全部**固定表（供部署自检 / 脚本核对；顺序 = SQL 出现顺序）。
+INVENTORY_REPORT_TABLES: tuple[str, ...] = (
+    _TABLE_BARCODE,
+    _TABLE_STATUS_DIC,
+    _TABLE_LOCATION,
+    _TABLE_WAREHOUSE,
+    _TABLE_SHELF,
+    _TABLE_BC,
+    _TABLE_MATERIAL,
+    _TABLE_MATERIAL_I18N,
+    _TABLE_UNIT,
+    _TABLE_LOCATION_RECORD,
+    _TABLE_ORG,
+)
+
+#: 条码状态字典固定值（报表关键过滤：仅"入库/在库"条码计入现存量）。
+_STATUS_CODE_IN: str = "BARCODE_STATUS_IN"
+
+#: 物料名称 i18n 语言（报表口径：zh-CN）。
+_MATERIAL_I18N_LOCALE: str = "zh-CN"
+
+#: LIKE 转义字符（批次编码按**字面量**模糊匹配；% / _ 不作通配符）。
+_LIKE_ESCAPE: str = "\\"
+
+
 def _assert_safe_identifier(value: str, *, field_name: str) -> str:
     """校验 ``value`` 是 SQL 安全标识符（schema / table）。
 
@@ -232,90 +335,280 @@ def _validate_material_code(
     return value
 
 
-def _validate_warehouse_code(
-    raw: Any, *, max_len: int
+def _validate_optional_code(
+    raw: Any, *, field_name: str, max_len: int
 ) -> str | None:
-    """校验可选 ``warehouse_code``；None / 缺省 → None（可选语义）。
+    """校验**可选**编码参数（org_code / warehouse_code / location_code /
+    shelf_code / batch_code）；None / 缺省 → None（可选语义）。
 
-    字符集 / 长度规则与 material_code 相同（复用同一白名单正则）；
-    该字段当前为**契约保留**：库存表未提供 warehouse 维度，
-    Handler 对非 None 值会显式拒绝（见 ``GetInventoryHandler.__call__``），
-    不静默按全仓汇总。
+    字符集 / 长度规则与 material_code 相同（复用同一白名单正则）；全部作为
+    绑定参数使用（**不**进入 SQL 标识符位）。
 
     Raises:
-        ValueError: 格式非法（不暴露原始输入）。
-                    Tool Handler 会包成 ToolValidationError。
+        ValueError: 格式非法（**不**暴露原始输入 —— 避免注入值回显到
+                    ToolResult.error）。Tool Handler 会包成 ToolValidationError。
     """
     if raw is None:
         return None
     if not isinstance(raw, str):
-        raise ValueError(
-            f"warehouse_code 必须为字符串（got {type(raw).__name__}）"
-        )
+        raise ValueError(f"{field_name} 必须为字符串（got {type(raw).__name__}）")
     value = raw.strip()
     if not value:
-        raise ValueError("warehouse_code 不能为空或纯空白")
+        raise ValueError(f"{field_name} 不能为空或纯空白")
     if len(value) > max_len:
         raise ValueError(
-            f"warehouse_code 长度不能超过 {max_len}（got {len(value)}）"
+            f"{field_name} 长度不能超过 {max_len}（got {len(value)}）"
         )
     if not _MATERIAL_CODE_PATTERN.match(value):
         raise ValueError(
-            "warehouse_code 包含非法字符（仅允许字母/数字/点/下划线/dash）"
+            f"{field_name} 包含非法字符（仅允许字母/数字/点/下划线/dash）"
         )
     return value
+
+
+def _validate_stat_date(raw: Any) -> "date | None":
+    """校验 ``stat_date``（报表"统计日期"）；缺省 → None。
+
+    只接受 ``YYYY-MM-DD``（``datetime.date.fromisoformat``）；非法 ⇒ ValueError
+    （不暴露原始输入）。作为绑定参数传给 ``DATE(r.update_time) = :stat_date``。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"stat_date 必须为字符串（got {type(raw).__name__}）")
+    value = raw.strip()
+    if not value:
+        raise ValueError("stat_date 不能为空或纯空白")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("stat_date 格式非法（应为 YYYY-MM-DD）") from exc
+
+
+def _escape_like(value: str) -> str:
+    """转义 LIKE 元字符（``\\`` / ``%`` / ``_``），配合 ``ESCAPE '\\'``。
+
+    批次编码按**字面量**模糊匹配（用户输入的 ``%`` / ``_`` 不作通配符）。
+    """
+    return (
+        value.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
 
 
 # ============================================================
 # 真实 DB 查询（独立函数，便于单元测试 / 单步注入）
 # ============================================================
 
-async def _run_inventory_query(
+def _build_inventory_query(
+    *,
+    schema: str,
+    material_code: str,
+    org_code: str | None = None,
+    warehouse_code: str | None = None,
+    location_code: str | None = None,
+    shelf_code: str | None = None,
+    batch_code: str | None = None,
+    stat_date: date | None = None,
+    max_rows: int,
+) -> tuple[str, dict[str, Any]]:
+    """构造**库存现存量**查询（报表等价；全部过滤值为绑定参数）。
+
+    报表依据（第一份 ``库存现存量报表``；货架维度取自第二份）：
+
+    * 保留的关键过滤：``barcode.archived = '0'`` · ``bc.archived = '0'`` ·
+      ``status.code = 'BARCODE_STATUS_IN'`` · ``HAVING SUM(barcode.qty) <> 0``；
+    * ``latest_record`` = 每个 ``(location_id, material_id)`` 的
+      ``MAX(id)`` 行（**不是** MAX(update_time)）—— 语义已核对，不得修改；
+    * ``${if(...)}`` 全部转为绑定参数（组织 / 仓库 / 库位 / 货架 / 批次 /
+      统计日期）；批次为**字面量**模糊匹配（``%`` / ``_`` 已转义，
+      ``ESCAPE`` 显式声明）；
+    * 表 / 列 = 服务器端**固定映射常量**；仅 schema 来自配置并经白名单校验；
+    * 结果附带 ``COUNT(*) OVER ()``（分组总数）与 ``SUM(SUM(qty)) OVER ()``
+      （截断前的数量总量）⇒ 单次查询即可如实报告是否被 LIMIT 截断。
+
+    Returns:
+        (sql, params)：SQL 文本（标识符已校验；值为绑定参数）+ 绑定参数。
+
+    Raises:
+        ToolExecutionError: schema 配置非法（白名单校验失败；零 DB 访问）。
+    """
+    schema_ref = f'"{_assert_safe_identifier(schema, field_name="schema_name")}"'
+
+    where: list[str] = [
+        "barcode.archived = '0'",
+        "bc.archived = '0'",
+        "status.code = :status_code_in",
+        "material.material_code = :material_code",
+    ]
+    params: dict[str, Any] = {
+        "status_code_in": _STATUS_CODE_IN,
+        "material_code": material_code,
+        "max_rows": int(max_rows),
+    }
+    if org_code is not None:
+        where.append("org.kd_stock_code = :org_code")
+        params["org_code"] = org_code
+    if warehouse_code is not None:
+        where.append("warehouse.code = :warehouse_code")
+        params["warehouse_code"] = warehouse_code
+    if location_code is not None:
+        where.append("location.location_code = :location_code")
+        params["location_code"] = location_code
+    if batch_code is not None:
+        where.append(f"bc.code LIKE :batch_code ESCAPE '{_LIKE_ESCAPE}'")
+        params["batch_code"] = f"%{_escape_like(batch_code)}%"
+    if stat_date is not None:
+        where.append("DATE(r.update_time) = :stat_date")
+        params["stat_date"] = stat_date
+
+    where_sql = "\n    AND ".join(where)
+
+    # 货架维度（第二份报表）：**仅在过滤时**接入 —— 基础查询保持第一份报表
+    # 的维度集合（现存量口径），避免 HAVING 与更细粒度分组的语义漂移。
+    shelf_join = ""
+    if shelf_code is not None:
+        where.append("shelf.shelf_code = :shelf_code")
+        params["shelf_code"] = shelf_code
+        where_sql = "\n    AND ".join(where)
+        shelf_join = (
+            f"    LEFT JOIN {schema_ref}.{_TABLE_SHELF} AS shelf"
+            " ON shelf.id = barcode.shelf_id\n"
+        )
+
+    sql = (
+        "WITH latest_record AS (\n"
+        "    SELECT MAX(id) AS record_id, location_id, material_id\n"
+        f"    FROM {schema_ref}.{_TABLE_LOCATION_RECORD}\n"
+        "    WHERE archived = '0'\n"
+        "    GROUP BY location_id, material_id\n"
+        ")\n"
+        "SELECT\n"
+        "    org.cnname                    AS org_name,\n"
+        "    warehouse.code                AS warehouse_code,\n"
+        "    warehouse.name                AS warehouse_name,\n"
+        "    location.location_code        AS location_code,\n"
+        "    location.name                 AS location_name,\n"
+        "    bc.code                       AS batch_code,\n"
+        "    material_i18n.material_desc   AS material_name,\n"
+        "    unit.unit_desc                AS unit,\n"
+        "    SUM(barcode.qty)              AS qty,\n"
+        "    COUNT(barcode.id)             AS barcode_count,\n"
+        "    r.update_time                 AS last_update_time,\n"
+        "    COUNT(*) OVER ()              AS group_count,\n"
+        "    SUM(SUM(barcode.qty)) OVER () AS qty_total\n"
+        f"FROM {schema_ref}.{_TABLE_BARCODE} AS barcode\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_STATUS_DIC} AS status"
+        " ON status.id = barcode.status_dic_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_LOCATION} AS location"
+        " ON location.id = barcode.location_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_WAREHOUSE} AS warehouse"
+        " ON warehouse.id = barcode.warehouse_id\n"
+        f"{shelf_join}"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_BC} AS bc"
+        " ON bc.id = barcode.wh_bc_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_MATERIAL} AS material"
+        " ON material.id = barcode.material_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_MATERIAL_I18N} AS material_i18n"
+        f" ON material_i18n.id = material.id"
+        f" AND material_i18n.locale = '{_MATERIAL_I18N_LOCALE}'\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_UNIT} AS unit"
+        " ON unit.id = material.unit_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_ORG} AS org"
+        " ON org.id = barcode.org_id\n"
+        "    LEFT JOIN latest_record AS lr"
+        " ON lr.location_id = barcode.location_id"
+        " AND lr.material_id = barcode.material_id\n"
+        f"    LEFT JOIN {schema_ref}.{_TABLE_LOCATION_RECORD} AS r"
+        " ON r.id = lr.record_id\n"
+        f"WHERE {where_sql}\n"
+        "GROUP BY org.cnname, warehouse.code, warehouse.name,\n"
+        "         location.location_code, location.name,\n"
+        "         bc.code, material_i18n.material_desc, unit.unit_desc,\n"
+        "         r.update_time\n"
+        "HAVING SUM(barcode.qty) <> 0\n"
+        "ORDER BY r.update_time, warehouse.code, location.location_code,\n"
+        "         bc.code, unit.unit_desc\n"
+        "LIMIT :max_rows"
+    )
+    return sql, params
+
+
+def _map_report_rows(
+    rows: list[dict[str, Any]], *, max_rows: int
+) -> dict[str, Any]:
+    """报表行 → Tool 结果（分组明细 + 总量 + 截断标记；纯函数）。"""
+    groups: list[dict[str, Any]] = []
+    for row in rows[:max_rows]:
+        last_update = row.get("last_update_time")
+        groups.append(
+            {
+                "org_name": row.get("org_name"),
+                "warehouse_code": row.get("warehouse_code"),
+                "warehouse_name": row.get("warehouse_name"),
+                "location_code": row.get("location_code"),
+                "location_name": row.get("location_name"),
+                "batch_code": row.get("batch_code"),
+                "material_name": row.get("material_name"),
+                "unit": row.get("unit"),
+                "qty": float(row.get("qty") or 0.0),
+                "barcode_count": int(row.get("barcode_count") or 0),
+                "last_update_time": (
+                    last_update.isoformat()
+                    if hasattr(last_update, "isoformat")
+                    else None
+                ),
+            }
+        )
+    group_count = int(rows[0].get("group_count") or 0) if rows else 0
+    return {
+        "qty_total": float(rows[0].get("qty_total") or 0.0) if rows else 0.0,
+        "group_count": group_count,
+        "groups": groups,
+        "truncated": group_count > len(groups),
+    }
+
+
+async def _run_inventory_report_query(
     *,
     engine: Engine,
     schema: str,
-    table: str,
     material_code: str,
+    org_code: str | None = None,
+    warehouse_code: str | None = None,
+    location_code: str | None = None,
+    shelf_code: str | None = None,
+    batch_code: str | None = None,
+    stat_date: date | None = None,
     timeout_seconds: int,
-    material_code_column: str = "material_code",
-    qty_column: str = "qty",
-) -> float:
-    """执行只读查询并返回物料库存合计（**限量返回**：聚合标量，无明细）。
+    max_rows: int,
+) -> dict[str, Any]:
+    """执行只读**库存现存量**查询（报表等价；见 :func:`_build_inventory_query`）。
 
-    安全策略（纵深防御）：
-        1. ``material_code`` 通过绑定参数传递（**不**拼字符串）
-        2. schema / table / 列名（material_code_column / qty_column）均已通过
-           ``_assert_safe_identifier`` 校验 —— 来自**服务器端配置**
-           （``WMS_INVENTORY_*``），**绝不**由用户输入拼接
-        3. 事务级 ``BEGIN READ ONLY`` + ``SET LOCAL statement_timeout`` 防止
-           数据库端写操作 / 长时间占用
-        4. 自动 ``ROLLBACK`` 归还连接
-        5. SQL 文本不写入 ToolResult.error
-
-    Args:
-        engine: SQLAlchemy Engine。
-        schema: 已校验的 schema 名。
-        table:  已校验的 table 名。
-        material_code: 已校验的物料编码。
-        timeout_seconds: PostgreSQL ``statement_timeout``（秒）。
-        material_code_column: 已校验的物料编码列名（默认 ``material_code``）。
-        qty_column: 已校验的库存数量列名（默认 ``qty``）。
+    安全策略（纵深防御）：绑定参数（**不**拼字符串）· 事务级
+    ``BEGIN READ ONLY`` + ``SET LOCAL statement_timeout`` · 自动 ``ROLLBACK`` ·
+    ``LIMIT`` 行数上限 · SQL 文本不写入 ToolResult.error。
 
     Returns:
-        float: ``SUM(<qty_column>)``；不存在记录 → 0.0（真实空结果）。
+        {"qty_total": float, "group_count": int, "groups": [...], "truncated": bool}
 
     Raises:
         ToolExecutionError: DB 异常（错误消息仅含类名，不含 SQL / connection string）。
     """
-    # schema / table / 列名已通过 _assert_safe_identifier 校验 → 安全拼接
-    qualified_table = f'"{schema}"."{table}"'
-    sql = (
-        f'SELECT COALESCE(SUM("{qty_column}"), 0) '
-        f"FROM {qualified_table} "
-        f'WHERE "{material_code_column}" = :material_code'
+    sql, params = _build_inventory_query(
+        schema=schema,
+        material_code=material_code,
+        org_code=org_code,
+        warehouse_code=warehouse_code,
+        location_code=location_code,
+        shelf_code=shelf_code,
+        batch_code=batch_code,
+        stat_date=stat_date,
+        max_rows=max_rows,
     )
 
-    def _sync_query() -> float:
+    def _sync_query() -> list[dict[str, Any]]:
         # statement_timeout 不支持 bind parameter；用整数直接内插
         # （已钳制到 [1, 60]；Python int() 是无注入风险的）
         timeout_ms = str(int(timeout_seconds) * 1000)
@@ -327,18 +620,15 @@ async def _run_inventory_query(
                 conn.execute(sa_text(
                     f"SET LOCAL statement_timeout = {timeout_ms}"
                 ))
-                result = conn.execute(
-                    sa_text(sql),
-                    {"material_code": material_code},
-                ).scalar()
+                fetched = conn.execute(sa_text(sql), params).mappings().all()
             finally:
                 conn.rollback()
-        if result is None:
-            return 0.0
-        return float(result)
+        return [dict(row) for row in fetched]
 
     try:
-        return await asyncio.to_thread(_sync_query)
+        rows = await asyncio.to_thread(_sync_query)
+    except ToolError:
+        raise
     except Exception as exc:  # noqa: BLE001
         # 不向调用方暴露 SQL 原文 / connection string
         raise ToolExecutionError(
@@ -346,6 +636,7 @@ async def _run_inventory_query(
             reason="数据库查询失败",
             cause_type=type(exc).__name__,
         ) from exc
+    return _map_report_rows(rows, max_rows=max_rows)
 
 
 # ============================================================
@@ -429,33 +720,39 @@ class GetInventoryHandler:
                 field_path="material_code",
             ) from exc
 
-        # 1.1b 参数校验：warehouse_code（可选；Phase 3.11 Step 4）
+        # 1.1b 参数校验：可选筛选（报表 ${if(...)} 对应的已确认字段）
+        #      org_code / warehouse_code / location_code / shelf_code / batch_code
+        #      —— 全部作为**绑定参数**（不进入 SQL 标识符位）；非法值显式拒绝。
+        optional_codes: dict[str, str | None] = {}
+        for field_name in (
+            "org_code",
+            "warehouse_code",
+            "location_code",
+            "shelf_code",
+            "batch_code",
+        ):
+            try:
+                optional_codes[field_name] = _validate_optional_code(
+                    arguments.get(field_name),
+                    field_name=field_name,
+                    max_len=self._settings.material_code_max_len,
+                )
+            except ValueError as exc:
+                raise ToolValidationError(
+                    tool_name="get_inventory",
+                    reason=str(exc),
+                    field_path=field_name,
+                ) from exc
+
+        # 1.1c 参数校验：stat_date（报表"统计日期"；YYYY-MM-DD）
         try:
-            warehouse_code = _validate_warehouse_code(
-                arguments.get("warehouse_code"),
-                max_len=self._settings.material_code_max_len,
-            )
+            stat_date = _validate_stat_date(arguments.get("stat_date"))
         except ValueError as exc:
             raise ToolValidationError(
                 tool_name="get_inventory",
                 reason=str(exc),
-                field_path="warehouse_code",
+                field_path="stat_date",
             ) from exc
-
-        # 1.2 warehouse 维度 guard（Phase 3.11 Step 4）：
-        #     当前库存表（settings.inventory_tool.schema.table）没有
-        #     warehouse 列 → 无法在 SQL 层做仓库过滤。**显式拒绝**，
-        #     绝不静默忽略参数后按全仓汇总返回（那会给出错误的业务答案）。
-        #     未来库存表提供 warehouse 维度时，在此处改为把 warehouse_code
-        #     作为可选绑定参数传入 _run_inventory_query 即可（独立阶段）。
-        if warehouse_code is not None:
-            raise ToolExecutionError(
-                tool_name="get_inventory",
-                reason=(
-                    "库存表未提供 warehouse 维度，warehouse_code 过滤"
-                    "当前不受支持（显式拒绝而非静默忽略参数）"
-                ),
-            )
 
         # 2. Engine 解析（**唯一**顺序：engine_provider → 显式 engine → 全局缓存）
         #
@@ -487,20 +784,11 @@ class GetInventoryHandler:
                 reason="Database engine 未配置（DATABASE_URL 为空）",
             )
 
-        # 3. schema / table / 列名标识符校验
-        #    （全部来自服务器端配置 WMS_INVENTORY_*；白名单校验后安全拼接）
+        # 3. schema 标识符校验
+        #    （表 / 列为服务器端固定映射常量；仅 schema 来自配置 WMS_INVENTORY_SCHEMA，
+        #      白名单校验后安全拼接）
         schema = _assert_safe_identifier(
             self._settings.schema_name, field_name="schema_name"
-        )
-        table = _assert_safe_identifier(
-            self._settings.table_name, field_name="table_name"
-        )
-        material_code_column = _assert_safe_identifier(
-            self._settings.material_code_column,
-            field_name="material_code_column",
-        )
-        qty_column = _assert_safe_identifier(
-            self._settings.qty_column, field_name="qty_column"
         )
 
         # 4. ProjectContext 解析（仅用于 metadata；不进入 SQL 拼接）
@@ -517,23 +805,31 @@ class GetInventoryHandler:
                     extra={"error_type": type(exc).__name__},
                 )
 
-        # 5. 真实只读查询
+        # 5. 真实只读查询（库存现存量报表等价；绑定参数 + 超时 + 行数上限）
         try:
-            qty = await _run_inventory_query(
+            outcome = await _run_inventory_report_query(
                 engine=engine,
                 schema=schema,
-                table=table,
                 material_code=material_code,
+                org_code=optional_codes["org_code"],
+                warehouse_code=optional_codes["warehouse_code"],
+                location_code=optional_codes["location_code"],
+                shelf_code=optional_codes["shelf_code"],
+                batch_code=optional_codes["batch_code"],
+                stat_date=stat_date,
                 timeout_seconds=self._settings.query_timeout_seconds,
-                material_code_column=material_code_column,
-                qty_column=qty_column,
+                max_rows=self._settings.max_rows,
             )
         except ToolError:
             raise
 
         return {
             "material_code": material_code,
-            "qty": qty,
+            "qty": outcome["qty_total"],
+            "groups": outcome["groups"],
+            "group_count": outcome["group_count"],
+            "truncated": outcome["truncated"],
+            "max_rows": self._settings.max_rows,
             "project_id": project_id_label,
         }
 

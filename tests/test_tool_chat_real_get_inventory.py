@@ -25,7 +25,7 @@ Test 2  arguments 原样转发（material_code 逐字到达真实 Handler）
 Test 3  missing required → Registry 拒绝（DB 0 次）
 Test 4  unknown field    → Registry 拒绝（DB 0 次）
 Test 5  SQL 注入输入      → Handler 校验拒绝（DB 0 次、数据未泄露）
-Test 6  warehouse_code   → 真实 Handler 显式拒绝（不静默全仓汇总；DB 0 次）
+Test 6  warehouse_code   → 真实筛选生效（Phase 7 报表口径；绑定参数）
 Test 7  Multi-Step       → 两次真实查询（每次 ONE Tool execution）
 Test 8  DB writes = 0    → 行数不变 + 语句审计（仅 SELECT / SET / ROLLBACK）
 Test 9  project scope    → project-a 允许 → 真实执行
@@ -89,8 +89,10 @@ _PROJECT_ID = "inventory-tool-test"
 #: seed 数据（tests/test_get_inventory_tool.py::_INVENTORY_SEED_DATA）
 _SEED = {"10001": 120.0, "10002": 80.0, "MAT-001": 250.0, "SKU.001": 5.0}
 
-#: 只读语句白名单（Handler 只应产生这些语句）
-_READ_ONLY_PREFIXES = ("SELECT", "SET", "SHOW", "ROLLBACK", "BEGIN", "COMMIT")
+#: 只读语句白名单（Handler 只应产生这些语句；Phase 7 查询以 WITH CTE 开头）
+_READ_ONLY_PREFIXES = (
+    "SELECT", "WITH", "SET", "SHOW", "ROLLBACK", "BEGIN", "COMMIT",
+)
 
 
 # ============================================================
@@ -115,18 +117,8 @@ def real_engine() -> Any:
 
 
 def _fixture_inv_settings() -> InventoryToolSettings:
-    """隔离 fixture 表（``material_code`` / ``qty`` 列）的 Tool 配置。
-
-    显式指定**列映射**：本机 .env 可能把 ``WMS_INVENTORY_*_COLUMN`` 指向真实
-    ERP 表结构（如 ``available_qty`` / ``mat_code``）；本文件的 fixture 表
-    固定为 ``material_code`` + ``qty``，因此不继承 env 的列映射。
-    """
-    return InventoryToolSettings(
-        schema_name=_INVENTORY_TEST_SCHEMA,
-        table_name=_INVENTORY_TEST_TABLE,
-        material_code_column="material_code",
-        qty_column="qty",
-    )
+    """隔离 fixture schema 的 Tool 配置（Phase 7：报表口径固定表映射）。"""
+    return InventoryToolSettings(schema_name=_INVENTORY_TEST_SCHEMA)
 
 
 def _real_handler(engine: Any) -> GetInventoryHandler:
@@ -165,8 +157,11 @@ class _StatementRecorder:
 
     @property
     def selects(self) -> list[str]:
+        """只读查询语句（Phase 7 报表等价查询以 ``WITH`` CTE 开头）。"""
         return [
-            s for s in self.statements if s.upper().startswith("SELECT")
+            s
+            for s in self.statements
+            if s.upper().startswith(("SELECT", "WITH"))
         ]
 
     def assert_read_only(self) -> None:
@@ -356,10 +351,16 @@ class TestRealGetInventoryThroughToolChat:
         # 真实 SQL：唯一一条 SELECT（只读；绑定参数，无字符串拼接）
         assert len(recorder.selects) == 1
         select_sql = recorder.selects[0]
-        # 列名为**带引号**的标识符（配置化字段映射：WMS_INVENTORY_*_COLUMN）
-        assert 'SUM("QTY")' in select_sql.upper()
-        assert _INVENTORY_TEST_TABLE in select_sql
-        assert '"MATERIAL_CODE" = %(MATERIAL_CODE)S' in select_sql.upper()
+        upper = select_sql.upper()
+        # Phase 7：报表等价查询（固定表映射 + 报表关键过滤 + 绑定参数）
+        assert "SUM(BARCODE.QTY)" in upper
+        assert _INVENTORY_TEST_TABLE in select_sql  # dyn_wh_barcode
+        assert "BARCODE.ARCHIVED = '0'" in upper
+        assert "BC.ARCHIVED = '0'" in upper
+        assert "STATUS.CODE = %(STATUS_CODE_IN)S" in upper
+        assert "MATERIAL.MATERIAL_CODE = %(MATERIAL_CODE)S" in upper
+        assert "HAVING SUM(BARCODE.QTY) <> 0" in upper
+        assert "LIMIT %(MAX_ROWS)S" in upper
         recorder.assert_read_only()
 
     async def test_material_code_forwarded_verbatim(
@@ -458,11 +459,13 @@ class TestRealGetInventoryThroughToolChat:
         with real_engine.connect() as conn:
             assert _count_public_knowledge_rows(conn) == rows_before
 
-    async def test_warehouse_code_explicitly_rejected(
+    async def test_warehouse_code_filter_applied(
         self, real_engine: Any
     ) -> None:
-        """warehouse_code 为契约保留字段：真实 Handler 显式拒绝
-        （不静默按全仓汇总；DB 0 次）。"""
+        """Phase 7：warehouse_code 为**真实生效**的筛选（绑定参数；只读查询）。
+
+        fixture：10001 → 仓库 A01 qty=120；不存在的仓库编码 ⇒ 真实空结果 0。
+        """
         registry = _real_registry(real_engine)
         recorder = _StatementRecorder(real_engine)
         llm = ScriptedLLMClient([
@@ -470,7 +473,7 @@ class TestRealGetInventoryThroughToolChat:
                 "get_inventory",
                 {"material_code": "10001", "warehouse_code": "A01"},
             ),
-            "该维度当前不受支持。",
+            "A01 仓库 10001 库存为 120。",
         ])
         service = _scoped_service(registry, llm, project_id=_PROJECT_ID)
 
@@ -480,9 +483,12 @@ class TestRealGetInventoryThroughToolChat:
             recorder.close()
 
         payload = _tool_payload(llm)
-        assert payload["success"] is False
-        assert "warehouse" in payload["error"]
-        assert recorder.statements == []
+        assert payload["success"] is True, payload
+        assert float(payload["data"]["qty"]) == pytest.approx(120.0)
+        # 过滤值以**绑定参数**传递（不出现在 SQL 文本中）
+        assert len(recorder.selects) == 1
+        assert "WAREHOUSE.CODE = %(WAREHOUSE_CODE)S" in recorder.selects[0].upper()
+        recorder.assert_read_only()
 
     async def test_multi_step_two_real_queries(
         self, real_engine: Any
