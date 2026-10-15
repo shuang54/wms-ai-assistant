@@ -1,0 +1,64 @@
+# WMS AI Assistant - Dedicated PostgreSQL TEST Database (Phase 7 Recovery M2.3 A2)
+#
+# 独立测试数据库：与应用库（docker-compose.yml 的 wms-ai-postgres / wms_ai）
+# **完全隔离**——不同容器、不同数据库、不同命名卷、不同宿主机端口、
+# 不同凭证。任何情况下都不得把应用库 wms_ai 当作测试库。
+#
+# 隔离边界（与 docker-compose.yml 逐项对照）：
+#
+#   | 维度       | 应用库（勿动）            | 测试库（本文件）              |
+#   |------------|---------------------------|-------------------------------|
+#   | 容器名     | wms-ai-postgres           | wms-ai-postgres-test          |
+#   | 数据库名   | wms_ai                    | wms_ai_test                   |
+#   | 命名卷     | wms-ai-postgres-data      | wms-ai-postgres-test-data     |
+#   | 宿主机端口 | 5432                      | 5433                          |
+#   | 用户/密码  | POSTGRES_USER/PASSWORD    | WMS_TEST_DB_* 独立变量        |
+#
+# 用法（详见 docs/db-testing.md）：
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   docker compose -f docker-compose.test.yml ps
+#
+#   初始化 schema / 扩展（在测试库上）：
+#     $env:DATABASE_URL="postgresql+psycopg://<user>:<pass>@localhost:5433/wms_ai_test"
+#     python -m backend.app.db.init_db
+#
+#   运行 DB-gated 测试（必须显式指向 wms_ai_test）：
+#     $env:RUN_DB_TESTS="1"
+#     python -m pytest -q <db-gated files>
+#
+#   停止 / 清理（**仅**清理测试库卷，绝不触碰应用库卷）：
+#     docker compose -f docker-compose.test.yml down -v
+#
+# 安全约束：
+#   - 禁止 `docker compose down -v` 在不带 `-f docker-compose.test.yml` 时执行
+#     （那会删掉应用库卷 wms-ai-postgres-data）。
+#   - 默认密码仅供本地测试；真实值经 shell 环境或 .env.test 注入，**不得提交**。
+#   - 本文件**不读取**也不修改仓库根 .env（应用库配置保持原样）。
+
+services:
+  postgres-test:
+    image: pgvector/pgvector:pg16
+    container_name: wms-ai-postgres-test
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${WMS_TEST_DB_USER:-wms_test}
+      POSTGRES_PASSWORD: ${WMS_TEST_DB_PASSWORD:-wms_test_pw}
+      POSTGRES_DB: ${WMS_TEST_DB_NAME:-wms_ai_test}
+    ports:
+      # 宿主机 5433 → 容器 5432（应用库占用 5432，互不冲突）
+      - "${WMS_TEST_DB_PORT:-5433}:5432"
+    volumes:
+      # 独立命名卷：**不**挂载 wms-ai-postgres-data
+      - wms-ai-postgres-test-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U ${WMS_TEST_DB_USER:-wms_test} -d ${WMS_TEST_DB_NAME:-wms_ai_test}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  wms-ai-postgres-test-data:
+    name: wms-ai-postgres-test-data

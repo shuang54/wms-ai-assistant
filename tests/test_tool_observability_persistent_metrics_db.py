@@ -46,10 +46,14 @@ from backend.app.services.tool_execution_record import ToolExecutionRecord
 # 客户端 project_id 查询参数已移除，聚合必须在授权范围内执行。
 from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
 from tests.api_session_auth import (  # noqa: F401,E402
+    observability_ops_session,
     observability_project_scope_session,
 )
 
-pytestmark = pytest.mark.usefixtures("observability_project_scope_session")
+pytestmark = pytest.mark.usefixtures(
+    "observability_ops_session",
+    "observability_project_scope_session",
+)
 
 #: M2.3 A2：服务端唯一授权项目 / 授权范围外的项目。
 _SERVER_PROJECT_ID = "vietnam-wms"
@@ -279,7 +283,8 @@ class TestPersistentMetricsDb:
         ):
             payload = _metrics(metrics_api, query)
             assert payload["total_count"] <= 3, query
-            assert payload["max_duration_ms"] in (None, 300.0), query
+            # 范围内最大 duration = 300.0（C）；范围外为 400 / 500
+            assert (payload["max_duration_ms"] or 0.0) <= 300.0, query
 
     def test_invalid_parameters_return_422(self, metrics_api) -> None:
         """非法布尔字面量 → 422（FastAPI / Pydantic 校验）。
@@ -295,7 +300,7 @@ class TestPersistentMetricsDb:
         """Metrics 是单行聚合：limit / offset 不参与（额外参数被忽略）。"""
         payload = _metrics(metrics_api, "?limit=1&offset=0")
 
-        _assert_counts(payload, 5, 3, 2)
+        _assert_counts(payload, 3, 2, 1)      # A2：仅授权范围内 3 条
 
     def test_response_field_whitelist(self, metrics_api) -> None:
         payload = _metrics(metrics_api)
@@ -323,7 +328,7 @@ class TestPersistentMetricsDb:
     def test_llm_usage_table_untouched(self, metrics_api) -> None:
         engine = _engine()
 
-        _metrics(metrics_api, "?project_id=project-a")
+        _metrics(metrics_api)      # A2：客户端 project_id 已移除
 
         with engine.connect() as conn:
             llm_rows = conn.execute(

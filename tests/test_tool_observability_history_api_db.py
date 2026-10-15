@@ -186,6 +186,12 @@ class TestPersistentHistoryApiDb:
         """A2：project_id IS NULL 的记录对任何会话都不可见（fail-closed）。"""
         client, repository = db_api
         repository.create(
+            _record(request_id="step30-test-in-scope-1")
+        )
+        repository.create(
+            _record(request_id="step30-test-in-scope-2")
+        )
+        repository.create(
             _record(
                 request_id="step30-test-null-project",
                 success=False,
@@ -198,7 +204,7 @@ class TestPersistentHistoryApiDb:
         items = client.get(_API_PATH).json()["items"]
 
         assert [i["request_id"] for i in items] == [
-            "step30-test-001", "step30-test-002"
+            "step30-test-in-scope-2", "step30-test-in-scope-1"
         ]
         assert "step30-test-null-project" not in [
             i["request_id"] for i in items

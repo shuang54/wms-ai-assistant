@@ -60,10 +60,11 @@ from backend.app.services.tool_execution_service import ToolExecutionService
 from backend.app.tools.get_inventory import GET_INVENTORY_DEFINITION
 from backend.app.tools.registry import ToolRegistry
 from tests.api_session_auth import SessionTestClient as TestClient
-from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import observability_ops_session  # noqa: F401 —— pytest fixture
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
-pytestmark = pytest.mark.usefixtures("api_auth_session")
+# A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 需要运维白名单。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 _TABLE = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
 _PREFIX = "step40-%"

@@ -54,10 +54,11 @@ from backend.app.services.assistant_trace_query_service import (
 from backend.app.services.sql_executor_service import SQLExecutionResult
 from backend.app.services.text_to_sql_service import REFUSAL_MARKER
 from tests.api_session_auth import SessionTestClient as TestClient
-from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import observability_ops_session  # noqa: F401 —— pytest fixture
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
-pytestmark = pytest.mark.usefixtures("api_auth_session")
+# A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 需要运维白名单。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 # 复用既有装配 / Fake（不重造）
 from tests.test_assistant_trace_correlation_e2e import (  # noqa: PLC2701

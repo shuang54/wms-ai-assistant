@@ -232,10 +232,19 @@ async def _post_chats(questions: list[str]) -> list[tuple[int, Any]]:
 
 
 async def _get_timelines(request_ids: list[str]) -> list[dict[str, Any]]:
-    """**并发** GET assistant-timeline/{id}。"""
+    """**并发** GET assistant-timeline/{id}。
+
+    A2（M2.3）：Timeline 端点限定为运维专用 ⇒ 并发读同样必须携带
+    M1 会话 Cookie（会话由 ``observability_ops_session`` 的 Fake 提供，
+    运维白名单由该夹具注入）。
+    """
+    headers, cookies = _auth_material()
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
-        transport=transport, base_url="http://step70.test"
+        transport=transport,
+        base_url="http://step70.test",
+        headers=headers,
+        cookies=cookies,
     ) as client:
         responses = await asyncio.gather(
             *[

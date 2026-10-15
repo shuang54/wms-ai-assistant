@@ -29,7 +29,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import observability_ops_session  # noqa: F401,E402
+
+# A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 需要运维白名单。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 from sqlalchemy import text
 
 from backend.app.db.assistant_outcome_repository import (
