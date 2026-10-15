@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.db.models.tool_execution_record import (
@@ -35,8 +34,19 @@ from backend.app.db.tool_execution_repository import ToolExecutionRepository
 from backend.app.main import app
 from backend.app.services.tool_execution_record import ToolExecutionRecord
 
+# M2.3 A2：history 端点需要"已登录 + 服务端项目作用域"；客户端 project_id
+# 查询参数已移除。授权范围 = 服务端部署项目；NULL 项目记录不可见。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import (  # noqa: F401,E402
+    observability_project_scope_session,
+)
+
+pytestmark = pytest.mark.usefixtures("observability_project_scope_session")
+
 _TEST_TOOL = "get_inventory"
-_TEST_PROJECT = "test-project"
+#: M2.3 A2：测试记录的项目 = 服务端部署项目（与
+#: ``observability_project_scope_session`` 注入的作用域一致）。
+_TEST_PROJECT = "vietnam-wms"
 
 _TABLE = f"{TOOL_EXECUTION_SCHEMA}.{TOOL_EXECUTION_TABLE}"
 _TRUNCATE_SQL = text(f"TRUNCATE TABLE {_TABLE} RESTART IDENTITY")
@@ -172,13 +182,35 @@ class TestPersistentHistoryApiDb:
             "step30-test-2", "step30-test-1"
         ]
 
+    def test_null_project_record_is_invisible(self, db_api) -> None:
+        """A2：project_id IS NULL 的记录对任何会话都不可见（fail-closed）。"""
+        client, repository = db_api
+        repository.create(
+            _record(
+                request_id="step30-test-null-project",
+                success=False,
+                project_id=None,
+                error_code="invalid_argument",
+                error_type="ToolValidationError",
+            )
+        )
+
+        items = client.get(_API_PATH).json()["items"]
+
+        assert [i["request_id"] for i in items] == [
+            "step30-test-001", "step30-test-002"
+        ]
+        assert "step30-test-null-project" not in [
+            i["request_id"] for i in items
+        ]
+
     def test_failure_record_and_nullable_fields(self, db_api) -> None:
         client, repository = db_api
         repository.create(
             _record(
                 request_id="step30-test-failed",
                 success=False,
-                project_id=None,
+                project_id=_TEST_PROJECT,
                 error_code="invalid_argument",
                 error_type="ToolValidationError",
             )
@@ -187,7 +219,7 @@ class TestPersistentHistoryApiDb:
         item = client.get(_API_PATH).json()["items"][0]
 
         assert item["success"] is False
-        assert item["project_id"] is None
+        assert item["project_id"] == _TEST_PROJECT
         assert item["error_code"] == "invalid_argument"
         assert item["error_type"] == "ToolValidationError"
 

@@ -36,6 +36,20 @@ from backend.app.services.tool_observability_query_service import (
     ToolObservabilityQueryService,
 )
 
+# M2.3 A2：Tool History / Persistent Metrics 端点需要"已登录 + 服务端项目
+# 作用域"；Runtime 端点（tools / tools/metrics）需要"已登录 + 运维白名单"。
+# 两类装配同时安装，使本文件的 HTTP 断言继续验证既有边界语义。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import (  # noqa: F401,E402
+    observability_ops_session,
+    observability_project_scope_session,
+)
+
+pytestmark = pytest.mark.usefixtures(
+    "observability_ops_session",
+    "observability_project_scope_session",
+)
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: 无法静态确定 schema 字面值（保守：视为**未证明**在 ai_ops）。
@@ -1178,8 +1192,6 @@ class TestC36PersistentHistoryHttpBoundary:
 
     @staticmethod
     def _client():
-        from fastapi.testclient import TestClient
-
         from backend.app.api import orchestrator_chat as root
         from backend.app.main import app
 
@@ -1411,7 +1423,10 @@ class TestC37PersistentHistoryPaginationBoundary:
         )
 
         signature = inspect.signature(list_tool_execution_history)
-        assert list(signature.parameters)[:2] == ["limit", "offset"]
+        # M2.3 A2：request 承载服务端项目作用域；project_id 不再是客户端参数。
+        assert list(signature.parameters)[:3] == [
+            "request", "limit", "offset"
+        ]
         assert signature.parameters["limit"].default == 100
         assert signature.parameters["offset"].default == 0
 
@@ -1481,8 +1496,6 @@ class TestC37PersistentHistoryPaginationBoundary:
             assert forbidden not in identifiers, forbidden
 
     def test_c37_8_no_fallback(self, monkeypatch) -> None:
-        from fastapi.testclient import TestClient
-
         from backend.app.api import orchestrator_chat as root
         from backend.app.api import tool_observability as api
         from backend.app.db.tool_execution_repository import (
@@ -1630,10 +1643,11 @@ class TestC38PersistentHistoryFilteringBoundary:
 
         signature = inspect.signature(list_tool_execution_history)
 
+        # M2.3 A2：project_id 已从客户端契约移除（只来自服务端作用域）。
         assert list(signature.parameters) == [
-            "limit", "offset", "project_id", "tool_name", "success"
+            "request", "limit", "offset", "tool_name", "success"
         ]
-        assert signature.parameters["project_id"].default is None
+        assert "project_id" not in signature.parameters
         assert signature.parameters["tool_name"].default is None
         assert signature.parameters["success"].default is None
 
@@ -1760,8 +1774,6 @@ class TestC38PersistentHistoryFilteringBoundary:
 
     def test_c38_11_no_fallback(self) -> None:
         """DB 失败 + 过滤请求 → 502（不回退内存视图）。"""
-        from fastapi.testclient import TestClient
-
         from backend.app.api import orchestrator_chat as root
         from backend.app.api import tool_observability as api
         from backend.app.db.tool_execution_repository import (
@@ -1842,8 +1854,6 @@ class TestC39PersistentMetricsBoundary:
     """
 
     def test_c39_1_persistent_metrics_endpoint_exists(self) -> None:
-        from fastapi.testclient import TestClient
-
         from backend.app.main import app
 
         paths = set(app.openapi()["paths"])
@@ -1863,9 +1873,10 @@ class TestC39PersistentMetricsBoundary:
         )
 
         assert list(inspect.signature(tool_execution_metrics).parameters) == []
+        # M2.3 A2：project_id 已从客户端契约移除（只来自服务端作用域）。
         assert list(
             inspect.signature(persistent_tool_execution_metrics).parameters
-        ) == ["project_id", "tool_name", "success"]
+        ) == ["request", "tool_name", "success"]
 
     def test_c39_3_api_uses_persistent_query_service_only(self) -> None:
         identifiers = _identifiers("api")
@@ -1995,8 +2006,6 @@ class TestC39PersistentMetricsBoundary:
 
     def test_c39_10_no_fallback_or_merge(self) -> None:
         """DB 失败 → 502（不回退运行时的内存指标）。"""
-        from fastapi.testclient import TestClient
-
         from backend.app.api import orchestrator_chat as root
         from backend.app.api import tool_observability as api
         from backend.app.db.tool_execution_repository import (
@@ -2053,6 +2062,8 @@ class TestC39PersistentMetricsBoundary:
             inspect.signature(persistent_tool_execution_metrics).parameters
         )
 
-        assert parameters == {"project_id", "tool_name", "success"}
-        for forbidden in ("limit", "offset", "cursor", "page"):
+        # M2.3 A2：request 承载服务端作用域；无 limit / offset / cursor / page，
+        # 且**不再接受**客户端 project_id。
+        assert parameters == {"request", "tool_name", "success"}
+        for forbidden in ("limit", "offset", "cursor", "page", "project_id"):
             assert forbidden not in parameters, forbidden

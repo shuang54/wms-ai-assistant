@@ -504,6 +504,45 @@ class AgentCommandSettings:
 
 
 # ============================================================
+# Observability / Usage Read API 运维授权配置
+# （Phase 7 Recovery M2.3 A2；fail closed）
+# ============================================================
+
+
+@dataclass(frozen=True)
+class ObservabilityReadSettings:
+    """Usage / Observability 只读 API 的**运维授权**配置（M2.3 A2）。
+
+    背景：7 个只读端点原先匿名可达（全局用量 / Tool 历史 / Assistant Trace）。
+    A2 用 M1 会话认证收口，其中"全局视图"类端点进一步要求**运维授权**——
+    但 ``ai_ops.app_user`` **没有 role 列**（M1 有意设计：RBAC 属后续阶段），
+    ``Principal`` 也不携带角色主张，因此运维授权只能来自**服务端配置白名单**。
+
+    **不提供任何默认值**：默认空字符串 ⇒ 视为"未配置" ⇒ 需要运维权限的端点
+    一律 **503 fail closed**（**绝不**退化为"所有已登录用户均可访问"，
+    **绝不**回退匿名放行）。
+
+    安全边界（如实记录，不宣称已达成 RBAC）：
+
+        * 这是**部署级**授权（白名单 = 该部署的运维用户集合），
+          **不是**用户级 RBAC——无角色层级、无项目成员关系、可逐部署配置；
+        * 匹配键是 M1 会话 ``Principal.user_id``（服务端签发的 uuid4，
+          不可枚举、不可由客户端主张）；
+        * 客户端传入的角色 / 管理员标志 / 用户 ID 一律**不被接受**。
+
+    字段：
+        ops_user_ids: 逗号分隔的运维用户 ID 白名单（环境变量
+                      ``OBSERVABILITY_READ_OPS_USER_IDS``）。空 / 纯空白 /
+                      含空条目 ⇒ 无法解析 ⇒ 503。该值**不得**写入源码 /
+                      测试默认值 / 文档 / 日志 / 响应体。
+    """
+
+    ops_user_ids: str = field(
+        default_factory=lambda: _get_str("OBSERVABILITY_READ_OPS_USER_IDS", "")
+    )
+
+
+# ============================================================
 # 用户认证配置（Phase 7 Recovery M1 — Human User Authentication）
 # ============================================================
 
@@ -885,6 +924,9 @@ class Settings:
     agent_command: AgentCommandSettings = field(
         default_factory=AgentCommandSettings
     )
+    observability_read: ObservabilityReadSettings = field(
+        default_factory=ObservabilityReadSettings
+    )
     auth: AuthSettings = field(default_factory=AuthSettings)
     workflow_command: WorkflowCommandSettings = field(
         default_factory=WorkflowCommandSettings
@@ -911,6 +953,8 @@ __all__ = [
     "WorkflowReadSettings",
     "AgentReadSettings",
     "WorkflowCommandSettings",
+    "AgentCommandSettings",
+    "ObservabilityReadSettings",
     "AuthSettings",
     "TextToSQLSettings",
     "SQLExecutorSettings",

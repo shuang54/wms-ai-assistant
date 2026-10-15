@@ -34,10 +34,13 @@ from backend.app.services.tool_execution_persistent_query_service import (
     ToolExecutionPersistentQueryService,
 )
 from tests.api_session_auth import SessionTestClient as TestClient
-from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import observability_ops_session  # noqa: F401 —— pytest fixture
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
-pytestmark = pytest.mark.usefixtures("api_auth_session")
+# A2（M2.3）：/api/observability/assistant-trace/{id} 进一步限定为
+# 运维专用 ⇒ 需要"已登录 + 运维白名单"装配（observability_ops_session
+# 同时提供两者：会话 + 服务端白名单）。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _API_MODULE = "backend/app/api/assistant_trace.py"

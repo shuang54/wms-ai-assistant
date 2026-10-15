@@ -31,7 +31,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.db.models.tool_execution_record import (
@@ -42,6 +41,19 @@ from backend.app.db.session import get_engine, get_session_factory
 from backend.app.db.tool_execution_repository import ToolExecutionRepository
 from backend.app.main import app
 from backend.app.services.tool_execution_record import ToolExecutionRecord
+
+# M2.3 A2：persistent metrics 端点需要"已登录 + 服务端项目作用域"；
+# 客户端 project_id 查询参数已移除，聚合必须在授权范围内执行。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import (  # noqa: F401,E402
+    observability_project_scope_session,
+)
+
+pytestmark = pytest.mark.usefixtures("observability_project_scope_session")
+
+#: M2.3 A2：服务端唯一授权项目 / 授权范围外的项目。
+_SERVER_PROJECT_ID = "vietnam-wms"
+_OUT_OF_SCOPE_PROJECT_ID = "other-project"
 
 _TABLE = f"{TOOL_EXECUTION_SCHEMA}.{TOOL_EXECUTION_TABLE}"
 _DELETE_SQL = text(
@@ -56,12 +68,13 @@ _METRICS_PATH = "/api/observability/tools/metrics/persistent"
 _PREFIX = "step33-%"
 
 #: (request_id, project_id, tool_name, success, duration_ms)
+#: M2.3 A2：前三条在服务端授权项目内；后两条在授权范围外（不计入聚合）。
 _MATRIX = (
-    ("step33-A", "project-a", "get_inventory", True, 100.0),
-    ("step33-B", "project-a", "get_inventory", False, 200.0),
-    ("step33-C", "project-a", "get_work_order", True, 300.0),
-    ("step33-D", "project-b", "get_inventory", True, 400.0),
-    ("step33-E", "project-b", "get_work_order", False, 500.0),
+    ("step33-A", _SERVER_PROJECT_ID, "get_inventory", True, 100.0),
+    ("step33-B", _SERVER_PROJECT_ID, "get_inventory", False, 200.0),
+    ("step33-C", _SERVER_PROJECT_ID, "get_work_order", True, 300.0),
+    ("step33-D", _OUT_OF_SCOPE_PROJECT_ID, "get_inventory", True, 400.0),
+    ("step33-E", _OUT_OF_SCOPE_PROJECT_ID, "get_work_order", False, 500.0),
 )
 
 
@@ -172,23 +185,23 @@ def _assert_counts(
 @requires_db
 class TestPersistentMetricsDb:
     def test_all_records(self, metrics_api) -> None:
+        """A2：聚合只覆盖服务端授权项目内的 3 条（不含范围外 2 条）。"""
         payload = _metrics(metrics_api)
 
-        _assert_counts(payload, 5, 3, 2)
-        assert payload["success_rate"] == pytest.approx(0.6)
-        assert payload["failure_rate"] == pytest.approx(0.4)
-        assert payload["total_duration_ms"] == pytest.approx(1500.0)
-        assert payload["average_duration_ms"] == pytest.approx(300.0)
-        assert payload["max_duration_ms"] == pytest.approx(500.0)
+        _assert_counts(payload, 3, 2, 1)
+        assert payload["success_rate"] == pytest.approx(2 / 3)
+        assert payload["failure_rate"] == pytest.approx(1 / 3)
+        assert payload["total_duration_ms"] == pytest.approx(600.0)
+        assert payload["average_duration_ms"] == pytest.approx(200.0)
+        assert payload["max_duration_ms"] == pytest.approx(300.0)
 
-    def test_project_filters(self, metrics_api) -> None:
-        project_a = _metrics(metrics_api, "?project_id=project-a")
-        project_b = _metrics(metrics_api, "?project_id=project-b")
-
-        _assert_counts(project_a, 3, 2, 1)
-        _assert_counts(project_b, 2, 1, 1)
-        assert project_a["max_duration_ms"] == pytest.approx(300.0)
-        assert project_b["max_duration_ms"] == pytest.approx(500.0)
+    def test_client_project_id_is_ignored(self, metrics_api) -> None:
+        """A2：客户端 project_id 不再被接受，不能扩大授权范围。"""
+        for claimed in (
+            _SERVER_PROJECT_ID, _OUT_OF_SCOPE_PROJECT_ID, "",
+        ):
+            payload = _metrics(metrics_api, f"?project_id={claimed}")
+            _assert_counts(payload, 3, 2, 1)      # 恒为授权范围内
 
     def test_tool_filters(self, metrics_api) -> None:
         inventory = _metrics(
@@ -198,43 +211,42 @@ class TestPersistentMetricsDb:
             metrics_api, "?tool_name=get_work_order"
         )
 
-        _assert_counts(inventory, 3, 2, 1)
-        _assert_counts(work_order, 2, 1, 1)
-        assert inventory["total_duration_ms"] == pytest.approx(700.0)
-        assert work_order["total_duration_ms"] == pytest.approx(800.0)
+        _assert_counts(inventory, 2, 1, 1)
+        _assert_counts(work_order, 1, 1, 0)
+        assert inventory["total_duration_ms"] == pytest.approx(300.0)
+        assert work_order["total_duration_ms"] == pytest.approx(300.0)
 
     def test_success_filters(self, metrics_api) -> None:
         successes = _metrics(metrics_api, "?success=true")
         failures = _metrics(metrics_api, "?success=false")
 
-        _assert_counts(successes, 3, 3, 0)
+        _assert_counts(successes, 2, 2, 0)
         assert successes["success_rate"] == pytest.approx(1.0)
         assert successes["failure_rate"] == pytest.approx(0.0)
-        _assert_counts(failures, 2, 0, 2)
+        _assert_counts(failures, 1, 0, 1)
         assert failures["success_rate"] == pytest.approx(0.0)
         assert failures["failure_rate"] == pytest.approx(1.0)
 
     def test_combined_filters(self, metrics_api) -> None:
-        project_inventory = _metrics(
-            metrics_api, "?project_id=project-a&tool_name=get_inventory"
+        inventory = _metrics(
+            metrics_api, "?tool_name=get_inventory"
         )
-        project_success = _metrics(
-            metrics_api, "?project_id=project-a&success=true"
+        success = _metrics(
+            metrics_api, "?success=true"
         )
         triple = _metrics(
             metrics_api,
-            "?project_id=project-b&tool_name=get_work_order&success=false",
+            "?tool_name=get_work_order&success=false",
         )
 
-        _assert_counts(project_inventory, 2, 1, 1)
-        assert project_inventory["total_duration_ms"] == pytest.approx(300.0)
-        _assert_counts(project_success, 2, 2, 0)
-        _assert_counts(triple, 1, 0, 1)
-        assert triple["total_duration_ms"] == pytest.approx(500.0)
+        _assert_counts(inventory, 2, 1, 1)
+        assert inventory["total_duration_ms"] == pytest.approx(300.0)
+        _assert_counts(success, 2, 2, 0)
+        _assert_counts(triple, 0, 0, 0)      # 范围内没有该组合
 
     def test_empty_result_semantics(self, metrics_api) -> None:
         """无匹配行 → 计数 0；比率 / 均值 / 最大值 None（不是 0）。"""
-        payload = _metrics(metrics_api, "?project_id=does-not-exist")
+        payload = _metrics(metrics_api, "?tool_name=does-not-exist")
 
         _assert_counts(payload, 0, 0, 0)
         assert payload["success_rate"] is None
@@ -244,17 +256,30 @@ class TestPersistentMetricsDb:
         assert payload["total_duration_ms"] == 0.0
 
     def test_empty_string_filter_matches_nothing(self, metrics_api) -> None:
-        payload = _metrics(metrics_api, "?project_id=&tool_name=")
+        payload = _metrics(metrics_api, "?tool_name=")
 
         _assert_counts(payload, 0, 0, 0)
 
     def test_sql_injection_input_is_literal(self, metrics_api) -> None:
         payload = _metrics(
-            metrics_api, "?project_id=%27%20OR%201%3D1%20--"
+            metrics_api, "?tool_name=%27%20OR%201%3D1%20--"
         )
 
         _assert_counts(payload, 0, 0, 0)          # 不扩大结果
-        assert _metrics(metrics_api)["total_count"] == 5   # 表未被破坏
+        assert _metrics(metrics_api)["total_count"] == 3   # 表未被破坏
+
+    def test_out_of_scope_records_never_counted(self, metrics_api) -> None:
+        """A2：授权范围外的 2 条记录对任何过滤组合都不可见。"""
+        for query in (
+            "",
+            "?tool_name=get_inventory",
+            "?tool_name=get_work_order",
+            "?success=true",
+            "?success=false",
+        ):
+            payload = _metrics(metrics_api, query)
+            assert payload["total_count"] <= 3, query
+            assert payload["max_duration_ms"] in (None, 300.0), query
 
     def test_invalid_parameters_return_422(self, metrics_api) -> None:
         """非法布尔字面量 → 422（FastAPI / Pydantic 校验）。
@@ -273,7 +298,7 @@ class TestPersistentMetricsDb:
         _assert_counts(payload, 5, 3, 2)
 
     def test_response_field_whitelist(self, metrics_api) -> None:
-        payload = _metrics(metrics_api, "?project_id=project-a")
+        payload = _metrics(metrics_api)
 
         assert set(payload) == {
             "total_count", "success_count", "failure_count", "success_rate",

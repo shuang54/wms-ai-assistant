@@ -43,10 +43,11 @@ from backend.app.services.llm_usage_persistence_service import (
 from backend.app.services.text_to_sql_service import REFUSAL_MARKER
 from backend.app.config import settings
 from tests.api_session_auth import FakeSessionService
-from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import observability_ops_session  # noqa: F401 —— pytest fixture
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 并发请求同样携带 M1 会话 + CSRF。
-pytestmark = pytest.mark.usefixtures("api_auth_session")
+# A2（M2.3）：assistant-timeline 端点限定为运维专用 ⇒ 需要运维白名单。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 from tests.test_assistant_trace_correlation_e2e import (  # noqa: PLC2701
     _RAG_QUESTION,

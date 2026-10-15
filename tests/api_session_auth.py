@@ -28,24 +28,30 @@
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import pytest
 
 from backend.app.api import auth_dependency as auth_dep
-from backend.app.config import settings
+from backend.app.api import observability_read_auth as observability_read_auth_module
+from backend.app.config import ObservabilityReadSettings, settings
 from backend.app.main import app
 from tests.conversation_auth_support import (
     AutoCsrfTestClient,
     FakeSessionService,
     USER_PASSWORDS,
+    USER_IDS,
 )
 
 __all__ = [
     "SessionTestClient",
     "FakeSessionService",
     "api_auth_session",
+    "observability_ops_session",
+    "observability_project_scope_session",
     "install_fake_session_service",
+    "install_observability_ops_allowlist",
+    "install_observability_project_scope",
 ]
 
 
@@ -71,6 +77,63 @@ def api_auth_session(monkeypatch: pytest.MonkeyPatch) -> FakeSessionService:
     只让"会话存储"变成进程内实现（无 DB / 无残留）。
     """
     return install_fake_session_service(monkeypatch)
+
+
+def install_observability_ops_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+    user_ids: Iterable[str],
+) -> None:
+    """安装 M2.3 A2 运维白名单（**仅**会话存储之上的授权配置）。
+
+    只替换配置来源（``get_observability_read_settings``）；不触碰
+    ``require_session`` / ``require_observability_ops`` 本身——生产认证与
+    授权链路仍然真实执行。
+    """
+    monkeypatch.setattr(
+        observability_read_auth_module,
+        "get_observability_read_settings",
+        lambda: ObservabilityReadSettings(
+            ops_user_ids=",".join(sorted(set(user_ids)))
+        ),
+    )
+
+
+def install_observability_project_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    project_id: str | None,
+) -> None:
+    """安装 M2.3 A2 服务端项目作用域（``None`` = 模拟"配置不可解析"）。"""
+    monkeypatch.setattr(
+        observability_read_auth_module,
+        "get_observability_project_id",
+        lambda: project_id,
+    )
+
+
+@pytest.fixture()
+def observability_ops_session(monkeypatch: pytest.MonkeyPatch) -> FakeSessionService:
+    """A2 运维专用端点的测试装配：已登录会话 **+ 运维白名单**。
+
+    语义：alice 是运维用户（白名单成员）；bob / carol 不是（非白名单用例）。
+    """
+    service = install_fake_session_service(monkeypatch)
+    install_observability_ops_allowlist(monkeypatch, {USER_IDS["alice"]})
+    return service
+
+
+@pytest.fixture()
+def observability_project_scope_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> FakeSessionService:
+    """A2 项目作用域端点的测试装配：已登录会话 + 服务端项目作用域。
+
+    作用域值取测试固定的 ``vietnam-wms``（与 M2.2 同一部署项目语义）；
+    需要验证"作用域不可用"的用例请显式调用
+    ``install_observability_project_scope(monkeypatch, None)``。
+    """
+    service = install_fake_session_service(monkeypatch)
+    install_observability_project_scope(monkeypatch, "vietnam-wms")
+    return service
 
 
 class SessionTestClient(AutoCsrfTestClient):

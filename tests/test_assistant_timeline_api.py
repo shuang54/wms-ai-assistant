@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import assistant_timeline as timeline_module
 from backend.app.api.assistant_trace import AssistantTraceResponse
@@ -44,6 +43,14 @@ from backend.app.services.assistant_timeline_query_service import (
     AssistantTimelineQueryService,
 )
 from backend.app.services.llm_usage_query_service import LLMUsageTraceRecordView
+
+# M2.3 A2：Timeline / Trace 端点不再允许匿名读取 ⇒ 已登录 + 运维白名单客户端。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import observability_ops_session  # noqa: F401,E402
+
+# M2.3 A2：本文件全部用例都需要"已登录 + 运维白名单"（含对 Trace 端点的
+# 契约复核），否则匿名请求会被 401 拒绝而无法验证既有契约。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 _ENDPOINT: str = "/api/observability/assistant-timeline"
 _TRACE_ENDPOINT: str = "/api/observability/assistant-trace"

@@ -37,7 +37,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import usage as usage_module
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
@@ -62,6 +61,13 @@ from backend.app.services.llm_usage_query_service import (
     LLMUsageQueryFilter,
     LLMUsageQueryInputError,
 )
+
+# M2.3 A2：/api/usage/analytics 不再允许匿名读取 ⇒ 已登录 + 运维白名单客户端。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import observability_ops_session  # noqa: F401,E402
+
+# M2.3 A2：本文件全部用例都需要"已登录 + 运维白名单"才能读取用量数据。
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

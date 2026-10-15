@@ -30,19 +30,31 @@
 这是 **Grouped Timeline Projection**（不是 Unified Timeline）：
 响应里没有全局事件流、没有 event_id、没有 sequence、没有跨组排序。
 
-授权现状（Step 68 §十八 —— **如实记录，不隐藏**）：
+授权现状（Phase 7 Recovery M2.3 A2 —— 如实记录，不隐藏）：
 
-    本接口**没有 request-level authorization**：
-    知道 ``assistant_request_id`` 的调用方即可读取对应 Timeline。
-    与既有 ``/api/observability/assistant-trace/{id}`` 属同一暴露级别；
-    本阶段**不**引入 JWT / OAuth / API Key / tenant isolation。
+    本端点已从"匿名可读"收口为 **M1 会话 + 运维白名单**（装饰器级依赖
+    ``require_observability_ops``，先于任何数据读取）：
+
+        匿名 / 无效 / 过期 / 已撤销会话        ⇒ 401
+        运维白名单未配置 / 无法解析            ⇒ 503（fail closed）
+        已认证但 user_id 不在白名单            ⇒ 403
+
+    **仍然没有 request-level 项目授权**：无法从持久化数据可靠判定一条
+    Timeline 的项目归属（``llm_usage_record`` / ``assistant_outcome_record``
+    无 project_id 列，``resource_owner`` 也不登记 ``assistant_request_id``），
+    因此只能整端点限定为运维专用——与 Assistant Trace API（A2-06）**同一
+    访问策略**。该残留风险记录于 ``docs/security.md`` §A2。
+
+    不引入 JWT / OAuth / API Key / tenant isolation；GET 不适用 CSRF。
 """
 from __future__ import annotations
 
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+
+from backend.app.api.observability_read_auth import require_observability_ops
 
 from backend.app.api.assistant_trace import (
     MAX_ASSISTANT_REQUEST_ID_LENGTH,
@@ -120,6 +132,7 @@ def to_api_timeline(timeline: object) -> AssistantTimelineResponse:
 @router.get(
     "/observability/assistant-timeline/{assistant_request_id}",
     response_model=AssistantTimelineResponse,
+    dependencies=[Depends(require_observability_ops)],
     responses={
         200: {
             "description": (
@@ -128,6 +141,9 @@ def to_api_timeline(timeline: object) -> AssistantTimelineResponse:
             )
         },
         400: {"description": "assistant_request_id 非法（如纯空白）"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "已认证但非运维用户（固定文案；零业务执行）"},
+        503: {"description": "运维白名单未配置（fail closed；零业务执行）"},
         422: {"description": "路径参数校验失败（长度越界）"},
         502: {
             "description": (
@@ -186,9 +202,12 @@ async def get_assistant_timeline(
         ``source_id`` 是**内部事件标识**（来源表主键），仅用于同一次请求内
         区分事件 —— **不是** global event id、**不**表示顺序。
 
-    授权：本接口**没有** request-level authorization
-        （与既有 Assistant Trace API 同一暴露级别）：
-        知道 ``assistant_request_id`` 的调用方即可读取对应 Timeline。
+    授权（Phase 7 Recovery M2.3 A2）：M1 会话 + 运维白名单（装饰器级依赖，
+        先于任何数据读取）——匿名 ⇒ 401；非运维用户 ⇒ 403；白名单未配置
+        ⇒ 503。**"知道 ID 即可读"不再成立**。
+        **仍然没有** request-level 项目授权（无法可靠判定 Timeline 的
+        项目归属，见模块 docstring）⇒ 与 Assistant Trace API（A2-06）
+        同一访问策略；该残留风险记录于 ``docs/security.md``。
     """
     try:
         service: AssistantTimelineQueryService = (

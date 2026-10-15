@@ -49,17 +49,36 @@
     LLMUsageAggregationInputError                  → 500
     LLMUsageAnalyticsError / LLMUsageAggregationError → 500
 
-安全：响应与错误 detail 不含 API Key / Password / DATABASE_URL /
-SQL / Session / traceback / prompt 原文；字段仅为 Snapshot 白名单。
+安全（Phase 7 Recovery M2.3 A2）：响应与错误 detail 不含 API Key / Password /
+    DATABASE_URL / SQL / Session / traceback / prompt 原文；字段仅为 Snapshot
+    白名单；**底层异常正文不再回显**（A2 起 502/500 一律固定文案）。
+
+认证与授权（Phase 7 Recovery M2.3 A2 —— **不再允许匿名读取**）：
+
+    M1 会话 Cookie（require_session）        ⇒ 401（无 / 无效 / 过期 / 已撤销）
+        ↓
+    运维白名单（OBSERVABILITY_READ_OPS_USER_IDS）
+        ↓
+    503（白名单未配置 / 无法解析）· 403（已认证但非运维用户）
+        ↓
+    UsageAnalyticsQueryParams → ... → Snapshot → Response
+
+    * 认证与授权**先于**任何查询执行（装饰器级依赖）：未授权时 LLM Usage
+      查询 = 0、DB 查询 = 0；
+    * 本端点是**全局**用量视图（``llm_usage_record`` 无 project_id 维度），
+      因此限定为运维专用——不得伪装成项目级统计；
+    * 不新增 API-Key 旁路；GET 不适用 CSRF（沿用 M1 安全方法语义）。
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Final
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+
+from backend.app.api.observability_read_auth import require_observability_ops
 
 from backend.app.db.llm_usage_repository import LLMUsageRepositoryError
 from backend.app.services.llm_usage_aggregation_service import (
@@ -264,6 +283,11 @@ class UsageAnalyticsResponse(BaseModel):
     )
 
 
+#: A2：未授权时的固定错误文案（**不**回显底层异常 / 配置 / 连接信息）。
+_UNAVAILABLE_DETAIL: Final[str] = "Usage 查询失败"
+_INTERNAL_DETAIL: Final[str] = "Usage 查询服务内部错误"
+
+
 # ============================================================
 # Dependency（与 api/chat.py 同风格：模块级单例，测试用 monkeypatch 替换）
 # ============================================================
@@ -353,7 +377,17 @@ def _to_query_filter(
 # Endpoint
 # ============================================================
 
-@router.get("/usage/analytics", response_model=UsageAnalyticsResponse)
+@router.get(
+    "/usage/analytics",
+    response_model=UsageAnalyticsResponse,
+    dependencies=[Depends(require_observability_ops)],
+    responses={
+        200: {"description": "当前 Filter 命中的本页记录聚合快照（运维专用）"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "已认证但非运维用户（固定文案；零业务执行）"},
+        503: {"description": "运维白名单未配置（fail closed；零业务执行）"},
+    },
+)
 async def usage_analytics(
     params: Annotated[UsageAnalyticsQueryParams, Query()],
 ) -> UsageAnalyticsResponse:
@@ -373,7 +407,15 @@ async def usage_analytics(
           未知信息不丢失）；
         * 空数据是 200 + 零值 Snapshot + 空数组，不是错误。
 
-    异常映射（不吞异常、不伪装成功）：
+    授权（Phase 7 Recovery M2.3 A2）：
+
+        * M1 会话 + 运维白名单；**匿名请求 401**，非运维用户 403，
+          白名单未配置 503（三者均在任何查询执行之前）；
+        * **全局视图**：``llm_usage_record`` 无 project_id 维度，本端点
+          不提供（也无法提供）项目级过滤；
+        * GET 不适用 CSRF。
+
+    异常映射（不吞异常、不伪装成功；A2 起**不再回显底层异常正文**）：
 
         LLMUsageQueryInputError           → 422（Filter Contract 拒绝）
         LLMUsageRepositoryError           → 502（DB 未配置 / 查询失败）
@@ -392,34 +434,34 @@ async def usage_analytics(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
-    except LLMUsageRepositoryError as exc:
+    except LLMUsageRepositoryError:
         logger.warning(
-            "usage analytics repository error",
+            "usage analytics repository unavailable",
             extra={"error_type": "LLMUsageRepositoryError"},
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Usage 查询失败: {exc}",
-        )
-    except LLMUsageQueryError as exc:
+            detail=_UNAVAILABLE_DETAIL,
+        ) from None
+    except LLMUsageQueryError:
         logger.exception("usage analytics query service error")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Usage 查询服务内部错误: {exc}",
-        )
-    except (LLMUsageAnalyticsInputError, LLMUsageAggregationInputError) as exc:
+            detail=_INTERNAL_DETAIL,
+        ) from None
+    except (LLMUsageAnalyticsInputError, LLMUsageAggregationInputError):
         # Analytics 输入来自内部 Runtime（非调用方可控）→ 内部错误
         logger.exception("usage analytics internal input error")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Usage Analytics 内部错误: {exc}",
-        )
-    except (LLMUsageAnalyticsError, LLMUsageAggregationError) as exc:
+            detail=_INTERNAL_DETAIL,
+        ) from None
+    except (LLMUsageAnalyticsError, LLMUsageAggregationError):
         logger.exception("usage analytics service error")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Usage Analytics 服务内部错误: {exc}",
-        )
+            detail=_INTERNAL_DETAIL,
+        ) from None
 
     # 未知异常：不 except Exception、不吞掉，原样上抛交由
     # Starlette ServerErrorMiddleware 兜底 500（与项目既有端点一致）。

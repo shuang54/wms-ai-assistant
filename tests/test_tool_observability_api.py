@@ -49,10 +49,22 @@ from backend.app.services.tool_observability_snapshot import (
 )
 from backend.app.tools.registry import ToolRegistry
 from tests.api_session_auth import SessionTestClient as TestClient
-from tests.api_session_auth import api_auth_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import (  # noqa: F401 —— pytest fixtures
+    observability_ops_session,
+    observability_project_scope_session,
+)
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
-pytestmark = pytest.mark.usefixtures("api_auth_session")
+# A2（M2.3）：Runtime 端点（tools / tools/metrics）限定为运维专用；
+#      Persistent 端点（history / metrics/persistent）使用服务端项目作用域。
+#      两类端点都不再接受客户端 project_id。
+pytestmark = pytest.mark.usefixtures(
+    "observability_ops_session",
+    "observability_project_scope_session",
+)
+
+#: M2.3 A2：服务端项目作用域（由 observability_project_scope_session 注入）。
+_SERVER_PROJECT_ID = "vietnam-wms"
 
 # 复用既有测试资产（Fakes / decisions），不重复创建
 from tests.test_ai_orchestrator import (  # noqa: E402
@@ -897,23 +909,40 @@ class TestPersistentHistoryApi:
         assert "runtime-only-A" not in response.text
         assert response.json()["detail"] == "Tool 观测历史数据不可用"
 
-    # ---- Step 32：精确过滤（project_id / tool_name / success） ----
+    # ---- Step 32 + M2.3 A2：业务过滤透传 + 服务端项目作用域 ----
 
-    def test_filters_are_forwarded_to_service(self, history) -> None:
+    def test_business_filters_are_forwarded_to_service(self, history) -> None:
+        """tool_name / success 透传；project_id **只**来自服务端配置。"""
         client, install = history
         service = install([_snapshot_from(_record())])
 
         client.get(
             "/api/observability/tools/history"
-            "?project_id=project-a&tool_name=get_inventory&success=true"
-            "&limit=20&offset=5"
+            "?tool_name=get_inventory&success=true&limit=20&offset=5"
         )
 
         assert service.calls == [(20, 5)]
         assert service.filters == [{
-            "project_id": "project-a",
+            "project_id": _SERVER_PROJECT_ID,
             "tool_name": "get_inventory",
             "success": True,
+        }]
+
+    def test_client_project_id_cannot_widen_scope(self, history) -> None:
+        """A2：客户端 project_id 被忽略（不再接受），不能扩大授权范围。"""
+        client, install = history
+        service = install([])
+
+        response = client.get(
+            "/api/observability/tools/history"
+            "?project_id=some-other-project&tool_name=get_inventory"
+        )
+
+        assert response.status_code == 200
+        assert service.filters == [{
+            "project_id": _SERVER_PROJECT_ID,   # 不是客户端值
+            "tool_name": "get_inventory",
+            "success": None,
         }]
 
     def test_success_false_is_forwarded_as_false(self, history) -> None:
@@ -931,16 +960,18 @@ class TestPersistentHistoryApi:
         client.get("/api/observability/tools/history")
 
         assert service.filters == [{
-            "project_id": None, "tool_name": None, "success": None
+            "project_id": _SERVER_PROJECT_ID,
+            "tool_name": None,
+            "success": None,
         }]
 
-    def test_empty_string_filter_is_forwarded(self, history) -> None:
+    def test_empty_string_business_filter_is_forwarded(self, history) -> None:
         client, install = history
         service = install([])
 
-        client.get("/api/observability/tools/history?project_id=&tool_name=")
+        client.get("/api/observability/tools/history?tool_name=")
 
-        assert service.filters[0]["project_id"] == ""
+        assert service.filters[0]["project_id"] == _SERVER_PROJECT_ID
         assert service.filters[0]["tool_name"] == ""
 
     def test_invalid_success_value_returns_422(self, history) -> None:
@@ -961,7 +992,7 @@ class TestPersistentHistoryApi:
 
         payload = client.get(
             "/api/observability/tools/history"
-            "?project_id=project-a&limit=1&offset=1"
+            "?limit=1&offset=1"
         ).json()
 
         assert payload["limit"] == 1
@@ -1115,7 +1146,9 @@ class TestPersistentMetricsApi:
             "max_duration_ms": None,
         }
         assert service.metrics_calls == [{
-            "project_id": None, "tool_name": None, "success": None
+            "project_id": _SERVER_PROJECT_ID,
+            "tool_name": None,
+            "success": None,
         }]
 
     def test_populated_metrics(self, history) -> None:
@@ -1146,18 +1179,36 @@ class TestPersistentMetricsApi:
         assert payload["max_duration_ms"] == 300.0
 
     def test_filters_forwarded(self, history) -> None:
+        """业务过滤透传；project_id **只**来自服务端配置（A2）。"""
         client, install = history
         service = install()
 
         client.get(
             f"{_METRICS_PATH}"
-            "?project_id=project-a&tool_name=get_inventory&success=true"
+            "?tool_name=get_inventory&success=true"
         )
 
         assert service.metrics_calls == [{
-            "project_id": "project-a",
+            "project_id": _SERVER_PROJECT_ID,
             "tool_name": "get_inventory",
             "success": True,
+        }]
+
+    def test_client_project_id_cannot_widen_scope(self, history) -> None:
+        """A2：客户端 project_id 被忽略，SQL 聚合不越出服务端作用域。"""
+        client, install = history
+        service = install()
+
+        response = client.get(
+            f"{_METRICS_PATH}"
+            "?project_id=some-other-project&tool_name=get_inventory"
+        )
+
+        assert response.status_code == 200
+        assert service.metrics_calls == [{
+            "project_id": _SERVER_PROJECT_ID,
+            "tool_name": "get_inventory",
+            "success": None,
         }]
 
     def test_success_false_forwarded_as_false(self, history) -> None:
@@ -1169,15 +1220,17 @@ class TestPersistentMetricsApi:
         assert service.metrics_calls[0]["success"] is False
 
     def test_injection_string_forwarded_as_literal(self, history) -> None:
+        """A2：project_id 已不接受客户端输入 ⇒ 注入串只能落在 tool_name。"""
         client, install = history
         service = install()
 
         response = client.get(
-            f"{_METRICS_PATH}?project_id=%27%20OR%201%3D1%20--"
+            f"{_METRICS_PATH}?tool_name=%27%20OR%201%3D1%20--"
         )
 
         assert response.status_code == 200
-        assert service.metrics_calls[0]["project_id"] == "' OR 1=1 --"
+        assert service.metrics_calls[0]["project_id"] == _SERVER_PROJECT_ID
+        assert service.metrics_calls[0]["tool_name"] == "' OR 1=1 --"
 
     def test_invalid_success_returns_422(self, history) -> None:
         client, install = history
@@ -1224,7 +1277,7 @@ class TestPersistentMetricsApi:
         install()
 
         payload = client.get(
-            f"{_METRICS_PATH}?project_id=project-a&tool_name=get_inventory"
+            f"{_METRICS_PATH}?tool_name=get_inventory"
         ).json()
 
         assert tuple(payload) == _METRICS_FIELDS
@@ -1236,13 +1289,17 @@ class TestPersistentMetricsApi:
             assert forbidden not in payload, forbidden
 
     def test_no_limit_or_offset_parameters(self) -> None:
+        """无 limit / offset（聚合是单行）；**且无客户端 project_id**（A2）。"""
         import inspect
 
         signature = inspect.signature(api_module.persistent_tool_execution_metrics)
 
+        # M2.3 A2：project_id 已从客户端契约移除（只来自服务端作用域）；
+        # request 用于读取依赖注入的服务端作用域（fail-closed）。
         assert list(signature.parameters) == [
-            "project_id", "tool_name", "success"
+            "request", "tool_name", "success"
         ]
+        assert "project_id" not in signature.parameters
 
     def test_runtime_metrics_unchanged_when_persistent_broken(
         self, history

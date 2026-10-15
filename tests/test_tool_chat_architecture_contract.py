@@ -89,6 +89,19 @@ import pytest
 
 from backend.app.services.tool_execution_service import ToolExecutionService
 
+# M2.3 A2：C27 只读端点需要认证装配（Runtime 端点 = 运维白名单；
+# Persistent 端点 = 服务端项目作用域）。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import (  # noqa: F401,E402
+    observability_ops_session,
+    observability_project_scope_session,
+)
+
+pytestmark = pytest.mark.usefixtures(
+    "observability_ops_session",
+    "observability_project_scope_session",
+)
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _SERVICE_MODULE = "backend/app/services/tool_chat_service.py"
@@ -3210,8 +3223,6 @@ class TestC27HttpReadBoundary:
 
     @classmethod
     def _client(cls):
-        from fastapi.testclient import TestClient
-
         from backend.app.api import orchestrator_chat as root
         from backend.app.main import app
 
@@ -3328,10 +3339,13 @@ class TestC27HttpReadBoundary:
             node.name: [arg.arg for arg in node.args.args]
             for node in functions
         }
-        # Step 32：+ 精确过滤参数（project_id / tool_name / success）
+        # Step 32：+ 精确过滤参数（tool_name / success）
+        # M2.3 A2：project_id 已从客户端契约移除（只来自服务端作用域）；
+        #           request 承载依赖注入的服务端项目作用域。
         assert params["list_tool_execution_history"] == [
-            "limit", "offset", "project_id", "tool_name", "success"
+            "request", "limit", "offset", "tool_name", "success"
         ]
+        assert "project_id" not in params["list_tool_execution_history"]
         assert params["list_tool_executions"] == []
         assert params["tool_execution_metrics"] == []
         identifiers = _identifiers(tree)

@@ -1409,3 +1409,65 @@ The four AI execution endpoints no longer permit anonymous execution.
   `tests/test_rag_api.py`、`tests/test_tool_chat_api.py` 等 26 个文件
   （认证客户端由 `tests/api_session_auth.py` 提供；生产
   `require_session` / `require_csrf` 仍真实执行，**无** `dependency_overrides`）
+
+---
+
+## 14. 只读用量／可观测性接口认证与授权（Phase 7 Recovery M2.3 A2）
+
+**Breaking change**：下列 7 个端点从**匿名可读**改为**必须认证**（对早期
+"只读观测面公开"契约的正式修订；先例同 A1 / S7.1→S7.2）：
+
+| Method | Path | 访问模型 |
+| --- | --- | --- |
+| GET | `/api/usage/analytics` | Session + 运维白名单 |
+| GET | `/api/observability/tools` | Session + 运维白名单 |
+| GET | `/api/observability/tools/metrics` | Session + 运维白名单 |
+| GET | `/api/observability/tools/history` | Session + 服务端 `PROJECT_ID` |
+| GET | `/api/observability/tools/metrics/persistent` | Session + 服务端 `PROJECT_ID` |
+| GET | `/api/observability/assistant-trace/{assistant_request_id}` | Session + 运维白名单 |
+| GET | `/api/observability/assistant-timeline/{assistant_request_id}` | Session + 运维白名单 |
+
+### 14.1 状态码
+
+| 场景 | 状态码 | 说明 |
+| --- | --- | --- |
+| 匿名 / 无效 / 过期 / 已撤销会话 | `401` | 固定文案；认证前零数据读取 |
+| 会话服务不可用 | `503` | fail closed；绝不匿名放行 |
+| 运维白名单缺失 / 空白 / 无法解析 | `503` | 固定文案；不回显白名单内容 |
+| 已认证但非运维用户 | `403` | 固定文案；不泄露白名单内容 |
+| `PROJECT_ID` 缺失 / 空白 | `503` | 固定文案；不回退默认项目 |
+| 其余（DB 不可用 / 非法参数 / 未知异常） | `502` / `422` / `500` | 与 A2 前契约一致 |
+
+### 14.2 与 A2 前的契约差异
+
+- **新增**：401 / 403 / 503 响应（运维面 401+403+503；项目面 401+503）。
+- **移除**：`GET /api/observability/tools/history` 与
+  `GET /api/observability/tools/metrics/persistent` 的客户端 `project_id`
+  查询参数（Step 32 / Step 33 曾提供）。作用域只来自服务端 `PROJECT_ID`。
+- **不变**：成功响应 DTO 与字段白名单、分页语义（`limit` / `offset`）、
+  排序（`started_at DESC, id DESC`）、空结果语义（200 + 空列表 / 零值）、
+  502 不回退内存视图、`project_id IS NULL` 记录不可见（fail-closed）。
+- **GET 不适用 CSRF**：缺少或错误的 `X-CSRF-Token` 均不产生 403。
+
+### 14.3 配置
+
+```text
+OBSERVABILITY_READ_OPS_USER_IDS=<逗号分隔 user_id>   # 无默认值；未配置 ⇒ 503
+PROJECT_ID=<部署唯一授权项目>                        # 见 §12.4
+```
+
+### 14.4 边界（不宣称已达成）
+
+- A2-01 / A2-02 / A2-03 是**运维专用全局视图**，无项目级过滤维度。
+- A2-06 / A2-07 **无法验证资源级项目归属**（`llm_usage_record` /
+  `assistant_outcome_record` 无 `project_id`；`resource_owner` 不登记
+  `assistant_request_id`），只能整端点限定为运维专用。
+- 运维白名单是**部署级授权**，不是用户级 RBAC。
+- 详见 `docs/security.md` §10。
+
+### 14.5 测试证据
+
+`tests/test_observability_read_api_auth.py`（64 例）；DB 级断言见
+`tests/test_tool_observability_history_api_db.py`、
+`tests/test_tool_observability_history_filtering_db.py`、
+`tests/test_tool_observability_persistent_metrics_db.py`。

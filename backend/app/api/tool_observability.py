@@ -36,24 +36,45 @@ Architecture Boundary（§七 —— 本阶段最重要的约束）：
     * 空数据语义不变（§六）：``success_rate`` / ``failure_rate`` /
       ``average_duration_ms`` / ``max_duration_ms`` 为 ``null``（**不是** ``0``）。
 
-安全（§十四）：response 只含 Snapshot 的 11 个字段 / Metrics 的 8 个字段；
-    不含 Tool arguments / ToolResult.data / SQL / prompt / LLM response /
-    凭据 / 连接信息 / traceback / Collector 内部状态。
+安全（§十四 + Phase 7 Recovery M2.3 A2）：response 只含 Snapshot 的 11 个字段 /
+    Metrics 的 8 个字段；不含 Tool arguments / ToolResult.data / SQL / prompt /
+    LLM response / 凭据 / 连接信息 / traceback / Collector 内部状态。
 
-明确不做（§二）：
+认证与授权（Phase 7 Recovery M2.3 A2 —— **不再允许匿名读取**）：
 
-    Database Persistence / Redis / Kafka / Prometheus / OpenTelemetry /
-    Dashboard / Frontend / WebSocket / SSE / 鉴权重设计 / Audit 持久化 /
-    Event Bus / Background worker / Celery / Agent / MCP / LangGraph。
+    本模块 4 个端点**分两类**（按数据维度可信度划分，不虚构过滤能力）：
+
+    * **运维专用全局视图**（数据模型无可信项目维度 ⇒ 只能全局）：
+        - ``GET /observability/tools``          Runtime 快照（进程内存）
+        - ``GET /observability/tools/metrics``  Runtime 聚合（**无** by_project 维度）
+      依赖 ``require_observability_ops``（M1 会话 + 服务端运维白名单）。
+      白名单未配置 / 无法解析 ⇒ 503；已认证但非运维 ⇒ 403；匿名 ⇒ 401。
+
+    * **服务端项目作用域**（``tool_execution_record.project_id`` 为服务端
+      从 ProjectRegistry 解析的可信维度 ⇒ 可施加范围）：
+        - ``GET /observability/tools/history``            持久历史（分页 + 过滤）
+        - ``GET /observability/tools/metrics/persistent`` 持久聚合（SQL 下推）
+      依赖 ``require_observability_project_scope``（M1 会话 + 服务端
+      ``PROJECT_ID``）。**客户端 ``project_id`` 查询参数已移除**——它不能
+      扩大授权范围（与 ``workflow_read`` 同形同语义）；``PROJECT_ID``
+      缺失 / 空白 ⇒ 503。
+
+    * 两类均：认证与授权**先于**任何数据读取；GET 不适用 CSRF；
+      不新增 API-Key 旁路。
 """
 from __future__ import annotations
 
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from backend.app.api.observability_read_auth import (
+    get_observability_project_scope,
+    require_observability_ops,
+    require_observability_project_scope,
+)
 from backend.app.api.orchestrator_chat import (
     get_tool_execution_persistent_query_service,
     get_tool_observability_query_service,
@@ -142,13 +163,17 @@ class ToolExecutionHistoryResponse(BaseModel):
     Attributes:
         items:  当前页的 Tool 执行快照（``started_at DESC, id DESC``；
                 来自 Persistent Query Service，本层**不重排 / 不过滤 /
-                不聚合 / 不去重**）。
+                不聚合 / 不去重**）。**已由服务端 ``PROJECT_ID`` 限定范围**：
+                ``project_id`` 为空（未绑定项目边界）的记录不可见
+                （fail-closed 取舍，见 ``docs/security.md``）。
         limit:  本页请求的条数（回显请求参数）。
         offset: 本页请求的起始偏移（回显请求参数）。
 
     Note:
         **不返回** ``total_count``：那需要额外 ``COUNT(*)``，
         属后续 Metrics / Query metadata 范围（本阶段显式排除）。
+        **不接受**客户端 ``project_id``：作用域只来自服务端配置
+        （M2.3 A2；与 ``workflow_read`` 同形同语义）。
     """
 
     items: list[ToolExecutionHistoryItemResponse] = Field(
@@ -177,8 +202,12 @@ class ToolExecutionHistoryResponse(BaseModel):
 @router.get(
     "/observability/tools",
     response_model=ToolObservabilityRecordsResponse,
+    dependencies=[Depends(require_observability_ops)],
     responses={
         200: {"description": "当前 retention window 内的 Tool 执行快照"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "已认证但非运维用户（固定文案；零业务执行）"},
+        503: {"description": "运维白名单未配置（fail closed；零业务执行）"},
         500: {"description": "观测数据不可用（不暴露内部细节）"},
     },
 )
@@ -219,8 +248,12 @@ async def list_tool_executions() -> ToolObservabilityRecordsResponse:
 @router.get(
     "/observability/tools/metrics",
     response_model=ToolObservabilityMetricsResponse,
+    dependencies=[Depends(require_observability_ops)],
     responses={
         200: {"description": "当前 retention window 的聚合统计（无维度）"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "已认证但非运维用户（固定文案；零业务执行）"},
+        503: {"description": "运维白名单未配置（fail closed；零业务执行）"},
         500: {"description": "观测数据不可用（不暴露内部细节）"},
     },
 )
@@ -258,13 +291,18 @@ async def tool_execution_metrics() -> ToolObservabilityMetricsResponse:
 @router.get(
     "/observability/tools/history",
     response_model=ToolExecutionHistoryResponse,
+    dependencies=[Depends(require_observability_project_scope)],
     responses={
-        200: {"description": "数据库中的 Tool 执行历史（最近 N 条）"},
-        422: {"description": "limit 非法（FastAPI Query 校验）"},
+        200: {"description": "数据库中服务端项目范围内的 Tool 执行历史"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        503: {"description": "部署项目作用域未配置（fail closed；零业务执行）"},
+        422: {"description": "limit / offset / 过滤参数非法（FastAPI 校验）"},
         502: {"description": "持久历史不可用（数据库未配置 / 查询失败）"},
+        500: {"description": "Tool 观测数据不可用"},
     },
 )
 async def list_tool_execution_history(
+    request: Request,
     limit: Annotated[
         int,
         Query(
@@ -286,10 +324,6 @@ async def list_tool_execution_history(
             ),
         ),
     ] = DEFAULT_RECENT_OFFSET,
-    project_id: Annotated[
-        str | None,
-        Query(description="精确匹配 project_id（省略 = 不过滤）"),
-    ] = None,
     tool_name: Annotated[
         str | None,
         Query(description="精确匹配 tool_name（省略 = 不过滤）"),
@@ -304,21 +338,34 @@ async def list_tool_execution_history(
         ),
     ] = None,
 ) -> ToolExecutionHistoryResponse:
-    """Tool 执行**持久历史**（数据库）只读列表（Phase 3.11 Step 30）。
+    """Tool 执行**持久历史**（数据库）只读列表（Phase 3.11 Step 30；M2.3 A2 收口）。
 
     Pipeline：
 
-        ToolExecutionPersistentQueryService.list_recent(limit)   （只读；Step 29）
+        ToolExecutionPersistentQueryService.list_recent(project_id=服务端作用域)
+            （只读；Step 29）
             → list[ToolExecutionSnapshot]     （started_at DESC, id DESC）
             → snapshot_to_dict()              （Step 24 显式映射）
             → ToolExecutionHistoryResponse（items）
 
     与 Runtime 端点（``GET /api/observability/tools``）的关系：
 
-        Runtime      = 本进程内存 Collector（近期观测）
-        Persistent   = 数据库长期历史（跨进程 / 跨重启）
+        Runtime      = 本进程内存 Collector（近期观测；**运维专用全局视图**）
+        Persistent   = 数据库长期历史（跨进程 / 跨重启；**服务端项目范围**）
         **并列**：不 merge、不 fallback、不去重；
         DB 失败 → 502（**绝不**回退到内存视图）。
+
+    授权（M2.3 A2）：
+
+        * M1 会话（匿名 ⇒ 401）+ **服务端** ``PROJECT_ID`` 作用域
+          （缺失 / 空白 ⇒ 503 fail closed）；
+        * **客户端 ``project_id`` 查询参数已移除**（Step 32 曾提供）——
+          它不能扩大授权范围；作用域只来自服务端配置（与 ``workflow_read``
+          同形同语义）；
+        * ``project_id IS NULL`` 的记录（未绑定项目边界的执行）**不可见**
+          ——有意的 fail-closed 取舍，见 ``docs/security.md``；
+        * 越权访问不单独返回 403：范围外记录只是**不在结果集内**
+          （与"不存在"同构，不泄露存在性）。
 
     语义：
 
@@ -326,8 +373,9 @@ async def list_tool_execution_history(
         * 顺序完全由 Repository 决定（``started_at DESC, id DESC``）：
           本层不排序、不过滤、不聚合、不去重；分页 = 仅 LIMIT + OFFSET
           （所有页共用同一套稳定排序 → 跨页无重复 / 无遗漏）；
-        * 唯一 query parameters = ``limit`` + ``offset``
-          （无 total_count / COUNT(*)；无 cursor / keyset / filter）；
+        * query parameters = ``limit`` + ``offset`` + 业务过滤
+          （``tool_name`` / ``success``；**无** project_id；无 total_count /
+          COUNT(*)；无 cursor / keyset）；
         * 空库 / offset 超界 → ``{"items": [], "limit": …, "offset": …}``
           （200，不是 404 / 不是异常）。
         * DB 失败 → 502（**绝不**回退内存视图）。
@@ -337,7 +385,7 @@ async def list_tool_execution_history(
         snapshots = query.list_recent(
             limit=limit,
             offset=offset,
-            project_id=project_id,
+            project_id=get_observability_project_scope(request),
             tool_name=tool_name,
             success=success,
         )
@@ -374,17 +422,18 @@ async def list_tool_execution_history(
 @router.get(
     "/observability/tools/metrics/persistent",
     response_model=ToolObservabilityMetricsResponse,
+    dependencies=[Depends(require_observability_project_scope)],
     responses={
-        200: {"description": "数据库中的 Tool 执行聚合指标（可精确过滤）"},
+        200: {"description": "数据库中服务端项目范围内的 Tool 执行聚合指标"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        503: {"description": "部署项目作用域未配置（fail closed；零业务执行）"},
         422: {"description": "过滤参数非法（FastAPI Query 校验）"},
         502: {"description": "持久指标不可用（数据库未配置 / 查询失败）"},
+        500: {"description": "Tool 观测数据不可用"},
     },
 )
 async def persistent_tool_execution_metrics(
-    project_id: Annotated[
-        str | None,
-        Query(description="精确匹配 project_id（省略 = 不过滤）"),
-    ] = None,
+    request: Request,
     tool_name: Annotated[
         str | None,
         Query(description="精确匹配 tool_name（省略 = 不过滤）"),
@@ -399,26 +448,37 @@ async def persistent_tool_execution_metrics(
         ),
     ] = None,
 ) -> ToolObservabilityMetricsResponse:
-    """Tool 执行**持久指标**（数据库聚合；Phase 3.11 Step 33）。
+    """Tool 执行**持久指标**（数据库聚合；Phase 3.11 Step 33；M2.3 A2 收口）。
 
     Pipeline：
 
-        ToolExecutionPersistentQueryService.metrics(...)   （只读；SQL 聚合）
+        ToolExecutionPersistentQueryService.metrics(project_id=服务端作用域)
+            （只读；SQL 聚合）
             → ToolExecutionMetricsSnapshot（8 字段）
             → metrics_to_dict()                （Step 24 显式映射）
             → ToolObservabilityMetricsResponse
 
     与 Runtime 端点（``GET /api/observability/tools/metrics``）的关系：
 
-        Runtime      = 本进程内存 Collector 聚合
-        Persistent   = 数据库聚合（跨进程 / 跨重启）
+        Runtime      = 本进程内存 Collector 聚合（**运维专用全局视图**）
+        Persistent   = 数据库聚合（跨进程 / 跨重启；**服务端项目范围**）
         **并列**：不 merge、不 fallback；
         DB 失败 → 502（**绝不**回退到内存指标）。
+
+    授权（M2.3 A2）：
+
+        * M1 会话（匿名 ⇒ 401）+ **服务端** ``PROJECT_ID`` 作用域
+          （缺失 / 空白 ⇒ 503 fail closed）；
+        * **客户端 ``project_id`` 查询参数已移除**（Step 33 曾提供）——
+          它不能扩大授权范围；SQL 聚合**必须**在可信范围内执行；
+        * ``tool_name`` / ``success`` 只是**业务过滤条件**，同样不能
+          扩大授权范围（它们与服务端作用域 AND 后下推 SQL）；
+        * ``project_id IS NULL`` 的记录不计入聚合（fail-closed 取舍）。
 
     语义：
 
         * **只读**：不写库 / 不触发 Tool 执行 / 不修改 Collector；
-        * 精确过滤（project_id / tool_name / success；条件 AND）；
+        * 精确过滤（服务端 project_id + tool_name + success；条件 AND）；
           过滤**全部下推 SQL**，本层不做 Python 过滤 / 扫描 / 排序；
         * 无 ``limit`` / ``offset``（聚合结果是单行，不是列表）；
         * 空数据集 → 计数 0；``success_rate`` / ``failure_rate`` /
@@ -429,7 +489,7 @@ async def persistent_tool_execution_metrics(
     try:
         query = get_tool_execution_persistent_query_service()
         snapshot = query.metrics(
-            project_id=project_id,
+            project_id=get_observability_project_scope(request),
             tool_name=tool_name,
             success=success,
         )

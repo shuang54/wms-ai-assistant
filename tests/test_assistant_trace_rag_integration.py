@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app.api import assistant_trace as trace_module
 from backend.app.api.assistant_trace import (
@@ -34,6 +33,12 @@ from backend.app.db.rag_execution_repository import (
     RagExecutionRepositoryError,
 )
 from backend.app.main import app
+
+# A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 已登录 + 运维白名单客户端。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import observability_ops_session  # noqa: F401,E402
+
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 from backend.app.services.assistant_trace_query_service import (
     AssistantTraceQueryService,
     AssistantTraceView,

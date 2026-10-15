@@ -21,7 +21,6 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from backend.app.api import orchestrator_chat as root
@@ -40,6 +39,12 @@ from backend.app.db.tool_execution_repository import (
     ToolExecutionRepository,
 )
 from backend.app.services.tool_execution_record import ToolExecutionRecord
+
+# A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 已登录 + 运维白名单客户端。
+from tests.api_session_auth import SessionTestClient as TestClient  # noqa: E402
+from tests.api_session_auth import observability_ops_session  # noqa: F401,E402
+
+pytestmark = pytest.mark.usefixtures("observability_ops_session")
 
 _TABLE = f"{LLM_USAGE_SCHEMA}.llm_usage_record"
 _PREFIX = "step39-%"

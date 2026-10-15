@@ -31,6 +31,23 @@
 
 不新增（本阶段明确排除）：Trace Span / OpenTelemetry / Prometheus /
 Conversation / Memory / Agent / MCP / Streaming / WebSocket / Dashboard。
+
+授权（Phase 7 Recovery M2.3 A2 —— **不再允许匿名读取**）：
+
+    M1 会话 Cookie（require_session）        ⇒ 401（无 / 无效 / 过期 / 已撤销）
+        ↓
+    运维白名单（OBSERVABILITY_READ_OPS_USER_IDS）⇒ 503 未配置 / 403 非运维
+        ↓
+    AssistantTraceQueryService.get_trace()
+
+    * 本端点**没有 request-level 项目授权**：无法从持久化数据可靠判定一条
+      Trace 的项目归属（``llm_usage_record`` / ``assistant_outcome_record``
+      **无 project_id 列**；``resource_owner`` 也不登记
+      ``assistant_request_id``）⇒ 只能整端点限定为运维专用；
+    * **不**通过局部 Tool / RAG 记录的项目推断整体归属（那属于猜测）；
+    * 因此"知道 ID 即可读"**不再成立**：还必须是运维用户；
+    * 不新增 Schema、不新增资源归属表、不伪造历史项目归属；
+    * GET 不适用 CSRF；不新增 API-Key 旁路。
 """
 from __future__ import annotations
 
@@ -38,8 +55,10 @@ import logging
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, Field
+
+from backend.app.api.observability_read_auth import require_observability_ops
 
 from backend.app.api.orchestrator_chat import (
     get_assistant_trace_query_service,
@@ -266,9 +285,13 @@ def _to_trace_response(trace: AssistantTraceView) -> AssistantTraceResponse:
 @router.get(
     "/observability/assistant-trace/{assistant_request_id}",
     response_model=AssistantTraceResponse,
+    dependencies=[Depends(require_observability_ops)],
     responses={
         200: {"description": "该 Assistant Trace 的只读 Read Model（可为空）"},
         400: {"description": "assistant_request_id 非法（如纯空白）"},
+        401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
+        403: {"description": "已认证但非运维用户（固定文案；零业务执行）"},
+        503: {"description": "运维白名单未配置（fail closed；零业务执行）"},
         422: {"description": "路径参数校验失败（长度越界）"},
         502: {
             "description": (
@@ -327,6 +350,11 @@ async def get_assistant_trace(
         多 worker / Runtime Collector 淘汰后仍可查询。
         Runtime（``/api/observability/tools`` 与 RAG Runtime 查询服务）语义
         **不变**，且不与本端点合并。
+
+    授权（Phase 7 Recovery M2.3 A2）：M1 会话 + 运维白名单（装饰器级依赖，
+        先于任何数据读取）：匿名 ⇒ 401；非运维用户 ⇒ 403；白名单未配置 ⇒
+        503。**无法验证资源级项目归属**（见模块 docstring）⇒ 本端点只能
+        整端点限定为运维专用；该残留风险记录于 ``docs/security.md``。
     """
     try:
         service: AssistantTraceQueryService = (
