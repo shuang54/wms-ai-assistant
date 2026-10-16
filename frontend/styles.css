@@ -1,0 +1,334 @@
+/*
+ * Workflow Run Detail —— 内部运维风格样式（零依赖、无外部资源）。
+ *
+ * 可达性要求（Phase 7 Workflow UI Step 1 §四.B）：
+ *   状态**不单靠颜色**传递 —— 每个状态徽标都带文字标签，颜色只是辅助；
+ *   颜色对比较强，且在 `prefers-color-scheme` 下保持可读。
+ */
+
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #d6dae1;
+  --text: #1f2733;
+  --muted: #5d6b7f;
+  --accent: #1f5fa8;
+  --pending: #8a6d00;
+  --running: #1f5fa8;
+  --waiting: #8a4b00;
+  --ok: #1c6b3a;
+  --fail: #a52020;
+  --unknown: #5d6b7f;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem clamp(1rem, 4vw, 3rem) 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.page-header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.4rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.notice {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  background: #fff8e1;
+  border: 1px solid #e6d08a;
+  border-radius: 6px;
+}
+
+.notice code {
+  font-family: var(--mono);
+  background: rgba(0, 0, 0, 0.05);
+  padding: 0 0.25em;
+}
+
+.query {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 1rem 0 0.25rem;
+}
+
+.query label {
+  font-weight: 600;
+}
+
+.query input {
+  flex: 1 1 22rem;
+  min-width: 12rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  background: var(--panel);
+  color: inherit;
+}
+
+button {
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: var(--panel);
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+main#panels {
+  display: block;
+}
+
+section {
+  margin: 1.25rem 0;
+  padding: 1rem 1.15rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+section > h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.status {
+  margin: 0 0 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 4px;
+}
+
+.status.loading {
+  background: #eef4fb;
+  border: 1px solid #bcd4ef;
+}
+
+.status.error {
+  background: #fdeeee;
+  border: 1px solid #eab3b3;
+}
+
+.empty {
+  margin: 0.5rem 0 0;
+  padding: 0.6rem 0.75rem;
+  background: #f2f4f7;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+/* ---- key/value 列表 ---- */
+
+dl.kv {
+  display: grid;
+  grid-template-columns: minmax(9rem, 14rem) 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0.5rem 0 0;
+}
+
+dl.kv dt {
+  color: var(--muted);
+}
+
+dl.kv dd {
+  margin: 0;
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+/* ---- 徽标（文字 + 颜色双重表达）---- */
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 0.82em;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge-info {
+  color: var(--accent);
+}
+
+.status-pending {
+  color: var(--pending);
+}
+.status-running {
+  color: var(--running);
+}
+.status-waiting {
+  color: var(--waiting);
+}
+.status-completed {
+  color: var(--ok);
+}
+.status-failed {
+  color: var(--fail);
+}
+.status-cancelled,
+.status-unknown {
+  color: var(--unknown);
+}
+
+/* ---- 节点分组 ---- */
+
+.node-group,
+.approval {
+  margin: 0.9rem 0 0;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fbfcfd;
+}
+
+.node-group > header,
+.approval > header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.node-group h3,
+.approval h3 {
+  margin: 0;
+  font-size: 0.98rem;
+  font-family: var(--mono);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+}
+
+th,
+td {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  font-size: 0.92em;
+}
+
+th {
+  background: #eef1f5;
+  font-weight: 600;
+}
+
+td {
+  font-family: var(--mono);
+  word-break: break-word;
+}
+
+details.output summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+details.output pre {
+  max-height: 18rem;
+  overflow: auto;
+  margin: 0.4rem 0 0;
+  padding: 0.5rem;
+  background: #f4f6f9;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- 时间线 ---- */
+
+ol.timeline {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+  border-left: 2px solid var(--border);
+  list-style: none;
+}
+
+.timeline-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(11rem, 15rem) minmax(9rem, 12rem) 1fr;
+  gap: 0.5rem;
+  padding: 0.3rem 0 0.3rem 0.75rem;
+}
+
+.timeline-item::before {
+  content: "";
+  position: absolute;
+  left: -0.4rem;
+  top: 0.75rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  background: var(--accent);
+  border-radius: 50%;
+}
+
+.timeline-item.no-time::before {
+  background: var(--unknown);
+}
+
+.timeline-time {
+  font-family: var(--mono);
+  color: var(--muted);
+}
+
+.timeline-kind {
+  font-weight: 600;
+}
+
+.timeline-detail {
+  font-size: 0.92em;
+}
+
+.page-footer {
+  margin-top: 2rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.9em;
+}
+
+@media (max-width: 720px) {
+  .timeline-item {
+    grid-template-columns: 1fr;
+  }
+  dl.kv {
+    grid-template-columns: 1fr;
+  }
+}

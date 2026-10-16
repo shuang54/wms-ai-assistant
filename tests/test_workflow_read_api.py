@@ -42,6 +42,10 @@ from backend.app.config import WorkflowReadSettings
 from backend.app.db.models.workflow_approval import (
     WORKFLOW_APPROVAL_ID_MAX_LENGTH,
 )
+from backend.app.db.models.workflow_node_run import (
+    WORKFLOW_NODE_RUN_NODE_ID_MAX_LENGTH,
+)
+from backend.app.workflow.models import JSON_VALUE_MAX_BYTES
 from backend.app.db.models.workflow_run import (
     WORKFLOW_RUN_ID_MAX_LENGTH,
 )
@@ -65,7 +69,9 @@ from tests.test_workflow_runtime_read_service import (
 __all__ = [
     "TestRunDetailEndpoint",
     "TestNodesEndpoint",
+    "TestNodeSafeProjectionEndpoint",
     "TestApprovalEndpoint",
+    "TestApprovalByNodeEndpoint",
     "TestTimelineEndpoint",
     "TestErrorsAndIsolation",
     "TestSurfaceAndBoundaries",
@@ -296,6 +302,337 @@ class TestNodesEndpoint:
 
 
 # ============================================================
+# Phase 7：Node 安全投影（损坏 ⇒ 502 fail closed，绝不 200）
+# ============================================================
+
+
+class TestNodeSafeProjectionEndpoint:
+    """``/nodes`` 经 ``get_node_run_details``（安全投影）而非原始 Store Record。
+
+    旧实现直接透传 ``NodeRunRecord`` ⇒ 损坏的 ``output`` / 越白名单
+    ``status`` · ``node_type`` · ``error_code`` 会以 **200** 泄漏。
+    本类锁定"损坏 ⇒ 502 fail closed"（不截断 / 不修复 / 不原样返回）。
+    """
+
+    @pytest.mark.parametrize(
+        "corrupted",
+        ("{not json", '{"truncated": "abc', "123abc"),
+    )
+    def test_invalid_json_output_never_reaches_200(
+        self, monkeypatch: pytest.MonkeyPatch, corrupted: str
+    ) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record(output=corrupted)])
+        client = _client(monkeypatch, env)
+
+        response = client.get(
+            f"/api/workflow-runs/{_RUN_ID}/nodes", headers=_HEADERS
+        )
+
+        assert response.status_code == 502
+        assert corrupted not in response.text  # 损坏数据不进入任何响应
+        assert response.json()["detail"] == "Workflow 读取数据源不可用"
+        env.assert_no_writes()
+
+    def test_oversized_output_never_reaches_200(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        oversized = '{"pad":"' + ("x" * (JSON_VALUE_MAX_BYTES + 16)) + '"}'
+        env = _Env(run=_run_record(), nodes=[_node_record(output=oversized)])
+        client = _client(monkeypatch, env)
+
+        response = client.get(
+            f"/api/workflow-runs/{_RUN_ID}/nodes", headers=_HEADERS
+        )
+
+        assert response.status_code == 502
+        assert "x" * 128 not in response.text     # 不截断后回传部分输出
+
+    @pytest.mark.parametrize(
+        "overrides",
+        (
+            {"status": "NOT_A_STATUS"},
+            {"node_type": "MAGIC_TYPE"},
+            {"status": "FAILED", "error_code": "Traceback (most recent call last)"},
+            {"status": "FAILED", "error_code": "X" * 65},
+        ),
+    )
+    def test_illegal_status_type_or_error_code_never_reaches_200(
+        self, monkeypatch: pytest.MonkeyPatch, overrides: dict
+    ) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record(**overrides)])
+        client = _client(monkeypatch, env)
+
+        response = client.get(
+            f"/api/workflow-runs/{_RUN_ID}/nodes", headers=_HEADERS
+        )
+
+        assert response.status_code == 502
+        for value in overrides.values():
+            assert str(value) not in response.text  # 非法值不被原样返回
+
+    def test_valid_projection_still_200_with_exact_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """安全投影不改变合法响应的字段集与取值（契约兼容）。"""
+        env = _Env(
+            run=_run_record(),
+            nodes=[
+                _node_record(
+                    node_id="n1",
+                    attempt=1,
+                    status="FAILED",
+                    error_code="WORKFLOW_NODE_EXECUTION_FAILURE",
+                ),
+                _node_record(
+                    node_id="n1", attempt=2, status="SUCCEEDED",
+                    output='{"qty":3}', elapsed_ms=12.5,
+                ),
+            ],
+        )
+        client = _client(monkeypatch, env)
+
+        response = client.get(
+            f"/api/workflow-runs/{_RUN_ID}/nodes", headers=_HEADERS
+        )
+
+        assert response.status_code == 200
+        items = response.json()
+        assert [item["attempt"] for item in items] == [1, 2]
+        assert items[1]["output"] == '{"qty":3}'
+        assert items[1]["elapsed_ms"] == 12.5
+        assert items[0]["error_code"] == "WORKFLOW_NODE_EXECUTION_FAILURE"
+        for item in items:
+            assert set(item.keys()) == set(WORKFLOW_NODE_RUN_RESPONSE_FIELDS)
+        assert not (_keys(items) & _FORBIDDEN_KEYS)
+
+
+# ============================================================
+# Phase 7：按 (run, node) 读取审批（新增最小只读端点）
+# ============================================================
+
+
+class TestApprovalByNodeEndpoint:
+    """``GET /api/workflow-runs/{run_id}/approvals/{node_id}``。
+
+    复用 ``WorkflowReadService.get_approval_for_node``：
+    父 Run 归属 + 服务端项目作用域 + 审批行 ``(run, node)`` 一致性。
+    """
+
+    def _path(self, node_id: str = "gate") -> str:
+        return f"/api/workflow-runs/{_RUN_ID}/approvals/{node_id}"
+
+    def _env_with_approval(self, approval=None) -> _Env:
+        record = approval if approval is not None else _approval_record(
+            node_id="gate"
+        )
+        return _Env(
+            run=_run_record(),
+            nodes=[_node_record(node_type="APPROVAL", node_id="gate")],
+            by_node={(_RUN_ID, "gate"): record},
+        )
+
+    def test_pending_approval_200_exact_field_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env_with_approval(
+            _approval_record(node_id="gate", status="PENDING", resolved_at=None)
+        )
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path(), headers=_HEADERS)
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert set(payload.keys()) == set(WORKFLOW_APPROVAL_RESPONSE_FIELDS)
+        assert payload["approval_id"] == _APPROVAL_ID
+        assert payload["workflow_run_id"] == _RUN_ID
+        assert payload["node_id"] == "gate"
+        assert payload["status"] == "PENDING"
+        assert payload["resolved_at"] is None      # 未裁决 ⇒ null（不伪造）
+        assert "created_at" not in payload         # Port 未暴露 ⇒ 不补造
+        env.assert_no_writes()
+
+    def test_resolved_approval_200_keeps_persisted_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolved = _T0
+        env = self._env_with_approval(
+            _approval_record(
+                node_id="gate", status="APPROVED", resolved_at=resolved
+            )
+        )
+        client = _client(monkeypatch, env)
+
+        payload = client.get(self._path(), headers=_HEADERS).json()
+
+        assert payload["status"] == "APPROVED"
+        assert payload["resolved_at"] is not None  # 真实裁决时间
+
+    def test_no_approval_row_is_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """该节点尚无审批行 ⇒ 404（合法事实；与"不存在"同码同文案）。"""
+        env = _Env(run=_run_record(), by_node={})
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path("never-created"), headers=_HEADERS)
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Workflow 审批不存在"
+        env.assert_no_writes()
+
+    def test_run_not_found_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env = _Env(run=None)
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path(), headers=_HEADERS)
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Workflow 审批不存在"
+
+    def test_project_mismatch_404_isomorphic_with_not_found(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """授权作用域（服务端配置）与 Run 所属项目不一致 ⇒ 404（不泄漏存在性）。"""
+        env = self._env_with_approval()
+        client = _client(
+            monkeypatch,
+            env,
+            settings_override=WorkflowReadSettings(
+                api_key=_TEST_API_KEY, api_project_id="proj-OTHER"
+            ),
+        )
+
+        response = client.get(self._path(), headers=_HEADERS)
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Workflow 审批不存在"
+
+    @pytest.mark.parametrize(
+        "record_kwargs",
+        (
+            {"workflow_run_id": "wf-run-OTHER"},
+            {"node_id": "other-node"},
+        ),
+    )
+    def test_ownership_inconsistency_fails_closed_502(
+        self, monkeypatch: pytest.MonkeyPatch, record_kwargs: dict
+    ) -> None:
+        """存储层返回跨 Run / 跨 Node 的审批 ⇒ Read Layer fail closed ⇒ 502。"""
+        env = self._env_with_approval(
+            _approval_record(**record_kwargs)
+        )
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path(), headers=_HEADERS)
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == "Workflow 读取数据源不可用"
+        env.assert_no_writes()
+
+    def test_status_outside_whitelist_fails_closed_502(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env_with_approval(
+            _approval_record(node_id="gate", status="MAYBE")
+        )
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path(), headers=_HEADERS)
+
+        assert response.status_code == 502
+        assert "MAYBE" not in response.text
+
+    @pytest.mark.parametrize("suffix", ("%20", "%20%20"))
+    def test_blank_run_or_node_400(
+        self, monkeypatch: pytest.MonkeyPatch, suffix: str
+    ) -> None:
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        assert client.get(
+            f"/api/workflow-runs/{suffix}/approvals/gate", headers=_HEADERS
+        ).status_code == 400
+        assert client.get(
+            f"/api/workflow-runs/{_RUN_ID}/approvals/{suffix}",
+            headers=_HEADERS,
+        ).status_code == 400
+
+    def test_missing_credential_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        response = client.get(self._path())      # 无 X-API-Key
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "认证失败：缺少或无效的 API Key"
+
+    def test_wrong_credential_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        response = client.get(
+            self._path(), headers={"X-API-Key": "wrong-key"}
+        )
+
+        assert response.status_code == 401
+
+    def test_over_length_path_params_422(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        assert client.get(
+            f"/api/workflow-runs/{'x' * 65}/approvals/gate", headers=_HEADERS
+        ).status_code == 422
+        assert client.get(
+            f"/api/workflow-runs/{_RUN_ID}/approvals/{'x' * 65}",
+            headers=_HEADERS,
+        ).status_code == 422
+
+    def test_auth_precedes_data_access_and_blank_checks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """未认证优先于 400 / 404（认证在任何数据读取之前）。"""
+        env = _Env(run=None)
+        client = _client(monkeypatch, env)
+
+        blank = client.get(
+            f"/api/workflow-runs/%20/approvals/%20"
+        )
+        assert blank.status_code == 401
+
+    def test_response_has_no_input_or_forbidden_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        payload = client.get(self._path(), headers=_HEADERS).json()
+
+        assert not (_keys(payload) & _FORBIDDEN_KEYS)
+        # 无 ORM / Session / Connection 痕迹
+        for value in payload.values():
+            assert not hasattr(value, "__table__")
+            assert not hasattr(value, "connection")
+
+    def test_read_endpoint_does_not_trigger_runtime_advance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """只读端点不得触发 Runtime 状态推进（Fake 写方法计数 = 0）。"""
+        env = self._env_with_approval()
+        client = _client(monkeypatch, env)
+
+        for _ in range(3):
+            assert client.get(self._path(), headers=_HEADERS).status_code == 200
+
+        env.assert_no_writes()
+        assert env.run_store.get_calls >= 3      # 每次都经父 Run 校验
+        assert env.approval_store.for_node_calls >= 3
+
+
+# ============================================================
 # 3 / 6：Approval 详情
 # ============================================================
 
@@ -484,22 +821,31 @@ class TestErrorsAndIsolation:
 # ============================================================
 
 
+#: Workflow Read 只读面（Phase 7 闭环后 5 个端点：GET-only + 全部挂认证）。
+_READ_ROUTES = (
+    "/api/workflow-runs/{run_id}",
+    "/api/workflow-runs/{run_id}/nodes",
+    "/api/workflow-runs/{run_id}/timeline",
+    "/api/workflow-runs/{run_id}/approvals/{node_id}",
+    "/api/workflow-approvals/{approval_id}",
+)
+
+
 class TestSurfaceAndBoundaries:
     def test_openapi_surface_is_get_only(self) -> None:
         paths = app.openapi()["paths"]
-        for route in (
-            "/api/workflow-runs/{run_id}",
-            "/api/workflow-runs/{run_id}/nodes",
-            "/api/workflow-runs/{run_id}/timeline",
-            "/api/workflow-approvals/{approval_id}",
-        ):
+        for route in _READ_ROUTES:
             assert route in paths, f"缺少路由: {route}"
             assert set(paths[route].keys()) == {"get"}, (
                 f"{route} 只能有 GET（只读面形）"
             )
 
-    def test_openapi_declares_auth_on_all_four_endpoints(self) -> None:
-        """S7.2：四个端点 OpenAPI 均声明 API Key security（与运行时一致）。"""
+    def test_openapi_declares_auth_on_all_read_endpoints(self) -> None:
+        """只读面**每个**端点均声明 API Key security（与运行时一致）。
+
+        Phase 7 闭环新增 ``/workflow-runs/{run_id}/approvals/{node_id}``
+        ⇒ 由四个端点扩展为五个；不变式（"无未认证读端点"）保持不变。
+        """
         schema = app.openapi()
         schemes = schema["components"]["securitySchemes"]
         assert schemes, "缺少 securitySchemes（认证未声明）"
@@ -512,12 +858,7 @@ class TestSurfaceAndBoundaries:
         ]
         assert api_key_schemes, f"无 X-API-Key scheme: {schemes!r}"
         scheme_name = api_key_schemes[0]
-        for route in (
-            "/api/workflow-runs/{run_id}",
-            "/api/workflow-runs/{run_id}/nodes",
-            "/api/workflow-runs/{run_id}/timeline",
-            "/api/workflow-approvals/{approval_id}",
-        ):
+        for route in _READ_ROUTES:
             operation = schema["paths"][route]["get"]
             requirement = operation.get("security")
             assert requirement, f"{route} 未声明 security"
@@ -545,6 +886,11 @@ class TestSurfaceAndBoundaries:
         assert (
             workflow_read_module.WORKFLOW_APPROVAL_ID_MAX_LENGTH
             == WORKFLOW_APPROVAL_ID_MAX_LENGTH
+        )
+        # Phase 7 闭环：按 (run, node) 的审批端点的 node_id 边界须与列宽一致
+        assert (
+            workflow_read_module.WORKFLOW_NODE_ID_MAX_LENGTH
+            == WORKFLOW_NODE_RUN_NODE_ID_MAX_LENGTH
         )
 
     def test_api_module_does_not_expose_execution_entrypoints(self) -> None:

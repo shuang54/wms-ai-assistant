@@ -418,11 +418,30 @@ class TestSourceLevelControls:
                 f"workflow_read.py 出现客户端作用域 / 身份构造: {construct!r}"
             )
 
-    def test_auth_dependency_is_mounted_on_exactly_four_endpoints(self) -> None:
+    def test_auth_dependency_is_mounted_on_every_endpoint(self) -> None:
+        """**每个** Workflow Read 端点都必须挂载认证依赖（fail closed 全覆盖）。
+
+        Phase 7 Workflow Read API 闭环新增按 ``(run, node)`` 的审批只读端点
+        ⇒ 端点由 4 变为 5。本测试改为与 ``router`` 的**实际 GET 端点数**对齐
+        （而非硬编码数字）：这是更强的不变量——任何新增端点若忘记挂载认证，
+        计数就会小于端点数而立即失败。
+
+        Phase 6 S7.2 原意（"不存在未认证的读端点"）保持不变。
+        """
         source = Path(workflow_read_module.__file__).read_text(
             encoding="utf-8"
         )
-        assert source.count("Security(require_workflow_read_scope)") == 4
+        mounted = source.count("Security(require_workflow_read_scope)")
+        get_endpoints = sum(
+            1
+            for route in workflow_read_module.router.routes
+            if "GET" in getattr(route, "methods", set())
+        )
+        assert mounted == get_endpoints, (
+            f"存在未挂载认证依赖的端点：挂载 {mounted} / 端点 {get_endpoints}"
+        )
+        # 下界保护：本文件覆盖的只读面至少 5 个端点（防 router 被清空而误绿）
+        assert get_endpoints >= 5
 
     def test_auth_module_rejects_when_unconfigured_before_comparison(self) -> None:
         """未配置检查必须先于（且独立于）凭据比较（fail closed 顺序）。

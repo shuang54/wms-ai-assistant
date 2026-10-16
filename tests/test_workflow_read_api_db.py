@@ -43,6 +43,9 @@ from backend.app.db.workflow_node_run_repository import (
     WorkflowNodeRunRepository,
 )
 from backend.app.db.workflow_run_repository import WorkflowRunRepository
+from backend.app.dto.workflow_read_api import (
+    WORKFLOW_APPROVAL_RESPONSE_FIELDS,
+)
 from backend.app.main import app
 from backend.app.workflow.errors import WF_ERROR_NODE_EXECUTION_FAILURE
 from backend.app.workflow.states import APPROVAL_STATUS_APPROVED
@@ -241,6 +244,60 @@ class TestReadApiDb:
         assert resolved.json()["status"] == APPROVAL_STATUS_APPROVED
         assert resolved.json()["resolved_at"] is not None
 
+    def test_approval_by_node_via_real_chain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Phase 7 新增端点：HTTP → API → Read Service → Adapter → Repository。
+
+        同时验证 ``None``（无审批行）与"不存在 / 跨项目"同构（404 同码同文案），
+        以及 PENDING → APPROVED 的真实裁决时间往返。
+        """
+        run_id, approval_id = _seed_run(with_approval=True)
+        assert approval_id is not None
+        WorkflowNodeRunRepository().create(
+            workflow_run_id=run_id,
+            node_id="gate",
+            attempt=1,
+            node_type="APPROVAL",
+            status="WAITING_APPROVAL",
+        )
+        client = _client(monkeypatch)
+
+        pending = client.get(
+            f"/api/workflow-runs/{run_id}/approvals/gate", headers=_HEADERS
+        )
+        assert pending.status_code == 200
+        payload = pending.json()
+        assert set(payload.keys()) == set(WORKFLOW_APPROVAL_RESPONSE_FIELDS)
+        assert payload["approval_id"] == approval_id
+        assert payload["workflow_run_id"] == run_id
+        assert payload["node_id"] == "gate"
+        assert payload["status"] == "PENDING"
+        assert payload["resolved_at"] is None       # 未裁决 ⇒ null
+        assert "created_at" not in payload          # Port 未暴露 ⇒ 不补造
+
+        # 无审批行的节点 ⇒ 404（与"不存在"同码同文案）
+        absent = client.get(
+            f"/api/workflow-runs/{run_id}/approvals/never-created",
+            headers=_HEADERS,
+        )
+        missing_run = client.get(
+            "/api/workflow-runs/wf-p6s7-missing/approvals/gate",
+            headers=_HEADERS,
+        )
+        assert absent.status_code == missing_run.status_code == 404
+        assert absent.json() == missing_run.json()
+
+        WorkflowApprovalRepository().resolve(
+            approval_id=approval_id, decision=APPROVAL_STATUS_APPROVED
+        )
+        resolved = client.get(
+            f"/api/workflow-runs/{run_id}/approvals/gate", headers=_HEADERS
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["status"] == APPROVAL_STATUS_APPROVED
+        assert resolved.json()["resolved_at"] is not None   # 真实裁决时间
+
     def test_timeline_via_real_chain(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -301,6 +358,19 @@ class TestReadApiDb:
             f"/api/workflow-approvals/{other_approval}", headers=_HEADERS
         )
         assert approval.status_code == 404
+
+        # Phase 7 新增端点同样不得跨项目读取：
+        # "跨项目 Run 的审批" 必须与 "Run 不存在" **同码同文案**
+        # （比同一端点内的两个 404 —— 不泄漏 Run / 审批是否存在）
+        approval_by_node = client.get(
+            f"/api/workflow-runs/{other_id}/approvals/gate", headers=_HEADERS
+        )
+        approval_missing_run = client.get(
+            "/api/workflow-runs/wf-p6s7-missing/approvals/gate",
+            headers=_HEADERS,
+        )
+        assert approval_by_node.status_code == 404
+        assert approval_by_node.json() == approval_missing_run.json()
 
     def test_missing_credential_rejected_on_real_chain(
         self, monkeypatch: pytest.MonkeyPatch

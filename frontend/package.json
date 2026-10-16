@@ -1,0 +1,16 @@
+{
+  "name": "wms-ai-assistant-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Workflow Run Detail 只读运维页面（零依赖静态页面；本文件仅用于声明 ES Module 语义与测试入口）",
+  "type": "module",
+  "dependencies": {},
+  "devDependencies": {},
+  "scripts": {
+    "test": "node --test tests/",
+    "serve": "node scripts/serve-static.mjs"
+  },
+  "engines": {
+    "node": ">=16.17.0"
+  }
+}

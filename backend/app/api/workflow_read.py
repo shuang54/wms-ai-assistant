@@ -1,16 +1,25 @@
 """Workflow Read API（Phase 6 Step 7 · 7.2）—— **只读 + 认证** HTTP 边界。
 
 ```text
-HTTP GET /api/workflow-runs/{run_id}                 （Run 详情）
-HTTP GET /api/workflow-runs/{run_id}/nodes           （Node attempt 全历史）
-HTTP GET /api/workflow-runs/{run_id}/timeline        （持久化时间线）
-HTTP GET /api/workflow-approvals/{approval_id}       （审批详情）
+HTTP GET /api/workflow-runs/{run_id}                            （Run 详情）
+HTTP GET /api/workflow-runs/{run_id}/nodes                      （Node attempt 全历史）
+HTTP GET /api/workflow-runs/{run_id}/timeline                   （持久化时间线）
+HTTP GET /api/workflow-runs/{run_id}/approvals/{node_id}        （按 (Run, Node) 的审批）
+HTTP GET /api/workflow-approvals/{approval_id}                  （按 ID 的审批详情）
         ↓  X-API-Key（服务端配置比对；恒定时间）
         ↓  授权 project_id（**仅**来自服务端配置——S7.2）
 WorkflowReadService（S6；只读）
         ↓
 Store Ports → Store Adapters → Repositories → PostgreSQL
 ```
+
+安全投影（Phase 7 Workflow Read Layer 增强）：
+    * ``/nodes`` 经 ``get_node_run_details``（**安全投影**）而非原始 Store
+      Record ⇒ ``output`` 的 JSON 合法性 / 32 KiB 内联上限、``status`` ·
+      ``node_type`` · ``error_code`` 的域白名单均在 Read Layer 校验，
+      损坏 ⇒ **502 fail closed**（不截断 / 不修复 / 不以 200 返回损坏数据）；
+    * ``/approvals/{node_id}`` 经 ``get_approval_for_node`` ⇒ 父 Run 归属 +
+      服务端项目作用域 + 审批行 ``(run, node)`` 归属一致性三重校验。
 
 边界（**只读**；S7 §四 / §六 / §七 / §九）：
     * **Query only**：不调用 Runtime 的 start / advance / request_cancel /
@@ -80,8 +89,9 @@ from backend.app.workflow_runtime.read_factory import (
     create_workflow_read_service,
 )
 from backend.app.workflow_runtime.read_service import (
+    ApprovalDetail,
     ApprovalRecord,
-    NodeRunRecord,
+    NodeRunDetail,
     RunDetail,
     TimelineEvent,
     WorkflowReadError,
@@ -92,9 +102,10 @@ from backend.app.workflow_runtime.read_service import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-#: 路径参数长度边界（与 db 模型列宽一致：run_id 64 / approval_id 128；
-#: API 测试锁定一致性）。
+#: 路径参数长度边界（与 db 模型列宽一致：run_id 64 / node_id 64 /
+#: approval_id 128；API 测试锁定一致性）。
 WORKFLOW_RUN_ID_MAX_LENGTH: int = 64
+WORKFLOW_NODE_ID_MAX_LENGTH: int = 64
 WORKFLOW_APPROVAL_ID_MAX_LENGTH: int = 128
 
 #: 固定错误文案（**不**回传 DB 异常文本 / SQL / 路径 / 凭据）。
@@ -134,24 +145,40 @@ def to_api_run_detail(detail: RunDetail) -> WorkflowRunDetailResponse:
     )
 
 
-def to_api_node_run(record: NodeRunRecord) -> WorkflowNodeRunResponse:
-    """``NodeRunRecord`` → API DTO（output 原样；不解析 / 不修复）。"""
+def to_api_node_run(detail: NodeRunDetail) -> WorkflowNodeRunResponse:
+    """``NodeRunDetail``（**安全投影**）→ API DTO。
+
+    输入是 Read Layer 已按代白名单 / 内联边界校验过的投影（而非未经校验的
+    Store Record）⇒ 损坏的 ``output``（非法 JSON / 超 32 KiB）、非法
+    ``status`` / ``node_type`` / ``error_code`` 在 Read Layer 即 fail closed，
+    **不会**进入 HTTP 正常响应。
+
+    字段映射是显式逐字段的：``output`` **原样**透传（不解析 / 不截断 / 不修复
+    ——校验已在上游完成）；响应字段集与既有契约一致（10 项，未增未减）。
+    """
     return WorkflowNodeRunResponse(
-        workflow_run_id=record.workflow_run_id,
-        node_id=record.node_id,
-        attempt=record.attempt,
-        node_type=record.node_type,
-        status=record.status,
-        output=record.output,
-        error_code=record.error_code,
-        elapsed_ms=record.elapsed_ms,
-        started_at=record.started_at,
-        completed_at=record.completed_at,
+        workflow_run_id=detail.workflow_run_id,
+        node_id=detail.node_id,
+        attempt=detail.attempt,
+        node_type=detail.node_type,
+        status=detail.status,
+        output=detail.output,
+        error_code=detail.error_code,
+        elapsed_ms=detail.elapsed_ms,
+        started_at=detail.started_at,
+        completed_at=detail.completed_at,
     )
 
 
-def to_api_approval(record: ApprovalRecord) -> WorkflowApprovalResponse:
-    """``ApprovalRecord`` → API DTO（**无**创建时刻——真实字段面）。"""
+def to_api_approval(
+    record: ApprovalRecord | ApprovalDetail,
+) -> WorkflowApprovalResponse:
+    """``ApprovalRecord`` / ``ApprovalDetail`` → API DTO（**无**创建时刻）。
+
+    两者字段面**完全一致**（approval_id / workflow_run_id / node_id / status /
+    resolved_at）⇒ 同一显式映射可服务 by-id 与 by-(run, node) 两条只读路径，
+    响应契约不变。``created_at`` 不由本层补造（Store Port 未暴露）。
+    """
     return WorkflowApprovalResponse(
         approval_id=record.approval_id,
         workflow_run_id=record.workflow_run_id,
@@ -289,7 +316,12 @@ async def get_workflow_run(
         400: {"description": "run_id 非法（空白）"},
         404: {"description": "Run 不存在**或**不属于授权项目（不泄露存在性）"},
         422: {"description": "路径参数校验失败（长度越界）"},
-        502: {"description": "持久化读边界不可用 / 数据损坏"},
+        502: {
+            "description": (
+                "持久化读边界不可用 / 数据契约损坏"
+                "（非法 JSON 输出 / 越白名单状态·类型·错误码；fail closed）"
+            )
+        },
         **_AUTH_RESPONSES,
     },
 )
@@ -306,13 +338,22 @@ async def get_workflow_run_nodes(
         WorkflowReadScope, Security(require_workflow_read_scope)
     ],
 ) -> list[WorkflowNodeRunResponse]:
-    """读取该 Run 的 node attempt **全历史**（不重建 / 不推断未持久化状态）。"""
+    """读取该 Run 的 node attempt **全历史**（安全投影；不重建 / 不推断）。
+
+    经 ``WorkflowReadService.get_node_run_details``（**安全投影**）而非
+    ``get_node_runs``（原始 Store Record）⇒ 损坏的持久化字段（非法 JSON
+    ``output`` / 超内联上限 / 越白名单 ``status`` · ``node_type`` ·
+    ``error_code``）在 Read Layer 即 fail closed，映射为 **502**，
+    **不会**以 200 返回损坏数据。
+
+    同节点**全部**历史 attempt 保留（不折叠为最新一条）。
+    """
     _reject_blank("run_id", run_id)
     service = get_workflow_read_service()
     try:
-        records = await _call_read(
-            "workflow node runs",
-            service.get_node_runs,
+        details = await _call_read(
+            "workflow node run details",
+            service.get_node_run_details,
             workflow_run_id=run_id,
             project_id=scope.project_id,
         )
@@ -321,7 +362,7 @@ async def get_workflow_run_nodes(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=_RUN_NOT_FOUND_DETAIL,
         ) from None
-    return [to_api_node_run(record) for record in records]
+    return [to_api_node_run(detail) for detail in details]
 
 
 @router.get(
@@ -414,6 +455,79 @@ async def get_workflow_approval(
     return to_api_approval(record)
 
 
+@router.get(
+    "/workflow-runs/{run_id}/approvals/{node_id}",
+    response_model=WorkflowApprovalResponse,
+    responses={
+        200: {"description": "该 (Run, Node) 的审批详情（经父 Run 校验归属 + 项目）"},
+        400: {"description": "run_id / node_id 非法（空白）"},
+        404: {
+            "description": (
+                "Run 不存在 / 不属于授权项目 / 该节点**尚无审批行**"
+                "（**故意同码同文案**——不泄露存在性）"
+            )
+        },
+        422: {"description": "路径参数校验失败（长度越界）"},
+        502: {"description": "持久化读边界不可用 / 数据契约损坏（fail closed）"},
+        **_AUTH_RESPONSES,
+    },
+)
+async def get_workflow_run_approval(
+    run_id: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=WORKFLOW_RUN_ID_MAX_LENGTH,
+            description="Workflow Run 身份",
+        ),
+    ],
+    node_id: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=WORKFLOW_NODE_ID_MAX_LENGTH,
+            description="APPROVAL 节点标识（ai_ops.workflow_approval.node_id）",
+        ),
+    ],
+    scope: Annotated[
+        WorkflowReadScope, Security(require_workflow_read_scope)
+    ],
+) -> WorkflowApprovalResponse:
+    """按 ``(run_id, node_id)`` 读取审批的**只读**详情（**不**裁决 / 不推进）。
+
+    复用 ``WorkflowReadService.get_approval_for_node``：先经父 Run 校验存在性与
+    服务端项目作用域，再校验审批行的 Run / Node 归属一致；归属不一致 ⇒ Read
+    Layer fail closed（**502**）。
+
+    ``None``（该节点尚无审批行）与"Run 不存在 / 项目不匹配"均映射为 **404**
+    + 同一固定文案 —— 与 by-id 路由的既有安全约定一致（不泄露存在性），
+    **不**伪造审批创建时刻（Store Port 未暴露 ``created_at``）。
+    """
+    _reject_blank("run_id", run_id)
+    _reject_blank("node_id", node_id)
+    service = get_workflow_read_service()
+    try:
+        approval = await _call_read(
+            "workflow approval for node",
+            service.get_approval_for_node,
+            workflow_run_id=run_id,
+            node_id=node_id,
+            project_id=scope.project_id,
+        )
+    except WorkflowReadNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_APPROVAL_NOT_FOUND_DETAIL,
+        ) from None
+    if approval is None:
+        # 尚无审批行 = 合法事实；与"不存在 / 跨项目"同构 ⇒ 同码同文案
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_APPROVAL_NOT_FOUND_DETAIL,
+        )
+    return to_api_approval(approval)
+
+
 __all__ = [
     "router",
     "get_workflow_read_service",
@@ -422,5 +536,6 @@ __all__ = [
     "to_api_approval",
     "to_api_event",
     "WORKFLOW_RUN_ID_MAX_LENGTH",
+    "WORKFLOW_NODE_ID_MAX_LENGTH",
     "WORKFLOW_APPROVAL_ID_MAX_LENGTH",
 ]

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <!-- 只读运维页面：无第三方资源（不外链 CDN / 字体 / 分析），避免数据外泄 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    />
+    <title>Workflow Run Detail · WMS AI Assistant</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <h1>Workflow Run Detail</h1>
+      <p class="muted">
+        只读运行详情：输入已有的 Workflow Run ID 查看状态、节点执行记录、
+        时间线与审批情况。<strong>本页面不提供任何执行或写入操作。</strong>
+      </p>
+    </header>
+
+    <!--
+      真实数据访问状态（**如实标记**，见 docs/api.md §8 / docs/security.md §7）：
+      Workflow Read API 使用服务到服务的 X-API-Key，仓库内没有面向浏览器的
+      受信任代理与会话化读取路径，也没有 CORS 配置。因此本页面在真实环境中
+      查询会得到 401 —— 该边界不会被绕过，密钥不会进入浏览器。
+    -->
+    <aside class="notice" id="access-notice" role="note">
+      <strong>数据访问尚未接通（如实标记）：</strong>
+      后端 Workflow Read API 要求 <code>X-API-Key</code> 服务间凭据。出于安全
+      约束，<strong>该密钥不会出现在浏览器中</strong>（不写入源码、构建产物、
+      本地存储或 Cookie）。本页面的结构、状态与错误处理均已就绪；在缺少
+      受信任服务端代理 / 会话化读取路径之前，真实查询将返回
+      <code>401</code> 并显示对应错误状态。详见
+      <code>docs/decisions/Phase/</code> 下本阶段报告。
+    </aside>
+
+    <form id="run-form" class="query" autocomplete="off" novalidate>
+      <label for="run-id-input">Workflow Run ID</label>
+      <input
+        id="run-id-input"
+        name="run_id"
+        type="text"
+        inputmode="text"
+        maxlength="64"
+        placeholder="例如 wf-2026-01-01-abc123"
+        aria-describedby="run-id-help"
+        required
+      />
+      <button id="run-submit" type="submit">查询</button>
+      <button id="run-refresh" type="button" class="secondary">重新加载</button>
+      <span id="run-id-help" class="muted"
+        >Run ID 由 Workflow Command API 返回；本页面不提供 Run 列表。</span
+      >
+    </form>
+    <p id="current-run" class="muted">尚未查询任何 Run</p>
+
+    <main id="panels" aria-live="polite">
+      <!-- 初始状态：仅静态引导；数据由 app.js 渲染（不预置任何虚构数据） -->
+      <div id="status-region" role="status">
+        <p class="status muted">
+          请输入已有的 Workflow Run ID 并查询——页面只做只读展示，不会触发任何执行。
+        </p>
+      </div>
+    </main>
+
+    <footer class="page-footer muted">
+      <span>只读接口：Run 详情 / 节点执行记录 / 时间线 / 审批详情</span>
+    </footer>
+
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>

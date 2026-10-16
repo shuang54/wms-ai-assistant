@@ -953,14 +953,15 @@ python -m backend.app.cli.ingest_knowledge docs/knowledge/wms-basic-operations.m
 
 ## 8. Agent / Workflow Read API（Phase 5 P-8 / Phase 6 Step 7-8A）
 
-四个 Workflow 端点 + 两个 Agent 端点均为**只读**（Query only；不触发
+五个 Workflow 端点 + 两个 Agent 端点均为**只读**（Query only；不触发
 Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`** 请求头：
 
 | 端点 | 认证 | 授权作用域来源 |
 | --- | --- | --- |
 | `GET /api/workflow-runs/{run_id}` | `X-API-Key`（必需） | 服务端 `WORKFLOW_READ_API_PROJECT_ID` |
-| `GET /api/workflow-runs/{run_id}/nodes` | 同上 | 同上 |
+| `GET /api/workflow-runs/{run_id}/nodes` | 同上 | 同上（**安全投影**：损坏的 JSON / 越白名单状态·类型·错误码 ⇒ 502） |
 | `GET /api/workflow-runs/{run_id}/timeline` | 同上 | 同上 |
+| `GET /api/workflow-runs/{run_id}/approvals/{node_id}` | 同上 | 同上（经父 Run + `(run, node)` 归属校验） |
 | `GET /api/workflow-approvals/{approval_id}` | 同上 | 同上（经父 Run 归属校验） |
 | `GET /api/agent/runs/{run_id}` | `X-API-Key`（必需） | 服务端 `AGENT_READ_API_PROJECT_ID` |
 | `GET /api/agent/runs/{run_id}/timeline` | 同上 | 同上 |
