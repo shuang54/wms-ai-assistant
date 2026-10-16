@@ -13,11 +13,22 @@ WorkflowRunStore / WorkflowNodeRunStore / WorkflowApprovalStore
 ```
 
 职责（**只读 + 授权范围校验 + DTO 投影 + 结果组装**）：
-    * ``get_run_detail``       —— Run 只读详情（**不含 input / request_id**）
-    * ``get_node_runs``        —— 某 Run 的**全部** node attempt（历史保留、
-                                  写入序 = 执行序；不重建未持久化状态）
-    * ``get_approval_detail``  —— 单个审批详情（经父 Run 做归属 + 项目校验）
-    * ``get_run_timeline``     —— 由**真实持久化时间字段**构建的稳定排序时间线
+    * ``get_run_detail``        —— Run 只读详情（**不含 input / request_id**）
+    * ``get_node_runs``         —— 某 Run 的**全部** node attempt（Port 记录本体；
+                                   历史保留、写入序 = 执行序；既有 API 契约）
+    * ``get_node_run_details``  —— 同上的**安全投影版**（:class:`NodeRunDetail`）：
+                                   ``output`` / ``error_code`` / ``node_type`` /
+                                   ``status`` / ``attempt`` / ``elapsed_ms`` 逐项
+                                   按域白名单与内联边界校验，损坏 ⇒ fail closed
+    * ``get_approval_detail``   —— 单个审批详情（经父 Run 做归属 + 项目校验）
+    * ``get_approval_for_node`` —— **按 (run, node) 读取审批**（安全投影版，
+                                   :class:`ApprovalDetail`）；无审批行 ⇒ ``None``
+    * ``get_run_timeline``      —— 由**真实持久化时间字段**构建的稳定排序时间线
+
+为什么同时保留"Port 记录本体"与"安全投影"两条只读入口：
+    ``get_node_runs`` / ``get_approval_detail`` 已被 ``api/workflow_read.py`` 与
+    ``command_service`` 消费（既有契约）⇒ **不改其返回类型**；安全投影以**新增
+    方法**提供，避免破坏既有调用方，同时让需要严格输出边界的调用方有明确入口。
 
 硬约束（S6 任务书 §三/§六/§七/§九）：
     * 不做任何写入：不调用 Runtime 的 start / advance / request_cancel；
@@ -39,11 +50,18 @@ WorkflowRunStore / WorkflowNodeRunStore / WorkflowApprovalStore
 tools / api / llm / agent / projects；不 import 同包 runtime / execution /
 binding / factory / adapters / store_adapters（无反向 / 循环依赖）。
 
-已知限制（报告记录，不在本层绕过）：
+已知限制（报告记录，**不在本层绕过**——不改 Port / Repository / Schema）：
     * ``ApprovalRecord`` 无 ``created_at`` ⇒ 审批**创建时刻**不进入 Timeline /
-      Detail（不推断、不伪造；如未来需要属 ports 最小扩展）；
+      Detail（不推断、不伪造）。**仓库核实**：DB 列 ``ai_ops.workflow_approval.
+      created_at`` **存在**，但 Port 未暴露 ⇒ 这是 **Store Port 能力缺口**，
+      需 Port 最小扩展才能补齐（本层不擅自扩 Port）；
+    * ``ApprovalRecord`` / ``NodeRunRecord`` 均**未暴露** ``project_id``，尽管
+      DB 列 ``workflow_approval.project_id`` / ``workflow_node_run.project_id``
+      存在（ADR §16 I1/I4 冗余列）⇒ 本层无法对子记录做**独立**归属证明，
+      只能经父 Run 建立归属（S6 §五.4）；独立证明需 Port 扩展；
     * RunDetail 的节点统计仅含 run 行的 ``attempt_count``（可证明事实）；
-      跨表节点计数由 ``get_node_runs`` 明确提供（不做隐式额外查询）。
+      跨表节点计数由 ``get_node_runs`` / ``get_node_run_details`` 明确提供
+      （不做隐式额外查询）。
 """
 from __future__ import annotations
 
@@ -51,6 +69,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
+from backend.app.workflow.definition import NODE_TYPES
+from backend.app.workflow.errors import WF_ERROR_CODES, WorkflowOutputError
+from backend.app.workflow.models import validate_json_text
+from backend.app.workflow.states import APPROVAL_STATUSES, NODE_STATUSES
 from backend.app.workflow.states import WORKFLOW_STATUSES
 from backend.app.workflow_runtime.ports import (
     ApprovalRecord,
@@ -66,10 +88,17 @@ __all__ = [
     "WorkflowReadError",
     "WorkflowReadNotFoundError",
     "RunDetail",
+    "NodeRunDetail",
+    "ApprovalDetail",
     "TimelineEvent",
     "TIMELINE_EVENT_KINDS",
+    "MAX_ERROR_CODE_LENGTH",
     "WorkflowReadService",
 ]
+
+#: 稳定错误码列宽（镜像 ``ai_ops.workflow_node_run.error_code`` 的列宽）。
+#: 读侧**防御性上界**：仅用于拒绝超限的持久化值，不构成 schema 定义。
+MAX_ERROR_CODE_LENGTH: Final[int] = 64
 
 #: 时间线事件类型白名单（只描述**持久化时间戳事实**——不含状态推断）。
 TIMELINE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
@@ -161,6 +190,96 @@ class RunDetail:
             raise WorkflowReadError(
                 f"RunDetail.status 不在域白名单内: {self.status!r}"
             )
+
+
+@dataclass(frozen=True)
+class NodeRunDetail:
+    """单次 node attempt 的**安全投影**（显式构造；**不**返回 Port 记录本体）。
+
+    与 ``NodeRunDetail`` 对齐的持久化事实来自 ``workflow_node_run``；每个字段在
+    构造时按**域层白名单 / 内联边界**校验 ⇒ 持久化数据损坏时 **fail closed**
+    （不修复、不截断、不清空、不推断状态）。
+
+    Attributes:
+        workflow_run_id / node_id / attempt: 执行身份（attempt ≥ 1）。
+        node_type:  ``NODE_TYPES`` 之一（域白名单）。
+        status:     ``NODE_STATUSES`` 之一（域白名单；**不推断**未持久化状态）。
+        output:     持久化的 **JSON 文本**（``None`` = 无输出）；
+                    **必须**为合法 JSON 且 UTF-8 字节数
+                    ≤ ``JSON_VALUE_MAX_BYTES``（32 KiB）—— 违规 ⇒ fail closed。
+        error_code: ``None`` 或 ``WF_ERROR_CODES`` 域白名单内的稳定码；
+                    **不含** exception message / stack trace（列契约如此）。
+        elapsed_ms: ``None`` 或有限非负数。
+        started_at / completed_at: 真实持久化时间戳（可 None——不伪造）。
+    """
+
+    workflow_run_id: str
+    node_id: str
+    attempt: int
+    node_type: str
+    status: str
+    output: str | None
+    error_code: str | None
+    elapsed_ms: float | None
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        _require_projected_text(
+            "NodeRunDetail.workflow_run_id", self.workflow_run_id
+        )
+        _require_projected_text("NodeRunDetail.node_id", self.node_id)
+        _require_projected_attempt(self.attempt)
+        _require_projected_member(
+            "NodeRunDetail.node_type", self.node_type, NODE_TYPES
+        )
+        _require_projected_member(
+            "NodeRunDetail.status", self.status, NODE_STATUSES
+        )
+        _require_projected_output(self.output)
+        _require_projected_error_code(self.error_code)
+        _require_projected_elapsed_ms(self.elapsed_ms)
+        _require_projected_timestamp("NodeRunDetail.started_at", self.started_at)
+        _require_projected_timestamp(
+            "NodeRunDetail.completed_at", self.completed_at
+        )
+
+
+@dataclass(frozen=True)
+class ApprovalDetail:
+    """单个审批的**安全投影**（显式构造；字段 = Port 已持久化事实）。
+
+    **不含** ``created_at``：DB 列 ``workflow_approval.created_at`` 存在，但
+    ``ApprovalRecord``（Store Port）**未暴露** ⇒ 本层不推断、不伪造（见模块
+    docstring 已知限制）。补齐需 Port 最小扩展，属独立任务书。
+
+    Attributes:
+        approval_id / workflow_run_id / node_id: 审批身份与归属。
+        status: ``APPROVAL_STATUSES`` 之一（域白名单；PENDING / APPROVED /
+                REJECTED）。
+        resolved_at: **真实持久化**的裁决时间；未裁决 ⇒ ``None``（不伪造）。
+    """
+
+    approval_id: str
+    workflow_run_id: str
+    node_id: str
+    status: str
+    resolved_at: datetime | None
+
+    def __post_init__(self) -> None:
+        _require_projected_text(
+            "ApprovalDetail.approval_id", self.approval_id
+        )
+        _require_projected_text(
+            "ApprovalDetail.workflow_run_id", self.workflow_run_id
+        )
+        _require_projected_text("ApprovalDetail.node_id", self.node_id)
+        _require_projected_member(
+            "ApprovalDetail.status", self.status, APPROVAL_STATUSES
+        )
+        _require_projected_timestamp(
+            "ApprovalDetail.resolved_at", self.resolved_at
+        )
 
 
 @dataclass(frozen=True)
@@ -288,6 +407,67 @@ class WorkflowReadService:
             )
         return approval
 
+    def get_node_run_details(
+        self, *, workflow_run_id: str, project_id: str
+    ) -> tuple[NodeRunDetail, ...]:
+        """某 Run 的**全部** node attempt 的**安全投影**（含 output 边界校验）。
+
+        复用 :meth:`get_node_runs` ⇒ 父 Run 存在性 / 项目范围 / 归属一致性校验
+        只有**一份**实现（不重复判定）；本方法只增加"逐条安全投影"这一步。
+
+        Returns:
+            空结果 ⇒ ``()``（合法事实——不是错误）。
+
+        Raises:
+            WorkflowReadNotFoundError: Run 不存在 / 不在项目范围内（同构）。
+            WorkflowReadError: 存储故障 · 归属不一致 · **任何一条记录的持久化
+                字段损坏**（output 非合法 JSON / 超内联上限 / status 或
+                node_type 越白名单 / attempt 非法 / error_code 越白名单 /
+                elapsed_ms 非法 / 时间戳类型非法）。
+        """
+        records = self.get_node_runs(
+            workflow_run_id=workflow_run_id, project_id=project_id
+        )
+        return tuple(_project_node_run(record) for record in records)
+
+    def get_approval_for_node(
+        self, *, workflow_run_id: str, node_id: str, project_id: str
+    ) -> ApprovalDetail | None:
+        """按 ``(run, node)`` 读取该 APPROVAL 节点的审批（安全投影）。
+
+        归属校验（**双保险**）：先经父 Run 校验存在性与项目范围；再校验返回行
+        的 ``workflow_run_id`` / ``node_id`` 与请求一致——存储层若返回跨 Run /
+        跨节点数据 ⇒ **fail closed**（不返回）。
+
+        Returns:
+            ``None``: 该节点**尚无审批行**（合法事实——不是错误，也不是权限
+                问题；父 Run 已通过项目校验）。
+            :class:`ApprovalDetail`: 已存在审批行（PENDING / 已裁决）。
+
+        Raises:
+            WorkflowReadNotFoundError: 父 Run 不存在 / 不在项目范围内（同构）。
+            WorkflowReadError: 存储故障 · 归属不一致 · 持久化状态越域白名单。
+        """
+        run = self._require_run(workflow_run_id, project_id)
+        node = _require_text("node_id", node_id)
+        approval = self._store_call(
+            "Workflow 审批节点读取",
+            self._approval_store.get_for_node,
+            workflow_run_id=run.workflow_run_id,
+            node_id=node,
+        )
+        if approval is None:
+            return None
+        if (
+            approval.workflow_run_id != run.workflow_run_id
+            or approval.node_id != node
+        ):
+            # 存储层归属不一致 ⇒ fail closed（不返回跨 Run / 跨节点数据）
+            raise WorkflowReadError(
+                "审批归属与父 Run / 节点不一致（fail-closed）"
+            )
+        return _project_approval(approval)
+
     def get_run_timeline(
         self, *, workflow_run_id: str, project_id: str
     ) -> tuple[TimelineEvent, ...]:
@@ -399,6 +579,153 @@ class WorkflowReadService:
             raise WorkflowReadError(
                 f"{operation}失败: {type(exc).__name__}"
             ) from exc
+
+
+# ============================================================
+# 投影（Port 记录 → Read DTO；显式逐字段构造）
+# ============================================================
+
+
+def _project_node_run(record: NodeRunRecord) -> NodeRunDetail:
+    """``NodeRunRecord`` → :class:`NodeRunDetail`（显式逐字段；**不**透传对象）。
+
+    注意：``NodeRunRecord`` **无** ``project_id``（Port 未暴露）与 **无** ``input``
+    ⇒ 投影面天然不含这两类字段。字段值非法时由 DTO 构造 fail closed。
+    """
+    return NodeRunDetail(
+        workflow_run_id=record.workflow_run_id,
+        node_id=record.node_id,
+        attempt=record.attempt,
+        node_type=record.node_type,
+        status=record.status,
+        output=record.output,
+        error_code=record.error_code,
+        elapsed_ms=record.elapsed_ms,
+        started_at=record.started_at,
+        completed_at=record.completed_at,
+    )
+
+
+def _project_approval(record: ApprovalRecord) -> ApprovalDetail:
+    """``ApprovalRecord`` → :class:`ApprovalDetail`（显式逐字段）。"""
+    return ApprovalDetail(
+        approval_id=record.approval_id,
+        workflow_run_id=record.workflow_run_id,
+        node_id=record.node_id,
+        status=record.status,
+        resolved_at=record.resolved_at,
+    )
+
+
+# ============================================================
+# 投影字段校验（fail closed：拒绝、**不**修复 / 不截断 / 不清空）
+# ============================================================
+
+
+def _require_projected_text(field: str, value: object) -> None:
+    """非空 str（去空白后非空）。"""
+    if not isinstance(value, str) or not value.strip():
+        raise WorkflowReadError(
+            f"{field} 必须是非空 str（当前: {type(value).__name__}）"
+        )
+
+
+def _require_projected_attempt(attempt: object) -> None:
+    """attempt 必须为 ≥ 1 的 int（**拒** bool —— bool 是 int 的子类）。"""
+    if isinstance(attempt, bool) or not isinstance(attempt, int):
+        raise WorkflowReadError(
+            f"NodeRunDetail.attempt 必须是 int（当前: {type(attempt).__name__}）"
+        )
+    if attempt < 1:
+        raise WorkflowReadError(
+            f"NodeRunDetail.attempt 必须 ≥ 1（当前: {attempt}）"
+        )
+
+
+def _require_projected_member(
+    field: str, value: object, allowed: frozenset[str]
+) -> None:
+    """值必须属于域白名单（越界 ⇒ fail closed——不伪装成正常结果）。"""
+    if not isinstance(value, str) or value not in allowed:
+        raise WorkflowReadError(f"{field} 不在域白名单内: {value!r}")
+
+
+def _require_projected_output(output: object) -> None:
+    """``output``：``None`` 或**合法 JSON 文本**且 ≤ ``JSON_VALUE_MAX_BYTES``。
+
+    校验**委托**域层 :func:`validate_json_text`（与写侧
+    ``serialize_json_value`` 同一内联契约的单一事实来源）⇒ 读侧可对**不信任的
+    持久化内容**做独立复验，而无需在本层重复 JSON 契约。
+
+    损坏（非 str / 空白 / 非法 JSON / 超内联上限 / 无法 UTF-8 编码）
+    ⇒ :class:`WorkflowReadError`：**不截断、不清空、不自动修复**。
+    """
+    if output is None:
+        return
+    try:
+        validate_json_text(output)
+    except WorkflowOutputError as exc:
+        # 域层拒绝 ⇒ 读层 fail closed（异常链保留；消息不含内容本体）
+        raise WorkflowReadError(
+            "NodeRunDetail.output 不符合内联 JSON 契约"
+            "（fail-closed：不截断 / 不自动修复）"
+        ) from exc
+
+
+def _require_projected_error_code(error_code: object) -> None:
+    """``error_code``：``None`` 或 ``WF_ERROR_CODES`` 内的稳定码（≤ 列宽）。
+
+    列契约明确**禁止** exception message / stack trace / 自由文本 ⇒ 越界即
+    fail closed（不截断、不原样返回可能含内部信息的字符串）。
+    """
+    if error_code is None:
+        return
+    if not isinstance(error_code, str) or not error_code.strip():
+        raise WorkflowReadError(
+            "NodeRunDetail.error_code 必须是非空 str 或 None"
+            f"（当前: {type(error_code).__name__}）"
+        )
+    if len(error_code) > MAX_ERROR_CODE_LENGTH:
+        raise WorkflowReadError(
+            f"NodeRunDetail.error_code 超过列宽上限"
+            f"（{len(error_code)} > {MAX_ERROR_CODE_LENGTH}）"
+        )
+    if error_code not in WF_ERROR_CODES:
+        raise WorkflowReadError(
+            f"NodeRunDetail.error_code 不在域白名单内: {error_code!r}"
+        )
+
+
+def _require_projected_elapsed_ms(elapsed_ms: object) -> None:
+    """``elapsed_ms``：``None`` 或有限非负数（**拒** NaN / inf / 负数 / bool）。
+
+    Note:
+        用 ``0 <= value < inf`` 单次比较同时拒绝 NaN（比较为 False）、
+        ``±inf`` 与负数——因此本模块**无需** import ``math``
+        （read_service 的 stdlib 白名单有意只含 ``dataclasses`` /
+        ``datetime`` / ``typing``）。
+    """
+    if elapsed_ms is None:
+        return
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, (int, float)):
+        raise WorkflowReadError(
+            "NodeRunDetail.elapsed_ms 必须是数字或 None"
+            f"（当前: {type(elapsed_ms).__name__}）"
+        )
+    if not (0 <= elapsed_ms < float("inf")):
+        raise WorkflowReadError(
+            f"NodeRunDetail.elapsed_ms 必须有限且 ≥ 0（当前: {elapsed_ms!r}）"
+        )
+
+
+def _require_projected_timestamp(field: str, value: object) -> None:
+    """时间戳必须为 ``None`` 或 ``datetime``（不推断、不字符串化）。"""
+    if value is None:
+        return
+    if not isinstance(value, datetime):
+        raise WorkflowReadError(
+            f"{field} 必须是 datetime 或 None（当前: {type(value).__name__}）"
+        )
 
 
 # ============================================================

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -67,6 +68,7 @@ __all__ = [
     "TestReadServiceDb",
     "TestReadNonMutationDb",
     "TestResidueDb",
+    "TestNewReadCapabilitiesDb",
 ]
 
 _RUN_PREFIX = "wf-p6s6-"
@@ -350,3 +352,191 @@ class TestResidueDb:
             "workflow_node_run": 0,
             "workflow_approval": 0,
         }
+
+
+# ============================================================
+# Test 4：新增只读能力（安全投影 / 按 Node 读取审批）
+# ============================================================
+
+
+class TestNewReadCapabilitiesDb:
+    """真实 Repository → Store Adapter → Read Service 的新增能力集成。
+
+    验证：真实持久化行的安全投影（output 原样 / error_code 保留）、
+    按 ``(run, node)`` 读取审批、空结果语义、跨项目拒绝、查询不改状态。
+    """
+
+    def test_node_run_details_from_real_rows(self) -> None:
+        run_id = _seed_run()
+        node_repo = WorkflowNodeRunRepository()
+        node_repo.create(
+            workflow_run_id=run_id,
+            node_id="step_one",
+            attempt=1,
+            node_type="TOOL",
+            status="FAILED",
+            error_code=WF_ERROR_NODE_EXECUTION_FAILURE,
+        )
+        started_at = datetime(2026, 10, 16, 9, 0, tzinfo=timezone.utc)
+        node_repo.create(
+            workflow_run_id=run_id,
+            node_id="step_one",
+            attempt=2,
+            node_type="TOOL",
+            status="SUCCEEDED",
+            output='{"qty":3}',
+            elapsed_ms=12.5,
+            started_at=started_at,
+        )
+
+        details = _read_service().get_node_run_details(
+            workflow_run_id=run_id, project_id=_PROJECT
+        )
+
+        # 同一节点全部 attempt 保留（不被折叠成最新一条）
+        assert [d.attempt for d in details] == [1, 2]
+        assert details[0].status == "FAILED"
+        assert details[0].error_code == WF_ERROR_NODE_EXECUTION_FAILURE
+        assert details[0].output is None
+        assert details[1].status == "SUCCEEDED"
+        assert details[1].output == '{"qty":3}'      # 已持久化输出原样
+        assert details[1].elapsed_ms == 12.5
+        # 真实持久化时间戳往返一致（未写入的行保持 None——不伪造）
+        assert details[1].started_at is not None
+        assert details[1].started_at == started_at
+        assert details[0].started_at is None
+        # 投影面不含启动输入 / 内部对象
+        for detail in details:
+            assert not hasattr(detail, "input")
+            assert not hasattr(detail, "project_id")
+
+    def test_node_run_details_empty_for_run_without_attempts(self) -> None:
+        run_id = _seed_run()
+
+        assert _read_service().get_node_run_details(
+            workflow_run_id=run_id, project_id=_PROJECT
+        ) == ()
+
+    def test_node_run_details_cross_project_rejected(self) -> None:
+        run_id = _seed_run()
+        WorkflowNodeRunRepository().create(
+            workflow_run_id=run_id,
+            node_id="step_one",
+            attempt=1,
+            node_type="TOOL",
+            status="SUCCEEDED",
+            output='{"qty":1}',
+        )
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            _read_service().get_node_run_details(
+                workflow_run_id=run_id, project_id=_OTHER_PROJECT
+            )
+
+    def test_approval_for_node_pending_then_resolved(self) -> None:
+        run_id = _seed_run()
+        node_repo = WorkflowNodeRunRepository()
+        node_repo.create(
+            workflow_run_id=run_id,
+            node_id="gate",
+            attempt=1,
+            node_type="APPROVAL",
+            status="WAITING_APPROVAL",
+        )
+        approval_repo = WorkflowApprovalRepository()
+        approval_id = f"{run_id}-ap"
+        approval_repo.create(
+            approval_id=approval_id, workflow_run_id=run_id, node_id="gate"
+        )
+
+        service = _read_service()
+        pending = service.get_approval_for_node(
+            workflow_run_id=run_id, node_id="gate", project_id=_PROJECT
+        )
+        assert pending is not None
+        assert pending.approval_id == approval_id
+        assert pending.status == "PENDING"
+        assert pending.resolved_at is None       # 未裁决 ⇒ None（不伪造）
+        assert not hasattr(pending, "created_at")  # Port 未暴露 ⇒ 不伪造
+
+        approval_repo.resolve(
+            approval_id=approval_id, decision=APPROVAL_STATUS_APPROVED
+        )
+        resolved = service.get_approval_for_node(
+            workflow_run_id=run_id, node_id="gate", project_id=_PROJECT
+        )
+        assert resolved is not None
+        assert resolved.status == APPROVAL_STATUS_APPROVED
+        assert resolved.resolved_at is not None  # 真实裁决时间
+
+    def test_approval_for_node_absent_is_none(self) -> None:
+        """该节点尚无审批行 ⇒ ``None``（合法事实——不是错误）。"""
+        run_id = _seed_run()
+
+        assert _read_service().get_approval_for_node(
+            workflow_run_id=run_id, node_id="never-created",
+            project_id=_PROJECT,
+        ) is None
+
+    def test_approval_for_node_cross_project_rejected(self) -> None:
+        run_id = _seed_run()
+        WorkflowApprovalRepository().create(
+            approval_id=f"{run_id}-ap",
+            workflow_run_id=run_id,
+            node_id="gate",
+        )
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            _read_service().get_approval_for_node(
+                workflow_run_id=run_id, node_id="gate",
+                project_id=_OTHER_PROJECT,
+            )
+
+    def test_new_queries_do_not_change_persisted_state(
+        self, engine: Any
+    ) -> None:
+        """新增查询前后三表行 + 关键字段完全不变（只读性）。"""
+        run_id = _seed_run()
+        WorkflowNodeRunRepository().create(
+            workflow_run_id=run_id,
+            node_id="gate",
+            attempt=1,
+            node_type="APPROVAL",
+            status="WAITING_APPROVAL",
+        )
+        WorkflowApprovalRepository().create(
+            approval_id=f"{run_id}-ap",
+            workflow_run_id=run_id,
+            node_id="gate",
+        )
+
+        before_counts = _counts(engine)
+        service = _read_service()
+        approval_before = service.get_approval_for_node(
+            workflow_run_id=run_id, node_id="gate", project_id=_PROJECT
+        )
+        run_before = service.get_run_detail(
+            workflow_run_id=run_id, project_id=_PROJECT
+        )
+
+        for _ in range(3):
+            service.get_node_run_details(
+                workflow_run_id=run_id, project_id=_PROJECT
+            )
+            service.get_approval_for_node(
+                workflow_run_id=run_id, node_id="gate", project_id=_PROJECT
+            )
+
+        assert _counts(engine) == before_counts
+        approval_after = service.get_approval_for_node(
+            workflow_run_id=run_id, node_id="gate", project_id=_PROJECT
+        )
+        run_after = service.get_run_detail(
+            workflow_run_id=run_id, project_id=_PROJECT
+        )
+        assert approval_after is not None and approval_before is not None
+        assert approval_after.status == approval_before.status
+        assert approval_after.resolved_at == approval_before.resolved_at
+        assert run_after.state_version == run_before.state_version
+        assert run_after.status == run_before.status
+        assert run_after.updated_at == run_before.updated_at

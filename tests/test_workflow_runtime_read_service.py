@@ -19,7 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from backend.app.workflow.errors import WF_ERROR_NODE_EXECUTION_FAILURE
+from backend.app.workflow.definition import NODE_TYPES
+from backend.app.workflow.errors import (
+    WF_ERROR_CODES,
+    WF_ERROR_NODE_EXECUTION_FAILURE,
+)
+from backend.app.workflow.models import JSON_VALUE_MAX_BYTES
 from backend.app.workflow_runtime.ports import (
     ApprovalRecord,
     NodeRunRecord,
@@ -27,7 +32,10 @@ from backend.app.workflow_runtime.ports import (
     WorkflowPortsError,
 )
 from backend.app.workflow_runtime.read_service import (
+    MAX_ERROR_CODE_LENGTH,
     TIMELINE_EVENT_KINDS,
+    ApprovalDetail,
+    NodeRunDetail,
     RunDetail,
     TimelineEvent,
     WorkflowReadError,
@@ -38,7 +46,9 @@ from backend.app.workflow_runtime.read_service import (
 __all__ = [
     "TestRunDetail",
     "TestNodeRuns",
+    "TestNodeRunDetails",
     "TestApprovalDetail",
+    "TestApprovalForNode",
     "TestTimeline",
     "TestBoundaries",
 ]
@@ -99,6 +109,29 @@ def _node_record(**overrides) -> NodeRunRecord:
     }
     base.update(overrides)
     return NodeRunRecord(**base)
+
+
+def _node_detail(**overrides) -> NodeRunDetail:
+    """直接构造 :class:`NodeRunDetail`（用于测**读层自身**的防线）。
+
+    用途：Port 记录在构造时已拒绝部分非法值（空白 / 非 str / attempt < 1 /
+    非法 elapsed）⇒ 这些不变量无法经 Store 路径注入。直接构造 DTO 可验证
+    "即使未来 Port 放宽校验，读层仍独立 fail closed"。
+    """
+    base = {
+        "workflow_run_id": _RUN_ID,
+        "node_id": "n1",
+        "attempt": 1,
+        "node_type": "TOOL",
+        "status": "RUNNING",
+        "output": None,
+        "error_code": None,
+        "elapsed_ms": None,
+        "started_at": _T0 + timedelta(seconds=1),
+        "completed_at": None,
+    }
+    base.update(overrides)
+    return NodeRunDetail(**base)
 
 
 def _approval_record(**overrides) -> ApprovalRecord:
@@ -727,3 +760,542 @@ class TestBoundaries:
                 m == forbidden or m.startswith(forbidden + ".")
                 for m in modules
             ), f"read_service.py 禁入 import: {forbidden!r}"
+
+
+# ============================================================
+# Test 5：Node Attempt 安全投影（本轮新增）
+# ============================================================
+
+
+class TestNodeRunDetails:
+    """``get_node_run_details``：显式安全投影 + 持久化字段 fail closed。
+
+    覆盖任务书 §三.2：保留全部历史 attempt、真实字段排序、不推断状态、
+    安全投影 output / error_code、**损坏输出 fail closed（不自动修复）**。
+    """
+
+    def test_projects_every_attempt_in_write_order(self) -> None:
+        """同一节点 3 次 attempt 全部保留（不折叠 / 不去重 / 不取最新）。"""
+        env = _Env(
+            run=_run_record(),
+            nodes=[
+                _node_record(
+                    attempt=1,
+                    status="FAILED",
+                    error_code=WF_ERROR_NODE_EXECUTION_FAILURE,
+                ),
+                _node_record(
+                    attempt=2,
+                    status="FAILED",
+                    error_code=WF_ERROR_NODE_EXECUTION_FAILURE,
+                ),
+                _node_record(attempt=3, status="SUCCEEDED", output='{"ok":true}'),
+            ],
+        )
+
+        details = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )
+
+        assert [d.attempt for d in details] == [1, 2, 3]
+        assert [d.status for d in details] == ["FAILED", "FAILED", "SUCCEEDED"]
+        assert all(isinstance(d, NodeRunDetail) for d in details)
+        env.assert_no_writes()
+
+    def test_returns_dto_not_port_record(self) -> None:
+        """返回的是 Read DTO（**不是** Port 记录本体）。"""
+        env = _Env(run=_run_record(), nodes=[_node_record()])
+
+        details = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )
+
+        assert isinstance(details[0], NodeRunDetail)
+        assert not isinstance(details[0], NodeRunRecord)
+
+    def test_output_preserved_verbatim(self) -> None:
+        """合法 JSON 输出**原样**返回（不重新序列化 / 不改写持久化事实）。"""
+        raw = '{"b":1,"a":[1,2,{"c":"x"}]}'
+        env = _Env(run=_run_record(), nodes=[_node_record(output=raw)])
+
+        detail = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0]
+
+        assert detail.output == raw
+
+    def test_none_fields_stay_none(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record()])
+
+        detail = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0]
+
+        assert detail.output is None
+        assert detail.error_code is None
+        assert detail.elapsed_ms is None
+        assert detail.completed_at is None
+
+    def test_empty_result_is_legal(self) -> None:
+        env = _Env(run=_run_record(), nodes=[])
+
+        assert env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        ) == ()
+        env.assert_no_writes()
+
+    def test_run_not_found(self) -> None:
+        env = _Env(run=None, nodes=[_node_record()])
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    def test_project_mismatch_is_isomorphic_not_found(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record()])
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id="proj-OTHER"
+            )
+
+    def test_cross_run_record_fails_closed(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(workflow_run_id="wf-run-OTHER")],
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    def test_store_failure_wrapped_without_body_leak(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record()])
+        env.node_store.error = WorkflowPortsError(_SECRET)
+
+        with pytest.raises(WorkflowReadError) as info:
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+        assert _SECRET not in str(info.value)
+        assert isinstance(info.value.__cause__, WorkflowPortsError)
+        env.assert_no_writes()
+
+    # ---- 损坏的持久化输出 ⇒ fail closed（不截断 / 不清空 / 不修复） ----
+
+    @pytest.mark.parametrize(
+        "corrupted", ("{not json", '{"a": }', '{"truncated": "abc', "123abc")
+    )
+    def test_corrupted_output_fails_closed(self, corrupted: str) -> None:
+        """Port 只要求 output 是**非空 str**，不校验 JSON 合法性 ⇒
+
+        非法 JSON 能真实到达读层（例如行被绕过仓储改写）⇒ 读层必须 fail closed。
+        """
+        env = _Env(run=_run_record(), nodes=[_node_record(output=corrupted)])
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+        env.assert_no_writes()
+
+    def test_oversized_output_fails_closed_without_truncation(self) -> None:
+        """超内联上限 ⇒ 拒绝（**绝不**截断后返回部分输出）。"""
+        oversized = '{"pad":"' + ("x" * (JSON_VALUE_MAX_BYTES + 16)) + '"}'
+        env = _Env(run=_run_record(), nodes=[_node_record(output=oversized)])
+
+        with pytest.raises(WorkflowReadError) as info:
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+        assert "fail-closed" in str(info.value)
+
+    @pytest.mark.parametrize(
+        "bad_output", ("", "   ", {"not": "a str"}, b"bytes")
+    )
+    def test_blank_or_non_str_output_fails_closed_at_read_layer(
+        self, bad_output
+    ) -> None:
+        """空白 / 非 str：Port 已拒绝（无法经 Store 注入）⇒
+
+        直接构造 DTO 验证**读层自身**的独立防线（防未来 Port 放宽校验）。
+        """
+        with pytest.raises(WorkflowReadError):
+            _node_detail(output=bad_output)
+
+    def test_output_error_message_does_not_leak_content(self) -> None:
+        """拒绝消息**不**含损坏内容本体（避免把内部数据带进错误面）。"""
+        secret_blob = '{"secret": "' + _SECRET + '"'  # 非法 JSON（缺右括号）
+        env = _Env(run=_run_record(), nodes=[_node_record(output=secret_blob)])
+
+        with pytest.raises(WorkflowReadError) as info:
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+        assert _SECRET not in str(info.value)
+
+    # ---- 其它字段的域白名单 / 边界校验 ----
+
+    def test_status_outside_whitelist_fails_closed(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record(status="WEIRD")])
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    def test_node_type_outside_whitelist_fails_closed(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record(node_type="MAGIC")])
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    @pytest.mark.parametrize("bad_attempt", (0, -1, True, "1"))
+    def test_invalid_attempt_fails_closed_at_read_layer(
+        self, bad_attempt
+    ) -> None:
+        """``attempt`` 必须为 ≥ 1 的 int（**拒** bool —— bool ⊂ int）。
+
+        Port 已拒绝 ``0 / -1`` ⇒ 直接构造 DTO 验证读层独立防线。
+        """
+        with pytest.raises(WorkflowReadError):
+            _node_detail(attempt=bad_attempt)
+
+    def test_error_code_outside_whitelist_fails_closed(self) -> None:
+        """自由文本 error_code（潜在内部信息）⇒ 拒绝，不原样返回。"""
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(status="FAILED", error_code="Traceback ...")],
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    def test_error_code_over_column_width_fails_closed(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            nodes=[
+                _node_record(
+                    status="FAILED",
+                    error_code="X" * (MAX_ERROR_CODE_LENGTH + 1),
+                )
+            ],
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_node_run_details(
+                workflow_run_id=_RUN_ID, project_id=_PROJECT
+            )
+
+    def test_valid_error_code_passes(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            nodes=[
+                _node_record(
+                    status="FAILED", error_code=WF_ERROR_NODE_EXECUTION_FAILURE
+                )
+            ],
+        )
+
+        detail = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0]
+
+        assert detail.error_code == WF_ERROR_NODE_EXECUTION_FAILURE
+        assert detail.error_code in WF_ERROR_CODES
+
+    @pytest.mark.parametrize(
+        "bad_elapsed",
+        (-1.0, float("nan"), float("inf"), float("-inf"), "12", True),
+    )
+    def test_invalid_elapsed_fails_closed_at_read_layer(
+        self, bad_elapsed
+    ) -> None:
+        """``elapsed_ms`` 必须有限且 ≥ 0（拒 NaN / ±inf / 负数 / 非数字 / bool）。
+
+        Port 已拒绝部分取值 ⇒ 直接构造 DTO 验证读层独立防线（含 NaN 与
+        ``-inf`` 这类比较陷阱）。
+        """
+        with pytest.raises(WorkflowReadError):
+            _node_detail(elapsed_ms=bad_elapsed)
+
+    def test_valid_elapsed_passes(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record(elapsed_ms=12.5)])
+
+        assert env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0].elapsed_ms == 12.5
+
+    def test_dto_carries_no_input_or_project_id_or_orm(self) -> None:
+        """投影面**不含** input / project_id / ORM 内部字段。"""
+        env = _Env(run=_run_record(), nodes=[_node_record(output='{"a":1}')])
+
+        detail = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0]
+        names = set(dataclasses.asdict(detail))
+
+        assert "input" not in names
+        assert "project_id" not in names
+        assert "request_id" not in names
+        assert not hasattr(detail, "input")
+        for value in dataclasses.asdict(detail).values():
+            assert not hasattr(value, "__table__")   # 非 ORM 实体
+            assert not hasattr(value, "execute")     # 非 Session
+            assert not hasattr(value, "connection")  # 非 Connection
+
+    def test_dto_is_frozen(self) -> None:
+        env = _Env(run=_run_record(), nodes=[_node_record()])
+        detail = env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )[0]
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            detail.status = "SUCCEEDED"  # type: ignore[misc]
+
+
+# ============================================================
+# Test 6：按 Node 读取审批（本轮新增）
+# ============================================================
+
+
+class TestApprovalForNode:
+    """``get_approval_for_node``：按 (run, node) 读取 + 归属校验 + 安全投影。
+
+    覆盖任务书 §三.3：approval_id / 所属 Run / Node / status / 已持久化裁决
+    信息 / 裁决时间；**无审批行 ⇒ None**（合法事实）；归属不一致 ⇒ fail closed。
+    明确**不**提供 ``created_at``（Port 未暴露——不伪造）。
+    """
+
+    def test_pending_approval_projection(self) -> None:
+        approval = _approval_record(status="PENDING", resolved_at=None)
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(node_type="APPROVAL", node_id="gate")],
+            by_node={(_RUN_ID, "gate"): approval},
+        )
+
+        detail = env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        )
+
+        assert isinstance(detail, ApprovalDetail)
+        assert detail.approval_id == "wf-ap-1"
+        assert detail.workflow_run_id == _RUN_ID
+        assert detail.node_id == "gate"
+        assert detail.status == "PENDING"
+        assert detail.resolved_at is None      # 未裁决 ⇒ None（不伪造时间）
+        env.assert_no_writes()
+
+    def test_resolved_approval_keeps_persisted_time(self) -> None:
+        resolved = _T0 + timedelta(seconds=30)
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(node_type="APPROVAL", node_id="gate")],
+            by_node={
+                (_RUN_ID, "gate"): _approval_record(
+                    status="APPROVED", resolved_at=resolved
+                )
+            },
+        )
+
+        detail = env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        )
+
+        assert detail is not None
+        assert detail.status == "APPROVED"
+        assert detail.resolved_at == resolved
+
+    def test_missing_approval_row_is_none_not_error(self) -> None:
+        """该节点尚无审批行 ⇒ ``None``（合法事实——不是权限或错误）。"""
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(node_type="APPROVAL", node_id="gate")],
+            by_node={},
+        )
+
+        assert env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        ) is None
+        env.assert_no_writes()
+
+    def test_run_not_found(self) -> None:
+        env = _Env(run=None)
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+            )
+
+    def test_project_mismatch_is_isomorphic_not_found(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            by_node={(_RUN_ID, "gate"): _approval_record()},
+        )
+
+        with pytest.raises(WorkflowReadNotFoundError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID,
+                node_id="gate",
+                project_id="proj-OTHER",
+            )
+
+    def test_cross_run_approval_fails_closed(self) -> None:
+        """存储层返回其它 Run 的审批 ⇒ fail closed（不返回跨 Run 数据）。"""
+        env = _Env(
+            run=_run_record(),
+            by_node={
+                (_RUN_ID, "gate"): _approval_record(
+                    workflow_run_id="wf-run-OTHER"
+                )
+            },
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+            )
+
+    def test_wrong_node_approval_fails_closed(self) -> None:
+        """存储层返回其它 Node 的审批 ⇒ fail closed。"""
+        env = _Env(
+            run=_run_record(),
+            by_node={
+                (_RUN_ID, "gate"): _approval_record(node_id="other-node")
+            },
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+            )
+
+    def test_status_outside_whitelist_fails_closed(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            by_node={(_RUN_ID, "gate"): _approval_record(status="MAYBE")},
+        )
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+            )
+
+    def test_invalid_node_id_fails_closed(self) -> None:
+        env = _Env(run=_run_record())
+
+        with pytest.raises(WorkflowReadError):
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="   ", project_id=_PROJECT
+            )
+
+    def test_store_failure_wrapped_without_body_leak(self) -> None:
+        env = _Env(run=_run_record())
+        env.approval_store.error = WorkflowPortsError(_SECRET)
+
+        with pytest.raises(WorkflowReadError) as info:
+            env.service.get_approval_for_node(
+                workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+            )
+
+        assert _SECRET not in str(info.value)
+        env.assert_no_writes()
+
+    def test_dto_has_no_created_at_and_no_orm(self) -> None:
+        """``ApprovalDetail`` **不含** ``created_at``（Port 未暴露 ⇒ 不伪造）。"""
+        env = _Env(
+            run=_run_record(),
+            by_node={(_RUN_ID, "gate"): _approval_record()},
+        )
+
+        detail = env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        )
+        assert detail is not None
+        names = set(dataclasses.asdict(detail))
+
+        assert "created_at" not in names
+        assert "input" not in names
+        assert "project_id" not in names
+        assert not hasattr(detail, "created_at")
+
+    def test_dto_is_frozen(self) -> None:
+        env = _Env(
+            run=_run_record(),
+            by_node={(_RUN_ID, "gate"): _approval_record()},
+        )
+        detail = env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        )
+        assert detail is not None
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            detail.status = "APPROVED"  # type: ignore[misc]
+
+
+# ============================================================
+# Test 7：新增能力的边界（写方法 / 执行入口 / 敏感字段）
+# ============================================================
+
+
+class TestNewCapabilityBoundaries:
+    def test_new_methods_are_read_only(self) -> None:
+        """新增查询同样零写入调用。"""
+        env = _Env(
+            run=_run_record(),
+            nodes=[_node_record(output='{"a":1}')],
+            by_node={(_RUN_ID, "gate"): _approval_record(node_id="gate")},
+        )
+
+        env.service.get_node_run_details(
+            workflow_run_id=_RUN_ID, project_id=_PROJECT
+        )
+        env.service.get_approval_for_node(
+            workflow_run_id=_RUN_ID, node_id="gate", project_id=_PROJECT
+        )
+
+        env.assert_no_writes()
+        assert env.node_store.list_calls == 1
+        assert env.approval_store.for_node_calls == 1
+
+    def test_new_dtos_expose_no_input_field(self) -> None:
+        for dto in (NodeRunDetail, ApprovalDetail):
+            names = {f.name for f in dataclasses.fields(dto)}
+            assert "input" not in names, dto.__name__
+            assert "request_id" not in names, dto.__name__
+
+    def test_whitelists_imported_from_domain_layer(self) -> None:
+        """白名单来源必须是**域层**（不复制字面量 ⇒ 单一事实来源）。"""
+        tree = ast.parse(_READ_PATH.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported |= {alias.name for alias in node.names}
+                imported.add(node.module)
+
+        assert "NODE_TYPES" in imported
+        assert "WF_ERROR_CODES" in imported
+        assert "validate_json_text" in imported
+
+    def test_no_json_or_math_in_read_layer(self) -> None:
+        """read_service 的 stdlib 白名单有意最小化（JSON 契约归域层）。"""
+        tree = ast.parse(_READ_PATH.read_text(encoding="utf-8"))
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                modules.add(node.module)
+
+        assert "json" not in modules
+        assert "math" not in modules

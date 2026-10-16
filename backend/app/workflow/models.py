@@ -54,6 +54,7 @@ __all__ = [
     "NodeOutput",
     "validate_json_value",
     "serialize_json_value",
+    "validate_json_text",
     # 执行身份
     "NodeExecutionIdentity",
     # DTO
@@ -165,6 +166,51 @@ def serialize_json_value(value: object) -> str:
             f"{JSON_VALUE_MAX_BYTES} bytes（fail-closed：不截断 / 不静默丢弃）"
         )
     return text
+
+
+def validate_json_text(value: object) -> str:
+    """校验**已序列化的 JSON 文本**（读侧内联边界；单一事实来源）。
+
+    与 :func:`serialize_json_value` 构成同一内联契约的两端：
+    写侧保证 ``output`` 是本函数的合法输入；读侧可用本函数在不信任持久化
+    内容时**独立复验**（例如行被绕过仓储直接改写 / 被截断）。
+
+    契约（与 ``ai_ops.workflow_node_run.output`` 列一致）：
+        * ``value`` 必须是 str（``None`` 由调用方自行处理——本函数不接受）；
+        * 去空白后非空；
+        * UTF-8 字节数 ≤ :data:`JSON_VALUE_MAX_BYTES`（32 KiB）；
+        * 能被 :func:`json.loads` 解析为合法 JSON。
+
+    失败语义：任一条不满足 ⇒ :class:`WorkflowOutputError`
+    （**拒绝**；不截断、不清空、不自动修复、不返回部分结果）。
+
+    Args:
+        value: 待校验的 JSON 文本。
+
+    Returns:
+        **原样**返回 ``value``（不重新序列化——避免改变持久化事实）。
+
+    Raises:
+        WorkflowOutputError: 非法 / 超限 / 无法 UTF-8 编码 / 非合法 JSON。
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise WorkflowOutputError("JSON 文本必须是非空 str")
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise WorkflowOutputError(
+            "JSON 文本无法按 UTF-8 编码（fail-closed：不修复）"
+        ) from exc
+    if size > JSON_VALUE_MAX_BYTES:
+        raise WorkflowOutputError(
+            f"JSON 文本大小 {size} bytes 超过内联上限 "
+            f"{JSON_VALUE_MAX_BYTES} bytes（fail-closed：不截断 / 不静默丢弃）"
+        )
+    try:
+        json.loads(value)
+    except ValueError as exc:  # json.JSONDecodeError ⊂ ValueError
+        raise WorkflowOutputError("JSON 文本无法解析（fail-closed：不修复）") from exc
+    return value
 
 
 # ============================================================
