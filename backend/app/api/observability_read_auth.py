@@ -18,8 +18,22 @@ Principal（user_id / username / display_name）
 M1 会话 Cookie
     ↓  auth_dependency.require_session
 部署项目作用域（PROJECT_ID —— 服务端配置，**唯一**来源）
-项目只读（history / persistent metrics）               503 / 404
+    ↓  项目成员授权（ai_ops.authorization_grant：MEMBER / PROJECT_OPS）
+项目只读（history / persistent metrics）               403 / 503
 ```
+
+M2.4（最小 RBAC）后的**系统级**判定为**过渡期并集**：
+
+```text
+显式授予 = (授权表 ai_ops.authorization_grant 含 SYSTEM_OPS)
+           OR (user_id ∈ 旧白名单 OBSERVABILITY_READ_OPS_USER_IDS)
+旧白名单不可用 ⇒ 503（A2 语义逐字保留）
+授权存储不可用 ⇒ 503（M2.4 新增 fail-closed）
+两者皆无       ⇒ 403
+```
+
+`PROJECT_OPS`（项目级）**绝不**获得系统级访问；系统级行没有 `project_id`，
+项目级判定看不到它 —— 两个方向都不存在隐式推导。
 
 与 X-API-Key 域的**关键差别**（如实记录，不混淆）：
 
@@ -57,6 +71,7 @@ from typing import Annotated, Final
 
 from fastapi import Depends, HTTPException, Request, status
 
+from backend.app.api import authorization_dependency as authz
 from backend.app.api.auth_dependency import Principal, require_session
 from backend.app.config import ObservabilityReadSettings, settings
 
@@ -71,6 +86,8 @@ __all__ = [
     "require_observability_ops",
     "require_observability_project_scope",
     "get_observability_project_scope",
+    "OPS_USER_ID_MAX_LENGTH",
+    "OPS_USER_IDS_MAX_ENTRIES",
 ]
 
 #: 固定错误文案（**不**回传白名单内容 / 项目 ID / 目标资源信息）。
@@ -78,6 +95,8 @@ _NOT_AUTHENTICATED_DETAIL: Final[str] = "认证失败：缺少或无效的会话
 _OPS_NOT_CONFIGURED_DETAIL: Final[str] = "运维读取授权未配置（服务不可用）"
 _PROJECT_NOT_CONFIGURED_DETAIL: Final[str] = "部署项目作用域未配置（服务不可用）"
 _FORBIDDEN_DETAIL: Final[str] = "权限不足：需要运维读取授权"
+# M2.4：授权存储不可用 / 项目成员不足的**固定文案**统一由
+# authorization_dependency 持有（授权决策的单一事实来源），本模块不再重复定义。
 
 #: 白名单条目长度上限（与 ``ai_ops.app_user.user_id`` 列宽对齐）。
 OPS_USER_ID_MAX_LENGTH: Final[int] = 64
@@ -157,41 +176,77 @@ def _resolve_ops_user_ids() -> frozenset[str]:
         ) from None
 
 
-async def require_observability_ops(request: Request) -> None:
-    """运维只读端点统一的认证 + 运维授权依赖（装饰器级；**不**产生返回值）。
+def _has_system_ops_grant(user_id: str) -> bool:
+    """授权表是否显式授予 ``SYSTEM_OPS``（存储不可用 ⇒ 503 fail closed）。
 
-    判定顺序：会话 ⇒ 白名单可用性 ⇒ 白名单成员。任一步失败即抛出，
-    **不会**继续执行端点体（无部分结果、无降级）。
+    判定**委托**给 :func:`authorization_dependency.enforce_system_ops_grant`
+    —— 系统级授权决策只保留**一份实现**，避免两处逻辑分歧。
+    """
+    return authz.enforce_system_ops_grant(user_id)
+
+
+async def require_observability_ops(request: Request) -> None:
+    """运维只读端点统一的认证 + **系统级**授权依赖（装饰器级；无返回值）。
+
+    判定顺序（M2.4 D3 —— 过渡期并集，任一步失败即抛出，**无部分结果、无降级**）：
+
+        1. 会话缺失 / 无效 / 过期 / 已撤销   ⇒ **401**
+        2. 会话服务不可用                     ⇒ **503**
+        3. 旧白名单缺失 / 空白 / 无法解析     ⇒ **503**（A2 语义逐字保留）
+        4. 授权存储不可用                     ⇒ **503**（M2.4 新增 fail-closed）
+        5. 显式授予 = (授权表含 ``SYSTEM_OPS``) **OR** (``user_id`` ∈ 旧白名单)
+        6. 两者皆无                           ⇒ **403**
+
+    铁律：``PROJECT_OPS``（项目级）**绝不**获得系统级访问；旧白名单是**显式**
+    部署级授予，不是隐式回退；``membership`` 缺失不会回退为放行。
 
     Raises:
         HTTPException 401: 会话缺失 / 无效 / 过期 / 已撤销。
-        HTTPException 403: 已认证但不在运维白名单。
-        HTTPException 503: 会话服务不可用，或白名单未配置 / 无法解析。
+        HTTPException 403: 已认证但既无 ``SYSTEM_OPS`` 授权也不在旧白名单。
+        HTTPException 503: 会话服务不可用 / 旧白名单不可用 / 授权存储不可用。
     """
     principal = _require_authenticated(request)
+
+    # 3) 旧白名单可用性（A2 变更前的判定顺序保持不变：不可用 ⇒ 503）
     ops_user_ids = _resolve_ops_user_ids()
 
-    if principal.user_id not in ops_user_ids:
-        # 只记录"拒绝"事实——**不**记录 user_id / 白名单内容
-        logger.warning("observability ops read rejected")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=_FORBIDDEN_DETAIL,
-        )
+    # 4) 授权表可用性 + SYSTEM_OPS 判定（存储不可用 ⇒ 503）
+    granted_by_table = _has_system_ops_grant(principal.user_id)
+
+    # 5) 过渡期并集：两个来源都是**显式**授予
+    if granted_by_table or principal.user_id in ops_user_ids:
+        return
+
+    # 6) 拒绝（只记录"拒绝"事实——**不**记录 user_id / 白名单内容）
+    logger.warning("observability ops read rejected")
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=_FORBIDDEN_DETAIL,
+    )
 
 
 async def require_observability_project_scope(request: Request) -> None:
-    """项目只读端点（history / persistent metrics）统一的认证 + 作用域依赖。
+    """项目只读端点（history / persistent metrics）认证 + 作用域 + **成员**依赖。
 
-    作用域**只**来自服务端 ``PROJECT_ID``；客户端 Query / Header / Body
-    参数既不能覆盖也不能扩宽它。通过后把作用域写入 ``request.state``，
-    供端点体读取（端点因此**无需**新增作用域形参）。
+    判定顺序（M2.4 D2 —— 项目成员授权接入）：
+
+        1. 会话缺失 / 无效 / 过期 / 已撤销   ⇒ **401**
+        2. 会话服务不可用                     ⇒ **503**
+        3. 部署项目作用域缺失 / 空白          ⇒ **503**
+        4. 授权存储不可用                     ⇒ **503**（fail closed）
+        5. 调用者**不是**该项目成员           ⇒ **403**
+        6. 通过 ⇒ 作用域写入 ``request.state``
+
+    作用域**只**来自服务端 ``PROJECT_ID``（不来自客户端 Query / Header /
+    Body）；``MEMBER`` 与 ``PROJECT_OPS`` 均满足成员判定（后者是前者的超集）。
+    本项目**不**因持有系统级 ``SYSTEM_OPS`` 而自动成为项目成员。
 
     Raises:
         HTTPException 401: 会话缺失 / 无效 / 过期 / 已撤销。
-        HTTPException 503: 会话服务不可用，或部署项目作用域缺失 / 空白。
+        HTTPException 403: 已认证但不是该项目成员。
+        HTTPException 503: 会话服务不可用 / 作用域未配置 / 授权存储不可用。
     """
-    _require_authenticated(request)
+    principal = _require_authenticated(request)
 
     raw = get_observability_project_id()
     if raw is None or not raw.strip():
@@ -202,7 +257,17 @@ async def require_observability_project_scope(request: Request) -> None:
         )
 
     # 服务端唯一授权作用域（trim 后使用；客户端不可主张）
-    request.state.observability_project_scope = raw.strip()
+    scope = raw.strip()
+
+    # 项目成员判定（存储不可用 ⇒ 503；无授权 ⇒ 403）
+    #
+    # 判定**委托**给 authorization_dependency.enforce_project_access
+    # —— 项目级授权决策只保留**一份实现**（与 require_project_member /
+    # require_project_ops 完全同源），避免两处逻辑分歧。
+    authz.enforce_project_access(principal.user_id, scope, ops_only=False)
+
+    # 仅在授权通过后才把作用域放进 request.state（端点体据此读数据）
+    request.state.observability_project_scope = scope
 
 
 def get_observability_project_scope(request: Request) -> str:

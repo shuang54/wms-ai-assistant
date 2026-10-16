@@ -1471,3 +1471,59 @@ PROJECT_ID=<部署唯一授权项目>                        # 见 §12.4
 `tests/test_tool_observability_history_api_db.py`、
 `tests/test_tool_observability_history_filtering_db.py`、
 `tests/test_tool_observability_persistent_metrics_db.py`。
+---
+
+## 15. 用户—项目授权模型（最小 RBAC；Phase 7 Recovery M2.4）
+
+**新增授权要求**（对 M2.3 A2 契约的**加强**，不是放宽）：
+
+| Method | Path | M2.4 授权要求 |
+| --- | --- | --- |
+| GET | `/api/usage/analytics` | 会话 + 系统级：`SYSTEM_OPS` 授权行 **OR** 旧白名单 |
+| GET | `/api/observability/tools` | 同上 |
+| GET | `/api/observability/tools/metrics` | 同上 |
+| GET | `/api/observability/assistant-trace/{id}` | 同上 |
+| GET | `/api/observability/assistant-timeline/{id}` | 同上 |
+| GET | `/api/observability/tools/history` | 会话 + 服务端 `PROJECT_ID` + 该项目 `MEMBER`/`PROJECT_OPS` |
+| GET | `/api/observability/tools/metrics/persistent` | 同上 |
+
+### 15.1 状态码
+
+| 场景 | 状态码 | 说明 |
+| --- | --- | --- |
+| 匿名 / 无效 / 过期 / 已撤销会话 | `401` | 固定文案；认证前零数据读取 |
+| 会话服务不可用 | `503` | fail closed |
+| 旧白名单缺失 / 空白 / 无法解析 | `503` | **A2 语义逐字保留**（并集不削弱它） |
+| 授权存储不可用 | `503` | M2.4 新增 fail closed |
+| 已认证但无系统级授权（也不在旧白名单） | `403` | 固定文案 |
+| 已认证但不是该项目成员（项目级端点） | `403` | 固定文案（新增于 M2.4） |
+| 服务端 `PROJECT_ID` 缺失 / 空白 | `503` | 固定文案 |
+| 其余（DB 不可用 / 非法参数 / 未知异常） | `502` / `422` / `500` | 与 A2 前一致 |
+
+### 15.2 数据与授予方式
+
+- 授权关系存于 `ai_ops.authorization_grant`（`PROJECT`+`MEMBER`/
+  `PROJECT_OPS`+非空 `project_id`，或 `SYSTEM`+`SYSTEM_OPS`+NULL `project_id`）；
+- **没有**公开授权接口；由管理员经 `python -m backend.app.cli.grant_role` 写入；
+- M2.4 **不**新增任何环境变量；`OBSERVABILITY_READ_OPS_USER_IDS` 仍为过渡期
+  必填项（不可用时系统级端点仍 503）；
+- 判定接口**没有** role / membership 入参 ⇒ 客户端无法主张角色或成员身份。
+
+### 15.3 不变项
+
+成功 DTO 与字段白名单、分页与排序语义、空结果语义、`project_id IS NULL`
+记录不可见、GET 不适用 CSRF、502 不回退内存视图 —— **全部不变**。
+旧白名单**从**不授予项目级访问（两个方向都不存在隐式推导）。
+
+### 15.4 边界（不宣称已达成）
+
+- 仍是**部署级**授权 + 单部署项目作用域，**不是**组织 / 租户 / 角色继承模型；
+- 无管理 UI；`PROJECT_OPS` 在当前两个项目级端点上与 `MEMBER` 访问权限相同；
+- 资源级项目归属（G5）仍未实现；HTTPS 边界仍 **NOT VERIFIED**；
+- 详见 `docs/security.md` §11。
+
+### 15.5 测试证据
+
+`tests/test_authorization_service.py`（35）·
+`tests/test_authorization_api_enforcement.py`（50）·
+`tests/test_authorization_grant_db.py`（26，专用 PostgreSQL）。

@@ -295,7 +295,18 @@ async def tool_execution_metrics() -> ToolObservabilityMetricsResponse:
     responses={
         200: {"description": "数据库中服务端项目范围内的 Tool 执行历史"},
         401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
-        503: {"description": "部署项目作用域未配置（fail closed；零业务执行）"},
+        403: {
+            "description": (
+                "已认证但不是该项目成员（M2.4 项目级授权；固定文案；"
+                "零业务执行）"
+            )
+        },
+        503: {
+            "description": (
+                "部署项目作用域未配置，或授权存储不可用（fail closed；"
+                "零业务执行）"
+            )
+        },
         422: {"description": "limit / offset / 过滤参数非法（FastAPI 校验）"},
         502: {"description": "持久历史不可用（数据库未配置 / 查询失败）"},
         500: {"description": "Tool 观测数据不可用"},
@@ -426,7 +437,18 @@ async def list_tool_execution_history(
     responses={
         200: {"description": "数据库中服务端项目范围内的 Tool 执行聚合指标"},
         401: {"description": "未认证 / 会话无效（固定文案；零业务执行）"},
-        503: {"description": "部署项目作用域未配置（fail closed；零业务执行）"},
+        403: {
+            "description": (
+                "已认证但不是该项目成员（M2.4 项目级授权；固定文案；"
+                "零业务执行）"
+            )
+        },
+        503: {
+            "description": (
+                "部署项目作用域未配置，或授权存储不可用（fail closed；"
+                "零业务执行）"
+            )
+        },
         422: {"description": "过滤参数非法（FastAPI Query 校验）"},
         502: {"description": "持久指标不可用（数据库未配置 / 查询失败）"},
         500: {"description": "Tool 观测数据不可用"},

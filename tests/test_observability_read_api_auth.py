@@ -85,11 +85,16 @@ from backend.app.services.tool_observability_snapshot import (
 from tests.api_session_auth import (
     FakeSessionService,
     SessionTestClient,
+    install_authorization_grants,
     install_fake_session_service,
     install_observability_ops_allowlist,
     install_observability_project_scope,
 )
 from tests.conversation_auth_support import USER_IDS
+from backend.app.db.models.authorization_grant import (
+    PROJECT_ROLE_MEMBER,
+    PROJECT_ROLE_PROJECT_OPS,
+)
 
 # ---- 七个端点（与实施任务书 §三 一致）----
 _USAGE_PATH = "/api/usage/analytics"
@@ -142,25 +147,41 @@ def anonymous_client() -> TestClient:
 
 @pytest.fixture()
 def session_client(monkeypatch: pytest.MonkeyPatch) -> SessionTestClient:
-    """已登录但**不在**运维白名单（运维白名单配置为不含 alice）。"""
+    """已登录但**不在**运维白名单、**无**任何授权行（M2.4）。
+
+    语义：bob 既不在 ``OBSERVABILITY_READ_OPS_USER_IDS``，也没有
+    ``SYSTEM_OPS``，也不是任何项目成员 ⇒ 系统级与项目级端点都应拒绝。
+    """
     install_fake_session_service(monkeypatch)
     install_observability_ops_allowlist(monkeypatch, {USER_IDS["bob"]})
+    install_authorization_grants(monkeypatch)
     return SessionTestClient(app)
 
 
 @pytest.fixture()
 def ops_client(monkeypatch: pytest.MonkeyPatch) -> SessionTestClient:
-    """已登录且**在**运维白名单（alice）。"""
+    """已登录且**在**旧白名单（alice）；授权表为空（过渡期并集的旧白名单分支）。"""
     install_fake_session_service(monkeypatch)
     install_observability_ops_allowlist(monkeypatch, {USER_IDS["alice"]})
+    install_authorization_grants(monkeypatch)
     return SessionTestClient(app)
 
 
 @pytest.fixture()
 def project_scope_client(monkeypatch: pytest.MonkeyPatch) -> SessionTestClient:
-    """已登录 + 服务端项目作用域（history / persistent metrics）。"""
+    """已登录 + 服务端项目作用域 + 该项目 ``MEMBER``（M2.4 D2）。
+
+    M2.4 起项目级端点要求成员授权，因此本夹具同时安装
+    ``(alice, vietnam-wms) → MEMBER``。
+    """
     install_fake_session_service(monkeypatch)
     install_observability_project_scope(monkeypatch, _SERVER_PROJECT_ID)
+    install_authorization_grants(
+        monkeypatch,
+        project_roles={
+            (USER_IDS["alice"], _SERVER_PROJECT_ID): {PROJECT_ROLE_MEMBER}
+        },
+    )
     return SessionTestClient(app)
 
 
@@ -639,9 +660,19 @@ class TestNonOpsUserForbidden:
     def test_non_ops_user_still_can_use_project_scoped_endpoint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """项目作用域端点只要求会话（不要求运维白名单）。"""
+        """项目作用域端点要求会话 + **该项目成员**，但**不**要求系统运维。
+
+        M2.4 D2：成员授权（``MEMBER``）即满足；系统级 ``SYSTEM_OPS``
+        与项目级授权相互独立。
+        """
         install_fake_session_service(monkeypatch)
         install_observability_project_scope(monkeypatch, _SERVER_PROJECT_ID)
+        install_authorization_grants(
+            monkeypatch,
+            project_roles={
+                (USER_IDS["alice"], _SERVER_PROJECT_ID): {PROJECT_ROLE_MEMBER}
+            },
+        )
         persistent = _install_persistent_service(monkeypatch)
         client = SessionTestClient(app)
 

@@ -65,10 +65,17 @@ from backend.app.tools.get_inventory import GET_INVENTORY_DEFINITION
 from backend.app.tools.registry import ToolRegistry
 from tests.api_session_auth import SessionTestClient as TestClient
 from tests.api_session_auth import observability_ops_session  # noqa: F401 —— pytest fixture
+from tests.api_session_auth import (  # noqa: F401,E402
+    observability_project_scope_session,
+)
 
 # A1（M2.3）：/api/ai/chat 不再允许匿名执行 ⇒ 使用已认证客户端。
 # A2（M2.3）：assistant-trace 端点限定为运维专用 ⇒ 需要运维白名单。
-pytestmark = pytest.mark.usefixtures("observability_ops_session")
+# M2.4 D2：本文件还复核两个**项目级**端点 ⇒ 需"项目作用域 + 该项目 MEMBER"。
+pytestmark = pytest.mark.usefixtures(
+    "observability_ops_session",
+    "observability_project_scope_session",
+)
 
 _TRACE_ENDPOINT = "/api/observability/assistant-trace"
 _RAG_QUESTION = "采购入库的操作步骤是什么"

@@ -25,6 +25,7 @@ from backend.app.db.models.agent_approval import AgentApproval
 from backend.app.db.models.agent_tool_result import AgentToolResult
 from backend.app.db.models.app_user import AppUser
 from backend.app.db.models.assistant_outcome_record import AssistantOutcomeRecord
+from backend.app.db.models.authorization_grant import AuthorizationGrant
 from backend.app.db.models.conversation import Conversation
 from backend.app.db.models.conversation_evidence import ConversationEvidenceRecord
 from backend.app.db.models.conversation_turn import ConversationTurn
@@ -91,6 +92,9 @@ _MODELS: tuple[type, ...] = (
     UserSession,
     # 资源归属映射（独立表；conversation / agent_run 等冻结表**不加列**）。
     ResourceOwner,
+    # Phase 7 Recovery M2.4：最小 RBAC 授权关系（**全新**表；显式 scope_type；
+    # 不改任何既有表；随 create_all 自动创建，既有库首次 init_db() 即补建）。
+    AuthorizationGrant,
 )
 
 
@@ -103,6 +107,7 @@ __all__ = [
     "AgentApproval",
     "AppUser",
     "AssistantOutcomeRecord",
+    "AuthorizationGrant",
     "Conversation",
     "ConversationEvidenceRecord",
     "ConversationTurn",

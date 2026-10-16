@@ -323,3 +323,139 @@ DB 级断言见 `tests/test_tool_observability_history_api_db.py`
 `tests/test_tool_observability_history_filtering_db.py`（服务端作用域 +
 客户端 `project_id` 被忽略 + 范围外记录不可见）、
 `tests/test_tool_observability_persistent_metrics_db.py`（聚合只在授权范围内）。
+---
+
+## 11. 用户—项目授权模型（最小 RBAC；Phase 7 Recovery M2.4；已实现）
+
+M2.3 A2 的运维授权是**部署级**配置（`OBSERVABILITY_READ_OPS_USER_IDS`），
+不是用户级授权。M2.4 引入**持久化、显式**的授权关系与统一判定服务，
+并把它接入既有的两个项目级只读端点。
+
+### 11.1 授权数据模型（单表 + 显式 scope）
+
+`ai_ops.authorization_grant`（**唯一**新增表；不改任何既有表）：
+
+| 列 | 说明 |
+| --- | --- |
+| `user_id` | 被授权用户（`ai_ops.app_user.user_id`；服务端签发 uuid4；无 FK） |
+| `scope_type` | `PROJECT` / `SYSTEM`（**显式**；禁止从 `project_id` 是否为 NULL 推断） |
+| `project_id` | `PROJECT` ⇒ 非空；`SYSTEM` ⇒ **必须** NULL |
+| `role` | `PROJECT` ⇒ `MEMBER` / `PROJECT_OPS`；`SYSTEM` ⇒ `SYSTEM_OPS` |
+| `created_at` | 登记时间 |
+
+### 11.2 数据库级强制（不依赖应用代码纪律）
+
+仅允许三种组合，其余由 **复合 CHECK** 拒绝写入：
+
+```text
+PROJECT + MEMBER      + 非空 project_id
+PROJECT + PROJECT_OPS + 非空 project_id
+SYSTEM  + SYSTEM_OPS  + NULL project_id
+```
+
+⇒ `project_id IS NULL` 的**唯一**合法解释是 `SYSTEM` 作用域。
+"项目级权限通过 NULL 或缺失记录隐式升级为系统级"在**写入侧即不可能**
+（不是读侧解释约定）。
+
+唯一性用**两个 partial unique index**（PostgreSQL 视 NULL 互不相等 ⇒
+单一 `UNIQUE(user_id, project_id, role)` 无法阻止重复的 SYSTEM 行）：
+
+```text
+uq_authorization_grant_project  UNIQUE(user_id, project_id, role) WHERE scope_type='PROJECT'
+uq_authorization_grant_system   UNIQUE(user_id, role)             WHERE scope_type='SYSTEM'
+```
+
+读侧另有一致性防御：查询命中的行若不符合 scope ↔ role ↔ project_id 一致性
+（例如约束被删后植入的 `PROJECT` 行携带 `SYSTEM_OPS`），仓储**拒绝读取**
+（不猜测、不静默丢弃、不降级为"无授权"）。
+
+### 11.3 授权判定（`AuthorizationService`）
+
+```text
+project_role(user_id, project_id)       该项目上的角色（无 ⇒ None）
+is_project_member(...)                  MEMBER 或 PROJECT_OPS
+is_project_ops(...)                     仅 PROJECT_OPS
+is_system_ops(user_id)                  仅 SYSTEM 作用域的 SYSTEM_OPS
+```
+
+铁律：
+
+- 身份**只**来自服务端会话 `Principal.user_id`（客户端不可主张）；
+- 判定接口**没有** role / membership 入参 ⇒ 客户端伪造角色在结构上不可能；
+- **项目级 ≠ 系统级**（两个方向都不得推导）：
+  `PROJECT_OPS`（任意项目、任意数量）**不**等于 `SYSTEM_OPS`；
+  `SYSTEM_OPS` **不**等于任意项目成员；
+- 缺少授权行 = 无授权（`None` / `False`），**绝不**回退默认放行；
+- 授权存储**不可用** ⇒ 503 fail closed；
+- 授权存储**未配置**（无 `DATABASE_URL`）⇒ 等同于"无授权"（**不**报 503）——
+  这是无 DB 部署的既有形态，此时判定完全由显式配置来源（旧白名单）决定。
+
+### 11.4 端点适用
+
+| 端点 | 授权要求 |
+| --- | --- |
+| 5 个全局视图（usage / tools / metrics / trace / timeline） | 会话 + **系统级**：`SYSTEM_OPS` **OR** 旧白名单 |
+| `/api/observability/tools/history` | 会话 + 服务端 `PROJECT_ID` + 该项目 `MEMBER`/`PROJECT_OPS` |
+| `/api/observability/tools/metrics/persistent` | 同上 |
+
+项目级端点的 `project_id` 只来自服务端 `PROJECT_ID`；客户端 `project_id`
+查询参数已在 M2.3 A2 移除，且**不**参与授权判定。
+
+### 11.5 过渡期并集与旧配置废弃条件
+
+系统级端点的判定顺序（任一步失败即停止，无部分结果）：
+
+```text
+1. 会话缺失 / 无效 / 过期 / 已撤销   ⇒ 401
+2. 会话服务不可用                     ⇒ 503
+3. 旧白名单缺失 / 空白 / 无法解析     ⇒ 503   （A2 语义逐字保留，未被削弱）
+4. 授权存储不可用                     ⇒ 503   （M2.4 新增 fail closed）
+5. 显式授予 = (授权表 SYSTEM_OPS) OR (user_id ∈ 旧白名单)
+6. 两者皆无                           ⇒ 403
+```
+
+**旧配置废弃条件**（三者同时满足才可废弃；本阶段**不**废弃、**不**删除配置）：
+
+1. 所有目标部署已在 `ai_ops.authorization_grant` 写入对应 `SYSTEM_OPS` 行；
+2. `OBSERVABILITY_READ_OPS_USER_IDS` 已连续两个发布周期为空或与授权表一致；
+3. 存在独立授权的"废弃旧白名单"任务书。
+
+### 11.6 授权授予（受控管理员入口）
+
+**没有公开授权接口**；授权只能由管理员经 CLI 显式写入：
+
+```bash
+python -m backend.app.cli.grant_role --user-id <uuid> --role SYSTEM_OPS
+python -m backend.app.cli.grant_role --user-id <uuid> --project <pid> --role MEMBER
+python -m backend.app.cli.grant_role --user-id <uuid> --project <pid> --role PROJECT_OPS
+```
+
+- 幂等：重复授予同一组合不报错、**不**覆盖、**不**新增第二行；
+- `SYSTEM_OPS` **禁止**携带 `--project`（防止 NULL 歧义）；
+- M2.4 **不**为任何既有用户（含旧白名单用户）自动授予角色 —— 未知映射
+  保留为**待配置项**，由部署方显式登记。
+
+### 11.7 残留风险（明确记录，不得表述为已解决）
+
+1. 旧白名单仍是**部署级**授予（不是用户级 RBAC），其用户的具体角色映射
+   **未从仓库证明**；M2.4 不自动授予，故过渡期内两套来源并存。
+2. `PROJECT_OPS` 与 `MEMBER` 在**当前**两个项目级端点上访问权限相同
+   （端点要求"至少为成员"）；`PROJECT_OPS` 为更高层级，供后续更严端点使用。
+3. **不**实现组织树 / 租户树 / 角色继承；无管理 UI。
+4. 资源级项目归属（G5：`llm_usage_record` / `assistant_outcome_record` 的
+   `project_id`）**仍未实现**，M2.4 未触碰该 schema。
+5. HTTPS / 网络边界仍为 **NOT VERIFIED** ⇒ `PRODUCTION_DEPLOYMENT` 仍 **BLOCKED**。
+
+### 11.8 测试证据
+
+- `tests/test_authorization_service.py`（35 例）：正向授权、跨项目隔离、
+  无授权拒绝、项目级 ≠ 系统级（双向）、换 `project_id` 不扩权、伪造角色
+  结构性不可能、fail closed（存储故障 / 数据损坏）、参数与模型约束契约。
+- `tests/test_authorization_api_enforcement.py`（50 例）：5 个系统级端点的
+  并集语义（授权表分支 / 旧白名单分支）、项目级 `MEMBER`/`PROJECT_OPS`/非成员、
+  客户端 `project_id` 不能替代成员授权、503 语义回归、零业务读取、不泄漏。
+- `tests/test_authorization_grant_db.py`（26 例，**专用 PostgreSQL**
+  `localhost:5433/wms_ai_test`，含隔离硬断言）：写入 / 读取 / 幂等 /
+  partial unique 防重、数据库 CHECK 拒绝全部非法组合、用户与项目隔离、
+  系统级与项目级独立、读侧损坏行防御、真实不可达存储 fail closed、
+  `init_db` 可重复执行、授权操作不影响观测表。
