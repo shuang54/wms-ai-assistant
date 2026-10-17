@@ -4,70 +4,134 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
-    <!-- 只读运维页面：无第三方资源（不外链 CDN / 字体 / 分析），避免数据外泄 -->
+    <!-- 只读运维工作台：无第三方资源（不外链 CDN / 字体 / 分析），避免数据外泄 -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
     />
-    <title>Workflow Run Detail · WMS AI Assistant</title>
+    <title>Workflow 运维工作台 · WMS AI Assistant</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <header class="page-header">
-      <h1>Workflow Run Detail</h1>
+      <div class="title-row">
+        <h1>Workflow 运维工作台</h1>
+        <span id="current-project" class="project-chip">项目：未指定</span>
+      </div>
       <p class="muted">
-        只读运行详情：输入已有的 Workflow Run ID 查看状态、节点执行记录、
-        时间线与审批情况。<strong>本页面不提供任何执行或写入操作。</strong>
+        只读运行详情：输入 Project ID 与已有的 Workflow Run ID，查看状态、节点执行
+        历史、时间线与审批情况。<strong>本页面不提供任何执行或写入操作。</strong>
       </p>
     </header>
 
     <!--
-      真实数据访问状态（**如实标记**，见 docs/api.md §8 / docs/security.md §7）：
-      Workflow Read API 使用服务到服务的 X-API-Key，仓库内没有面向浏览器的
-      受信任代理与会话化读取路径，也没有 CORS 配置。因此本页面在真实环境中
-      查询会得到 401 —— 该边界不会被绕过，密钥不会进入浏览器。
+      真实数据访问方式（**如实标记**）：
+      本页面经浏览器**受保护**只读面 /api/ui/projects/{project_id}/... 读取，
+      认证 = 既有 M1 会话 Cookie（HttpOnly，同源自动携带），授权 = 既有 M2.4
+      项目成员授权，两者均由**服务端**执行。浏览器中**不存在**任何服务端
+      密钥；路径中的 project_id 只是请求目标，不构成授权结论。
     -->
     <aside class="notice" id="access-notice" role="note">
-      <strong>数据访问尚未接通（如实标记）：</strong>
-      后端 Workflow Read API 要求 <code>X-API-Key</code> 服务间凭据。出于安全
-      约束，<strong>该密钥不会出现在浏览器中</strong>（不写入源码、构建产物、
-      本地存储或 Cookie）。本页面的结构、状态与错误处理均已就绪；在缺少
-      受信任服务端代理 / 会话化读取路径之前，真实查询将返回
-      <code>401</code> 并显示对应错误状态。详见
-      <code>docs/decisions/Phase/</code> 下本阶段报告。
+      <strong>数据访问方式（会话 + 项目成员授权）：</strong>
+      本页面经浏览器只读面
+      <code>/api/ui/projects/{project_id}/workflow-runs/…</code> 读取，认证使用
+      <strong>既有登录会话</strong>（HttpOnly Cookie，同源自动携带），授权使用
+      <strong>既有项目成员授权</strong>——两者均由服务端判定。浏览器中
+      <strong>不存放任何服务端密钥</strong>（不写入源码、构建产物、本地存储或
+      Cookie）。<br />
+      因此：<strong>未登录 ⇒ 需要登录提示</strong>；<strong
+        >会话过期 ⇒ 重新登录提示</strong
+      >；<strong>非该项目成员 ⇒ 权限错误</strong>。路径中的
+      <code>project_id</code> 仅表示请求目标，服务端会独立校验成员资格。
     </aside>
 
     <form id="run-form" class="query" autocomplete="off" novalidate>
-      <label for="run-id-input">Workflow Run ID</label>
-      <input
-        id="run-id-input"
-        name="run_id"
-        type="text"
-        inputmode="text"
-        maxlength="64"
-        placeholder="例如 wf-2026-01-01-abc123"
-        aria-describedby="run-id-help"
-        required
-      />
-      <button id="run-submit" type="submit">查询</button>
-      <button id="run-refresh" type="button" class="secondary">重新加载</button>
-      <span id="run-id-help" class="muted"
-        >Run ID 由 Workflow Command API 返回；本页面不提供 Run 列表。</span
-      >
+      <div class="field">
+        <label for="project-id-input">Project ID</label>
+        <input
+          id="project-id-input"
+          name="project_id"
+          type="text"
+          inputmode="text"
+          maxlength="128"
+          placeholder="例如 vietnam-wms"
+          aria-describedby="query-help"
+          required
+        />
+      </div>
+      <div class="field grow">
+        <label for="run-id-input">Workflow Run ID</label>
+        <input
+          id="run-id-input"
+          name="run_id"
+          type="text"
+          inputmode="text"
+          maxlength="64"
+          placeholder="例如 wf-2026-01-01-abc123"
+          aria-describedby="query-help"
+          required
+        />
+      </div>
+      <div class="query-actions">
+        <button id="run-submit" type="submit">查询</button>
+        <button id="run-refresh" type="button" class="secondary">重新加载</button>
+      </div>
+      <p id="query-help" class="muted full">
+        Run ID 由 Workflow Command API 返回；本页面不提供 Run 列表。项目 ID 仅指定
+        读取目标，服务端会校验您的成员资格。
+      </p>
     </form>
+
+    <!-- 节点状态筛选条（**纯前端**过滤；不重新请求、不改服务端数据） -->
+    <section id="filter-bar" class="filter-bar" aria-label="节点状态筛选">
+      <div class="field">
+        <label for="node-filter">节点状态筛选</label>
+        <select id="node-filter" aria-describedby="filter-meta">
+          <option value="all">全部状态</option>
+          <option value="running">运行中</option>
+          <option value="succeeded">已完成</option>
+          <option value="failed">失败</option>
+          <option value="waiting_approval">等待审批</option>
+          <option value="unknown">未知状态</option>
+        </select>
+      </div>
+      <button id="node-filter-clear" type="button" class="secondary small">
+        清除筛选
+      </button>
+      <span id="filter-meta" class="muted" role="status" aria-live="polite"
+        >尚未加载数据</span
+      >
+    </section>
+
+    <!--
+      Graph View 说明（**如实标注**）：
+      节点与连接线来自服务器端工作流定义（已做无环 / 可达性校验），
+      **不**按 Attempt 先后顺序推断边；拓扑不可用（定义未注册 /
+      版本不一致）时不绘制任何连接线，并给出明确提示。
+    -->
+    <p class="graph-intro muted">
+      Graph View：节点与连接线来自服务器端<strong>工作流定义</strong>（真实拓扑，
+      已做无环 / 可达性校验）——<strong>不</strong>按 Attempt 先后顺序推断边。
+      拓扑不可用时（定义未注册 / 版本不一致）不绘制连接线并给出明确提示。
+    </p>
+
     <p id="current-run" class="muted">尚未查询任何 Run</p>
 
     <main id="panels" aria-live="polite">
       <!-- 初始状态：仅静态引导；数据由 app.js 渲染（不预置任何虚构数据） -->
       <div id="status-region" role="status">
         <p class="status muted">
-          请输入已有的 Workflow Run ID 并查询——页面只做只读展示，不会触发任何执行。
+          请输入 Project ID 与已有的 Workflow Run ID 并查询——页面只做只读展示，
+          不会触发任何执行。
         </p>
       </div>
     </main>
 
     <footer class="page-footer muted">
-      <span>只读接口：Run 详情 / 节点执行记录 / 时间线 / 审批详情</span>
+      <span
+        >只读接口：Run 详情 / 节点执行记录 / 时间线 / 审批详情 · 筛选与定位仅影响
+        前端展示</span
+      >
     </footer>
 
     <script type="module" src="./js/app.js"></script>

@@ -1,9 +1,10 @@
 /**
  * 控制器纯逻辑测试 —— `node --test`（Node 内置，**零依赖**）。
  *
- * 覆盖（Phase 7 Workflow UI Step 1 §八 1/7/8/9/10/11/12）：
- *   查询正常 · Loading · 404 · 401 · 502 · 刷新 · 重复提交防护 ·
- *   竞态（过期响应不得覆盖新查询）· 错误不泄漏内部信息。
+ * 覆盖（Step 2 §七.C + §八）：
+ *   查询正常 · Loading · 401（需登录 / 会话过期）· 403（非成员）· 404 · 502 ·
+ *   刷新 · 重复提交防护 · 竞态（过期响应不得覆盖新查询）·
+ *   错误不泄漏内部信息 · 只以 (projectId, runId) 调用读取实现。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,13 +13,23 @@ import { ReadError } from '../js/api-client.js';
 import { createController, normalizeError } from '../js/controller.js';
 import { PHASE } from '../js/state.js';
 
+const PROJECT = 'proj-a';
+const RUN = 'wf-run-1';
+
+const SAMPLE = {
+  run: { workflow_run_id: RUN },
+  nodes: [],
+  timeline: [],
+  approvalsByNode: {},
+};
+
 /** 受控的读取替身（记录调用；可手动 settle）。 */
 function makeReader() {
   const calls = [];
   let resolveNext;
   let rejectNext;
-  const reader = (runId) => {
-    calls.push(runId);
+  const reader = (projectId, runId) => {
+    calls.push([projectId, runId]);
     return new Promise((resolve, reject) => {
       resolveNext = resolve;
       rejectNext = reject;
@@ -32,34 +43,41 @@ function makeReader() {
   };
 }
 
-const SAMPLE = { run: { workflow_run_id: 'r1' }, nodes: [], timeline: [], approvalsByNode: {} };
-
-test('正常查询：loading → loaded，并记录 Run ID', async () => {
+test('正常查询：loading → loaded，并记录（项目, Run）', async () => {
   const reader = makeReader();
-  const states = [];
+  const phases = [];
   const controller = createController({
     readRun: reader.reader,
-    onChange: (state) => states.push(state.phase),
+    onChange: (state) => phases.push(state.phase),
   });
 
-  const pending = controller.submit('  r1  ');
+  const pending = controller.submit(`  ${PROJECT}  `, `  ${RUN}  `);
   assert.equal(controller.getState().phase, PHASE.LOADING);
   reader.resolve(SAMPLE);
   const result = await pending;
 
   assert.deepEqual(result, { accepted: true, applied: true });
   assert.equal(controller.getState().phase, PHASE.LOADED);
-  assert.equal(controller.getState().runId, 'r1'); // 已 trim
-  assert.deepEqual(states, [PHASE.LOADING, PHASE.LOADED]);
-  assert.deepEqual(reader.calls, ['r1']); // 只发一次请求
+  assert.equal(controller.getState().projectId, PROJECT); // 已 trim
+  assert.equal(controller.getState().runId, RUN);
+  assert.deepEqual(phases, [PHASE.LOADING, PHASE.LOADED]);
+  assert.deepEqual(reader.calls, [[PROJECT, RUN]]);       // 只发一次
 });
 
-test('空输入：拒绝提交且不发请求', async () => {
+test('空输入：项目 ID 或 Run ID 缺失即拒绝提交且不发请求', async () => {
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  for (const value of ['', '   ', null, undefined, 42]) {
-    const result = await controller.submit(value);
+  const cases = [
+    ['', ''],
+    ['   ', RUN],
+    [PROJECT, '   '],
+    [null, RUN],
+    [PROJECT, undefined],
+    [42, RUN],
+  ];
+  for (const [project, run] of cases) {
+    const result = await controller.submit(project, run);
     assert.deepEqual(result, { accepted: false, applied: false });
   }
   assert.equal(reader.calls.length, 0);
@@ -70,13 +88,13 @@ test('重复提交防护：加载中再次提交被拒绝，且不产生第二�
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  const first = controller.submit('r1');
-  const second = await controller.submit('r1'); // 加载中
-  const third = await controller.submit('r2');  // 加载中
+  const first = controller.submit(PROJECT, RUN);
+  const second = await controller.submit(PROJECT, RUN);
+  const third = await controller.submit(PROJECT, 'wf-run-2');
 
   assert.deepEqual(second, { accepted: false, applied: false });
   assert.deepEqual(third, { accepted: false, applied: false });
-  assert.deepEqual(reader.calls, ['r1']); // 只有一个请求
+  assert.deepEqual(reader.calls, [[PROJECT, RUN]]);
 
   reader.resolve(SAMPLE);
   await first;
@@ -84,34 +102,91 @@ test('重复提交防护：加载中再次提交被拒绝，且不产生第二�
 });
 
 test('竞态：过期响应不得覆盖较新的查询', async () => {
-  const pendingResolvers = [];
+  const resolvers = [];
   const controller = createController({
-    readRun: (runId) =>
-      new Promise((resolve) => {
-        pendingResolvers.push({ runId, resolve });
-      }),
+    readRun: (projectId, runId) =>
+      new Promise((resolve) => resolvers.push({ projectId, runId, resolve })),
   });
 
-  const firstRun = controller.submit('run-old');
-  pendingResolvers[0].resolve({ ...SAMPLE, run: { workflow_run_id: 'run-old' } });
-  await firstRun; // 第一次完成（loaded）
+  const first = controller.submit(PROJECT, 'run-old');
+  resolvers[0].resolve({
+    ...SAMPLE,
+    run: { workflow_run_id: 'run-old' },
+  });
+  await first;
 
-  const secondRun = controller.submit('run-new');
+  const second = controller.submit(PROJECT, 'run-new');
   assert.equal(controller.getState().phase, PHASE.LOADING);
   assert.equal(controller.getState().data, null); // 旧数据已清空
 
-  pendingResolvers[1].resolve({ ...SAMPLE, run: { workflow_run_id: 'run-new' } });
-  await secondRun;
+  resolvers[1].resolve({
+    ...SAMPLE,
+    run: { workflow_run_id: 'run-new' },
+  });
+  await second;
 
   assert.equal(controller.getState().runId, 'run-new');
   assert.equal(controller.getState().data.run.workflow_run_id, 'run-new');
 });
 
-test('404：进入 error 且保留 runId（可重试）', async () => {
+test('401 首次失败 ⇒ "需要登录"（不是"会话过期"）', async () => {
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  const pending = controller.submit('missing');
+  const pending = controller.submit(PROJECT, RUN);
+  reader.reject(new ReadError('unauthorized', 401));
+  await pending;
+
+  const { error, phase, projectId, runId } = controller.getState();
+  assert.equal(phase, PHASE.ERROR);
+  assert.equal(error.category, 'unauthorized');
+  assert.equal(error.status, 401);
+  assert.equal(error.hint, 'login-required');
+  assert.match(error.message, /需要登录/);
+  // 失败后保留输入（可重试）
+  assert.equal(projectId, PROJECT);
+  assert.equal(runId, RUN);
+});
+
+test('401 在曾经成功加载后出现 ⇒ "会话已过期"', async () => {
+  const reader = makeReader();
+  const controller = createController({ readRun: reader.reader });
+
+  const first = controller.submit(PROJECT, RUN);
+  reader.resolve(SAMPLE);
+  await first;
+  assert.equal(controller.getState().phase, PHASE.LOADED);
+
+  const second = controller.refresh();
+  reader.reject(new ReadError('unauthorized', 401));
+  await second;
+
+  const { error } = controller.getState();
+  assert.equal(error.category, 'unauthorized');
+  assert.equal(error.hint, 'session-expired');
+  assert.match(error.message, /会话已过期|重新登录/);
+});
+
+test('403 ⇒ 非该项目成员（授权失败，不提示登录）', async () => {
+  const reader = makeReader();
+  const controller = createController({ readRun: reader.reader });
+
+  const pending = controller.submit(PROJECT, RUN);
+  reader.reject(new ReadError('forbidden', 403));
+  await pending;
+
+  const { error } = controller.getState();
+  assert.equal(error.category, 'forbidden');
+  assert.equal(error.status, 403);
+  assert.match(error.message, /不是该项目的成员/);
+  assert.doesNotMatch(error.message, /需要登录/);
+});
+
+test('404：进入 error 且保留（项目, Run）（可重试）', async () => {
+  const reader = makeReader();
+  const controller = createController({ readRun: reader.reader });
+
+  const pending = controller.submit(PROJECT, 'missing');
   reader.reject(new ReadError('notFound', 404));
   await pending;
 
@@ -119,30 +194,16 @@ test('404：进入 error 且保留 runId（可重试）', async () => {
   assert.equal(state.phase, PHASE.ERROR);
   assert.equal(state.error.category, 'notFound');
   assert.equal(state.error.status, 404);
+  assert.equal(state.projectId, PROJECT);
   assert.equal(state.runId, 'missing');
   assert.equal(state.data, null); // 不留半成品数据
-});
-
-test('401：错误类别正确，且不带任何凭据提示', async () => {
-  const reader = makeReader();
-  const controller = createController({ readRun: reader.reader });
-
-  const pending = controller.submit('r1');
-  reader.reject(new ReadError('unauthorized', 401));
-  await pending;
-
-  const { error } = controller.getState();
-  assert.equal(error.category, 'unauthorized');
-  assert.equal(error.status, 401);
-  assert.match(error.message, /无权访问/);
-  assert.doesNotMatch(error.message, /API-?Key|X-API-Key|token/i);
 });
 
 test('502：投影失败按"数据无法安全投影"处理，不尝试修复', async () => {
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  const pending = controller.submit('r1');
+  const pending = controller.submit(PROJECT, RUN);
   reader.reject(new ReadError('projection', 502));
   await pending;
 
@@ -152,7 +213,7 @@ test('502：投影失败按"数据无法安全投影"处理，不尝试修复', 
   assert.match(error.message, /无法安全投影/);
 });
 
-test('刷新：对当前 Run 重发 GET；无当前 Run 时不动作', async () => {
+test('刷新：对当前（项目, Run）重发 GET；无当前 Run 时不动作', async () => {
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
@@ -162,12 +223,15 @@ test('刷新：对当前 Run 重发 GET；无当前 Run 时不动作', async () 
   });
   assert.equal(reader.calls.length, 0);
 
-  const first = controller.submit('r1');
+  const first = controller.submit(PROJECT, RUN);
   reader.resolve(SAMPLE);
   await first;
 
   const second = controller.refresh();
-  assert.deepEqual(reader.calls, ['r1', 'r1']); // 同一 Run ID 再次读取
+  assert.deepEqual(reader.calls, [
+    [PROJECT, RUN],
+    [PROJECT, RUN],
+  ]);
   reader.resolve(SAMPLE);
   await second;
   assert.equal(controller.getState().phase, PHASE.LOADED);
@@ -177,14 +241,14 @@ test('刷新：加载中不重复触发', async () => {
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  const pending = controller.submit('r1');
+  const pending = controller.submit(PROJECT, RUN);
   assert.deepEqual(await controller.refresh(), {
     accepted: false,
     applied: false,
   });
   reader.resolve(SAMPLE);
   await pending;
-  assert.deepEqual(reader.calls, ['r1']);
+  assert.deepEqual(reader.calls, [[PROJECT, RUN]]);
 });
 
 test('未预期异常：规范化为安全文案，不透出原始消息', async () => {
@@ -194,7 +258,7 @@ test('未预期异常：规范化为安全文案，不透出原始消息', async
   const reader = makeReader();
   const controller = createController({ readRun: reader.reader });
 
-  const pending = controller.submit('r1');
+  const pending = controller.submit(PROJECT, RUN);
   reader.reject(leaky);
   await pending;
 
@@ -203,13 +267,25 @@ test('未预期异常：规范化为安全文案，不透出原始消息', async
   assert.equal(error.status, 0);
   assert.doesNotMatch(error.message, /psycopg|postgresql|host\/db/);
 
-  // normalizeError 本身也不透出原始正文
   const normalized = normalizeError(leaky);
   assert.equal(normalized.message, '读取失败：发生未预期的前端错误。');
   assert.doesNotMatch(JSON.stringify(normalized), /psycopg|postgresql/);
 });
 
-test('读取实现只被以 Run ID 调用（无写入参数 / 无 project_id）', async () => {
+test('normalizeError：401 的 hint 由"是否成功过"决定', () => {
+  const unauthorized = new ReadError('unauthorized', 401);
+
+  assert.equal(normalizeError(unauthorized, false).hint, 'login-required');
+  assert.equal(normalizeError(unauthorized, true).hint, 'session-expired');
+  assert.match(
+    normalizeError(unauthorized, true).message,
+    /会话已过期|重新登录/
+  );
+  // 非 401 不受影响
+  assert.equal(normalizeError(new ReadError('forbidden', 403), true).hint, '');
+});
+
+test('读取实现只被以 (projectId, runId) 调用（无额外参数 / 无 project 覆盖）', async () => {
   const seen = [];
   const controller = createController({
     readRun: async (...args) => {
@@ -218,7 +294,7 @@ test('读取实现只被以 Run ID 调用（无写入参数 / 无 project_id）'
     },
   });
 
-  await controller.submit('r1');
+  await controller.submit(PROJECT, RUN);
 
-  assert.deepEqual(seen, [['r1']]); // 仅一个位置参数：Run ID
+  assert.deepEqual(seen, [[PROJECT, RUN]]); // 仅两个位置参数
 });

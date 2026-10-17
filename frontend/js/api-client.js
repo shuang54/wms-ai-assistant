@@ -1,24 +1,29 @@
 /**
- * Workflow Read API client —— **只读、同源、零凭证**。
+ * Workflow UI Read API client —— **只读、同源、会话 Cookie、零凭证**。
  *
- * 安全边界（**硬性**，Phase 7 Workflow UI Step 1 §五）：
+ * Phase 7 Workflow UI Step 2：接入**受保护**的浏览器只读面
+ * （`backend/app/api/workflow_ui_read.py`）：
  *
- *   * 本模块**没有任何地方**读取或发送 `X-API-Key`：请求只带 `Accept`；
- *   * 密钥**绝不**进入前端源码 / 打包产物 / `localStorage` /
- *     `sessionStorage` / Cookie；浏览器请求**绝不**携带服务端密钥；
- *   * `API_BASE` 固定为**空字符串**（同源相对路径）——不允许硬编码主机、
- *     不允许通过查询参数指定后端、不允许通过请求参数覆盖服务端
- *     `project_id`（后端本就不接受 `project_id` 参数）；
- *   * 只暴露 `readJson`（内部固定 `method: 'GET'`）——**不存在**任何写入 /
- *     执行方法（无 start / advance / cancel / decision / retry）；
- *   * `credentials: 'same-origin'`：仅在**同源**时携带浏览器自身的 Cookie
- *     （浏览器默认语义），绝不跨源发送；这不涉及任何密钥写入。
+ * ```text
+ * GET /api/ui/projects/{project_id}/workflow-runs/{run_id}
+ * GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/nodes
+ * GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/timeline
+ * GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/approvals/{node_id}
+ * GET /api/ui/projects/{project_id}/workflow-approvals/{approval_id}
+ * ```
  *
- * 当前阻塞项（未接通真实数据，**如实标记**）：
- *   后端 Workflow Read API 使用**服务到服务**的 `X-API-Key`；仓库内没有
- *   受信任的服务端代理、没有面向浏览器的会话化读取路径、也没有 CORS 配置。
- *   因此本客户端在**真实**环境发出的请求会得到 `401`（缺少凭据）—— 这正是
- *   页面的 error 状态之一；页面**不会**为了"看起来能用"而绕过该边界。
+ * 认证与授权**完全由服务端**执行（M1 会话 Cookie + M2.4 项目成员授权）；
+ * 客户端**不参与**授权决策：
+ *
+ *   * **无任何服务端密钥**：不读取 / 不构造 `X-API-Key`，不写
+ *     `localStorage` / `sessionStorage` / `document.cookie`；
+ *   * ``credentials: 'same-origin'``：由浏览器按同源语义自动携带
+ *     **HttpOnly 会话 Cookie**（JS 无法读取其内容，也无需读取）；
+ *   * 路径中的 ``project_id`` 仅是**请求目标**——服务端会独立校验
+ *     "该会话用户是否是该项目的成员"，**不**采信客户端声明；
+ *   * 只有 `GET`（`readJson` 无 `method` 形参）⇒ 结构上不可能发写请求；
+ *   * 同源相对路径（`API_BASE = ''`）；不接受任意后端主机；不把认证信息
+ *     放进 URL（无 token / key 查询参数）。
  */
 /* eslint-env browser */
 
@@ -26,32 +31,45 @@
 export const API_BASE = '';
 
 /**
- * 真实存在的五个只读端点（与 `backend/app/api/workflow_read.py` 一致）。
+ * 真实存在的五个 UI 只读端点（与 `backend/app/api/workflow_ui_read.py` 一致）。
  *
- * 路径参数一律经 `encodeURIComponent` 转义——不允许拼接未转义的用户输入。
+ * 每行一个**完整**模板字面量：便于静态审计（路径不会被跨行拼接拆开）。
+ * 路径参数一律经 `encodeURIComponent` 转义。
  */
 export const READ_ROUTES = Object.freeze({
-  // 每行一个**完整**模板字面量：便于静态审计（路径不会被跨行拼接拆开）
-  runDetail: (runId) => `/api/workflow-runs/${encodeURIComponent(runId)}`,
-  runNodes: (runId) => `/api/workflow-runs/${encodeURIComponent(runId)}/nodes`,
-  runTimeline: (runId) => `/api/workflow-runs/${encodeURIComponent(runId)}/timeline`,
-  runApprovalByNode: (runId, nodeId) => `/api/workflow-runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(nodeId)}`,
-  approvalById: (approvalId) => `/api/workflow-approvals/${encodeURIComponent(approvalId)}`,
+  runDetail: (projectId, runId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-runs/${encodeURIComponent(runId)}`,
+  runNodes: (projectId, runId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-runs/${encodeURIComponent(runId)}/nodes`,
+  runTimeline: (projectId, runId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-runs/${encodeURIComponent(runId)}/timeline`,
+  runGraph: (projectId, runId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-runs/${encodeURIComponent(runId)}/graph`,
+  runApprovalByNode: (projectId, runId, nodeId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(nodeId)}`,
+  approvalById: (projectId, approvalId) => `/api/ui/projects/${encodeURIComponent(projectId)}/workflow-approvals/${encodeURIComponent(approvalId)}`,
+});
+
+/**
+ * Graph 拓扑状态（与后端 ``WORKFLOW_GRAPH_STATUSES`` 逐字一致）。
+ *
+ * 非 ``available`` 时后端返回空 ``nodes`` ⇒ 前端**不**画任何边
+ * （不用可能已变化的拓扑冒充历史版本的拓扑）。
+ */
+export const GRAPH_STATUS = Object.freeze({
+  AVAILABLE: 'available',
+  NOT_REGISTERED: 'not_registered',
+  VERSION_MISMATCH: 'version_mismatch',
 });
 
 /**
  * 错误类别 —— 与后端**真实**状态码契约一一对应（不得臆造映射）。
  *
- * ```
- * unauthorized  401  缺少 / 错误凭据（当前无安全浏览器路径 ⇒ 最常见结果）
- * forbidden     403  已认证但无权（当前读面不返回；保留契约位）
- * notFound      404  资源不存在 **或** 不属于授权项目（同构，不区分）
- * invalid       400 / 422  参数非法 / 长度越界
- * projection    502  持久化数据无法安全投影（**不由前端修复**）
- * unavailable   503  服务端认证 / 作用域未配置（fail closed）
- * server        5xx  其它服务端错误
- * invalidPayload 2xx 但响应不是合法 JSON / 形状不符
- * network       网络中断 / 请求被中止
+ * ```text
+ * unauthorized    401  无会话 / 会话过期或吊销（需登录）
+ * forbidden       403  已认证但**不是**该项目成员（M2.4 项目授权）
+ * notFound        404  资源不存在 / 不属于该项目（同构，不区分）
+ * invalid         400 / 422  参数非法 / 长度越界
+ * projection      502  持久化数据无法安全投影（**不由前端修复**）
+ * unavailable     503  会话服务 / 授权存储不可用（fail closed）
+ * server          5xx  其它服务端错误
+ * invalidPayload  2xx 但响应不是合法 JSON / 形状不符
+ * network         网络中断 / 请求被中止
  * ```
  */
 export const ERROR_CATEGORIES = Object.freeze([
@@ -68,29 +86,37 @@ export const ERROR_CATEGORIES = Object.freeze([
 
 /** 面向用户的固定文案（**不**透出后端 detail 正文 / 堆栈 / SQL）。 */
 export const ERROR_MESSAGES = Object.freeze({
-  unauthorized: '无权访问：缺少或无效的访问凭据。',
-  forbidden: '无权访问：当前身份没有读取该 Run 的权限。',
-  notFound: '未找到该资源：Run 不存在，或不在当前读取授权范围内。',
-  invalid: '请求参数非法（Run ID 为空或长度越界）。',
+  unauthorized: '需要登录：当前没有有效会话，请先登录后再查询。',
+  forbidden: '无权访问：当前账号不是该项目的成员，无法读取该项目的 Workflow 数据。',
+  notFound: '未找到该资源：Run 不存在，或不属于所选项目。',
+  invalid: '请求参数非法（项目 ID 或 Run ID 为空 / 长度越界）。',
   projection:
     '持久化数据无法安全投影（后端 fail closed）。数据不会被修复或截断，请检查运行记录。',
-  unavailable: '读取服务不可用（服务端未完成认证 / 作用域配置）。',
+  unavailable: '读取服务不可用（会话服务或授权存储异常）。请稍后重试。',
   server: '读取失败：服务端错误。可稍后重试。',
   invalidPayload: '响应格式不符合预期，已拒绝展示该数据。',
   network: '网络错误：无法连接到读取服务。可稍后重试。',
 });
+
+/** 会话过期（曾成功加载过，随后 401）时的文案——与"从未登录"区分。 */
+export const SESSION_EXPIRED_MESSAGE =
+  '会话已过期或被吊销：请重新登录后再查询。';
 
 /** 读取错误（携带**类别**与 HTTP 状态；不携带响应正文的原始内容）。 */
 export class ReadError extends Error {
   /**
    * @param {string} category ERROR_CATEGORIES 之一
    * @param {number} status HTTP 状态码（网络错误为 0）
+   * @param {'login-required'|'session-expired'|''} [hint] 仅 401 使用
    */
-  constructor(category, status) {
-    super(ERROR_MESSAGES[category] || '读取失败。');
+  constructor(category, status, hint = '') {
+    super(
+      hint === 'session-expired' ? SESSION_EXPIRED_MESSAGE : ERROR_MESSAGES[category] || '读取失败。'
+    );
     this.name = 'ReadError';
     this.category = category;
     this.status = status;
+    this.hint = hint;
   }
 }
 
@@ -130,6 +156,7 @@ export async function readJson(path, options = {}) {
     response = await fetchImpl(API_BASE + path, {
       method: 'GET',
       headers: { Accept: 'application/json' },
+      // 同源时才由浏览器携带 HttpOnly 会话 Cookie（JS 不接触其内容）
       credentials: 'same-origin',
       signal: options.signal,
     });
@@ -153,21 +180,23 @@ export async function readJson(path, options = {}) {
 }
 
 /**
- * 读取 Run 详情页所需的**全部**只读数据。
+ * 读取 Run 详情页所需的**全部**只读数据（同一项目作用域内）。
  *
  * 审批按 Node 单独读取：只有真实存在的 APPROVAL 节点才发起该请求
  * （`node_type === 'APPROVAL'`），避免对每个节点盲目打请求。
  *
+ * @param {string} projectId 项目作用域（请求目标；由服务端独立授权校验）
  * @param {string} runId
  * @param {{ fetchImpl?: Function, signal?: AbortSignal }} [options]
  * @returns {Promise<{run: unknown, nodes: unknown, timeline: unknown,
  *   approvalsByNode: Record<string, unknown>}>}
  */
-export async function readRunBundle(runId, options = {}) {
-  const run = await readJson(READ_ROUTES.runDetail(runId), options);
-  const [nodes, timeline] = await Promise.all([
-    readJson(READ_ROUTES.runNodes(runId), options),
-    readJson(READ_ROUTES.runTimeline(runId), options),
+export async function readRunBundle(projectId, runId, options = {}) {
+  const [run, nodes, timeline, graph] = await Promise.all([
+    readJson(READ_ROUTES.runDetail(projectId, runId), options),
+    readJson(READ_ROUTES.runNodes(projectId, runId), options),
+    readJson(READ_ROUTES.runTimeline(projectId, runId), options),
+    readJson(READ_ROUTES.runGraph(projectId, runId), options),
   ]);
 
   const approvalsByNode = {};
@@ -183,7 +212,7 @@ export async function readRunBundle(runId, options = {}) {
     approvalNodeIds.map(async (nodeId) => {
       try {
         approvalsByNode[nodeId] = await readJson(
-          READ_ROUTES.runApprovalByNode(runId, nodeId),
+          READ_ROUTES.runApprovalByNode(projectId, runId, nodeId),
           options
         );
       } catch (error) {
@@ -197,5 +226,5 @@ export async function readRunBundle(runId, options = {}) {
     })
   );
 
-  return { run, nodes: list, timeline, approvalsByNode };
+  return { run, nodes: list, timeline, graph, approvalsByNode };
 }

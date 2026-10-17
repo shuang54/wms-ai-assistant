@@ -1,0 +1,16 @@
+# Node 依赖（E2E devDependency 安装产物；**不**入库）
+node_modules/
+
+# Playwright 测试产物（trace / 截图 / video / 报告）
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# 本地一键启动的运行时状态（PIDs / 时间戳；**不**入库）
+.dev-launch.json
+
+# 本地环境变量（若在 frontend/ 下自建；真实值**不**入库）
+.env
+.env.local
+.env.*.local

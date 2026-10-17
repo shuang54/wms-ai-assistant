@@ -954,7 +954,8 @@ python -m backend.app.cli.ingest_knowledge docs/knowledge/wms-basic-operations.m
 ## 8. Agent / Workflow Read API（Phase 5 P-8 / Phase 6 Step 7-8A）
 
 五个 Workflow 端点 + 两个 Agent 端点均为**只读**（Query only；不触发
-Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`** 请求头：
+Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`** 请求头
+（**服务间**访问面；凭据**不得**进入浏览器）：
 
 | 端点 | 认证 | 授权作用域来源 |
 | --- | --- | --- |
@@ -963,6 +964,26 @@ Resume / Approve / Cancel / start / advance），并统一要求 **`X-API-Key`**
 | `GET /api/workflow-runs/{run_id}/timeline` | 同上 | 同上 |
 | `GET /api/workflow-runs/{run_id}/approvals/{node_id}` | 同上 | 同上（经父 Run + `(run, node)` 归属校验） |
 | `GET /api/workflow-approvals/{approval_id}` | 同上 | 同上（经父 Run 归属校验） |
+
+### 8.1 浏览器只读面（Phase 7 Workflow UI Step 2；已实现）
+
+浏览器**不**使用上表的 API Key 面，改用**会话 + 项目成员授权**的独立只读面
+（同一 `WorkflowReadService`、同一响应 DTO、同一错误契约）：
+
+| 端点 | 认证 | 授权 |
+| --- | --- | --- |
+| `GET /api/ui/projects/{project_id}/workflow-runs/{run_id}` | M1 会话 Cookie | M2.4 项目成员（`MEMBER` / `PROJECT_OPS`） |
+| `GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/nodes` | 同上 | 同上（**安全投影**；损坏数据 ⇒ 502） |
+| `GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/timeline` | 同上 | 同上 |
+| `GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/approvals/{node_id}` | 同上 | 同上（经父 Run + `(run, node)` 归属校验；无审批行 ⇒ 404） |
+| `GET /api/ui/projects/{project_id}/workflow-approvals/{approval_id}` | 同上 | 同上（经父 Run 归属校验） |
+
+- 路径中的 `project_id` **仅**是请求目标：授权结论来自服务端对
+  `(user_id, project_id)` 的显式授权查询；跨项目 Run 返回与"不存在"
+  **同码同文案 404**；未登录 ⇒ 401；非成员 ⇒ 403；授权存储不可用 ⇒ 503。
+- **全部 GET**；无写接口（无审批决策 / 取消 / 重试 / 启动）。
+- 无新增环境变量；浏览器中**无任何服务端密钥**。
+- 安全细节见 `docs/security.md` §7.1；前端见 `frontend/README.md`。
 | `GET /api/agent/runs/{run_id}` | `X-API-Key`（必需） | 服务端 `AGENT_READ_API_PROJECT_ID` |
 | `GET /api/agent/runs/{run_id}/timeline` | 同上 | 同上 |
 

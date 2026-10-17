@@ -131,9 +131,37 @@ LLM 仅负责"提议调用哪个能力"，**不负责决定权限与业务校验
 
 明确边界（**不**宣称已达成）：
 - API Key ≠ 用户身份系统（无用户 / 角色 / RBAC；多项目映射与凭据轮换属后续阶段）；
+- **本节的 API Key 面是服务间（service-to-service）访问面**：凭据**不得**进入
+  浏览器。浏览器访问请使用 §7.1 的**会话化 UI 只读面**；
 - HTTPS = **NOT VERIFIED**、网络边界 = **NOT VERIFIED**（仓库内无网关 / 反向代理
   / TLS 配置）⇒ **PRODUCTION_DEPLOYMENT 仍为 BLOCKED**，直到部署层完成独立验证
   （外部客户端不可绕过网关 / 只有可信网关可传递身份 / 网关覆盖而非盲信客户端身份头）。
+
+### 7.1 浏览器只读面（Phase 7 Workflow UI Step 2；已实现）
+
+浏览器**不**接触服务间 API Key。前端改为调用**会话保护**的独立只读面：
+
+```text
+GET /api/ui/projects/{project_id}/workflow-runs/{run_id}
+GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/nodes
+GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/timeline
+GET /api/ui/projects/{project_id}/workflow-runs/{run_id}/approvals/{node_id}
+GET /api/ui/projects/{project_id}/workflow-approvals/{approval_id}
+```
+
+| 项 | 行为 |
+| --- | --- |
+| 认证 | **既有 M1 会话 Cookie**（`require_session`；HttpOnly / 生产 `Secure` / SameSite=Lax）——**不新增**登录或令牌系统 |
+| 授权 | **既有 M2.4 项目成员授权**（`enforce_project_access`；真实 `ai_ops.authorization_grant` 查询） |
+| 路径中的 `project_id` | **仅**是请求目标，**不**构成授权结论；服务端独立校验 `(user_id, project_id)` 的显式成员授权 |
+| 二次校验 | `WorkflowReadService` 再校验 `run.project_id == 请求 project_id` ⇒ 跨项目 Run 返回与"不存在"**同码同文案 404** |
+| 子记录 | Node / Approval 归属（跨 Run / 跨节点）⇒ Read Service **fail closed**（502） |
+| 浏览器凭据 | **无任何服务端密钥**：不写源码 / 构建产物 / `localStorage` / `sessionStorage` / Cookie；请求仅带 `Accept`；`credentials: 'same-origin'`（同源 HttpOnly Cookie 由浏览器自动携带） |
+| 只读 | 5 个端点**全部 GET**；不调用 Runtime 执行入口 / Tool / LLM；无写接口 |
+| 错误契约 | 401（未登录 / 会话过期）· 403（非该项目成员）· 404（不存在 / 跨项目，同构）· 400 / 422（参数）· 502（数据无法安全投影）· 503（会话 / 授权存储不可用）——文案固定，**不**含异常正文 / SQL / 凭据 / 内部路径 |
+| 服务间面 | `X-API-Key` 面**保持原样**（两套机制**并存不替代**）：会话 + 成员授权**不能**替代 API Key，反之亦然 |
+
+前端实现与安全约束见 `frontend/README.md`；本面无新增环境变量。
 
 配置示例（写入 `.env`，值**不得**提交到 Git；变量名见 `.env.example` 占位）：
 

@@ -2,13 +2,16 @@
   "name": "wms-ai-assistant-frontend",
   "version": "0.0.0",
   "private": true,
-  "description": "Workflow Run Detail 只读运维页面（零依赖静态页面；本文件仅用于声明 ES Module 语义与测试入口）",
+  "description": "Workflow 运维工作台：零运行时依赖静态页面 + 内置测试 + Chromium E2E（devDependency 仅用于 E2E）",
   "type": "module",
-  "dependencies": {},
-  "devDependencies": {},
+  "devDependencies": {
+    "@playwright/test": "^1.47.2"
+  },
   "scripts": {
     "test": "node --test tests/",
-    "serve": "node scripts/serve-static.mjs"
+    "test:e2e": "playwright test",
+    "serve": "node scripts/serve-static.mjs",
+    "dev:same-origin": "node scripts/dev-gateway.mjs"
   },
   "engines": {
     "node": ">=16.17.0"

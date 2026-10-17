@@ -30,6 +30,7 @@ from backend.app.api import (
     workflow_command,
     workflow_definitions,
     workflow_read,
+    workflow_ui_read,
 )
 from backend.app.config import settings
 
@@ -109,6 +110,15 @@ def create_app() -> FastAPI:
     # 复用 Workflow 读取域认证；不暴露模板 / 参数映射 / 审批文案。
     app.include_router(
         workflow_definitions.router, prefix="/api", tags=["workflow"]
+    )
+    # Phase 7 Workflow UI Step 2：**浏览器**只读访问面
+    # （GET /api/ui/projects/{project_id}/workflow-runs/... 等 5 个端点）——
+    # 认证 = M1 会话 Cookie（require_session），授权 = M2.4 项目成员
+    # （enforce_project_access）；与会话/授权机制**复用不新增**，
+    # 且与既有服务间 X-API-Key 读面（workflow_read）并存不替代。
+    # 纯只读：无写方法、不触 Runtime 执行入口。
+    app.include_router(
+        workflow_ui_read.router, prefix="/api", tags=["workflow-ui"]
     )
     return app
 

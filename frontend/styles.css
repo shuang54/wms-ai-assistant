@@ -332,3 +332,435 @@ ol.timeline {
     grid-template-columns: 1fr;
   }
 }
+
+/* ============================================================
+ * Phase 7 Workflow UI Step 3：运维工作台
+ * ============================================================ */
+
+.title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.project-chip {
+  padding: 0.1rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+/* ---- 查询区（两输入 + 动作）---- */
+
+.query {
+  display: grid;
+  grid-template-columns: minmax(12rem, 16rem) minmax(16rem, 1fr) auto;
+  align-items: end;
+  gap: 0.5rem 0.75rem;
+}
+
+.query .field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.query .field.grow {
+  min-width: 0;
+}
+
+.query .query-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.query .full {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.9em;
+}
+
+.query label,
+.filter-bar label {
+  font-weight: 600;
+  font-size: 0.9em;
+}
+
+.query input,
+.filter-bar select {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  background: var(--panel);
+  color: inherit;
+  min-width: 0;
+}
+
+/* ---- 筛选条 ---- */
+
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem 0.75rem;
+  margin: 1rem 0 0;
+  padding: 0.6rem 0.85rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.filter-bar .field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+#filter-meta {
+  font-size: 0.9em;
+  align-self: center;
+}
+
+button.small {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.85em;
+}
+
+/* ---- Attempt 行：命中 / 灰化 / 失败 / 选中 ---- */
+
+tr.attempt-row.is-dimmed td {
+  opacity: 0.45;
+}
+
+tr.attempt-row.is-failed td.cell-error-code {
+  color: var(--fail);
+  font-weight: 600;
+}
+
+tr.attempt-row.is-selected td {
+  background: #fff6d6;
+}
+
+tr.attempt-row[data-revealed='true'] td {
+  background: #fff6d6;
+}
+
+.node-group.has-failure {
+  border-color: #e6b3b3;
+  box-shadow: inset 3px 0 0 var(--fail);
+}
+
+/* ---- 输出块 ---- */
+
+.output-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.output-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+pre.output-full {
+  max-height: 22rem;
+  overflow: auto;
+}
+
+/* ---- 时间线：类型区分 / 联动高亮 ---- */
+
+li.timeline-item {
+  grid-template-columns: minmax(11rem, 15rem) minmax(8rem, 11rem) 1fr auto;
+  align-items: baseline;
+  border-radius: 4px;
+  padding-right: 0.4rem;
+}
+
+li.timeline-item.kind-run::before {
+  background: var(--accent);
+}
+
+li.timeline-item.kind-node-start::before {
+  background: var(--running);
+}
+
+li.timeline-item.kind-node-finish::before {
+  background: var(--ok);
+}
+
+li.timeline-item.kind-approval::before {
+  background: var(--waiting);
+}
+
+li.timeline-item.is-related {
+  background: #fff6d6;
+}
+
+li.timeline-item[data-revealed='true'] {
+  background: #fff6d6;
+}
+
+li.timeline-item .no-target {
+  font-size: 0.85em;
+}
+
+/* ---- 状态提示 ---- */
+
+.status.copy-ok {
+  background: #eaf7ee;
+  border: 1px solid #b7dcc2;
+}
+
+/* ---- 窄屏 ---- */
+
+@media (max-width: 900px) {
+  .query {
+    grid-template-columns: 1fr;
+  }
+  .query .query-actions {
+    grid-column: 1 / -1;
+  }
+  .filter-bar {
+    align-items: stretch;
+  }
+}
+
+@media (max-width: 720px) {
+  li.timeline-item {
+    grid-template-columns: 1fr;
+  }
+  dl.kv {
+    grid-template-columns: 1fr;
+  }
+  table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+/* ============================================================
+ * Phase 7 Step 4：Graph View（工作流拓扑）
+ * ============================================================ */
+
+.graph-intro {
+  margin: 0.75rem 0 0;
+  font-size: 0.9em;
+}
+
+.graph-intro strong {
+  color: var(--text);
+}
+
+/* ---- 图例（文字 + 颜色双重表达）---- */
+
+ul.graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.9rem;
+  margin: 0.5rem 0 0.75rem;
+  padding: 0;
+  list-style: none;
+  font-size: 0.85em;
+}
+
+ul.graph-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--muted);
+}
+
+.legend-swatch {
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+.legend-swatch.status-running { color: var(--running); background: #e8f0fa; }
+.legend-swatch.status-succeeded { color: var(--ok); background: #eaf7ee; }
+.legend-swatch.status-failed { color: var(--fail); background: #fdeeee; }
+.legend-swatch.status-waiting { color: var(--waiting); background: #fdf3e6; }
+.legend-swatch.status-unknown { color: var(--unknown); background: #f2f4f7; }
+
+/* ---- 画布与滚动 ---- */
+
+.graph-scroller {
+  overflow: auto;
+  max-width: 100%;
+  padding: 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background:
+    linear-gradient(0deg, rgba(0, 0, 0, 0.02), rgba(0, 0, 0, 0.02)),
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 23px,
+      rgba(0, 0, 0, 0.03) 23px,
+      rgba(0, 0, 0, 0.03) 24px
+    );
+}
+
+.graph-canvas {
+  position: relative;
+  margin: 0 auto;
+}
+
+svg.graph-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+.graph-edge {
+  fill: none;
+  stroke: #9aa7b8;
+  stroke-width: 1.6;
+}
+
+.graph-edge.edge-true { stroke: var(--ok); }
+.graph-edge.edge-false { stroke: var(--fail); }
+
+.graph-edge[data-related='true'] {
+  stroke: var(--accent);
+  stroke-width: 2.6;
+}
+
+.graph-arrow-head {
+  fill: #9aa7b8;
+}
+
+.graph-edge-label {
+  fill: var(--muted);
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+/* ---- 节点卡片 ---- */
+
+.graph-node {
+  position: absolute;
+  box-sizing: border-box;
+}
+
+.graph-node-inner {
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.4rem 0.55rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--unknown);
+  border-radius: 6px;
+  cursor: pointer;
+  overflow: hidden;
+  transition: box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.graph-node-inner:hover {
+  box-shadow: 0 1px 6px rgba(31, 39, 51, 0.18);
+}
+
+.graph-node-inner:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.graph-node-id {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-node-type,
+.graph-node-status,
+.graph-node-attempts {
+  font-size: 0.76em;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.graph-node-status {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 状态：左边框 + 文字（不单靠颜色） */
+.graph-node-inner[data-status='RUNNING'],
+.graph-node .graph-node-inner { border-left-color: var(--unknown); }
+
+.graph-node[data-status='RUNNING'] .graph-node-inner { border-left-color: var(--running); }
+.graph-node[data-status='SUCCEEDED'] .graph-node-inner { border-left-color: var(--ok); }
+.graph-node[data-status='FAILED'] .graph-node-inner { border-left-color: var(--fail); }
+.graph-node[data-status='WAITING_APPROVAL'] .graph-node-inner { border-left-color: var(--waiting); }
+
+.graph-node-inner.is-failed {
+  background: #fdf6f6;
+}
+
+.graph-node-inner.is-not-run .graph-node-status {
+  color: var(--unknown);
+  font-weight: 500;
+}
+
+.graph-node-inner.is-unknown .graph-node-status {
+  color: var(--unknown);
+}
+
+.graph-node-inner.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(31, 95, 168, 0.35);
+}
+
+.graph-node-start,
+.graph-node-error {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.3rem;
+  font-size: 0.68em;
+  padding: 0 0.3em;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}
+
+.graph-node-start { color: var(--accent); }
+.graph-node-error { color: var(--fail); top: 1.35rem; }
+
+/* ---- 窄屏 ---- */
+
+@media (max-width: 720px) {
+  ul.graph-legend {
+    font-size: 0.8em;
+  }
+  .graph-scroller {
+    /* 窄屏：图形容器内横向滚动（不导致页面级溢出） */
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+/* Step 4：Graph View 选中节点 ⇒ Node Attempts 中该节点全部行高亮 */
+tr.attempt-row.is-node-selected td {
+  background: #e8f0fa;
+}
+
+tr.attempt-row.is-node-selected td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}

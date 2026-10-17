@@ -51,35 +51,42 @@ const RUN = {
 test('初始状态为 idle，无数据无错误', () => {
   const state = createInitialState();
   assert.equal(state.phase, PHASE.IDLE);
+  assert.equal(state.projectId, '');
   assert.equal(state.runId, '');
   assert.equal(state.data, null);
   assert.equal(state.error, null);
 });
 
-test('提交阻止：空输入阻止；加载中阻止', () => {
-  assert.equal(isSubmitBlocked(createInitialState(), ''), true);
-  assert.equal(isSubmitBlocked(createInitialState(), '   '), true);
-  assert.equal(isSubmitBlocked(createInitialState(), 'r1'), false);
+test('提交阻止：项目 ID 与 Run ID 都必填；加载中阻止', () => {
+  const idle = createInitialState();
+  // 两者缺一即阻止
+  assert.equal(isSubmitBlocked(idle, '', 'r1'), true);
+  assert.equal(isSubmitBlocked(idle, 'p1', ''), true);
+  assert.equal(isSubmitBlocked(idle, '', ''), true);
+  assert.equal(isSubmitBlocked(idle, '   ', 'r1'), true);
+  assert.equal(isSubmitBlocked(idle, 'p1', '   '), true);
+  assert.equal(isSubmitBlocked(idle, 'p1', 'r1'), false);
 
-  const loading = beginLoad(createInitialState(), 'r1');
+  const loading = beginLoad(idle, 'p1', 'r1');
   assert.equal(loading.phase, PHASE.LOADING);
-  assert.equal(isSubmitBlocked(loading, 'r1'), true);
+  assert.equal(isSubmitBlocked(loading, 'p1', 'r1'), true);
 });
 
 test('beginLoad 清空旧数据与旧错误（避免旧数据被误认为最新）', () => {
-  const loaded = applySuccess(beginLoad(createInitialState(), 'r1'), {
+  const loaded = applySuccess(beginLoad(createInitialState(), 'p1', 'r1'), {
     run: RUN, nodes: [], timeline: [], approvalsByNode: {},
   });
   assert.equal(loaded.phase, PHASE.LOADED);
 
-  const again = beginLoad(loaded, 'r2');
+  const again = beginLoad(loaded, 'p2', 'r2');
   assert.equal(again.data, null);
   assert.equal(again.error, null);
+  assert.equal(again.projectId, 'p2');
   assert.equal(again.runId, 'r2');
 });
 
-test('applyFailure 保留 runId（可重试）并清空数据', () => {
-  const loaded = applySuccess(beginLoad(createInitialState(), 'r1'), {
+test('applyFailure 保留 projectId / runId（可重试）并清空数据', () => {
+  const loaded = applySuccess(beginLoad(createInitialState(), 'p1', 'r1'), {
     run: RUN, nodes: [], timeline: [], approvalsByNode: {},
   });
   const failed = applyFailure(loaded, {
@@ -87,6 +94,7 @@ test('applyFailure 保留 runId（可重试）并清空数据', () => {
   });
 
   assert.equal(failed.phase, PHASE.ERROR);
+  assert.equal(failed.projectId, 'p1');
   assert.equal(failed.runId, 'r1');
   assert.equal(failed.data, null);
   assert.equal(failed.error.category, 'notFound');
@@ -337,4 +345,12 @@ test('toViewModel：APPROVAL 节点无审批行 ⇒ 空状态视图', () => {
   assert.equal(vm.approvals.length, 1);
   assert.equal(vm.approvals[0].view.empty, true);
   assert.equal(vm.approvals[0].view.present, false);
+});
+
+
+test('Overview 展示后端返回的真实 project_id（不来自客户端输入）', () => {
+  const rows = toRunOverview({ ...RUN, project_id: 'server-project' });
+  const byKey = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+
+  assert.equal(byKey.project_id, 'server-project');
 });
