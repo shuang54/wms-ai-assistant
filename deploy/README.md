@@ -103,6 +103,71 @@ Nginx（生产网关 / 反向代理）        ← deploy/nginx/wms-workflow-ui.c
    curl -I http://127.0.0.1:8000/                # 仅本机可达（外部应失败）
    ```
 
+6. **破坏性操作防护（部署与回滚通用，必须遵守）**
+
+   > 本仓库**没有**蓝绿发布、release 目录或自动回滚机制；以下全部为**人工**步骤。
+   > 不得假设项目已有上述能力。
+
+   **6.1 先定义并校验路径（禁用相对路径）**
+
+   ```bash
+   APP_DIR=<APP_DIR>            # 源码工作区
+   STATIC_ROOT=<STATIC_ROOT>    # 已发布的静态产物目录
+   BACKUP_DIR=<BACKUP_DIR>      # 本次部署备份（含时间戳）
+   DB_DATA_DIR=<DB_DATA_DIR>    # 数据库数据目录（**禁止**进入任何同步 / 删除范围）
+
+   for d in "$APP_DIR" "$STATIC_ROOT" "$BACKUP_DIR"; do
+     [ -d "$d" ] || { echo "目录不存在: $d"; exit 1; }
+   done
+   [ "$STATIC_ROOT" = "/" ] && { echo "拒绝: STATIC_ROOT 不能是 /"; exit 1; }
+   [ "$APP_DIR" = "$STATIC_ROOT" ] && { echo "拒绝: 源码与产物目录不得相同"; exit 1; }
+   case "$STATIC_ROOT" in
+     "$DB_DATA_DIR"*) echo "拒绝: 产物目录不得位于数据库数据目录内"; exit 1;;
+   esac
+   ```
+
+   **6.2 `rsync --delete` 必须先 dry-run**
+
+   ```bash
+   # 1) 先看会删什么
+   rsync -a --delete --dry-run <SRC>/ "$STATIC_ROOT"/      # 人工审阅
+   # 2) 确认无误后执行
+   rsync -a --delete <SRC>/ "$STATIC_ROOT"/
+   ```
+
+   ```text
+   · --delete 只允许作用于 $STATIC_ROOT（静态产物）
+   · 绝不作用于 APP_DIR / DB_DATA_DIR / 家目录 / 挂载点
+   · 源必须是 frontend/index.html + styles.css + js/，不得整目录同步 frontend/
+     （会带上 tests/、e2e/、scripts/、node_modules/）
+   · dry-run 出现任何非预期删除 ⇒ **立即停止**，不要执行第二步
+   ```
+
+   **6.3 禁止用 `git checkout` 覆盖操作者的未提交修改**
+
+   ```bash
+   git -C "$APP_DIR" status --porcelain    # 必须为空，否则停止
+   git -C "$APP_DIR" rev-parse --short HEAD > "$BACKUP_DIR/prev_revision.txt"
+   ```
+
+   **6.4 必须由有权限的部署人员逐项确认**
+
+   ```text
+   [ ] 四个路径的校验结果（6.1 全部通过）
+   [ ] rsync dry-run 输出（6.2）
+   [ ] nginx -t 结果
+   [ ] 后端服务重启 / reload 的执行与结果
+   [ ] 回滚触发决定
+   ```
+
+7. **回滚（人工）**
+
+   完整步骤、约束与完成判定见
+   `docs/decisions/Phase/Phase 8 Step 3 — Production Deployment Readiness.md` §7。
+
+   回滚同样受本节 6.1–6.4 约束：**路径校验 → dry-run → 才允许破坏性同步**，
+   且数据库数据目录**永不**纳入同步或删除范围。
+
 ---
 
 ## 4. 与本仓库其它部分的关系

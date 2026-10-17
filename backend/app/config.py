@@ -18,6 +18,7 @@ DATABASE_URL 为空时，DB 相关功能自动禁用：
 from __future__ import annotations
 
 import os
+from typing import Final
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
@@ -57,11 +58,167 @@ def _get_float(key: str, default: float) -> float:
 
 
 def _get_bool(key: str, default: bool = False) -> bool:
-    """读取布尔型环境变量。接受 1/true/yes/on（不区分大小写）。"""
+    """读取布尔型环境变量。接受 1/true/yes/on（不区分大小写）。
+
+    ⚠️ 非严格解析：无法识别的值**一律返回 False**（静默降级）。
+
+    仅用于**非安全关键**的功能开关（如 ``DATABASE_ECHO`` / ``RERANKER_ENABLED``）。
+    安全关键配置必须使用 :func:`_get_bool_strict`。
+    """
     raw = os.getenv(key)
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+#: 严格布尔解析接受的**真**值（不区分大小写）。
+_BOOL_TRUE_TOKENS: Final = frozenset({"1", "true", "yes", "on"})
+
+#: 严格布尔解析接受的**假**值（不区分大小写）。
+_BOOL_FALSE_TOKENS: Final = frozenset({"0", "false", "no", "off"})
+
+
+def _get_bool_strict(key: str, default: bool) -> bool:
+    """读取**安全关键**布尔型环境变量（Phase 8 Step 4）。
+
+    与 :func:`_get_bool` 的区别：无法识别的值 **不会**静默变成 ``False``，
+    而是抛出 :class:`ValueError` 使启动失败。用于 ``AUTH_COOKIE_SECURE``
+    这类"拼错一个字母就降级为不安全"的配置。
+
+    语义区分（三者互不相同）：
+
+    * **未设置**（``None``）⇒ 返回 ``default``；
+    * **显式设置为空**（``""``）⇒ 视为未设置，返回 ``default``（fail-safe：
+      ``AUTH_COOKIE_SECURE`` 的 default 是 ``True``）；
+    * **设置了非法值**（如 ``flase`` / ``enabled`` / ``abc``）⇒ 抛错。
+
+    异常信息只包含**变量名**与允许取值，绝不回显变量值（避免把可能混入的
+    凭据写进日志）。
+    """
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _BOOL_TRUE_TOKENS:
+        return True
+    if normalized in _BOOL_FALSE_TOKENS:
+        return False
+    raise ValueError(
+        f"环境变量 {key} 取值非法：仅接受 true/false/1/0/yes/no/on/off"
+        "（不区分大小写）。为避免安全配置静默降级，启动被拒绝。"
+    )
+
+
+#: 视为"**生产**"的 ``APP_ENV`` 取值（小写比较）。
+_PRODUCTION_ENV_TOKENS: Final = frozenset({"production", "prod"})
+
+#: 视为"**明确非生产**"的 ``APP_ENV`` 取值（小写比较）。
+#: 只有这些值才允许后端绑定到非回环地址。
+_NON_PRODUCTION_ENV_TOKENS: Final = frozenset(
+    {"development", "dev", "test", "testing", "ci", "local"}
+)
+
+#: 允许的**回环**监听地址（生产环境后端只能绑这些）。
+_LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: 环境声明的三种解析结果。
+ENVIRONMENT_PRODUCTION: Final = "production"
+ENVIRONMENT_NON_PRODUCTION: Final = "non-production"
+ENVIRONMENT_UNSPECIFIED: Final = "unspecified"
+
+
+def _resolve_environment(app_env: str | None) -> str:
+    """把 ``APP_ENV`` 解析为三种明确状态之一（Phase 8 Step 4A）。
+
+    与"读一个默认字符串"的关键区别：**未声明**不再等同于 ``development``。
+
+    ==========================  ==========================================
+    输入                         结果
+    ==========================  ==========================================
+    ``None`` / ``""`` / 纯空白     ``unspecified``（未声明）
+    ``production`` / ``prod``     ``production``（大小写与空白无关）
+    ``development`` / ``dev``     ``non-production``
+    ``test`` / ``testing``        ``non-production``
+    ``ci`` / ``local``            ``non-production``
+    其它非空值（如 ``prodction``）  **抛 ``ValueError``**（拼写保护）
+    ==========================  ==========================================
+
+    异常信息只给出变量名与允许取值集合，**不回显**实际配置内容。
+    """
+    if app_env is None:
+        return ENVIRONMENT_UNSPECIFIED
+    token = app_env.strip().lower()
+    if token == "":
+        return ENVIRONMENT_UNSPECIFIED
+    if token in _PRODUCTION_ENV_TOKENS:
+        return ENVIRONMENT_PRODUCTION
+    if token in _NON_PRODUCTION_ENV_TOKENS:
+        return ENVIRONMENT_NON_PRODUCTION
+    allowed = sorted(_PRODUCTION_ENV_TOKENS | _NON_PRODUCTION_ENV_TOKENS)
+    raise ValueError(
+        "环境变量 APP_ENV 取值非法：未在受支持的取值集合内"
+        f"（{' / '.join(allowed)}，不区分大小写）。"
+        "未声明的拼写错误不能被当作开发环境，启动被拒绝。"
+    )
+
+
+def _validate_production_binding(
+    app_env: str | None,
+    app_host: str,
+    app_port: int,
+    *,
+    host_explicit: bool = False,
+) -> None:
+    """监听地址边界（Phase 8 Step 4 + 4A）。
+
+    判定表：
+
+    ================================  ========================  ==============
+    ``APP_ENV``                       ``APP_HOST``               结果
+    ================================  ========================  ==============
+    ``production`` / ``prod``         回环                      允许
+    ``production`` / ``prod``         非回环                     **拒绝**
+    明确非生产（dev/test/ci/...）     任意                      允许
+    未声明（缺失 / 空 / 空白）         回环                      允许
+    未声明                           默认值且未显式设置          允许（兼容）
+    未声明                           **显式**非回环             **拒绝**
+    非法值                            任意                      **拒绝**
+    ================================  ========================  ==============
+
+    设计要点（为什么"未声明 + 显式非回环"要拒绝）：
+
+    * 代码默认 ``APP_HOST=0.0.0.0`` 属历史行为，本阶段**不改**默认值，
+      否则会破坏全部开发与测试环境的 ``import``；
+    * 但若操作者**主动**把后端绑到非回环地址、却没有声明环境，这恰恰是
+      "生产漏配 ``APP_ENV``"的典型形态 ⇒ 必须 fail closed，而不是静默放行；
+    * 因此用 ``host_explicit`` 区分"默认值"与"显式配置"。
+    """
+    kind = _resolve_environment(app_env)          # 非法值在此抛错
+    host = (app_host or "").strip()
+    loopback = host in _LOOPBACK_HOSTS
+
+    if kind == ENVIRONMENT_PRODUCTION:
+        if loopback:
+            return
+        raise ValueError(
+            "APP_ENV=production 时 APP_HOST 必须是回环地址"
+            f"（{' / '.join(sorted(_LOOPBACK_HOSTS))}）。"
+            "生产后端只能由本机反向代理访问；如需暴露到其它接口，"
+            "必须先通过部署评审并显式修改该约束。"
+        )
+
+    if kind == ENVIRONMENT_NON_PRODUCTION:
+        return
+
+    # 未声明环境：只允许"回环"或"沿用默认值"，显式非回环一律拒绝。
+    if loopback or not host_explicit:
+        return
+    raise ValueError(
+        "APP_ENV 未声明（缺失或空白）却把 APP_HOST 显式设置为非回环地址；"
+        "已拒绝启动。请显式声明环境："
+        f"生产用 APP_ENV=production（要求回环监听），"
+        f"开发/测试用 APP_ENV=development 或 APP_ENV=test。"
+    )
 
 
 def _get_int_clamped(
@@ -614,7 +771,9 @@ class AuthSettings:
         )
     )
     cookie_secure: bool = field(
-        default_factory=lambda: _get_bool("AUTH_COOKIE_SECURE", True)
+        # 安全关键：非法值必须启动失败，**不得**静默降级为 False
+        # （Phase 8 Step 4；其余功能开关仍用宽松的 ``_get_bool``）。
+        default_factory=lambda: _get_bool_strict("AUTH_COOKIE_SECURE", True)
     )
     cookie_samesite: str = field(
         default_factory=lambda: _get_str("AUTH_COOKIE_SAMESITE", "lax").lower()
@@ -898,7 +1057,10 @@ class Settings:
     """全局应用配置。"""
 
     app_name: str = field(default_factory=lambda: _get_str("APP_NAME", "WMS AI Assistant"))
-    app_env: str = field(default_factory=lambda: _get_str("APP_ENV", "development"))
+    #: 环境声明。**默认空串 = 未声明**（Phase 8 Step 4A）：
+    #: 不再把"没配 APP_ENV"伪装成 `development`，否则生产漏配会被静默放行。
+    #: 开发环境由 `.env.example` 显式提供 `APP_ENV=development`。
+    app_env: str = field(default_factory=lambda: _get_str("APP_ENV", ""))
     app_host: str = field(default_factory=lambda: _get_str("APP_HOST", "0.0.0.0"))
     app_port: int = field(default_factory=lambda: _get_int("APP_PORT", 8000))
     llm: LLMSettings = field(default_factory=LLMSettings)
@@ -934,6 +1096,44 @@ class Settings:
     text_to_sql: TextToSQLSettings = field(default_factory=TextToSQLSettings)
     sql_executor: SQLExecutorSettings = field(default_factory=SQLExecutorSettings)
     ai_router: AIRouterSettings = field(default_factory=AIRouterSettings)
+
+    def __post_init__(self) -> None:
+        """构造后校验（Phase 8 Step 4 / 4A）。
+
+        * ``APP_ENV=production`` ⇒ 必须绑定回环；
+        * ``APP_ENV`` 为受支持的开发 / 测试值 ⇒ 不限制；
+        * ``APP_ENV`` 缺失或空白 ⇒ 仅当 ``APP_HOST`` **未被显式设置**（沿用
+          默认值）或为回环时才允许；显式设成非回环 ⇒ 拒绝；
+        * ``APP_ENV`` 为非法值 ⇒ 拒绝（拼写错误不得被当作开发环境）。
+
+        校验失败 ⇒ ``ValueError`` ⇒ 进程启动失败（不允许"静默用不安全默认值
+        继续跑"）。
+        """
+        raw_host = os.getenv("APP_HOST")
+        host_explicit = raw_host is not None and raw_host.strip() != ""
+        _validate_production_binding(
+            self.app_env,
+            self.app_host,
+            self.app_port,
+            host_explicit=host_explicit,
+        )
+
+    @property
+    def environment_kind(self) -> str:
+        """``production`` / ``non-production`` / ``unspecified``。"""
+        return _resolve_environment(self.app_env)
+
+    @property
+    def production_binding_verified(self) -> bool:
+        """**生产监听安全校验是否真的完成**（不得被"未声明"冒充）。
+
+        仅当 ``APP_ENV`` 明确为生产且 ``APP_HOST`` 为回环时才是 ``True``。
+        任何"未声明 / 空白 / 开发 / 测试"环境下该值恒为 ``False``。
+        """
+        return (
+            self.environment_kind == ENVIRONMENT_PRODUCTION
+            and (self.app_host or "").strip() in _LOOPBACK_HOSTS
+        )
 
 
 settings = Settings()

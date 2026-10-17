@@ -47,7 +47,8 @@ services:
       POSTGRES_DB: ${WMS_TEST_DB_NAME:-wms_ai_test}
     ports:
       # 宿主机 5433 → 容器 5432（应用库占用 5432，互不冲突）
-      - "${WMS_TEST_DB_PORT:-5433}:5432"
+      # 仅绑定本机回环：测试库不得暴露到局域网 / 公网（Phase 8 Step 4）。
+      - "127.0.0.1:${WMS_TEST_DB_PORT:-5433}:5432"
     volumes:
       # 独立命名卷：**不**挂载 wms-ai-postgres-data
       - wms-ai-postgres-test-data:/var/lib/postgresql/data

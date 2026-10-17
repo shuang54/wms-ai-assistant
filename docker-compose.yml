@@ -28,7 +28,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-wms_ai}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # 仅绑定本机回环：数据库不得暴露到局域网 / 公网（Phase 8 Step 4）。
+      # 如需从其它主机访问，必须经明确评审的隧道方案，不得改回 0.0.0.0。
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
