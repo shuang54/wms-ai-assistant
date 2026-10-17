@@ -1,0 +1,126 @@
+# ============================================================================
+# WMS AI Assistant — Workflow 运维工作台 · 生产网关模板（Nginx）
+#
+# ⚠️ 本文件是**模板**，不可直接启动：
+#    · 所有 <UPPERCASE_PLACEHOLDER> 必须由部署层替换为真实值；
+#    · 不含任何真实域名、证书、私钥、凭据或服务器地址；
+#    · 未经真实环境验证 ⇒ Production Deployment 仍为 BLOCKED。
+#
+# 边界（与 docs/security.md §7.1、deploy/README.md 一致）：
+#   1. TLS 只在**本层**终结；后端仅监听 127.0.0.1，不得直接暴露到公网。
+#   2. 只转发白名单：/api/ui/projects/（只读）与 /api/auth/{login,logout}。
+#   3. 其余 /api/* 一律 404 —— **不做** /api/ 全路径转发。
+#   4. 客户端提供的 X-Forwarded-* 由本层**覆盖**（见 proxy-headers.conf）。
+#   5. 不添加任何 Access-Control-* 头（同源部署，无需 CORS）。
+#   6. 不引用开发网关（dev-gateway.mjs）或本地启动脚本。
+# ============================================================================
+
+upstream wms_workflow_ui_backend {
+    # 后端只允许回环可达（APP_HOST=127.0.0.1）；此处不得改为公网地址。
+    server 127.0.0.1:8000;
+    keepalive 16;
+}
+
+# ---- 80：仅做 HTTPS 跳转，不承载任何业务内容 ----
+server {
+    listen 80;
+    server_name <PRODUCTION_HOST>;
+    server_tokens off;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name <PRODUCTION_HOST>;
+    server_tokens off;
+
+    # 证书由部署层提供并负责续期（Let's Encrypt / 企业 CA 均可）。
+    ssl_certificate     <TLS_CERT_PATH>;
+    ssl_certificate_key <TLS_KEY_PATH>;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:WMS_UI_TLS:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+    add_header X-Frame-Options           "DENY" always;
+    add_header Referrer-Policy           "no-referrer" always;
+
+    # 登录请求体很小；限制体积以缩小攻击面。
+    client_max_body_size 16k;
+
+    # ---- 静态工作台（只读资源白名单）----
+    # <STATIC_ROOT> 指向部署层发布的 frontend 静态资源目录；
+    # 不得包含 tests / e2e / scripts / node_modules。
+    root <STATIC_ROOT>;
+    index index.html;
+
+    location = / {
+        return 302 /index.html;
+    }
+
+    location = /index.html {
+        try_files /index.html =404;
+    }
+
+    location = /styles.css {
+        try_files /styles.css =404;
+    }
+
+    location ^~ /js/ {
+        try_files $uri =404;
+    }
+
+    # ---- 只读 UI API：仅 GET / HEAD ----
+    # 路径前缀已限定到 /api/ui/projects/，且方法由 limit_except 收窄。
+    # 认证（M1 会话 Cookie）与项目授权（M2.4）仍由后端执行。
+    location ^~ /api/ui/projects/ {
+        limit_except GET {
+            deny all;
+        }
+
+        proxy_pass         http://wms_workflow_ui_backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+
+        include proxy-headers.conf;
+    }
+
+    # ---- 认证：仅登录 / 登出（后端真实存在的两个路由）----
+    # /api/auth/me 页面当前不使用，故意不暴露。
+    location = /api/auth/login {
+        limit_except POST {
+            deny all;
+        }
+
+        proxy_pass         http://wms_workflow_ui_backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+
+        include proxy-headers.conf;
+    }
+
+    location = /api/auth/logout {
+        limit_except POST {
+            deny all;
+        }
+
+        proxy_pass         http://wms_workflow_ui_backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+
+        include proxy-headers.conf;
+    }
+
+    # ---- 其余 API 一律拒绝（防止误开放全路径转发）----
+    location ^~ /api/ {
+        return 404;
+    }
+
+    # ---- 其余路径一律拒绝 ----
+    location / {
+        return 404;
+    }
+}
